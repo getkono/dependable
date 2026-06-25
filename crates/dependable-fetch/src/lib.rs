@@ -1,21 +1,35 @@
 //! Async IO layer for `dependable`: registry adapters, the OSV client, and caching.
 //!
-//! This crate depends on [`dependable_core`] for the pure data model and adds the
-//! network and concurrency concerns. The crates.io fetcher, OSV client, and moka
-//! cache land with the Rust/Crates.io MVP.
+//! Depends on [`dependable_core`] for the pure data model and adds the network +
+//! concurrency concerns that the core deliberately excludes.
 
-/// Short identifier for this crate. Placeholder until the fetch layer lands.
-#[must_use]
-pub fn name() -> &'static str {
-    "dependable-fetch"
-}
+use std::time::Duration;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub mod cache;
+pub mod dependency;
+pub mod error;
+pub mod osv;
+pub mod registries;
 
-    #[test]
-    fn name_is_stable() {
-        assert_eq!(name(), "dependable-fetch");
-    }
+pub use dependency::{Dependency, VulnerabilityId};
+pub use error::FetchError;
+pub use osv::{OsvClient, OsvQuery};
+pub use registries::{CratesIoFetcher, FetchedVersions, RegistryFetcher};
+
+/// Build the shared HTTP client used by all fetchers.
+///
+/// rustls TLS, gzip decompression, a 10-second timeout, and a descriptive
+/// User-Agent. The connection pool is shared by cloning the returned client.
+///
+/// # Errors
+/// Returns an error if the TLS backend or client cannot be constructed.
+pub fn build_client() -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .user_agent(format!(
+            "Dependable/{} ({})",
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS
+        ))
+        .timeout(Duration::from_secs(10))
+        .build()
 }

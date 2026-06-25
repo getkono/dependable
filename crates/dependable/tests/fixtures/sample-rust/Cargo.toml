@@ -1,0 +1,17 @@
+# A demo fixture (not built) exercising every status path:
+#   serde / tokio  -> locked behind latest    -> update / patch available
+#   time = "=0.2.7" -> pinned, known advisory  -> vulnerable
+#   local-thing     -> path dependency         -> skipped (local)
+[package]
+name = "sample-rust"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = "1"
+tokio = "1"
+time = "=0.2.7"
+local-thing = { path = "../local-thing" }
+
+[dev-dependencies]
+anyhow = "1"

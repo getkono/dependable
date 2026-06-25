@@ -1,0 +1,19 @@
+# Hand-written lock fixture: pins each crate behind its latest release so the
+# demo shows patch/update statuses deterministically.
+version = 3
+
+[[package]]
+name = "anyhow"
+version = "1.0.40"
+
+[[package]]
+name = "serde"
+version = "1.0.100"
+
+[[package]]
+name = "time"
+version = "0.2.7"
+
+[[package]]
+name = "tokio"
+version = "1.20.0"

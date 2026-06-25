@@ -15,3 +15,15 @@ path = "src/main.rs"
 [dependencies]
 dependable-core = { path = "../dependable-core" }
 dependable-fetch = { path = "../dependable-fetch" }
+toml_edit.workspace = true
+clap.workspace = true
+tokio.workspace = true
+futures.workspace = true
+owo-colors.workspace = true
+indicatif.workspace = true
+figment.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true

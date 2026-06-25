@@ -1,23 +1,23 @@
 //! Pure, IO-free parsing and version-checking core for `dependable`.
 //!
-//! This crate takes `&str` manifest content and returns plain data structures.
-//! It performs zero filesystem and zero network access, which keeps it fully
-//! unit-testable without mocking.
-//!
-//! The type model, parsers, and semver engine land with the Rust/Crates.io MVP.
+//! Everything here takes `&str` input and returns plain data structures — no
+//! filesystem, network, or async — which keeps the crate fully unit-testable
+//! without mocking.
 
-/// Short identifier for this crate. Placeholder until the type model lands.
-#[must_use]
-pub fn name() -> &'static str {
-    "dependable-core"
-}
+pub mod ecosystem;
+pub mod error;
+pub mod item;
+pub mod lockfiles;
+pub mod manifest;
+pub mod parsers;
+pub mod result;
+pub mod semver;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn name_is_stable() {
-        assert_eq!(name(), "dependable-core");
-    }
-}
+pub use ecosystem::Ecosystem;
+pub use error::ParseError;
+pub use item::{Item, PackageSource};
+pub use lockfiles::{LockfileData, apply_lockfile, parse_cargo_lock};
+pub use manifest::{AlternateRegistryDecl, ManifestKind, ParsedManifest};
+pub use parsers::{CargoTomlParser, Parser, parse};
+pub use result::{CheckResult, DependencyStatus};
+pub use semver::{Evaluation, check_version};

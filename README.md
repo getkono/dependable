@@ -17,6 +17,29 @@ mise install        # install hk + cargo-llvm-cov from mise.toml
 mise run build
 ```
 
+## Usage
+
+```bash
+dependable check [PATH]           # check a project (default: current dir)
+dependable check . --format json  # machine-readable output (also: text)
+dependable check . --fail-on vulnerable   # exit non-zero for CI
+dependable list .                 # list dependencies without checking
+dependable fix . --dry-run        # preview in-place upgrades
+```
+
+`check` parses every `Cargo.toml` it finds, reads `Cargo.lock`, fetches versions
+from the crates.io sparse index, classifies each dependency, and scans
+[OSV](https://osv.dev) for known vulnerabilities:
+
+```
+Cargo.toml — Rust (5 dependencies)
+
+Package  Current  Latest   Status
+serde    1.0.100  1.0.228  patch available
+tokio    1.20.0   1.52.3   3 vulnerabilities
+time     0.2.7    0.3.51   1 vulnerability
+```
+
 ## Development
 
 | Command              | Description                                  |

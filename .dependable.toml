@@ -1,0 +1,19 @@
+# Example dependable configuration. The values shown are the defaults.
+
+[global]
+# Max concurrent HTTP requests.
+concurrency = 20
+# Include GHSA advisories (in addition to RUSTSEC/CVE) in vulnerability checks.
+include_ghsa = false
+# Read Cargo.lock to show the resolved version.
+lock_file = true
+# Exit non-zero in CI when results match: "none" | "outdated" | "vulnerable" | "any".
+fail_on = "none"
+
+[rust]
+enabled = true
+registry = "https://index.crates.io"
+
+[vulnerability]
+enabled = true
+osv_batch_url = "https://api.osv.dev/v1/querybatch"

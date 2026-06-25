@@ -5,6 +5,9 @@ members = [
     "crates/dependable-fetch",
     "crates/dependable",
 ]
+# Test fixtures contain their own Cargo.toml/Cargo.lock and are parsed as data,
+# never built — keep them out of the workspace.
+exclude = ["crates/dependable/tests/fixtures"]
 
 [workspace.package]
 version = "0.1.0"
@@ -14,6 +17,31 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/getkono/dependable"
 authors = ["Justin Chung"]
 
-# Shared dependency catalogue. Populated as the MVP lands (commit 3); kept empty
-# in the scaffold so the workspace builds with no third-party code.
+# Shared dependency catalogue for the Rust/Crates.io MVP.
 [workspace.dependencies]
+# --- dependable-core (pure) ---
+toml_edit = "0.22"
+serde = { version = "1", features = ["derive"] }
+semver = "1"
+thiserror = "2"
+# --- dependable-fetch / dependable (IO) ---
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "gzip",
+    "json",
+    "http2",
+    "charset",
+] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+moka = { version = "0.12", features = ["future"] }
+futures = "0.3"
+clap = { version = "4", features = ["derive"] }
+owo-colors = { version = "4", features = ["supports-colors"] }
+indicatif = "0.17"
+figment = { version = "0.10", features = ["toml", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+anyhow = "1"
+# dev
+wiremock = "0.6"

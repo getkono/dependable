@@ -9,3 +9,16 @@ repository.workspace = true
 
 [dependencies]
 dependable-core = { path = "../dependable-core" }
+semver.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+moka.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+wiremock.workspace = true

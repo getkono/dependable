@@ -8,3 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+toml_edit.workspace = true
+serde.workspace = true
+semver.workspace = true
+thiserror.workspace = true

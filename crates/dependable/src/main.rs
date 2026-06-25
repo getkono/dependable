@@ -1,21 +1,49 @@
-//! `dependable` CLI entry point.
-//!
-//! Scaffold only — argument parsing and orchestration land with the MVP.
+//! `dependable` — check dependency versions and known vulnerabilities.
 
-fn greeting() -> &'static str {
-    "dependable: dependency version + vulnerability checker"
-}
+use std::process::ExitCode;
 
-fn main() {
-    println!("{}", greeting());
-}
+use clap::Parser;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+mod cli;
+mod config;
+mod discover;
+mod fix;
+mod output;
+mod runner;
 
-    #[test]
-    fn greeting_mentions_dependable() {
-        assert!(greeting().contains("dependable"));
+use cli::{Cli, Command};
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    let cli = Cli::parse();
+    init_tracing(cli.verbose());
+
+    let result = match cli.command {
+        Command::Check(args) => runner::run_check(args).await,
+        Command::List(args) => runner::run_list(args).await,
+        Command::Fix(args) => runner::run_fix(args).await,
+    };
+
+    match result {
+        Ok(code) => code,
+        Err(err) => {
+            eprintln!("error: {err:#}");
+            ExitCode::from(2)
+        }
     }
+}
+
+fn init_tracing(verbose: bool) {
+    use tracing_subscriber::EnvFilter;
+
+    let default = if verbose {
+        "dependable=debug,dependable_fetch=debug"
+    } else {
+        "warn"
+    };
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
 }
