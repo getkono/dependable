@@ -1,0 +1,19 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/dependable-core",
+    "crates/dependable-fetch",
+    "crates/dependable",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/getkono/dependable"
+authors = ["Justin Chung"]
+
+# Shared dependency catalogue. Populated as the MVP lands (commit 3); kept empty
+# in the scaffold so the workspace builds with no third-party code.
+[workspace.dependencies]

@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Format, lint, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # rust-toolchain.toml is the canonical toolchain source; rustup (preinstalled
+      # on the runner) installs the pinned channel + components on first use.
+      - name: Materialize Rust toolchain
+        run: rustup show active-toolchain || rustup show
+      - uses: Swatinem/rust-cache@v2
+      # mise installs hk + cargo-llvm-cov and exposes the `mise run` tasks.
+      - uses: jdx/mise-action@v2
+      - name: Format check
+        run: mise run fmt:check
+      - name: Lint
+        run: mise run lint
+      - name: Test
+        run: mise run test
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Materialize Rust toolchain
+        run: rustup show active-toolchain || rustup show
+      - uses: Swatinem/rust-cache@v2
+      - uses: jdx/mise-action@v2
+      - name: Generate coverage report
+        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+      - name: Coverage summary
+        run: cargo llvm-cov report --summary-only
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: lcov.info

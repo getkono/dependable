@@ -1,0 +1,10 @@
+[package]
+name = "dependable-core"
+description = "Pure, IO-free parsing and version-checking core for dependable."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

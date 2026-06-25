@@ -1,0 +1,66 @@
+amends "package://github.com/jdx/hk/releases/download/v1.48.0/hk@1.48.0#/Config.pkl"
+
+// Workspace-wide Rust steps. Each defines a read-only `check` and (where it makes
+// sense) a `fix`. Check-only hooks (pre-push) run `check`; fix hooks (pre-commit)
+// run `fix`. We define explicit stable, workspace commands rather than the cargo_*
+// builtins so clippy gets `-D warnings` and nothing requires a nightly toolchain.
+
+local fmt = new Step {
+    glob = "**/*.rs"
+    check = "cargo fmt --all --check"
+    fix = "cargo fmt --all"
+}
+
+local clippy = new Step {
+    glob = List("**/*.rs", "**/Cargo.toml")
+    check = "cargo clippy --workspace --all-targets -- -D warnings"
+    fix = "cargo clippy --fix --allow-dirty --allow-staged --workspace --all-targets"
+}
+
+// No `glob`: these always run as a final gate, even when only Cargo.toml changes.
+local test = new Step {
+    check = "cargo test --workspace"
+}
+
+local coverage = new Step {
+    check = "cargo llvm-cov --workspace"
+}
+
+hooks {
+    // pre-commit auto-fixes staged work; `stage` defaults to true so fixes are
+    // re-staged, and `stash = "git"` isolates fixes to staged content.
+    ["pre-commit"] {
+        fix = true
+        stash = "git"
+        steps {
+            ["fmt"] = fmt
+            ["clippy"] = clippy
+        }
+    }
+
+    // pre-push is the read-only gate before code reaches the remote.
+    ["pre-push"] {
+        steps {
+            ["fmt"] = fmt
+            ["clippy"] = clippy
+            ["test"] = test
+            ["coverage"] = coverage
+        }
+    }
+
+    // `hk check` / `hk fix` for manual or CI invocation.
+    ["check"] {
+        steps {
+            ["fmt"] = fmt
+            ["clippy"] = clippy
+            ["test"] = test
+        }
+    }
+    ["fix"] {
+        fix = true
+        steps {
+            ["fmt"] = fmt
+            ["clippy"] = clippy
+        }
+    }
+}

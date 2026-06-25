@@ -1,0 +1,11 @@
+[package]
+name = "dependable-fetch"
+description = "Async registry and OSV fetch layer for dependable."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+dependable-core = { path = "../dependable-core" }

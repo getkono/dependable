@@ -1,0 +1,49 @@
+# mise configuration: dev tools + task runner.
+#
+# The Rust toolchain itself is owned by `rust-toolchain.toml` (rustup), which is
+# the canonical source for the channel + components and is what CI honors. mise
+# manages the auxiliary tools below and the task runner.
+
+[tools]
+hk = "latest"                            # git hooks manager (reads tool versions from mise)
+"aqua:taiki-e/cargo-llvm-cov" = "latest" # coverage
+
+[tasks.hooks]
+description = "Install the hk git hooks (routed through mise)"
+run = "hk install --mise"
+
+[tasks.build]
+description = "Build the workspace"
+run = "cargo build --workspace"
+
+[tasks.test]
+description = "Run all tests (live network tests are #[ignore]d and skipped)"
+run = "cargo test --workspace"
+
+[tasks."test:live"]
+description = "Run the live network smoke tests (hits crates.io + OSV)"
+run = "cargo test --workspace -- --ignored"
+
+[tasks.fmt]
+description = "Format the workspace"
+run = "cargo fmt --all"
+
+[tasks."fmt:check"]
+description = "Check formatting without modifying files"
+run = "cargo fmt --all --check"
+
+[tasks.lint]
+description = "Lint with clippy, treating warnings as errors"
+run = "cargo clippy --workspace --all-targets -- -D warnings"
+
+[tasks.check]
+description = "Type-check the whole workspace"
+run = "cargo check --workspace --all-targets"
+
+[tasks.coverage]
+description = "Generate a coverage report (informational, no threshold)"
+run = "cargo llvm-cov --workspace"
+
+[tasks.ci]
+description = "Run the full local CI gate: format check, lint, and tests"
+depends = ["fmt:check", "lint", "test"]
