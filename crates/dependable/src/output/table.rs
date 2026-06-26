@@ -1,6 +1,6 @@
 //! Colored, TTY-aware table output (the default).
 
-use dependable_core::{CheckResult, DependencyStatus};
+use dependable_fetch::{CheckResult, DependencyStatus};
 use owo_colors::{OwoColorize, Stream, Style};
 
 use super::{ManifestReport, Summary, current_display, latest_display};
@@ -101,6 +101,7 @@ fn status_cell(result: &CheckResult) -> String {
         DependencyStatus::Outdated | DependencyStatus::Error(_) => Style::new().red(),
         DependencyStatus::Vulnerable => Style::new().red().bold(),
         DependencyStatus::Local | DependencyStatus::Git => Style::new().dimmed(),
+        _ => Style::new(),
     };
     format!(
         "{}",

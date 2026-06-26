@@ -3,7 +3,8 @@
 
 use std::path::Path;
 
-use dependable_core::{CargoTomlParser, PackageSource, Parser, apply_lockfile, parse_cargo_lock};
+use dependable_fetch::PackageSource;
+use dependable_fetch::core::{CargoTomlParser, Parser, apply_lockfile, parse_cargo_lock};
 
 #[test]
 fn fixture_parses_and_applies_lock() {

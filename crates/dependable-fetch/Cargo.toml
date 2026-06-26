@@ -11,7 +11,7 @@ repository.workspace = true
 dependable-core = { path = "../dependable-core" }
 semver.workspace = true
 reqwest.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["fs"] }
 moka.workspace = true
 futures.workspace = true
 serde.workspace = true

@@ -7,10 +7,15 @@ use crate::result::DependencyStatus;
 
 /// The outcome of evaluating one constraint against a set of available versions.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Evaluation {
+    /// The classified status.
     pub status: DependencyStatus,
+    /// Best version satisfying the declared constraint.
     pub latest_compatible: Option<String>,
+    /// Absolute latest available version (may be outside the constraint).
     pub latest_available: Option<String>,
+    /// Whether a patch-level update exists within the constraint.
     pub patch_available: bool,
 }
 

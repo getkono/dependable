@@ -3,7 +3,10 @@
 use thiserror::Error;
 
 /// An error from a registry or OSV request.
+///
+/// `#[non_exhaustive]`: match with a wildcard arm so new variants are additive.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum FetchError {
     #[error("http error: {0}")]
     Http(#[from] reqwest::Error),

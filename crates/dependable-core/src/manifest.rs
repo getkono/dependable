@@ -7,8 +7,11 @@ use crate::item::Item;
 
 /// The result of parsing a manifest: its kind and the dependencies it declares.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ParsedManifest {
+    /// The kind of manifest that was parsed.
     pub kind: ManifestKind,
+    /// The dependencies declared in the manifest, in source order.
     pub items: Vec<Item>,
     /// Alternate registry declarations (Rust `[registries.*]`).
     pub alternate_registries: Vec<AlternateRegistryDecl>,
@@ -16,15 +19,20 @@ pub struct ParsedManifest {
 
 /// A declared alternate registry (Rust only).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AlternateRegistryDecl {
+    /// The registry alias used by `registry = "..."` entries.
     pub name: String,
+    /// The sparse-index URL, if declared.
     pub index_url: Option<String>,
+    /// An auth token for the registry, if declared.
     pub auth_token: Option<String>,
 }
 
 /// Distinguishes manifest files. Only [`ManifestKind::CargoToml`] is parsed in
 /// V1; the rest exist so detection and the ecosystem mapping are forward-stable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ManifestKind {
     CargoToml,
     GoMod,

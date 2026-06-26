@@ -40,6 +40,45 @@ tokio    1.20.0   1.52.3   3 vulnerabilities
 time     0.2.7    0.3.51   1 vulnerability
 ```
 
+## Use as a library
+
+`dependable-fetch` is the high-level library: depend on it alone to scan a
+`Cargo.toml` and report outdated or vulnerable dependencies. The `dependable` CLI
+is a thin wrapper over the same `Checker` API, so the library and the CLI share one
+implementation.
+
+```toml
+[dependencies]
+dependable-fetch = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+```
+
+```rust
+use dependable_fetch::{Checker, ManifestKind};
+
+# async fn run() -> Result<(), dependable_fetch::CheckError> {
+// Build once and reuse — clones share the HTTP pool and the version/OSV caches.
+let checker = Checker::new()?;
+
+// check_manifest takes content (ideal for in-memory / unsaved editor buffers);
+// check_path(path) reads a manifest + its sibling lockfile off disk.
+let manifest = std::fs::read_to_string("Cargo.toml")?;
+let check = checker
+    .check_manifest(ManifestKind::CargoToml, &manifest, None)
+    .await?;
+
+for result in check.outdated() {
+    println!("{}: {}", result.item.name, result.status.label());
+}
+# Ok(())
+# }
+```
+
+Only direct registry dependencies are checked (local/git/workspace deps are
+skipped and transitive deps are never fetched), and the public API is
+forward-compatible: enums are `#[non_exhaustive]` and the registry layer routes
+per ecosystem, so future registries (npm, PyPI, Go, …) are additive.
+
 ## Development
 
 | Command              | Description                                  |
@@ -55,8 +94,10 @@ time     0.2.7    0.3.51   1 vulnerability
 ## Workspace
 
 - **`dependable-core`** — pure, IO-free parsing + version logic (`&str` → data).
-- **`dependable-fetch`** — async registry + OSV fetch layer with caching.
-- **`dependable`** — the CLI binary.
+- **`dependable-fetch`** — the high-level library: `Checker` ties parsing to async
+  registry + OSV fetching and caching. The public end-to-end entry point for other
+  tools; re-exports the core types so consumers need only this crate.
+- **`dependable`** — the CLI binary; a thin wrapper over `dependable-fetch`.
 
 ## Git Hooks
 

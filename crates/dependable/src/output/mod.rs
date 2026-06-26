@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use dependable_core::{CheckResult, DependencyStatus, Ecosystem};
+use dependable_fetch::{CheckResult, DependencyStatus, Ecosystem};
 
 use crate::cli::Format;
 
@@ -48,6 +48,7 @@ impl Summary {
                     DependencyStatus::Error(_) => s.error += 1,
                     DependencyStatus::Local => s.local += 1,
                     DependencyStatus::Git => s.git += 1,
+                    _ => {}
                 }
             }
         }
