@@ -1,6 +1,6 @@
 //! Colored, TTY-aware table output (the default).
 
-use dependable_core::{CheckResult, DependencyStatus};
+use dependable_fetch::{CheckResult, DependencyStatus};
 use owo_colors::{OwoColorize, Stream, Style};
 
 use super::{ManifestReport, Summary, current_display, latest_display};

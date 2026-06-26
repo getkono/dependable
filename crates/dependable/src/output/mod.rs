@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use dependable_core::{CheckResult, DependencyStatus, Ecosystem};
+use dependable_fetch::{CheckResult, DependencyStatus, Ecosystem};
 
 use crate::cli::Format;
 

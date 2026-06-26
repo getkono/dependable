@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use anyhow::Context;
-use dependable_core::{CheckResult, DependencyStatus};
+use dependable_fetch::{CheckResult, DependencyStatus};
 use toml_edit::{DocumentMut, value};
 
 /// A single applied (or would-be-applied) version change.
