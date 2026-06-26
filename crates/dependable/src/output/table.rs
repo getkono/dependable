@@ -101,6 +101,7 @@ fn status_cell(result: &CheckResult) -> String {
         DependencyStatus::Outdated | DependencyStatus::Error(_) => Style::new().red(),
         DependencyStatus::Vulnerable => Style::new().red().bold(),
         DependencyStatus::Local | DependencyStatus::Git => Style::new().dimmed(),
+        _ => Style::new(),
     };
     format!(
         "{}",

@@ -48,6 +48,7 @@ impl Summary {
                     DependencyStatus::Error(_) => s.error += 1,
                     DependencyStatus::Local => s.local += 1,
                     DependencyStatus::Git => s.git += 1,
+                    _ => {}
                 }
             }
         }

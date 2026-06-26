@@ -170,15 +170,7 @@ impl Engine {
                     versions,
                     item.locked_version.as_deref(),
                 );
-                CheckResult {
-                    item: item.clone(),
-                    status: eval.status,
-                    latest_compatible: eval.latest_compatible,
-                    latest_available: eval.latest_available,
-                    patch_available: eval.patch_available,
-                    current_vulnerabilities: Vec::new(),
-                    all_vulnerabilities: HashMap::new(),
-                }
+                CheckResult::from_evaluation(item.clone(), eval)
             }
             Some(Err(e)) => base_result(item, DependencyStatus::Error(e.clone())),
             None => base_result(item, DependencyStatus::Error("not fetched".to_string())),
@@ -297,6 +289,7 @@ pub async fn run_list(args: ListArgs) -> anyhow::Result<ExitCode> {
                 PackageSource::Git => " (git)",
                 PackageSource::Jsr => " (jsr)",
                 PackageSource::Registry => "",
+                _ => "",
             };
             println!("  {} {}{}", item.name, constraint, note);
         }
@@ -365,15 +358,7 @@ fn collect_manifests(manifest: Option<&Path>, path: Option<&Path>, depth: usize)
 }
 
 fn base_result(item: &Item, status: DependencyStatus) -> CheckResult {
-    CheckResult {
-        item: item.clone(),
-        status,
-        latest_compatible: None,
-        latest_available: None,
-        patch_available: false,
-        current_vulnerabilities: Vec::new(),
-        all_vulnerabilities: HashMap::new(),
-    }
+    CheckResult::new(item.clone(), status)
 }
 
 fn lockfile_path(manifest: &Path) -> Option<PathBuf> {

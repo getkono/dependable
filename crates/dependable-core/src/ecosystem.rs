@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 /// exist so the data model (and OSV/registry mappings) stay stable as ecosystems
 /// are added.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum Ecosystem {
     Rust,
     Go,
