@@ -5,8 +5,12 @@ use futures::future::BoxFuture;
 use crate::error::FetchError;
 
 pub mod crates_io;
+pub mod jsr;
+pub mod npm;
 
 pub use crates_io::CratesIoFetcher;
+pub use jsr::JsrFetcher;
+pub use npm::NpmFetcher;
 
 /// The versions fetched from a registry for one package.
 ///

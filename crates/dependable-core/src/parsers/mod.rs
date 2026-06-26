@@ -4,9 +4,16 @@ use crate::error::ParseError;
 use crate::manifest::{ManifestKind, ParsedManifest};
 
 pub mod cargo_toml;
+pub mod deno_json;
+pub mod json_scan;
+pub mod package_json;
+pub mod pnpm_workspace;
 pub mod position;
 
 pub use cargo_toml::CargoTomlParser;
+pub use deno_json::DenoJsonParser;
+pub use package_json::PackageJsonParser;
+pub use pnpm_workspace::PnpmWorkspaceParser;
 
 /// A pure manifest parser: `&str` in, structured data out, no side effects.
 pub trait Parser {
@@ -18,6 +25,9 @@ pub trait Parser {
 pub fn parse(kind: ManifestKind, content: &str) -> Result<ParsedManifest, ParseError> {
     match kind {
         ManifestKind::CargoToml => CargoTomlParser.parse(content),
+        ManifestKind::PackageJson => PackageJsonParser.parse(content),
+        ManifestKind::DenoJson => DenoJsonParser.parse(content),
+        ManifestKind::PnpmWorkspaceYaml => PnpmWorkspaceParser.parse(content),
         other => Err(ParseError::Unsupported(other)),
     }
 }
