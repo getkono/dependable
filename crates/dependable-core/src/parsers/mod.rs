@@ -4,9 +4,11 @@ use crate::error::ParseError;
 use crate::manifest::{ManifestKind, ParsedManifest};
 
 pub mod cargo_toml;
+pub mod go_mod;
 pub mod position;
 
 pub use cargo_toml::CargoTomlParser;
+pub use go_mod::GoModParser;
 
 /// A pure manifest parser: `&str` in, structured data out, no side effects.
 pub trait Parser {
@@ -18,6 +20,7 @@ pub trait Parser {
 pub fn parse(kind: ManifestKind, content: &str) -> Result<ParsedManifest, ParseError> {
     match kind {
         ManifestKind::CargoToml => CargoTomlParser.parse(content),
+        ManifestKind::GoMod => GoModParser.parse(content),
         other => Err(ParseError::Unsupported(other)),
     }
 }

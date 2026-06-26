@@ -1,7 +1,9 @@
 //! Hermetic HTTP tests against a local wiremock server (run in normal CI), plus
 //! `#[ignore]`d live smoke tests (run via `mise run test:live`).
 
-use dependable_fetch::{CratesIoFetcher, OsvClient, OsvQuery, RegistryFetcher, build_client};
+use dependable_fetch::{
+    CratesIoFetcher, GoProxyFetcher, OsvClient, OsvQuery, RegistryFetcher, build_client,
+};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -56,6 +58,64 @@ async fn osv_querybatch_aligns_and_filters_ghsa() {
     let out = osv.query_batch(&queries).await.unwrap();
     assert_eq!(out[0], vec!["RUSTSEC-2020-0001"]); // GHSA filtered out
     assert!(out[1].is_empty());
+}
+
+#[tokio::test]
+async fn go_proxy_lists_versions_strips_v_and_sorts() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/github.com/foo/bar/@v/list"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("v1.0.0\nv1.2.0\nv1.1.0\n"))
+        .mount(&server)
+        .await;
+
+    let fetcher = GoProxyFetcher::with_proxy(build_client().unwrap(), server.uri());
+    let fetched = fetcher.fetch_versions("github.com/foo/bar").await.unwrap();
+    assert_eq!(fetched.versions, vec!["1.2.0", "1.1.0", "1.0.0"]);
+}
+
+#[tokio::test]
+async fn go_proxy_falls_back_to_latest_when_list_empty() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/example.com/m/@v/list"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(""))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/example.com/m/@latest"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"Version":"v0.5.0"}"#))
+        .mount(&server)
+        .await;
+
+    let fetcher = GoProxyFetcher::with_proxy(build_client().unwrap(), server.uri());
+    let fetched = fetcher.fetch_versions("example.com/m").await.unwrap();
+    assert_eq!(fetched.versions, vec!["0.5.0"]);
+}
+
+#[tokio::test]
+async fn go_proxy_case_encodes_uppercase_module() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/github.com/!azure/foo/@v/list"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("v1.0.0\n"))
+        .mount(&server)
+        .await;
+
+    let fetcher = GoProxyFetcher::with_proxy(build_client().unwrap(), server.uri());
+    let fetched = fetcher
+        .fetch_versions("github.com/Azure/foo")
+        .await
+        .unwrap();
+    assert_eq!(fetched.versions, vec!["1.0.0"]);
+}
+
+#[tokio::test]
+#[ignore = "hits the network (Go module proxy)"]
+async fn live_go_proxy_has_versions() {
+    let fetcher = GoProxyFetcher::new(build_client().unwrap());
+    let fetched = fetcher.fetch_versions("golang.org/x/text").await.unwrap();
+    assert!(!fetched.versions.is_empty());
 }
 
 #[tokio::test]

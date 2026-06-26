@@ -2,7 +2,11 @@
 //! parse → fetch → evaluate → OSV scan over inline manifest content against a
 //! local wiremock server that mocks both the crates.io sparse index and OSV.
 
-use dependable_fetch::{Checker, DependencyStatus, Ecosystem, ManifestKind, build_client};
+use std::sync::Arc;
+
+use dependable_fetch::{
+    Checker, DependencyStatus, Ecosystem, GoProxyFetcher, ManifestKind, build_client,
+};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -92,6 +96,43 @@ async fn check_manifest_classifies_and_scans() {
     );
     // The path dependency is skipped, never fetched or queried.
     assert_eq!(by_name("local-thing").status, DependencyStatus::Local);
+}
+
+#[tokio::test]
+async fn check_go_mod_end_to_end() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/github.com/foo/bar/@v/list"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("v1.0.0\nv1.2.0\n"))
+        .mount(&server)
+        .await;
+
+    let client = build_client().unwrap();
+    let checker = Checker::builder()
+        .http_client(client.clone())
+        .registry(
+            Ecosystem::Go,
+            Arc::new(GoProxyFetcher::with_proxy(client, server.uri())),
+        )
+        .vulnerabilities(false)
+        .build()
+        .unwrap();
+
+    let manifest = "require (\n\tgithub.com/foo/bar v1.0.0\n)\n";
+    let check = checker
+        .check_manifest(ManifestKind::GoMod, manifest, None)
+        .await
+        .unwrap();
+
+    assert_eq!(check.ecosystem, Ecosystem::Go);
+    let r = check
+        .results
+        .iter()
+        .find(|r| r.item.name == "github.com/foo/bar")
+        .unwrap();
+    // Resolved at v1.0.0, latest within the major is v1.2.0.
+    assert_eq!(r.status, DependencyStatus::UpdateAvailable);
+    assert_eq!(r.latest_available.as_deref(), Some("1.2.0"));
 }
 
 #[tokio::test]
