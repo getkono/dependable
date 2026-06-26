@@ -2,7 +2,8 @@
 //! `#[ignore]`d live smoke tests (run via `mise run test:live`).
 
 use dependable_fetch::{
-    CratesIoFetcher, JsrFetcher, NpmFetcher, OsvClient, OsvQuery, RegistryFetcher, build_client,
+    CratesIoFetcher, JsrFetcher, NpmFetcher, OsvClient, OsvQuery, PackagistFetcher,
+    RegistryFetcher, build_client,
 };
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -92,6 +93,30 @@ async fn jsr_fetch_parses_versions_filtering_yanked() {
     let fetched = fetcher.fetch_versions("@std/path").await.unwrap();
     assert_eq!(fetched.versions, vec!["1.0.0", "0.8.0"]); // 0.9.0 yanked
     assert_eq!(fetched.latest_tag.as_deref(), Some("1.0.0"));
+}
+
+#[tokio::test]
+async fn packagist_fetch_parses_versions_and_strips_v() {
+    let server = MockServer::start().await;
+    let body = r#"{"packages":{"monolog/monolog":[
+        {"version":"2.1.0"},{"version":"v2.0.0"},{"version":"2.2.0"}]}}"#;
+    Mock::given(method("GET"))
+        .and(path("/p2/monolog/monolog.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let fetcher = PackagistFetcher::with_registry(build_client().unwrap(), server.uri());
+    let fetched = fetcher.fetch_versions("monolog/monolog").await.unwrap();
+    assert_eq!(fetched.versions, vec!["2.2.0", "2.1.0", "2.0.0"]);
+}
+
+#[tokio::test]
+#[ignore = "hits the network (Packagist)"]
+async fn live_packagist_monolog_has_versions() {
+    let fetcher = PackagistFetcher::new(build_client().unwrap());
+    let fetched = fetcher.fetch_versions("monolog/monolog").await.unwrap();
+    assert!(!fetched.versions.is_empty());
 }
 
 #[tokio::test]

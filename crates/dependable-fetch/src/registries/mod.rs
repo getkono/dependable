@@ -7,10 +7,12 @@ use crate::error::FetchError;
 pub mod crates_io;
 pub mod jsr;
 pub mod npm;
+pub mod packagist;
 
 pub use crates_io::CratesIoFetcher;
 pub use jsr::JsrFetcher;
 pub use npm::NpmFetcher;
+pub use packagist::PackagistFetcher;
 
 /// The versions fetched from a registry for one package.
 ///

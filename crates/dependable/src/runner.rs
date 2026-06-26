@@ -12,7 +12,7 @@ use anyhow::Context;
 use dependable_fetch::core::parse;
 use dependable_fetch::{
     CheckError, Checker, DependencyStatus, Ecosystem, JsrFetcher, ManifestKind, NpmFetcher,
-    PackageSource, ParseError, ProgressEvent, UnstableFilter, build_client,
+    PackageSource, PackagistFetcher, ParseError, ProgressEvent, UnstableFilter, build_client,
 };
 use indicatif::{ProgressBar, ProgressStyle};
 
@@ -101,6 +101,15 @@ impl Engine {
                     client.clone(),
                     cfg.npm.jsr_registry.clone(),
                 )));
+        }
+        if cfg.php.enabled {
+            builder = builder.registry(
+                Ecosystem::Php,
+                Arc::new(PackagistFetcher::with_registry(
+                    client.clone(),
+                    cfg.php.registry.clone(),
+                )),
+            );
         }
         if show_progress {
             builder = builder.on_progress(progress_sink());

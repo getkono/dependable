@@ -17,11 +17,13 @@ pub use ecosystem::Ecosystem;
 pub use error::ParseError;
 pub use item::{Item, PackageSource};
 pub use lockfiles::{
-    LockfileData, apply_lockfile, parse_cargo_lock, parse_lockfile, parse_package_lock,
+    LockfileData, apply_lockfile, parse_cargo_lock, parse_composer_lock, parse_lockfile,
+    parse_package_lock,
 };
 pub use manifest::{AlternateRegistryDecl, ManifestKind, ParsedManifest};
 pub use parsers::{
-    CargoTomlParser, DenoJsonParser, PackageJsonParser, Parser, PnpmWorkspaceParser, parse,
+    CargoTomlParser, ComposerJsonParser, DenoJsonParser, PackageJsonParser, Parser,
+    PnpmWorkspaceParser, parse,
 };
 pub use result::{CheckResult, DependencyStatus};
 pub use semver::{Evaluation, UnstableFilter, check_version, is_prerelease};
