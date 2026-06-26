@@ -1,7 +1,40 @@
-//! Async IO layer for `dependable`: registry adapters, the OSV client, and caching.
+//! The high-level `dependable` library: parse a manifest, fetch registry versions
+//! and OSV advisories, and report which dependencies are outdated or vulnerable.
 //!
-//! Depends on [`dependable_core`] for the pure data model and adds the network +
-//! concurrency concerns that the core deliberately excludes.
+//! This crate is the recommended entry point for embedding `dependable` in another
+//! tool (an IDE, a bot, a service). It re-exports the pure [`dependable_core`] data
+//! model and adds the network + concurrency layer, so **depending on this crate
+//! alone is sufficient**. The CLI binary is a thin wrapper over the same API.
+//!
+//! [`Checker`] is the entry point; [`CratesIoFetcher`]/[`OsvClient`] remain public
+//! for callers who want to compose the low-level pieces by hand.
+//!
+//! Only direct registry dependencies are checked: local/git/workspace deps are
+//! skipped, names are deduplicated before fetching, and transitive deps are never
+//! queried. The design routes per [`Ecosystem`], so adding registries (npm, PyPI,
+//! Go, …) is additive.
+//!
+//! # Example
+//!
+//! ```no_run
+//! use dependable_fetch::{Checker, ManifestKind};
+//!
+//! # async fn run() -> Result<(), dependable_fetch::CheckError> {
+//! // One checker, reused across manifests (shares the HTTP pool and caches).
+//! let checker = Checker::new()?;
+//!
+//! // Check an in-memory manifest (e.g. an unsaved IDE buffer).
+//! let manifest = std::fs::read_to_string("Cargo.toml")?;
+//! let check = checker
+//!     .check_manifest(ManifestKind::CargoToml, &manifest, None)
+//!     .await?;
+//!
+//! for result in check.outdated() {
+//!     println!("{}: {}", result.item.name, result.status.label());
+//! }
+//! # Ok(())
+//! # }
+//! ```
 
 use std::time::Duration;
 

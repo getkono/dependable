@@ -8,9 +8,12 @@ for what is deferred and why.
 
 - **`dependable-core`** (`crates/dependable-core`) — pure, **IO-free** core: takes
   `&str` manifest content, returns plain data. **No filesystem, no network, no async.**
-- **`dependable-fetch`** (`crates/dependable-fetch`) — async IO: crates.io sparse
-  index, OSV client, moka cache. Depends on `dependable-core`.
-- **`dependable`** (`crates/dependable`) — the CLI binary (clap).
+- **`dependable-fetch`** (`crates/dependable-fetch`) — the **high-level library** and
+  public end-to-end entry point: the `Checker` (parse → fetch → evaluate → OSV scan)
+  plus async IO (crates.io sparse index, OSV client, moka cache). Depends on and
+  re-exports `dependable-core`, so external consumers (e.g. an IDE) need only this crate.
+- **`dependable`** (`crates/dependable`) — the CLI binary (clap); a thin wrapper over
+  `dependable-fetch::Checker` that owns only discovery, config, output, fix, and exit codes.
 
 ## Quality
 
