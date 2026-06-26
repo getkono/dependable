@@ -6,13 +6,35 @@
 use std::time::Duration;
 
 pub mod cache;
+pub mod check;
 pub mod error;
 pub mod osv;
 pub mod registries;
 
+// High-level entry point (recommended for embedding).
+pub use check::{CheckError, Checker, CheckerBuilder, ManifestCheck, ProgressEvent};
+
+// Low-level building blocks (compose-it-yourself).
 pub use error::FetchError;
 pub use osv::{OsvClient, OsvQuery};
 pub use registries::{CratesIoFetcher, FetchedVersions, RegistryFetcher};
+
+// Re-export the core types a consumer needs, so depending on `dependable-fetch`
+// alone is sufficient. `core` is the escape hatch for everything else (lockfiles,
+// parsers, `check_version`, ...).
+pub use dependable_core as core;
+pub use dependable_core::{
+    CheckResult, DependencyStatus, Ecosystem, Evaluation, Item, ManifestKind, PackageSource,
+    ParseError, ParsedManifest,
+};
+
+/// One-import convenience for consumers: `use dependable_fetch::prelude::*;`.
+pub mod prelude {
+    pub use crate::{
+        CheckError, CheckResult, Checker, DependencyStatus, Ecosystem, ManifestCheck, ManifestKind,
+        ProgressEvent,
+    };
+}
 
 /// Build the shared HTTP client used by all fetchers.
 ///
