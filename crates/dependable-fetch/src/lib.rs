@@ -50,7 +50,7 @@ pub use check::{CheckError, Checker, CheckerBuilder, ManifestCheck, ProgressEven
 // Low-level building blocks (compose-it-yourself).
 pub use error::FetchError;
 pub use osv::{OsvClient, OsvQuery};
-pub use registries::{CratesIoFetcher, FetchedVersions, RegistryFetcher};
+pub use registries::{CratesIoFetcher, FetchedVersions, PyPiFetcher, RegistryFetcher};
 
 // Re-export the core types a consumer needs, so depending on `dependable-fetch`
 // alone is sufficient. `core` is the escape hatch for everything else (lockfiles,

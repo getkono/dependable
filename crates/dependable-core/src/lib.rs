@@ -18,6 +18,6 @@ pub use error::ParseError;
 pub use item::{Item, PackageSource};
 pub use lockfiles::{LockfileData, apply_lockfile, parse_cargo_lock, parse_lockfile};
 pub use manifest::{AlternateRegistryDecl, ManifestKind, ParsedManifest};
-pub use parsers::{CargoTomlParser, Parser, parse};
+pub use parsers::{CargoTomlParser, Parser, PyprojectTomlParser, RequirementsTxtParser, parse};
 pub use result::{CheckResult, DependencyStatus};
-pub use semver::{Evaluation, UnstableFilter, check_version, is_prerelease};
+pub use semver::{Evaluation, UnstableFilter, check_version, is_prerelease, to_semver_constraint};

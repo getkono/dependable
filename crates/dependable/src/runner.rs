@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex};
 use anyhow::Context;
 use dependable_fetch::core::parse;
 use dependable_fetch::{
-    CheckError, Checker, DependencyStatus, ManifestKind, PackageSource, ParseError, ProgressEvent,
-    UnstableFilter,
+    CheckError, Checker, DependencyStatus, Ecosystem, ManifestKind, PackageSource, ParseError,
+    ProgressEvent, PyPiFetcher, UnstableFilter, build_client,
 };
 use indicatif::{ProgressBar, ProgressStyle};
 
@@ -75,8 +75,11 @@ struct Engine {
 }
 
 impl Engine {
-    fn new(settings: &Settings, show_progress: bool) -> anyhow::Result<Self> {
+    fn new(settings: &Settings, cfg: &Config, show_progress: bool) -> anyhow::Result<Self> {
+        // One HTTP client, shared (connection pool included) by every fetcher.
+        let client = build_client().context("building HTTP client")?;
         let mut builder = Checker::builder()
+            .http_client(client.clone())
             .rust_registry(settings.registry.clone(), None)
             .vulnerabilities(settings.check_vuln)
             .include_ghsa(settings.include_ghsa)
@@ -84,6 +87,16 @@ impl Engine {
             .concurrency(settings.concurrency)
             .read_lockfiles(settings.check_lockfile)
             .unstable(settings.unstable);
+        // Register non-Rust ecosystem fetchers when enabled in config.
+        if cfg.python.enabled {
+            builder = builder.registry(
+                Ecosystem::Python,
+                Arc::new(PyPiFetcher::with_registry(
+                    client.clone(),
+                    cfg.python.registry.clone(),
+                )),
+            );
+        }
         if show_progress {
             builder = builder.on_progress(progress_sink());
         }
@@ -175,7 +188,7 @@ pub async fn run_check(args: CheckArgs) -> anyhow::Result<ExitCode> {
     }
 
     let fail_on = settings.fail_on;
-    let engine = Engine::new(&settings, !args.quiet)?;
+    let engine = Engine::new(&settings, &cfg, !args.quiet)?;
     let mut reports = Vec::new();
     for manifest in &manifests {
         if let Some(report) = engine.check_manifest(manifest).await? {
@@ -270,7 +283,7 @@ pub async fn run_fix(args: FixArgs) -> anyhow::Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    let engine = Engine::new(&settings, true)?;
+    let engine = Engine::new(&settings, &cfg, true)?;
     let mut total = 0;
     for manifest in &manifests {
         let Some(report) = engine.check_manifest(manifest).await? else {

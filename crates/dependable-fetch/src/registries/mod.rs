@@ -5,8 +5,10 @@ use futures::future::BoxFuture;
 use crate::error::FetchError;
 
 pub mod crates_io;
+pub mod pypi;
 
 pub use crates_io::CratesIoFetcher;
+pub use pypi::PyPiFetcher;
 
 /// The versions fetched from a registry for one package.
 ///
