@@ -9,8 +9,11 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
-use dependable_fetch::core::{CargoTomlParser, Parser};
-use dependable_fetch::{Checker, DependencyStatus, PackageSource, ProgressEvent};
+use dependable_fetch::core::parse;
+use dependable_fetch::{
+    CheckError, Checker, DependencyStatus, ManifestKind, PackageSource, ParseError, ProgressEvent,
+    UnstableFilter,
+};
 use indicatif::{ProgressBar, ProgressStyle};
 
 use crate::cli::{CheckArgs, FailOn, FixArgs, ListArgs};
@@ -26,6 +29,7 @@ struct Settings {
     check_vuln: bool,
     include_ghsa: bool,
     fail_on: FailOn,
+    unstable: UnstableFilter,
     registry: String,
     osv_url: String,
 }
@@ -57,6 +61,9 @@ fn resolve_check_settings(args: &CheckArgs, cfg: &Config) -> Settings {
         check_vuln: cfg.vulnerability.enabled && !args.no_vuln && !env_no_vuln,
         include_ghsa: args.include_ghsa || cfg.global.include_ghsa || env_ghsa,
         fail_on,
+        unstable: args
+            .unstable
+            .map_or_else(|| cfg.global.unstable.into(), Into::into),
         registry: cfg.rust.registry.clone(),
         osv_url: cfg.vulnerability.osv_batch_url.clone(),
     }
@@ -75,7 +82,8 @@ impl Engine {
             .include_ghsa(settings.include_ghsa)
             .osv_url(settings.osv_url.clone())
             .concurrency(settings.concurrency)
-            .read_lockfiles(settings.check_lockfile);
+            .read_lockfiles(settings.check_lockfile)
+            .unstable(settings.unstable);
         if show_progress {
             builder = builder.on_progress(progress_sink());
         }
@@ -83,20 +91,39 @@ impl Engine {
         Ok(Self { checker })
     }
 
-    async fn check_manifest(&self, path: &Path) -> anyhow::Result<ManifestReport> {
-        let check = self
-            .checker
-            .check_path(path)
-            .await
-            .with_context(|| format!("checking {}", path.display()))?;
-        for warning in &check.warnings {
-            eprintln!("warning: {} — {warning}", path.display());
+    /// Check one manifest, returning `None` (with a skip note) when its ecosystem
+    /// has no registered checker or no parser yet — so a polyglot repo with a
+    /// not-yet-supported manifest does not abort the whole run.
+    async fn check_manifest(&self, path: &Path) -> anyhow::Result<Option<ManifestReport>> {
+        match self.checker.check_path(path).await {
+            Ok(check) => {
+                for warning in &check.warnings {
+                    eprintln!("warning: {} — {warning}", path.display());
+                }
+                Ok(Some(ManifestReport {
+                    path: path.to_path_buf(),
+                    ecosystem: check.ecosystem,
+                    results: check.results,
+                }))
+            }
+            Err(CheckError::UnsupportedEcosystem(eco)) => {
+                eprintln!(
+                    "skipping {}: {} is not enabled or not yet supported",
+                    path.display(),
+                    eco.display_name()
+                );
+                Ok(None)
+            }
+            Err(CheckError::Parse(ParseError::Unsupported(kind))) => {
+                eprintln!("skipping {}: no parser for {kind:?}", path.display());
+                Ok(None)
+            }
+            Err(CheckError::UnknownManifest(p)) => {
+                eprintln!("skipping {}: unrecognized manifest", p.display());
+                Ok(None)
+            }
+            Err(e) => Err(anyhow::Error::new(e).context(format!("checking {}", path.display()))),
         }
-        Ok(ManifestReport {
-            path: path.to_path_buf(),
-            ecosystem: check.ecosystem,
-            results: check.results,
-        })
     }
 }
 
@@ -143,7 +170,7 @@ pub async fn run_check(args: CheckArgs) -> anyhow::Result<ExitCode> {
         settings.depth,
     );
     if manifests.is_empty() {
-        eprintln!("No Cargo.toml manifests found.");
+        eprintln!("No supported manifests found.");
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -151,7 +178,9 @@ pub async fn run_check(args: CheckArgs) -> anyhow::Result<ExitCode> {
     let engine = Engine::new(&settings, !args.quiet)?;
     let mut reports = Vec::new();
     for manifest in &manifests {
-        reports.push(engine.check_manifest(manifest).await?);
+        if let Some(report) = engine.check_manifest(manifest).await? {
+            reports.push(report);
+        }
     }
 
     output::render(args.format, &reports, args.quiet)?;
@@ -162,21 +191,40 @@ pub async fn run_check(args: CheckArgs) -> anyhow::Result<ExitCode> {
 pub async fn run_list(args: ListArgs) -> anyhow::Result<ExitCode> {
     let manifests = collect_manifests(args.manifest.as_deref(), args.path.as_deref(), args.depth);
     if manifests.is_empty() {
-        eprintln!("No Cargo.toml manifests found.");
+        eprintln!("No supported manifests found.");
         return Ok(ExitCode::SUCCESS);
     }
-    for (i, manifest) in manifests.iter().enumerate() {
-        if i > 0 {
-            println!();
-        }
+    let mut printed = 0;
+    for manifest in &manifests {
+        let Some(kind) = ManifestKind::detect(manifest) else {
+            continue;
+        };
         let content = std::fs::read_to_string(manifest)
             .with_context(|| format!("reading {}", manifest.display()))?;
-        let parsed = CargoTomlParser
-            .parse(&content)
-            .with_context(|| format!("parsing {}", manifest.display()))?;
+        let parsed = match parse(kind, &content) {
+            Ok(parsed) => parsed,
+            Err(ParseError::Unsupported(_)) => {
+                eprintln!(
+                    "skipping {}: {} is not yet supported",
+                    manifest.display(),
+                    kind.ecosystem().display_name()
+                );
+                continue;
+            }
+            Err(e) => {
+                return Err(
+                    anyhow::Error::new(e).context(format!("parsing {}", manifest.display()))
+                );
+            }
+        };
+        if printed > 0 {
+            println!();
+        }
+        printed += 1;
         println!(
-            "{} — Rust ({} dependencies)",
+            "{} — {} ({} dependencies)",
             manifest.display(),
+            kind.ecosystem().display_name(),
             parsed.items.len()
         );
         for item in &parsed.items {
@@ -208,6 +256,7 @@ pub async fn run_fix(args: FixArgs) -> anyhow::Result<ExitCode> {
         check_vuln: false,
         include_ghsa: false,
         fail_on: FailOn::None,
+        unstable: cfg.global.unstable.into(),
         registry: cfg.rust.registry.clone(),
         osv_url: cfg.vulnerability.osv_batch_url.clone(),
     };
@@ -217,14 +266,16 @@ pub async fn run_fix(args: FixArgs) -> anyhow::Result<ExitCode> {
         settings.depth,
     );
     if manifests.is_empty() {
-        eprintln!("No Cargo.toml manifests found.");
+        eprintln!("No supported manifests found.");
         return Ok(ExitCode::SUCCESS);
     }
 
     let engine = Engine::new(&settings, true)?;
     let mut total = 0;
     for manifest in &manifests {
-        let report = engine.check_manifest(manifest).await?;
+        let Some(report) = engine.check_manifest(manifest).await? else {
+            continue;
+        };
         let records = fix::apply_fixes(manifest, &report.results, args.all, args.dry_run)?;
         if records.is_empty() {
             continue;

@@ -70,6 +70,8 @@ impl ManifestKind {
     pub fn lockfile_name(self) -> Option<&'static str> {
         match self {
             ManifestKind::CargoToml => Some("Cargo.lock"),
+            ManifestKind::PackageJson => Some("package-lock.json"),
+            ManifestKind::ComposerJson => Some("composer.lock"),
             _ => None,
         }
     }
@@ -82,15 +84,34 @@ impl ManifestKind {
 
     /// Detect a manifest kind from a file path.
     ///
-    /// V1 recognizes only `Cargo.toml`; other manifests return `None` until their
-    /// parser lands, so directory walks silently skip them.
+    /// Recognition is by file name. A kind being recognized here does not imply a
+    /// parser exists for it yet — discovery surfaces the file and the higher
+    /// layers skip it gracefully if its ecosystem is unsupported.
     #[must_use]
     pub fn detect(path: &Path) -> Option<Self> {
-        match path.file_name()?.to_str()? {
-            "Cargo.toml" => Some(ManifestKind::CargoToml),
-            _ => None,
-        }
+        let name = path.file_name()?.to_str()?;
+        let kind = match name {
+            "Cargo.toml" => ManifestKind::CargoToml,
+            "go.mod" => ManifestKind::GoMod,
+            "package.json" => ManifestKind::PackageJson,
+            "deno.json" | "deno.jsonc" => ManifestKind::DenoJson,
+            "pnpm-workspace.yaml" | "pnpm-workspace.yml" => ManifestKind::PnpmWorkspaceYaml,
+            "composer.json" => ManifestKind::ComposerJson,
+            "pyproject.toml" | "pixi.toml" => ManifestKind::PyprojectToml,
+            "pubspec.yaml" => ManifestKind::PubspecYaml,
+            "mix.exs" => ManifestKind::MixExs,
+            _ if is_requirements_file(name) => ManifestKind::RequirementsTxt,
+            _ if name.ends_with(".csproj") => ManifestKind::Csproj,
+            _ => return None,
+        };
+        Some(kind)
     }
+}
+
+/// Whether `name` is a Python requirements file (`requirements.txt`,
+/// `requirements-dev.txt`, `requirements.in`, …).
+fn is_requirements_file(name: &str) -> bool {
+    name.starts_with("requirements") && (name.ends_with(".txt") || name.ends_with(".in"))
 }
 
 #[cfg(test)]
@@ -98,12 +119,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn detects_cargo_toml_only() {
-        assert_eq!(
-            ManifestKind::detect(Path::new("a/b/Cargo.toml")),
-            Some(ManifestKind::CargoToml)
-        );
-        assert_eq!(ManifestKind::detect(Path::new("package.json")), None);
+    fn detects_known_manifest_filenames() {
+        let cases = [
+            ("a/b/Cargo.toml", ManifestKind::CargoToml),
+            ("go.mod", ManifestKind::GoMod),
+            ("package.json", ManifestKind::PackageJson),
+            ("deno.json", ManifestKind::DenoJson),
+            ("deno.jsonc", ManifestKind::DenoJson),
+            ("pnpm-workspace.yaml", ManifestKind::PnpmWorkspaceYaml),
+            ("composer.json", ManifestKind::ComposerJson),
+            ("requirements.txt", ManifestKind::RequirementsTxt),
+            ("requirements-dev.txt", ManifestKind::RequirementsTxt),
+            ("requirements.in", ManifestKind::RequirementsTxt),
+            ("pyproject.toml", ManifestKind::PyprojectToml),
+            ("pixi.toml", ManifestKind::PyprojectToml),
+            ("pubspec.yaml", ManifestKind::PubspecYaml),
+            ("mix.exs", ManifestKind::MixExs),
+            ("App.csproj", ManifestKind::Csproj),
+        ];
+        for (path, expected) in cases {
+            assert_eq!(
+                ManifestKind::detect(Path::new(path)),
+                Some(expected),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn ignores_unknown_files() {
+        assert_eq!(ManifestKind::detect(Path::new("README.md")), None);
+        assert_eq!(ManifestKind::detect(Path::new("notes.in")), None);
+        assert_eq!(ManifestKind::detect(Path::new("setup.py")), None);
+    }
+
+    #[test]
+    fn lockfile_names() {
         assert_eq!(ManifestKind::CargoToml.lockfile_name(), Some("Cargo.lock"));
+        assert_eq!(
+            ManifestKind::PackageJson.lockfile_name(),
+            Some("package-lock.json")
+        );
+        assert_eq!(
+            ManifestKind::ComposerJson.lockfile_name(),
+            Some("composer.lock")
+        );
+        assert_eq!(ManifestKind::GoMod.lockfile_name(), None);
     }
 }

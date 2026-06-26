@@ -7,8 +7,9 @@ use dependable_fetch::ManifestKind;
 /// Directories never descended into during discovery.
 const SKIP_DIRS: &[&str] = &["target", "node_modules", ".git", "vendor"];
 
-/// Find `Cargo.toml` manifests under `root`, searching up to `max_depth`
-/// directories deep, skipping build/vendor directories.
+/// Find every recognized manifest under `root`, searching up to `max_depth`
+/// directories deep, skipping build/vendor directories. Recognition is by
+/// [`ManifestKind::detect`]; unsupported ecosystems are filtered later, not here.
 #[must_use]
 pub fn find_manifests(root: &Path, max_depth: usize) -> Vec<PathBuf> {
     let mut out = Vec::new();
@@ -33,7 +34,7 @@ fn walk(dir: &Path, depth_left: usize, out: &mut Vec<PathBuf>) {
                 continue;
             }
             walk(&path, depth_left - 1, out);
-        } else if ManifestKind::detect(&path) == Some(ManifestKind::CargoToml) {
+        } else if ManifestKind::detect(&path).is_some() {
             out.push(path);
         }
     }

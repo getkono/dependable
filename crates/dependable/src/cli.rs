@@ -48,7 +48,8 @@ pub struct CheckArgs {
     /// Config file path.
     #[arg(long, default_value = ".dependable.toml")]
     pub config: PathBuf,
-    /// Pre-release filter (reserved; only `exclude` acts in V1).
+    /// Pre-release filter: `exclude` (default), `include-always`, or
+    /// `include-if-current`. Overrides `[global] unstable`.
     #[arg(long, value_enum)]
     pub unstable: Option<UnstableFilter>,
     /// Ignore `Cargo.lock`.
@@ -149,10 +150,25 @@ impl FailOn {
     }
 }
 
-/// Pre-release filtering mode (reserved for full implementation).
-#[derive(Copy, Clone, Debug, ValueEnum)]
+/// Pre-release filtering mode, selectable via `--unstable` or `[global] unstable`.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum UnstableFilter {
+    /// Hide pre-releases (default).
+    #[default]
     Exclude,
+    /// Always consider pre-releases.
     IncludeAlways,
+    /// Consider pre-releases only when the current version is a pre-release.
     IncludeIfCurrent,
+}
+
+impl From<UnstableFilter> for dependable_fetch::UnstableFilter {
+    fn from(value: UnstableFilter) -> Self {
+        match value {
+            UnstableFilter::Exclude => dependable_fetch::UnstableFilter::Exclude,
+            UnstableFilter::IncludeAlways => dependable_fetch::UnstableFilter::IncludeAlways,
+            UnstableFilter::IncludeIfCurrent => dependable_fetch::UnstableFilter::IncludeIfCurrent,
+        }
+    }
 }

@@ -58,7 +58,7 @@ pub use registries::{CratesIoFetcher, FetchedVersions, RegistryFetcher};
 pub use dependable_core as core;
 pub use dependable_core::{
     CheckResult, DependencyStatus, Ecosystem, Evaluation, Item, ManifestKind, PackageSource,
-    ParseError, ParsedManifest,
+    ParseError, ParsedManifest, UnstableFilter,
 };
 
 /// One-import convenience for consumers: `use dependable_fetch::prelude::*;`.
