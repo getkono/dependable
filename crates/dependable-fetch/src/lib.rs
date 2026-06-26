@@ -6,12 +6,10 @@
 use std::time::Duration;
 
 pub mod cache;
-pub mod dependency;
 pub mod error;
 pub mod osv;
 pub mod registries;
 
-pub use dependency::{Dependency, VulnerabilityId};
 pub use error::FetchError;
 pub use osv::{OsvClient, OsvQuery};
 pub use registries::{CratesIoFetcher, FetchedVersions, RegistryFetcher};
