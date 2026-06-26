@@ -2,13 +2,32 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [master]
   pull_request:
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  commits:
+    name: Conventional commits
+    # PR-only: the pull_request context (base/head SHAs) is empty on push events.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so the base..head range and its commits are available.
+          fetch-depth: 0
+      # rust-toolchain.toml drives the toolchain; rustup lets the mise cargo backend
+      # build convco on first run (mise-action caches it for subsequent runs).
+      - name: Materialize Rust toolchain
+        run: rustup show active-toolchain || rustup show
+      - uses: jdx/mise-action@v2
+      # Range mode skips merge commits by default (no --merges), so merges pass through.
+      - name: Check conventional commits
+        run: convco check ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}
+
   check:
     name: Format, lint, test
     runs-on: ubuntu-latest

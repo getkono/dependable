@@ -7,6 +7,7 @@
 [tools]
 hk = "latest"                            # git hooks manager (reads tool versions from mise)
 "aqua:taiki-e/cargo-llvm-cov" = "latest" # coverage
+"cargo:convco" = "latest"                # conventional-commit checker (commit-msg hook + PR CI)
 
 [tasks.hooks]
 description = "Install the hk git hooks (routed through mise)"
@@ -43,6 +44,10 @@ run = "cargo check --workspace --all-targets"
 [tasks.coverage]
 description = "Generate a coverage report (informational, no threshold)"
 run = "cargo llvm-cov --workspace"
+
+[tasks.commits]
+description = "Check that commits on this branch follow Conventional Commits"
+run = "convco check master..HEAD"
 
 [tasks.ci]
 description = "Run the full local CI gate: format check, lint, and tests"

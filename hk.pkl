@@ -26,6 +26,16 @@ local coverage = new Step {
     check = "cargo llvm-cov --workspace"
 }
 
+// commit-msg validates the just-written message against Conventional Commits via convco.
+// `--from-stdin` checks the single message we feed in; `--strip` drops git's comment lines
+// and trailing whitespace (like `git commit --cleanup=strip`). Skip during merges/reverts:
+// git runs commit-msg for merge commits too, and their "Merge ..."/"Revert ..." subjects
+// aren't conventional. convco's range check (CI) skips these by default, so we mirror that
+// here by short-circuiting when MERGE_HEAD/REVERT_HEAD is present.
+local conventional = new Step {
+    check = "git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1 || git rev-parse -q --verify REVERT_HEAD >/dev/null 2>&1 || convco check --from-stdin --strip < {{commit_msg_file}}"
+}
+
 hooks {
     // pre-commit auto-fixes staged work; `stage` defaults to true so fixes are
     // re-staged, and `stash = "git"` isolates fixes to staged content.
@@ -35,6 +45,13 @@ hooks {
         steps {
             ["fmt"] = fmt
             ["clippy"] = clippy
+        }
+    }
+
+    // commit-msg enforces Conventional Commits; merges/reverts pass through (see step).
+    ["commit-msg"] {
+        steps {
+            ["conventional"] = conventional
         }
     }
 
