@@ -1,16 +1,16 @@
-//! Orchestration: discover → parse → fetch → check → render.
+//! Orchestration: discover manifests, check each via `dependable-fetch`, render.
+//!
+//! All dependency-checking logic (parse → fetch → evaluate → OSV scan) lives in
+//! [`dependable_fetch::Checker`]. This module owns only CLI concerns: config
+//! layering, manifest discovery, progress UX, output rendering, and exit codes.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
-use dependable_core::{
-    CargoTomlParser, CheckResult, DependencyStatus, Ecosystem, Item, ManifestKind, PackageSource,
-    Parser, apply_lockfile, check_version, parse_cargo_lock,
-};
-use dependable_fetch::{CratesIoFetcher, OsvClient, OsvQuery, RegistryFetcher, build_client};
-use futures::stream::{self, StreamExt};
+use dependable_fetch::core::{CargoTomlParser, Parser};
+use dependable_fetch::{Checker, DependencyStatus, PackageSource, ProgressEvent};
 use indicatif::{ProgressBar, ProgressStyle};
 
 use crate::cli::{CheckArgs, FailOn, FixArgs, ListArgs};
@@ -62,182 +62,75 @@ fn resolve_check_settings(args: &CheckArgs, cfg: &Config) -> Settings {
     }
 }
 
-/// Holds the shared HTTP-backed fetchers and settings for one run.
+/// Adapts the library [`Checker`] to the CLI's per-manifest report shape.
 struct Engine {
-    fetcher: CratesIoFetcher,
-    osv: OsvClient,
-    settings: Settings,
-    show_progress: bool,
+    checker: Checker,
 }
 
 impl Engine {
-    fn new(settings: Settings, show_progress: bool) -> anyhow::Result<Self> {
-        let client = build_client().context("building HTTP client")?;
-        let fetcher =
-            CratesIoFetcher::with_registry(client.clone(), settings.registry.clone(), None);
-        let osv = OsvClient::with_url(client, settings.osv_url.clone(), settings.include_ghsa);
-        Ok(Self {
-            fetcher,
-            osv,
-            settings,
-            show_progress,
-        })
+    fn new(settings: &Settings, show_progress: bool) -> anyhow::Result<Self> {
+        let mut builder = Checker::builder()
+            .rust_registry(settings.registry.clone(), None)
+            .vulnerabilities(settings.check_vuln)
+            .include_ghsa(settings.include_ghsa)
+            .osv_url(settings.osv_url.clone())
+            .concurrency(settings.concurrency)
+            .read_lockfiles(settings.check_lockfile);
+        if show_progress {
+            builder = builder.on_progress(progress_sink());
+        }
+        let checker = builder.build().context("building checker")?;
+        Ok(Self { checker })
     }
 
     async fn check_manifest(&self, path: &Path) -> anyhow::Result<ManifestReport> {
-        let content =
-            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let mut parsed = CargoTomlParser
-            .parse(&content)
-            .with_context(|| format!("parsing {}", path.display()))?;
-
-        if self.settings.check_lockfile
-            && let Some(lock_path) = lockfile_path(path)
-            && let Ok(lock_content) = std::fs::read_to_string(&lock_path)
-            && let Ok(lock) = parse_cargo_lock(&lock_content)
-        {
-            apply_lockfile(&mut parsed.items, &lock);
+        let check = self
+            .checker
+            .check_path(path)
+            .await
+            .with_context(|| format!("checking {}", path.display()))?;
+        for warning in &check.warnings {
+            eprintln!("warning: {} — {warning}", path.display());
         }
-
-        let mut names: Vec<String> = parsed
-            .items
-            .iter()
-            .filter(|i| i.is_checkable())
-            .map(|i| i.name.clone())
-            .collect();
-        names.sort();
-        names.dedup();
-
-        let fetched = self.fetch_all(&names).await;
-        let mut results: Vec<CheckResult> = parsed
-            .items
-            .iter()
-            .map(|item| self.evaluate_item(item, &fetched))
-            .collect();
-
-        if self.settings.check_vuln {
-            self.scan_vulnerabilities(&mut results).await?;
-        }
-
         Ok(ManifestReport {
             path: path.to_path_buf(),
-            ecosystem: Ecosystem::Rust,
-            results,
+            ecosystem: check.ecosystem,
+            results: check.results,
         })
     }
+}
 
-    /// Fetch versions for every name concurrently.
-    async fn fetch_all(&self, names: &[String]) -> HashMap<String, Result<Vec<String>, String>> {
-        let progress = self.progress_bar(names.len() as u64);
-        let fetcher = self.fetcher.clone();
-        let map = stream::iter(names.iter().cloned())
-            .map(|name| {
-                let fetcher = fetcher.clone();
-                let progress = progress.clone();
-                async move {
-                    let result = fetcher
-                        .fetch_versions(&name)
-                        .await
-                        .map(|fetched| fetched.versions)
-                        .map_err(|e| e.to_string());
-                    progress.inc(1);
-                    (name, result)
+/// A progress sink that drives a per-manifest indicatif bar. Each manifest's
+/// check emits one `Started → Advanced* → Finished` cycle, so the shared bar is
+/// (re)created on `Started` and cleared on `Finished`.
+fn progress_sink() -> Arc<dyn Fn(ProgressEvent) + Send + Sync> {
+    let bar: Arc<Mutex<Option<ProgressBar>>> = Arc::new(Mutex::new(None));
+    Arc::new(move |event| {
+        let Ok(mut slot) = bar.lock() else { return };
+        match event {
+            ProgressEvent::Started { total } => {
+                if total == 0 {
+                    return;
                 }
-            })
-            .buffer_unordered(self.settings.concurrency)
-            .collect::<HashMap<_, _>>()
-            .await;
-        progress.finish_and_clear();
-        map
-    }
-
-    fn evaluate_item(
-        &self,
-        item: &Item,
-        fetched: &HashMap<String, Result<Vec<String>, String>>,
-    ) -> CheckResult {
-        if !item.is_checkable() {
-            let status = match item.source {
-                PackageSource::Git => DependencyStatus::Git,
-                _ => DependencyStatus::Local,
-            };
-            return base_result(item, status);
-        }
-        match fetched.get(&item.name) {
-            Some(Ok(versions)) => {
-                let eval = check_version(
-                    &item.version_constraint,
-                    versions,
-                    item.locked_version.as_deref(),
-                );
-                CheckResult {
-                    item: item.clone(),
-                    status: eval.status,
-                    latest_compatible: eval.latest_compatible,
-                    latest_available: eval.latest_available,
-                    patch_available: eval.patch_available,
-                    current_vulnerabilities: Vec::new(),
-                    all_vulnerabilities: HashMap::new(),
+                let pb = ProgressBar::new(total as u64);
+                if let Ok(style) = ProgressStyle::with_template("{spinner} fetching {pos}/{len}") {
+                    pb.set_style(style);
+                }
+                *slot = Some(pb);
+            }
+            ProgressEvent::Advanced { completed, .. } => {
+                if let Some(pb) = slot.as_ref() {
+                    pb.set_position(completed as u64);
                 }
             }
-            Some(Err(e)) => base_result(item, DependencyStatus::Error(e.clone())),
-            None => base_result(item, DependencyStatus::Error("not fetched".to_string())),
-        }
-    }
-
-    /// Query OSV for the current version of each checkable dependency and flip
-    /// its status to `Vulnerable` when advisories are found.
-    async fn scan_vulnerabilities(&self, results: &mut [CheckResult]) -> anyhow::Result<()> {
-        let mut queries = Vec::new();
-        let mut index_for = Vec::new();
-        for (i, result) in results.iter().enumerate() {
-            if !result.item.is_checkable() || matches!(result.status, DependencyStatus::Error(_)) {
-                continue;
+            ProgressEvent::Finished => {
+                if let Some(pb) = slot.take() {
+                    pb.finish_and_clear();
+                }
             }
-            let current = result
-                .item
-                .locked_version
-                .clone()
-                .or_else(|| result.latest_compatible.clone());
-            if let Some(version) = current {
-                queries.push(OsvQuery {
-                    ecosystem: Ecosystem::Rust.osv_name().to_string(),
-                    name: result.item.name.clone(),
-                    version,
-                });
-                index_for.push(i);
-            }
+            _ => {}
         }
-        if queries.is_empty() {
-            return Ok(());
-        }
-
-        let osv_results = self
-            .osv
-            .query_batch(&queries)
-            .await
-            .context("querying OSV")?;
-        for (query_idx, &result_idx) in index_for.iter().enumerate() {
-            if let Some(ids) = osv_results.get(query_idx)
-                && !ids.is_empty()
-            {
-                results[result_idx].current_vulnerabilities = ids.clone();
-                results[result_idx].status = DependencyStatus::Vulnerable;
-            }
-        }
-        Ok(())
-    }
-
-    fn progress_bar(&self, len: u64) -> ProgressBar {
-        if !self.show_progress || len == 0 {
-            return ProgressBar::hidden();
-        }
-        let bar = ProgressBar::new(len);
-        if let Ok(style) = ProgressStyle::with_template("{spinner} fetching {pos}/{len}") {
-            bar.set_style(style);
-        }
-        bar
-    }
+    })
 }
 
 /// `dependable check`
@@ -255,7 +148,7 @@ pub async fn run_check(args: CheckArgs) -> anyhow::Result<ExitCode> {
     }
 
     let fail_on = settings.fail_on;
-    let engine = Engine::new(settings, !args.quiet)?;
+    let engine = Engine::new(&settings, !args.quiet)?;
     let mut reports = Vec::new();
     for manifest in &manifests {
         reports.push(engine.check_manifest(manifest).await?);
@@ -297,6 +190,7 @@ pub async fn run_list(args: ListArgs) -> anyhow::Result<ExitCode> {
                 PackageSource::Git => " (git)",
                 PackageSource::Jsr => " (jsr)",
                 PackageSource::Registry => "",
+                _ => "",
             };
             println!("  {} {}{}", item.name, constraint, note);
         }
@@ -327,7 +221,7 @@ pub async fn run_fix(args: FixArgs) -> anyhow::Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    let engine = Engine::new(settings, true)?;
+    let engine = Engine::new(&settings, true)?;
     let mut total = 0;
     for manifest in &manifests {
         let report = engine.check_manifest(manifest).await?;
@@ -362,23 +256,6 @@ fn collect_manifests(manifest: Option<&Path>, path: Option<&Path>, depth: usize)
     }
     let root = path.map_or_else(|| PathBuf::from("."), Path::to_path_buf);
     discover::find_manifests(&root, depth)
-}
-
-fn base_result(item: &Item, status: DependencyStatus) -> CheckResult {
-    CheckResult {
-        item: item.clone(),
-        status,
-        latest_compatible: None,
-        latest_available: None,
-        patch_available: false,
-        current_vulnerabilities: Vec::new(),
-        all_vulnerabilities: HashMap::new(),
-    }
-}
-
-fn lockfile_path(manifest: &Path) -> Option<PathBuf> {
-    let name = ManifestKind::CargoToml.lockfile_name()?;
-    Some(manifest.parent().unwrap_or(Path::new(".")).join(name))
 }
 
 fn exit_code(reports: &[ManifestReport], fail_on: FailOn) -> ExitCode {

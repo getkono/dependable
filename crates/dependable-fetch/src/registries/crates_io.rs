@@ -1,6 +1,8 @@
 //! The crates.io sparse-index fetcher.
 
 use ::semver::Version;
+use futures::FutureExt;
+use futures::future::BoxFuture;
 use serde::Deserialize;
 
 use super::{FetchedVersions, RegistryFetcher};
@@ -50,25 +52,31 @@ impl CratesIoFetcher {
 }
 
 impl RegistryFetcher for CratesIoFetcher {
-    async fn fetch_versions(&self, name: &str) -> Result<FetchedVersions, FetchError> {
-        let url = format!("{}/{}", self.base_url, index_path(name));
-        let mut req = self.client.get(&url);
-        if let Some(token) = &self.auth {
-            req = req.header(reqwest::header::AUTHORIZATION, token);
+    fn fetch_versions<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> BoxFuture<'a, Result<FetchedVersions, FetchError>> {
+        async move {
+            let url = format!("{}/{}", self.base_url, index_path(name));
+            let mut req = self.client.get(&url);
+            if let Some(token) = &self.auth {
+                req = req.header(reqwest::header::AUTHORIZATION, token);
+            }
+            let resp = req.send().await?;
+            let status = resp.status();
+            if status == reqwest::StatusCode::NOT_FOUND {
+                return Err(FetchError::NotFound(name.to_string()));
+            }
+            if !status.is_success() {
+                return Err(FetchError::Status {
+                    code: status.as_u16(),
+                    package: name.to_string(),
+                });
+            }
+            let body = resp.text().await?;
+            Ok(parse_index(&body))
         }
-        let resp = req.send().await?;
-        let status = resp.status();
-        if status == reqwest::StatusCode::NOT_FOUND {
-            return Err(FetchError::NotFound(name.to_string()));
-        }
-        if !status.is_success() {
-            return Err(FetchError::Status {
-                code: status.as_u16(),
-                package: name.to_string(),
-            });
-        }
-        let body = resp.text().await?;
-        Ok(parse_index(&body))
+        .boxed()
     }
 }
 
@@ -83,12 +91,7 @@ fn parse_index(body: &str) -> FetchedVersions {
         .map(|line| line.vers)
         .collect();
     sort_desc(&mut versions);
-    let latest_tag = versions.first().cloned();
-    FetchedVersions {
-        versions,
-        latest_tag,
-        error: None,
-    }
+    FetchedVersions::new(versions)
 }
 
 fn sort_desc(versions: &mut [String]) {

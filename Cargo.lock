@@ -315,10 +315,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "dependable-core",
  "dependable-fetch",
  "figment",
- "futures",
  "indicatif",
  "owo-colors",
  "serde",

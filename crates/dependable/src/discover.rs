@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use dependable_core::ManifestKind;
+use dependable_fetch::ManifestKind;
 
 /// Directories never descended into during discovery.
 const SKIP_DIRS: &[&str] = &["target", "node_modules", ".git", "vendor"];

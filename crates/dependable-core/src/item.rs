@@ -5,6 +5,7 @@
 /// Carries the byte position of the version *value* so the CLI can rewrite it in
 /// place during `--fix` without disturbing surrounding formatting or comments.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Item {
     /// Package name as declared in the manifest.
     pub name: String,
@@ -43,6 +44,7 @@ impl Item {
 
 /// Where a dependency comes from. Determines whether it is version-checked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum PackageSource {
     /// A normal registry package (the default).
     #[default]

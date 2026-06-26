@@ -15,7 +15,7 @@ end-to-end and establishes the type model + traits that later ecosystems plug in
 | Deliverable | Kind | Responsibility |
 |---|---|---|
 | `dependable-core` | library | Pure, IO-free: parse `Cargo.toml` + `Cargo.lock`, the core data model, and the semver comparison engine. Zero filesystem/network/async. |
-| `dependable-fetch` | library | Async IO: crates.io sparse-index fetcher, OSV vulnerability client, moka in-process cache. |
+| `dependable-fetch` | library | The high-level, public end-to-end entry point: the `Checker` (parse → fetch → evaluate → OSV scan) over the crates.io sparse-index fetcher, OSV vulnerability client, and moka in-process cache. Re-exports the core types so external consumers depend on this crate alone. |
 | `dependable` | application | CLI: `check` / `list` / `fix`, with `table` / `json` / `text` output, `.dependable.toml` + `DEPENDABLE_*` config, and `--fail-on` CI exit codes. |
 
 `dependable-report` (the V2 crate) is **not** created in V1.
