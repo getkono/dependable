@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use dependable_fetch::{
-    Checker, DependencyStatus, Ecosystem, ManifestKind, PyPiFetcher, build_client,
+    Checker, DependencyStatus, Ecosystem, GoProxyFetcher, ManifestKind, PyPiFetcher, build_client,
 };
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -134,6 +134,43 @@ async fn check_requirements_txt_pep440() {
         .unwrap();
     assert_eq!(flask.status, DependencyStatus::UpdateAvailable);
     assert_eq!(flask.latest_available.as_deref(), Some("3.1.0")); // not 3.2.0a1
+}
+
+#[tokio::test]
+async fn check_go_mod_end_to_end() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/github.com/foo/bar/@v/list"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("v1.0.0\nv1.2.0\n"))
+        .mount(&server)
+        .await;
+
+    let client = build_client().unwrap();
+    let checker = Checker::builder()
+        .http_client(client.clone())
+        .registry(
+            Ecosystem::Go,
+            Arc::new(GoProxyFetcher::with_proxy(client, server.uri())),
+        )
+        .vulnerabilities(false)
+        .build()
+        .unwrap();
+
+    let manifest = "require (\n\tgithub.com/foo/bar v1.0.0\n)\n";
+    let check = checker
+        .check_manifest(ManifestKind::GoMod, manifest, None)
+        .await
+        .unwrap();
+
+    assert_eq!(check.ecosystem, Ecosystem::Go);
+    let r = check
+        .results
+        .iter()
+        .find(|r| r.item.name == "github.com/foo/bar")
+        .unwrap();
+    // Resolved at v1.0.0, latest within the major is v1.2.0.
+    assert_eq!(r.status, DependencyStatus::UpdateAvailable);
+    assert_eq!(r.latest_available.as_deref(), Some("1.2.0"));
 }
 
 #[tokio::test]
