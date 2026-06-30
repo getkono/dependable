@@ -2,7 +2,8 @@
 //! `#[ignore]`d live smoke tests (run via `mise run test:live`).
 
 use dependable_fetch::{
-    CratesIoFetcher, GoProxyFetcher, OsvClient, OsvQuery, RegistryFetcher, build_client,
+    CratesIoFetcher, GoProxyFetcher, OsvClient, OsvQuery, PyPiFetcher, RegistryFetcher,
+    build_client,
 };
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -58,6 +59,34 @@ async fn osv_querybatch_aligns_and_filters_ghsa() {
     let out = osv.query_batch(&queries).await.unwrap();
     assert_eq!(out[0], vec!["RUSTSEC-2020-0001"]); // GHSA filtered out
     assert!(out[1].is_empty());
+}
+
+#[tokio::test]
+async fn pypi_fetch_filters_yanked_and_sorts() {
+    let server = MockServer::start().await;
+    let body = r#"{"releases":{
+        "1.0.0":[{"yanked":false}],
+        "1.1.0":[{"yanked":true}],
+        "2.0.0":[{"yanked":false}],
+        "2.1.0a1":[{"yanked":false}]}}"#;
+    Mock::given(method("GET"))
+        .and(path("/flask/json"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let fetcher = PyPiFetcher::with_registry(build_client().unwrap(), server.uri());
+    let fetched = fetcher.fetch_versions("flask").await.unwrap();
+    // 1.1.0 is fully yanked; raw PEP 440 strings, newest-first by semver order.
+    assert_eq!(fetched.versions, vec!["2.1.0a1", "2.0.0", "1.0.0"]);
+}
+
+#[tokio::test]
+#[ignore = "hits the network (PyPI)"]
+async fn live_pypi_flask_has_versions() {
+    let fetcher = PyPiFetcher::new(build_client().unwrap());
+    let fetched = fetcher.fetch_versions("flask").await.unwrap();
+    assert!(!fetched.versions.is_empty());
 }
 
 #[tokio::test]

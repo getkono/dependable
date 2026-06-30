@@ -142,6 +142,17 @@ pub fn normalize_constraint(constraint: &str) -> String {
     }
 }
 
+/// Convert a constraint into a `semver::VersionReq`-compatible string for the
+/// given ecosystem. Python uses PEP 440 translation; every other ecosystem is
+/// already semver-compatible and only needs [`normalize_constraint`].
+#[must_use]
+pub fn to_semver_constraint(constraint: &str, ecosystem: Ecosystem) -> String {
+    match ecosystem {
+        Ecosystem::Python => crate::semver::python::pep440_constraint_to_semver(constraint),
+        _ => normalize_constraint(constraint),
+    }
+}
+
 /// Normalize a concrete version string: strip a leading `v`/`V` and pad partial
 /// versions (`1` → `1.0.0`, `1.2` → `1.2.0`) so they parse as `semver::Version`.
 #[must_use]

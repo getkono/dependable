@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use dependable_fetch::{
-    Checker, DependencyStatus, Ecosystem, GoProxyFetcher, ManifestKind, build_client,
+    Checker, DependencyStatus, Ecosystem, GoProxyFetcher, ManifestKind, PyPiFetcher, build_client,
 };
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -96,6 +96,44 @@ async fn check_manifest_classifies_and_scans() {
     );
     // The path dependency is skipped, never fetched or queried.
     assert_eq!(by_name("local-thing").status, DependencyStatus::Local);
+}
+
+#[tokio::test]
+async fn check_requirements_txt_pep440() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/flask/json"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"releases":{"2.0.0":[{"yanked":false}],"3.1.0":[{"yanked":false}],"3.2.0a1":[{"yanked":false}]}}"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let client = build_client().unwrap();
+    let checker = Checker::builder()
+        .http_client(client.clone())
+        .registry(
+            Ecosystem::Python,
+            Arc::new(PyPiFetcher::with_registry(client, server.uri())),
+        )
+        .vulnerabilities(false)
+        .build()
+        .unwrap();
+
+    // `==2.0.0` pins below the latest; the 3.2.0a1 pre-release is excluded by default.
+    let check = checker
+        .check_manifest(ManifestKind::RequirementsTxt, "flask==2.0.0\n", None)
+        .await
+        .unwrap();
+
+    assert_eq!(check.ecosystem, Ecosystem::Python);
+    let flask = check
+        .results
+        .iter()
+        .find(|r| r.item.name == "flask")
+        .unwrap();
+    assert_eq!(flask.status, DependencyStatus::UpdateAvailable);
+    assert_eq!(flask.latest_available.as_deref(), Some("3.1.0")); // not 3.2.0a1
 }
 
 #[tokio::test]
