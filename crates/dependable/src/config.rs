@@ -20,6 +20,8 @@ pub struct Config {
     #[serde(default)]
     pub rust: RustConfig,
     #[serde(default)]
+    pub go: GoConfig,
+    #[serde(default)]
     pub vulnerability: VulnConfig,
 }
 
@@ -57,6 +59,22 @@ impl Default for RustConfig {
         Self {
             enabled: true,
             registry: "https://index.crates.io".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GoConfig {
+    pub enabled: bool,
+    pub registry: String,
+}
+
+impl Default for GoConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            registry: "https://proxy.golang.org".to_string(),
         }
     }
 }

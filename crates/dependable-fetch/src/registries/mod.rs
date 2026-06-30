@@ -5,8 +5,10 @@ use futures::future::BoxFuture;
 use crate::error::FetchError;
 
 pub mod crates_io;
+pub mod go_proxy;
 
 pub use crates_io::CratesIoFetcher;
+pub use go_proxy::GoProxyFetcher;
 
 /// The versions fetched from a registry for one package.
 ///
