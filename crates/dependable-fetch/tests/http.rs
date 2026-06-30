@@ -2,8 +2,8 @@
 //! `#[ignore]`d live smoke tests (run via `mise run test:live`).
 
 use dependable_fetch::{
-    CratesIoFetcher, GoProxyFetcher, OsvClient, OsvQuery, PyPiFetcher, RegistryFetcher,
-    build_client,
+    CratesIoFetcher, GoProxyFetcher, JsrFetcher, NpmFetcher, OsvClient, OsvQuery, PackagistFetcher,
+    PyPiFetcher, RegistryFetcher, build_client,
 };
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -144,6 +144,80 @@ async fn go_proxy_case_encodes_uppercase_module() {
 async fn live_go_proxy_has_versions() {
     let fetcher = GoProxyFetcher::new(build_client().unwrap());
     let fetched = fetcher.fetch_versions("golang.org/x/text").await.unwrap();
+    assert!(!fetched.versions.is_empty());
+}
+
+#[tokio::test]
+async fn npm_fetch_parses_versions_and_latest_tag() {
+    let server = MockServer::start().await;
+    let body = r#"{"name":"react","dist-tags":{"latest":"18.2.0"},
+        "versions":{"18.0.0":{},"18.2.0":{},"18.1.0":{}}}"#;
+    Mock::given(method("GET"))
+        .and(path("/react"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let fetcher = NpmFetcher::with_registry(build_client().unwrap(), server.uri());
+    let fetched = fetcher.fetch_versions("react").await.unwrap();
+    assert_eq!(fetched.versions, vec!["18.2.0", "18.1.0", "18.0.0"]);
+    assert_eq!(fetched.latest_tag.as_deref(), Some("18.2.0"));
+}
+
+#[tokio::test]
+async fn jsr_fetch_parses_versions_filtering_yanked() {
+    let server = MockServer::start().await;
+    let body = r#"{"scope":"std","name":"path","latest":"1.0.0",
+        "versions":{"1.0.0":{},"0.9.0":{"yanked":true},"0.8.0":{}}}"#;
+    Mock::given(method("GET"))
+        .and(path("/@std/path/meta.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let fetcher = JsrFetcher::with_registry(build_client().unwrap(), server.uri());
+    let fetched = fetcher.fetch_versions("@std/path").await.unwrap();
+    assert_eq!(fetched.versions, vec!["1.0.0", "0.8.0"]); // 0.9.0 yanked
+    assert_eq!(fetched.latest_tag.as_deref(), Some("1.0.0"));
+}
+
+#[tokio::test]
+async fn packagist_fetch_parses_versions_and_strips_v() {
+    let server = MockServer::start().await;
+    let body = r#"{"packages":{"monolog/monolog":[
+        {"version":"2.1.0"},{"version":"v2.0.0"},{"version":"2.2.0"}]}}"#;
+    Mock::given(method("GET"))
+        .and(path("/p2/monolog/monolog.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let fetcher = PackagistFetcher::with_registry(build_client().unwrap(), server.uri());
+    let fetched = fetcher.fetch_versions("monolog/monolog").await.unwrap();
+    assert_eq!(fetched.versions, vec!["2.2.0", "2.1.0", "2.0.0"]);
+}
+
+#[tokio::test]
+#[ignore = "hits the network (Packagist)"]
+async fn live_packagist_monolog_has_versions() {
+    let fetcher = PackagistFetcher::new(build_client().unwrap());
+    let fetched = fetcher.fetch_versions("monolog/monolog").await.unwrap();
+    assert!(!fetched.versions.is_empty());
+}
+
+#[tokio::test]
+#[ignore = "hits the network (npm registry)"]
+async fn live_npm_react_has_versions() {
+    let fetcher = NpmFetcher::new(build_client().unwrap());
+    let fetched = fetcher.fetch_versions("react").await.unwrap();
+    assert!(!fetched.versions.is_empty());
+}
+
+#[tokio::test]
+#[ignore = "hits the network (JSR)"]
+async fn live_jsr_std_path_has_versions() {
+    let fetcher = JsrFetcher::new(build_client().unwrap());
+    let fetched = fetcher.fetch_versions("@std/path").await.unwrap();
     assert!(!fetched.versions.is_empty());
 }
 

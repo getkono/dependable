@@ -4,13 +4,22 @@ use crate::error::ParseError;
 use crate::manifest::{ManifestKind, ParsedManifest};
 
 pub mod cargo_toml;
+pub mod composer_json;
+pub mod deno_json;
 pub mod go_mod;
+pub mod json_scan;
+pub mod package_json;
+pub mod pnpm_workspace;
 pub mod position;
 pub mod pyproject_toml;
 pub mod requirements_txt;
 
 pub use cargo_toml::CargoTomlParser;
+pub use composer_json::ComposerJsonParser;
+pub use deno_json::DenoJsonParser;
 pub use go_mod::GoModParser;
+pub use package_json::PackageJsonParser;
+pub use pnpm_workspace::PnpmWorkspaceParser;
 pub use pyproject_toml::PyprojectTomlParser;
 pub use requirements_txt::RequirementsTxtParser;
 
@@ -25,6 +34,10 @@ pub fn parse(kind: ManifestKind, content: &str) -> Result<ParsedManifest, ParseE
     match kind {
         ManifestKind::CargoToml => CargoTomlParser.parse(content),
         ManifestKind::GoMod => GoModParser.parse(content),
+        ManifestKind::PackageJson => PackageJsonParser.parse(content),
+        ManifestKind::DenoJson => DenoJsonParser.parse(content),
+        ManifestKind::PnpmWorkspaceYaml => PnpmWorkspaceParser.parse(content),
+        ManifestKind::ComposerJson => ComposerJsonParser.parse(content),
         ManifestKind::RequirementsTxt => RequirementsTxtParser.parse(content),
         ManifestKind::PyprojectToml => PyprojectTomlParser.parse(content),
         other => Err(ParseError::Unsupported(other)),

@@ -6,7 +6,7 @@
 //! `dependable-fetch`. The low-level building blocks ([`crate::CratesIoFetcher`],
 //! [`crate::OsvClient`]) remain public for callers who want to compose by hand.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -131,6 +131,9 @@ impl ManifestCheck {
 #[derive(Clone)]
 pub struct Checker {
     registries: HashMap<Ecosystem, Arc<dyn RegistryFetcher>>,
+    /// Fetcher for [`PackageSource::Jsr`] items (a sub-registry of the npm
+    /// ecosystem), used for Deno `jsr:` dependencies.
+    jsr: Option<Arc<dyn RegistryFetcher>>,
     osv: Option<Arc<OsvClient>>,
     concurrency: usize,
     read_lockfiles: bool,
@@ -138,6 +141,22 @@ pub struct Checker {
     versions_cache: VersionsCache,
     progress: Option<ProgressSink>,
 }
+
+/// Cache key used for JSR lookups, kept distinct from the npm ecosystem key.
+const JSR_CACHE_KEY: &str = "jsr";
+
+/// One package to fetch: its name, the fetcher to use, and its versions-cache key.
+struct FetchTask {
+    name: String,
+    fetcher: Arc<dyn RegistryFetcher>,
+    cache_key: &'static str,
+}
+
+/// The result of one fetch task: `(name, cache_key, versions-or-error)`.
+type FetchOutcome = (String, &'static str, Result<Vec<String>, String>);
+
+/// Fetched versions (or a per-package error message) keyed by package name.
+type FetchedMap = HashMap<String, Result<Vec<String>, String>>;
 
 impl Checker {
     /// Start configuring a checker.
@@ -226,16 +245,26 @@ impl Checker {
             apply_lockfile(&mut parsed.items, &data);
         }
 
-        let mut names: Vec<String> = parsed
-            .items
-            .iter()
-            .filter(|i| i.is_checkable())
-            .map(|i| i.name.clone())
-            .collect();
-        names.sort();
-        names.dedup();
+        // Build the fetch task list, routing JSR-sourced items (Deno `jsr:` deps)
+        // to the JSR fetcher and everything else to the ecosystem fetcher, with a
+        // distinct cache key per registry. Deduplicated by (cache_key, name).
+        let mut seen: HashSet<(&'static str, String)> = HashSet::new();
+        let mut tasks: Vec<FetchTask> = Vec::new();
+        for item in parsed.items.iter().filter(|i| i.is_checkable()) {
+            let (task_fetcher, cache_key) = match (item.source, &self.jsr) {
+                (PackageSource::Jsr, Some(jsr)) => (jsr.clone(), JSR_CACHE_KEY),
+                _ => (fetcher.clone(), ecosystem.osv_name()),
+            };
+            if seen.insert((cache_key, item.name.clone())) {
+                tasks.push(FetchTask {
+                    name: item.name.clone(),
+                    fetcher: task_fetcher,
+                    cache_key,
+                });
+            }
+        }
 
-        let fetched = self.fetch_all(ecosystem, &fetcher, &names).await;
+        let fetched = self.fetch_all(tasks).await;
         let mut results: Vec<CheckResult> = parsed
             .items
             .iter()
@@ -257,38 +286,32 @@ impl Checker {
         })
     }
 
-    /// Fetch versions for every name concurrently, serving and populating the
-    /// in-process versions cache, and emitting progress events.
-    async fn fetch_all(
-        &self,
-        ecosystem: Ecosystem,
-        fetcher: &Arc<dyn RegistryFetcher>,
-        names: &[String],
-    ) -> HashMap<String, Result<Vec<String>, String>> {
-        let total = names.len();
+    /// Run every fetch task concurrently, serving and populating the in-process
+    /// versions cache (keyed per registry), and emitting one progress cycle.
+    async fn fetch_all(&self, tasks: Vec<FetchTask>) -> FetchedMap {
+        let total = tasks.len();
         self.emit(ProgressEvent::Started { total });
 
-        let eco_key = ecosystem.osv_name();
-        let mut out: HashMap<String, Result<Vec<String>, String>> = HashMap::new();
-        let mut to_fetch: Vec<String> = Vec::new();
-        for name in names {
-            let key = (eco_key.to_string(), name.clone());
+        let mut out: FetchedMap = HashMap::new();
+        let mut to_fetch: Vec<FetchTask> = Vec::new();
+        for task in tasks {
+            let key = (task.cache_key.to_string(), task.name.clone());
             if let Some(versions) = self.versions_cache.get(&key).await {
-                out.insert(name.clone(), Ok(versions));
+                out.insert(task.name.clone(), Ok(versions));
             } else {
-                to_fetch.push(name.clone());
+                to_fetch.push(task);
             }
         }
 
         let counter = Arc::new(AtomicUsize::new(out.len()));
-        let fetched: Vec<(String, Result<Vec<String>, String>)> = stream::iter(to_fetch)
-            .map(|name| {
-                let fetcher = fetcher.clone();
+        let fetched: Vec<FetchOutcome> = stream::iter(to_fetch)
+            .map(|task| {
                 let progress = self.progress.clone();
                 let counter = counter.clone();
                 async move {
-                    let result = fetcher
-                        .fetch_versions(&name)
+                    let result = task
+                        .fetcher
+                        .fetch_versions(&task.name)
                         .await
                         .map(|fetched| fetched.versions)
                         .map_err(|e| e.to_string());
@@ -299,17 +322,17 @@ impl Checker {
                             total,
                         });
                     }
-                    (name, result)
+                    (task.name, task.cache_key, result)
                 }
             })
             .buffer_unordered(self.concurrency)
             .collect()
             .await;
 
-        for (name, result) in fetched {
+        for (name, cache_key, result) in fetched {
             if let Ok(versions) = &result {
                 self.versions_cache
-                    .insert((eco_key.to_string(), name.clone()), versions.clone())
+                    .insert((cache_key.to_string(), name.clone()), versions.clone())
                     .await;
             }
             out.insert(name, result);
@@ -330,7 +353,7 @@ impl Checker {
 /// configured pre-release filter before classification.
 fn evaluate_item(
     item: &Item,
-    fetched: &HashMap<String, Result<Vec<String>, String>>,
+    fetched: &FetchedMap,
     ecosystem: Ecosystem,
     unstable: UnstableFilter,
 ) -> CheckResult {
@@ -431,6 +454,7 @@ pub struct CheckerBuilder {
     rust_registry: String,
     rust_auth: Option<String>,
     extra_registries: Vec<(Ecosystem, Arc<dyn RegistryFetcher>)>,
+    jsr: Option<Arc<dyn RegistryFetcher>>,
     vulnerabilities: bool,
     include_ghsa: bool,
     osv_url: String,
@@ -447,6 +471,7 @@ impl Default for CheckerBuilder {
             rust_registry: Ecosystem::Rust.default_registry().to_string(),
             rust_auth: None,
             extra_registries: Vec::new(),
+            jsr: None,
             vulnerabilities: true,
             include_ghsa: false,
             osv_url: DEFAULT_OSV_BATCH_URL.to_string(),
@@ -478,6 +503,14 @@ impl CheckerBuilder {
     /// forward-compatible extension point for npm, PyPI, Go, and others.
     pub fn registry(mut self, ecosystem: Ecosystem, fetcher: Arc<dyn RegistryFetcher>) -> Self {
         self.extra_registries.push((ecosystem, fetcher));
+        self
+    }
+
+    /// Register the JSR fetcher used for Deno `jsr:` dependencies. JSR is a
+    /// sub-registry of the npm ecosystem: items with [`PackageSource::Jsr`] route
+    /// here instead of to the npm fetcher.
+    pub fn jsr_registry(mut self, fetcher: Arc<dyn RegistryFetcher>) -> Self {
+        self.jsr = Some(fetcher);
         self
     }
 
@@ -558,6 +591,7 @@ impl CheckerBuilder {
 
         Ok(Checker {
             registries,
+            jsr: self.jsr,
             osv,
             concurrency: self.concurrency,
             read_lockfiles: self.read_lockfiles,

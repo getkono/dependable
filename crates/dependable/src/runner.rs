@@ -11,8 +11,9 @@ use std::sync::{Arc, Mutex};
 use anyhow::Context;
 use dependable_fetch::core::parse;
 use dependable_fetch::{
-    CheckError, Checker, DependencyStatus, Ecosystem, GoProxyFetcher, ManifestKind, PackageSource,
-    ParseError, ProgressEvent, PyPiFetcher, UnstableFilter, build_client,
+    CheckError, Checker, DependencyStatus, Ecosystem, GoProxyFetcher, JsrFetcher, ManifestKind,
+    NpmFetcher, PackageSource, PackagistFetcher, ParseError, ProgressEvent, PyPiFetcher,
+    UnstableFilter, build_client,
 };
 use indicatif::{ProgressBar, ProgressStyle};
 
@@ -97,12 +98,35 @@ impl Engine {
                 )),
             );
         }
+        if cfg.npm.enabled {
+            builder = builder
+                .registry(
+                    Ecosystem::Npm,
+                    Arc::new(NpmFetcher::with_registry(
+                        client.clone(),
+                        cfg.npm.registry.clone(),
+                    )),
+                )
+                .jsr_registry(Arc::new(JsrFetcher::with_registry(
+                    client.clone(),
+                    cfg.npm.jsr_registry.clone(),
+                )));
+        }
         if cfg.python.enabled {
             builder = builder.registry(
                 Ecosystem::Python,
                 Arc::new(PyPiFetcher::with_registry(
                     client.clone(),
                     cfg.python.registry.clone(),
+                )),
+            );
+        }
+        if cfg.php.enabled {
+            builder = builder.registry(
+                Ecosystem::Php,
+                Arc::new(PackagistFetcher::with_registry(
+                    client.clone(),
+                    cfg.php.registry.clone(),
                 )),
             );
         }

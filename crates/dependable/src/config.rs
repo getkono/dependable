@@ -22,7 +22,11 @@ pub struct Config {
     #[serde(default)]
     pub go: GoConfig,
     #[serde(default)]
+    pub npm: NpmConfig,
+    #[serde(default)]
     pub python: PythonConfig,
+    #[serde(default)]
+    pub php: PhpConfig,
     #[serde(default)]
     pub vulnerability: VulnConfig,
 }
@@ -83,6 +87,25 @@ impl Default for GoConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+pub struct NpmConfig {
+    pub enabled: bool,
+    pub registry: String,
+    /// JSR registry for Deno `jsr:` dependencies (npm-ecosystem sub-registry).
+    pub jsr_registry: String,
+}
+
+impl Default for NpmConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            registry: "https://registry.npmjs.org".to_string(),
+            jsr_registry: "https://jsr.io".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PythonConfig {
     pub enabled: bool,
     pub registry: String,
@@ -93,6 +116,22 @@ impl Default for PythonConfig {
         Self {
             enabled: true,
             registry: "https://pypi.org/pypi".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PhpConfig {
+    pub enabled: bool,
+    pub registry: String,
+}
+
+impl Default for PhpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            registry: "https://repo.packagist.org".to_string(),
         }
     }
 }

@@ -5,7 +5,8 @@
 use std::sync::Arc;
 
 use dependable_fetch::{
-    Checker, DependencyStatus, Ecosystem, GoProxyFetcher, ManifestKind, PyPiFetcher, build_client,
+    Checker, DependencyStatus, Ecosystem, GoProxyFetcher, JsrFetcher, ManifestKind, NpmFetcher,
+    PackageSource, PackagistFetcher, PyPiFetcher, build_client,
 };
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -171,6 +172,150 @@ async fn check_go_mod_end_to_end() {
     // Resolved at v1.0.0, latest within the major is v1.2.0.
     assert_eq!(r.status, DependencyStatus::UpdateAvailable);
     assert_eq!(r.latest_available.as_deref(), Some("1.2.0"));
+}
+
+#[tokio::test]
+async fn check_package_json_with_lockfile() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/react"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"dist-tags":{"latest":"18.2.0"},"versions":{"18.0.0":{},"18.2.0":{}}}"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let client = build_client().unwrap();
+    let checker = Checker::builder()
+        .http_client(client.clone())
+        .registry(
+            Ecosystem::Npm,
+            Arc::new(NpmFetcher::with_registry(client, server.uri())),
+        )
+        .vulnerabilities(false)
+        .build()
+        .unwrap();
+
+    let manifest = r#"{ "dependencies": { "react": "^18.0.0", "local": "file:../x" } }"#;
+    let lock = r#"{ "packages": { "node_modules/react": { "version": "18.0.0" } } }"#;
+    let check = checker
+        .check_manifest(ManifestKind::PackageJson, manifest, Some(lock))
+        .await
+        .unwrap();
+
+    assert_eq!(check.ecosystem, Ecosystem::Npm);
+    let react = check
+        .results
+        .iter()
+        .find(|r| r.item.name == "react")
+        .unwrap();
+    assert_eq!(react.item.locked_version.as_deref(), Some("18.0.0"));
+    assert_eq!(react.status, DependencyStatus::UpdateAvailable);
+    let local = check
+        .results
+        .iter()
+        .find(|r| r.item.name == "local")
+        .unwrap();
+    assert_eq!(local.status, DependencyStatus::Local);
+}
+
+#[tokio::test]
+async fn check_deno_routes_jsr_and_npm() {
+    let server = MockServer::start().await;
+    // npm-sourced `chalk`
+    Mock::given(method("GET"))
+        .and(path("/chalk"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"versions":{"5.0.0":{},"5.3.0":{},"6.0.0":{}}}"#),
+        )
+        .mount(&server)
+        .await;
+    // jsr-sourced `@std/path`
+    Mock::given(method("GET"))
+        .and(path("/@std/path/meta.json"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"latest":"1.0.0","versions":{"1.0.0":{}}}"#),
+        )
+        .mount(&server)
+        .await;
+
+    let client = build_client().unwrap();
+    let checker = Checker::builder()
+        .http_client(client.clone())
+        .registry(
+            Ecosystem::Npm,
+            Arc::new(NpmFetcher::with_registry(client.clone(), server.uri())),
+        )
+        .jsr_registry(Arc::new(JsrFetcher::with_registry(client, server.uri())))
+        .vulnerabilities(false)
+        .build()
+        .unwrap();
+
+    let manifest =
+        r#"{ "imports": { "chalk": "npm:chalk@^5.0.0", "@std/path": "jsr:@std/path@^1.0.0" } }"#;
+    let check = checker
+        .check_manifest(ManifestKind::DenoJson, manifest, None)
+        .await
+        .unwrap();
+
+    // Each item was fetched from its own registry (routing by source).
+    let chalk = check
+        .results
+        .iter()
+        .find(|r| r.item.name == "chalk")
+        .unwrap();
+    assert_eq!(chalk.item.source, PackageSource::Registry);
+    assert_eq!(chalk.latest_available.as_deref(), Some("6.0.0"));
+    let path = check
+        .results
+        .iter()
+        .find(|r| r.item.name == "@std/path")
+        .unwrap();
+    assert_eq!(path.item.source, PackageSource::Jsr);
+    assert_eq!(path.latest_available.as_deref(), Some("1.0.0"));
+}
+
+#[tokio::test]
+async fn check_composer_json_with_lockfile() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/p2/monolog/monolog.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"packages":{"monolog/monolog":[{"version":"2.0.0"},{"version":"2.3.0"}]}}"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let client = build_client().unwrap();
+    let checker = Checker::builder()
+        .http_client(client.clone())
+        .registry(
+            Ecosystem::Php,
+            Arc::new(PackagistFetcher::with_registry(client, server.uri())),
+        )
+        .vulnerabilities(false)
+        .build()
+        .unwrap();
+
+    let manifest = r#"{ "require": { "php": ">=8.0", "monolog/monolog": "^2.0" } }"#;
+    let lock = r#"{ "packages": [ { "name": "monolog/monolog", "version": "2.0.0" } ] }"#;
+    let check = checker
+        .check_manifest(ManifestKind::ComposerJson, manifest, Some(lock))
+        .await
+        .unwrap();
+
+    assert_eq!(check.ecosystem, Ecosystem::Php);
+    // The `php` platform requirement is not a checkable result.
+    assert!(check.results.iter().all(|r| r.item.name != "php"));
+    let monolog = check
+        .results
+        .iter()
+        .find(|r| r.item.name == "monolog/monolog")
+        .unwrap();
+    assert_eq!(monolog.item.locked_version.as_deref(), Some("2.0.0"));
+    assert_eq!(monolog.status, DependencyStatus::UpdateAvailable);
 }
 
 #[tokio::test]
