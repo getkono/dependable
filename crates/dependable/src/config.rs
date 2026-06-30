@@ -22,6 +22,8 @@ pub struct Config {
     #[serde(default)]
     pub npm: NpmConfig,
     #[serde(default)]
+    pub php: PhpConfig,
+    #[serde(default)]
     pub vulnerability: VulnConfig,
 }
 
@@ -78,6 +80,22 @@ impl Default for NpmConfig {
             enabled: true,
             registry: "https://registry.npmjs.org".to_string(),
             jsr_registry: "https://jsr.io".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PhpConfig {
+    pub enabled: bool,
+    pub registry: String,
+}
+
+impl Default for PhpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            registry: "https://repo.packagist.org".to_string(),
         }
     }
 }

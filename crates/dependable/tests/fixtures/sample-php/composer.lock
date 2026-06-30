@@ -1,0 +1,15 @@
+{
+  "_readme": ["This file locks dependencies"],
+  "packages": [
+    {
+      "name": "monolog/monolog",
+      "version": "2.1.0"
+    }
+  ],
+  "packages-dev": [
+    {
+      "name": "phpunit/phpunit",
+      "version": "9.5.0"
+    }
+  ]
+}

@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use dependable_fetch::{
     Checker, DependencyStatus, Ecosystem, JsrFetcher, ManifestKind, NpmFetcher, PackageSource,
-    build_client,
+    PackagistFetcher, build_client,
 };
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -200,6 +200,47 @@ async fn check_deno_routes_jsr_and_npm() {
         .unwrap();
     assert_eq!(path.item.source, PackageSource::Jsr);
     assert_eq!(path.latest_available.as_deref(), Some("1.0.0"));
+}
+
+#[tokio::test]
+async fn check_composer_json_with_lockfile() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/p2/monolog/monolog.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"packages":{"monolog/monolog":[{"version":"2.0.0"},{"version":"2.3.0"}]}}"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let client = build_client().unwrap();
+    let checker = Checker::builder()
+        .http_client(client.clone())
+        .registry(
+            Ecosystem::Php,
+            Arc::new(PackagistFetcher::with_registry(client, server.uri())),
+        )
+        .vulnerabilities(false)
+        .build()
+        .unwrap();
+
+    let manifest = r#"{ "require": { "php": ">=8.0", "monolog/monolog": "^2.0" } }"#;
+    let lock = r#"{ "packages": [ { "name": "monolog/monolog", "version": "2.0.0" } ] }"#;
+    let check = checker
+        .check_manifest(ManifestKind::ComposerJson, manifest, Some(lock))
+        .await
+        .unwrap();
+
+    assert_eq!(check.ecosystem, Ecosystem::Php);
+    // The `php` platform requirement is not a checkable result.
+    assert!(check.results.iter().all(|r| r.item.name != "php"));
+    let monolog = check
+        .results
+        .iter()
+        .find(|r| r.item.name == "monolog/monolog")
+        .unwrap();
+    assert_eq!(monolog.item.locked_version.as_deref(), Some("2.0.0"));
+    assert_eq!(monolog.status, DependencyStatus::UpdateAvailable);
 }
 
 #[tokio::test]
