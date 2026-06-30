@@ -1,5 +1,18 @@
-//! Lockfile parsers. V1 ships the `Cargo.lock` parser.
+//! Lockfile parsers and per-kind dispatch.
+
+use crate::error::ParseError;
+use crate::manifest::ManifestKind;
 
 pub mod cargo_lock;
 
 pub use cargo_lock::{LockfileData, apply_lockfile, parse_cargo_lock};
+
+/// Parse lockfile `content` for a given manifest `kind`, dispatching to the right
+/// parser. Returns [`ParseError::Unsupported`] for kinds whose lockfile parser
+/// has not landed yet (callers treat that as "no locked versions").
+pub fn parse_lockfile(kind: ManifestKind, content: &str) -> Result<LockfileData, ParseError> {
+    match kind {
+        ManifestKind::CargoToml => parse_cargo_lock(content),
+        other => Err(ParseError::Unsupported(other)),
+    }
+}

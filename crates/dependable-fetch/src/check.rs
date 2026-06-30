@@ -12,8 +12,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use dependable_core::{
-    CheckResult, DependencyStatus, Ecosystem, Item, ManifestKind, PackageSource, apply_lockfile,
-    check_version, parse, parse_cargo_lock,
+    CheckResult, DependencyStatus, Ecosystem, Item, ManifestKind, PackageSource, UnstableFilter,
+    apply_lockfile, check_version, parse, parse_lockfile,
 };
 use futures::stream::{self, StreamExt};
 
@@ -134,6 +134,7 @@ pub struct Checker {
     osv: Option<Arc<OsvClient>>,
     concurrency: usize,
     read_lockfiles: bool,
+    unstable: UnstableFilter,
     versions_cache: VersionsCache,
     progress: Option<ProgressSink>,
 }
@@ -214,12 +215,13 @@ impl Checker {
 
         let mut parsed = parse(kind, manifest)?;
 
-        // Apply the lockfile to annotate locked versions. Only Cargo lockfiles are
-        // understood today; when other ecosystems land this becomes a per-kind
-        // dispatch. `apply_lockfile` only annotates existing items, never inserts,
-        // so transitive deps are never introduced.
+        // Apply the lockfile to annotate locked versions, dispatching by manifest
+        // kind. A kind without a lockfile parser (or an unparseable lockfile) is
+        // ignored — the dependency is simply checked without a locked version.
+        // `apply_lockfile` only annotates existing items, never inserts, so
+        // transitive deps are never introduced.
         if let Some(lock) = lockfile
-            && let Ok(data) = parse_cargo_lock(lock)
+            && let Ok(data) = parse_lockfile(kind, lock)
         {
             apply_lockfile(&mut parsed.items, &data);
         }
@@ -237,7 +239,7 @@ impl Checker {
         let mut results: Vec<CheckResult> = parsed
             .items
             .iter()
-            .map(|item| evaluate_item(item, &fetched))
+            .map(|item| evaluate_item(item, &fetched, ecosystem, self.unstable))
             .collect();
 
         let mut warnings = Vec::new();
@@ -324,10 +326,13 @@ impl Checker {
     }
 }
 
-/// Evaluate one parsed item against the fetched version lists.
+/// Evaluate one parsed item against the fetched version lists, applying the
+/// configured pre-release filter before classification.
 fn evaluate_item(
     item: &Item,
     fetched: &HashMap<String, Result<Vec<String>, String>>,
+    ecosystem: Ecosystem,
+    unstable: UnstableFilter,
 ) -> CheckResult {
     if !item.is_checkable() {
         let status = match item.source {
@@ -338,9 +343,17 @@ fn evaluate_item(
     }
     match fetched.get(&item.name) {
         Some(Ok(versions)) => {
+            // The current version drives `IncludeIfCurrent`: the locked version if
+            // known, else the declared constraint (its pre-release markers, if any,
+            // are detected by substring).
+            let current = item
+                .locked_version
+                .as_deref()
+                .or(Some(item.version_constraint.as_str()));
+            let candidates = unstable.filter(versions, current, ecosystem);
             let eval = check_version(
                 &item.version_constraint,
-                versions,
+                &candidates,
                 item.locked_version.as_deref(),
             );
             CheckResult::from_evaluation(item.clone(), eval)
@@ -410,6 +423,7 @@ pub struct CheckerBuilder {
     osv_url: String,
     concurrency: usize,
     read_lockfiles: bool,
+    unstable: UnstableFilter,
     progress: Option<ProgressSink>,
 }
 
@@ -425,6 +439,7 @@ impl Default for CheckerBuilder {
             osv_url: DEFAULT_OSV_BATCH_URL.to_string(),
             concurrency: DEFAULT_CONCURRENCY,
             read_lockfiles: true,
+            unstable: UnstableFilter::default(),
             progress: None,
         }
     }
@@ -483,6 +498,12 @@ impl CheckerBuilder {
         self
     }
 
+    /// How to treat pre-release versions (default: [`UnstableFilter::Exclude`]).
+    pub fn unstable(mut self, filter: UnstableFilter) -> Self {
+        self.unstable = filter;
+        self
+    }
+
     /// Register a progress sink. Both check methods emit through it; external
     /// callers that don't need progress can ignore this.
     pub fn on_progress(mut self, sink: Arc<dyn Fn(ProgressEvent) + Send + Sync>) -> Self {
@@ -527,6 +548,7 @@ impl CheckerBuilder {
             osv,
             concurrency: self.concurrency,
             read_lockfiles: self.read_lockfiles,
+            unstable: self.unstable,
             versions_cache: versions_cache(),
             progress: self.progress,
         })

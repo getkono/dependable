@@ -8,6 +8,7 @@ use std::ops::Range;
 use toml_edit::{ImDocument, Item as TomlItem, TableLike};
 
 use super::Parser;
+use super::position::{line_starts, offset_to_line_col};
 use crate::error::ParseError;
 use crate::item::{Item, PackageSource};
 use crate::manifest::{AlternateRegistryDecl, ManifestKind, ParsedManifest};
@@ -158,23 +159,6 @@ fn skip_item(name: &str, source: PackageSource) -> Item {
         registry: None,
         locked_version: None,
     }
-}
-
-fn line_starts(src: &str) -> Vec<usize> {
-    let mut starts = vec![0usize];
-    for (i, b) in src.bytes().enumerate() {
-        if b == b'\n' {
-            starts.push(i + 1);
-        }
-    }
-    starts
-}
-
-fn offset_to_line_col(starts: &[usize], offset: usize) -> (usize, usize) {
-    let line = starts
-        .partition_point(|&start| start <= offset)
-        .saturating_sub(1);
-    (line, offset - starts[line])
 }
 
 #[cfg(test)]

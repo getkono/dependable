@@ -9,6 +9,8 @@ include_ghsa = false
 lock_file = true
 # Exit non-zero in CI when results match: "none" | "outdated" | "vulnerable" | "any".
 fail_on = "none"
+# Pre-release handling: "exclude" | "include-always" | "include-if-current".
+unstable = "exclude"
 
 [rust]
 enabled = true

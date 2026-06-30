@@ -10,7 +10,7 @@ use figment::Figment;
 use figment::providers::{Format as _, Serialized, Toml};
 use serde::{Deserialize, Serialize};
 
-use crate::cli::FailOn;
+use crate::cli::{FailOn, UnstableFilter};
 
 /// The full configuration, with sane defaults when the file is absent.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -30,6 +30,7 @@ pub struct GlobalConfig {
     pub include_ghsa: bool,
     pub lock_file: bool,
     pub fail_on: FailOn,
+    pub unstable: UnstableFilter,
 }
 
 impl Default for GlobalConfig {
@@ -39,6 +40,7 @@ impl Default for GlobalConfig {
             include_ghsa: false,
             lock_file: true,
             fail_on: FailOn::None,
+            unstable: UnstableFilter::Exclude,
         }
     }
 }

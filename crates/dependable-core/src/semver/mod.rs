@@ -4,4 +4,4 @@ pub mod checker;
 pub mod normalize;
 
 pub use checker::{Evaluation, check_version, to_version_req};
-pub use normalize::{normalize_constraint, normalize_version};
+pub use normalize::{UnstableFilter, is_prerelease, normalize_constraint, normalize_version};

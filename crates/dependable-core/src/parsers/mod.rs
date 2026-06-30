@@ -4,6 +4,7 @@ use crate::error::ParseError;
 use crate::manifest::{ManifestKind, ParsedManifest};
 
 pub mod cargo_toml;
+pub mod position;
 
 pub use cargo_toml::CargoTomlParser;
 
