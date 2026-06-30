@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use dependable_core::{
     CheckResult, DependencyStatus, Ecosystem, Item, ManifestKind, PackageSource, UnstableFilter,
-    apply_lockfile, check_version, parse, parse_lockfile,
+    apply_lockfile, check_version, parse, parse_lockfile, to_semver_constraint,
 };
 use futures::stream::{self, StreamExt};
 
@@ -373,12 +373,12 @@ fn evaluate_item(
                 .locked_version
                 .as_deref()
                 .or(Some(item.version_constraint.as_str()));
-            let candidates = unstable.filter(versions, current, ecosystem);
-            let eval = check_version(
-                &item.version_constraint,
-                &candidates,
-                item.locked_version.as_deref(),
-            );
+            // Filter on the raw (registry-native) version strings so pre-release
+            // detection sees real markers, then translate to semver for comparison.
+            let filtered = unstable.filter(versions, current, ecosystem);
+            let candidates = to_semver_versions(&filtered, ecosystem);
+            let constraint = to_semver_constraint(&item.version_constraint, ecosystem);
+            let eval = check_version(&constraint, &candidates, item.locked_version.as_deref());
             CheckResult::from_evaluation(item.clone(), eval)
         }
         Some(Err(e)) => CheckResult::new(item.clone(), DependencyStatus::Error(e.clone())),
@@ -386,6 +386,19 @@ fn evaluate_item(
             item.clone(),
             DependencyStatus::Error("not fetched".to_string()),
         ),
+    }
+}
+
+/// Translate registry-native version strings into semver for comparison. Only
+/// Python (PEP 440) needs conversion; other ecosystems already use semver.
+fn to_semver_versions(versions: &[String], ecosystem: Ecosystem) -> Vec<String> {
+    if ecosystem == Ecosystem::Python {
+        versions
+            .iter()
+            .filter_map(|v| dependable_core::semver::python::pep440_to_semver(v))
+            .collect()
+    } else {
+        versions.to_vec()
     }
 }
 

@@ -20,7 +20,11 @@ pub struct Config {
     #[serde(default)]
     pub rust: RustConfig,
     #[serde(default)]
+    pub go: GoConfig,
+    #[serde(default)]
     pub npm: NpmConfig,
+    #[serde(default)]
+    pub python: PythonConfig,
     #[serde(default)]
     pub php: PhpConfig,
     #[serde(default)]
@@ -67,6 +71,22 @@ impl Default for RustConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+pub struct GoConfig {
+    pub enabled: bool,
+    pub registry: String,
+}
+
+impl Default for GoConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            registry: "https://proxy.golang.org".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct NpmConfig {
     pub enabled: bool,
     pub registry: String,
@@ -80,6 +100,22 @@ impl Default for NpmConfig {
             enabled: true,
             registry: "https://registry.npmjs.org".to_string(),
             jsr_registry: "https://jsr.io".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PythonConfig {
+    pub enabled: bool,
+    pub registry: String,
+}
+
+impl Default for PythonConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            registry: "https://pypi.org/pypi".to_string(),
         }
     }
 }

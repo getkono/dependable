@@ -129,12 +129,28 @@ fn python_implicit_prerelease(lower: &str) -> bool {
 /// accepts.
 ///
 /// For Rust this is largely a pass-through — the `semver` crate already
-/// understands Cargo's syntax (`1`, `1.2`, `^1.2.3`, `=1.0.0`, `>=1, <2`) — so we
-/// only trim surrounding whitespace. Other ecosystems will translate their own
-/// constraint dialects in dedicated modules.
+/// understands Cargo's syntax (`1`, `1.2`, `^1.2.3`, `=1.0.0`, `>=1, <2`). We trim
+/// whitespace and strip a leading `v`/`V` before a digit (Go's `v1.2.3`, some PHP
+/// tags), which `semver::VersionReq` would otherwise reject. Ecosystems with
+/// richer dialects (e.g. PEP 440) translate in dedicated modules.
 #[must_use]
 pub fn normalize_constraint(constraint: &str) -> String {
-    constraint.trim().to_string()
+    let trimmed = constraint.trim();
+    match trimmed.strip_prefix(['v', 'V']) {
+        Some(rest) if rest.starts_with(|c: char| c.is_ascii_digit()) => rest.to_string(),
+        _ => trimmed.to_string(),
+    }
+}
+
+/// Convert a constraint into a `semver::VersionReq`-compatible string for the
+/// given ecosystem. Python uses PEP 440 translation; every other ecosystem is
+/// already semver-compatible and only needs [`normalize_constraint`].
+#[must_use]
+pub fn to_semver_constraint(constraint: &str, ecosystem: Ecosystem) -> String {
+    match ecosystem {
+        Ecosystem::Python => crate::semver::python::pep440_constraint_to_semver(constraint),
+        _ => normalize_constraint(constraint),
+    }
 }
 
 /// Normalize a concrete version string: strip a leading `v`/`V` and pad partial
@@ -172,6 +188,15 @@ mod tests {
     #[test]
     fn trims_constraint() {
         assert_eq!(normalize_constraint("  ^1.0 "), "^1.0");
+    }
+
+    #[test]
+    fn strips_leading_v_from_constraint() {
+        assert_eq!(normalize_constraint("v1.2.3"), "1.2.3");
+        assert_eq!(normalize_constraint("V2.0"), "2.0");
+        // A `v` not before a digit (or part of an operator constraint) is kept.
+        assert_eq!(normalize_constraint("^1.0"), "^1.0");
+        assert_eq!(normalize_constraint(">=1, <2"), ">=1, <2");
     }
 
     fn vers(list: &[&str]) -> Vec<String> {

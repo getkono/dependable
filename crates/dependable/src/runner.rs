@@ -11,8 +11,9 @@ use std::sync::{Arc, Mutex};
 use anyhow::Context;
 use dependable_fetch::core::parse;
 use dependable_fetch::{
-    CheckError, Checker, DependencyStatus, Ecosystem, JsrFetcher, ManifestKind, NpmFetcher,
-    PackageSource, PackagistFetcher, ParseError, ProgressEvent, UnstableFilter, build_client,
+    CheckError, Checker, DependencyStatus, Ecosystem, GoProxyFetcher, JsrFetcher, ManifestKind,
+    NpmFetcher, PackageSource, PackagistFetcher, ParseError, ProgressEvent, PyPiFetcher,
+    UnstableFilter, build_client,
 };
 use indicatif::{ProgressBar, ProgressStyle};
 
@@ -88,6 +89,15 @@ impl Engine {
             .read_lockfiles(settings.check_lockfile)
             .unstable(settings.unstable);
         // Register non-Rust ecosystem fetchers when enabled in config.
+        if cfg.go.enabled {
+            builder = builder.registry(
+                Ecosystem::Go,
+                Arc::new(GoProxyFetcher::with_proxy(
+                    client.clone(),
+                    cfg.go.registry.clone(),
+                )),
+            );
+        }
         if cfg.npm.enabled {
             builder = builder
                 .registry(
@@ -101,6 +111,15 @@ impl Engine {
                     client.clone(),
                     cfg.npm.jsr_registry.clone(),
                 )));
+        }
+        if cfg.python.enabled {
+            builder = builder.registry(
+                Ecosystem::Python,
+                Arc::new(PyPiFetcher::with_registry(
+                    client.clone(),
+                    cfg.python.registry.clone(),
+                )),
+            );
         }
         if cfg.php.enabled {
             builder = builder.registry(
