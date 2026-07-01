@@ -24,7 +24,7 @@ pub use manifest::{AlternateRegistryDecl, ManifestKind, ParsedManifest};
 pub use parsers::{
     CargoTomlParser, ComposerJsonParser, CsprojParser, DenoJsonParser, GoModParser, MixExsParser,
     PackageJsonParser, Parser, PnpmWorkspaceParser, PubspecYamlParser, PyprojectTomlParser,
-    RequirementsTxtParser, parse,
+    RequirementsTxtParser, parse, parse_cargo_config,
 };
 pub use result::{CheckResult, DependencyStatus};
 pub use semver::{Evaluation, UnstableFilter, check_version, is_prerelease, to_semver_constraint};

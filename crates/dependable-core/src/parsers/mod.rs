@@ -17,7 +17,7 @@ pub mod pubspec_yaml;
 pub mod pyproject_toml;
 pub mod requirements_txt;
 
-pub use cargo_toml::CargoTomlParser;
+pub use cargo_toml::{CargoTomlParser, parse_cargo_config};
 pub use composer_json::ComposerJsonParser;
 pub use csproj::CsprojParser;
 pub use deno_json::DenoJsonParser;

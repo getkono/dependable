@@ -3,6 +3,7 @@
 //! Uses `toml_edit`'s span-preserving immutable document so we can record the
 //! exact byte range of every version value for in-place `--fix` editing.
 
+use std::collections::BTreeMap;
 use std::ops::Range;
 
 use toml_edit::{ImDocument, Item as TomlItem, TableLike};
@@ -65,6 +66,82 @@ impl Parser for CargoTomlParser {
             alternate_registries,
         })
     }
+}
+
+/// Parse Cargo's `$CARGO_HOME/config.toml` and optional `credentials.toml` into
+/// alternate-registry declarations, keyed by alias (the name used by a
+/// dependency's `registry = "..."`).
+///
+/// `[registries.<name>]` tables contribute the sparse `index` URL (normally from
+/// `config`) and the auth `token` (normally from `credentials`, which wins over
+/// any token declared inline in `config`). IO-free: the caller reads the two
+/// files and passes their contents; a missing `credentials` file is `None`.
+///
+/// Malformed input yields no declarations rather than an error, and registries
+/// without an `index` are still returned (with `index_url: None`) so the caller
+/// can skip them gracefully.
+#[must_use]
+pub fn parse_cargo_config(config: &str, credentials: Option<&str>) -> Vec<AlternateRegistryDecl> {
+    let mut decls: BTreeMap<String, AlternateRegistryDecl> = BTreeMap::new();
+
+    // `config.toml` supplies index URLs (and, rarely, inline tokens).
+    for (name, index, token) in registries_in(config) {
+        let decl = decls
+            .entry(name.clone())
+            .or_insert_with(|| empty_registry(name));
+        if index.is_some() {
+            decl.index_url = index;
+        }
+        if token.is_some() {
+            decl.auth_token = token;
+        }
+    }
+
+    // `credentials.toml` supplies tokens, taking precedence over inline ones.
+    if let Some(credentials) = credentials {
+        for (name, _index, token) in registries_in(credentials) {
+            if token.is_none() {
+                continue;
+            }
+            decls
+                .entry(name.clone())
+                .or_insert_with(|| empty_registry(name))
+                .auth_token = token;
+        }
+    }
+
+    decls.into_values().collect()
+}
+
+/// An [`AlternateRegistryDecl`] with only its alias set.
+fn empty_registry(name: String) -> AlternateRegistryDecl {
+    AlternateRegistryDecl {
+        name,
+        index_url: None,
+        auth_token: None,
+    }
+}
+
+/// Extract `(name, index, token)` from every `[registries.<name>]` table in a
+/// Cargo `config`/`credentials` TOML document. Unparseable input yields nothing.
+fn registries_in(content: &str) -> Vec<(String, Option<String>, Option<String>)> {
+    let Ok(doc) = ImDocument::parse(content.to_owned()) else {
+        return Vec::new();
+    };
+    let Some(regs) = doc
+        .as_table()
+        .get("registries")
+        .and_then(TomlItem::as_table_like)
+    else {
+        return Vec::new();
+    };
+    regs.iter()
+        .filter_map(|(name, item)| {
+            let table = item.as_table_like()?;
+            let str_field = |key| table.get(key).and_then(TomlItem::as_str).map(str::to_owned);
+            Some((name.to_owned(), str_field("index"), str_field("token")))
+        })
+        .collect()
 }
 
 fn collect(table: &dyn TableLike, starts: &[usize], items: &mut Vec<Item>) {
@@ -235,5 +312,47 @@ mod tests {
             m.alternate_registries[0].index_url.as_deref(),
             Some("https://example.com/index")
         );
+    }
+
+    #[test]
+    fn cargo_config_merges_index_from_config_and_token_from_credentials() {
+        let config = "[registries.corp]\nindex = \"sparse+https://corp.example/index/\"\n";
+        let credentials = "[registries.corp]\ntoken = \"Bearer sekret\"\n";
+        let decls = parse_cargo_config(config, Some(credentials));
+        assert_eq!(decls.len(), 1);
+        assert_eq!(decls[0].name, "corp");
+        assert_eq!(
+            decls[0].index_url.as_deref(),
+            Some("sparse+https://corp.example/index/")
+        );
+        assert_eq!(decls[0].auth_token.as_deref(), Some("Bearer sekret"));
+    }
+
+    #[test]
+    fn cargo_config_credentials_token_overrides_inline_config_token() {
+        let config = "[registries.corp]\nindex = \"https://corp.example/i\"\ntoken = \"inline\"\n";
+        let credentials = "[registries.corp]\ntoken = \"from-credentials\"\n";
+        let decls = parse_cargo_config(config, Some(credentials));
+        assert_eq!(decls[0].auth_token.as_deref(), Some("from-credentials"));
+    }
+
+    #[test]
+    fn cargo_config_without_credentials_has_index_but_no_token() {
+        let config = "[registries.corp]\nindex = \"https://corp.example/i\"\n";
+        let decls = parse_cargo_config(config, None);
+        assert_eq!(decls.len(), 1);
+        assert_eq!(
+            decls[0].index_url.as_deref(),
+            Some("https://corp.example/i")
+        );
+        assert_eq!(decls[0].auth_token, None);
+    }
+
+    #[test]
+    fn cargo_config_ignores_malformed_and_unrelated_input() {
+        // Missing closing bracket -> unparseable -> no declarations, not a panic.
+        assert!(parse_cargo_config("[registries.corp\nindex = \"x\"", None).is_empty());
+        // No `[registries]` table at all.
+        assert!(parse_cargo_config("[net]\nretry = 2\n", None).is_empty());
     }
 }

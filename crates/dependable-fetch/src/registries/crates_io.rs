@@ -61,15 +61,26 @@ impl CratesIoFetcher {
     }
 
     /// A fetcher against an alternate sparse index, with an optional auth token.
+    ///
+    /// A Cargo `sparse+` scheme prefix (as stored in `config.toml`, e.g.
+    /// `sparse+https://…/index/`) is accepted and stripped; a trailing slash is
+    /// trimmed. The token, when present, is sent verbatim in the `Authorization`
+    /// header on every request.
     #[must_use]
     pub fn with_registry(
         client: reqwest::Client,
         index_url: impl Into<String>,
         auth: Option<String>,
     ) -> Self {
+        let raw = index_url.into();
+        let base_url = raw
+            .strip_prefix("sparse+")
+            .unwrap_or(&raw)
+            .trim_end_matches('/')
+            .to_string();
         Self {
             client,
-            base_url: index_url.into().trim_end_matches('/').to_string(),
+            base_url,
             auth,
         }
     }

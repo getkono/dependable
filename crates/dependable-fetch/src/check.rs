@@ -131,6 +131,11 @@ impl ManifestCheck {
 #[derive(Clone)]
 pub struct Checker {
     registries: HashMap<Ecosystem, Arc<dyn RegistryFetcher>>,
+    /// Alternate Rust registries keyed by alias (`registry = "<alias>"`), resolved
+    /// from `$CARGO_HOME/config.toml` + `credentials.toml`. A checkable item whose
+    /// `registry` alias matches one here is fetched from it (with its auth token)
+    /// instead of the default crates.io index.
+    rust_registries: HashMap<String, Arc<dyn RegistryFetcher>>,
     /// Fetcher for [`PackageSource::Jsr`] items (a sub-registry of the npm
     /// ecosystem), used for Deno `jsr:` dependencies.
     jsr: Option<Arc<dyn RegistryFetcher>>,
@@ -149,14 +154,15 @@ pub struct Checker {
 const JSR_CACHE_KEY: &str = "jsr";
 
 /// One package to fetch: its name, the fetcher to use, and its versions-cache key.
+/// The key is owned because alternate registries namespace it by alias at runtime.
 struct FetchTask {
     name: String,
     fetcher: Arc<dyn RegistryFetcher>,
-    cache_key: &'static str,
+    cache_key: String,
 }
 
 /// The result of one fetch task: `(name, cache_key, versions-or-error)`.
-type FetchOutcome = (String, &'static str, Result<Vec<String>, String>);
+type FetchOutcome = (String, String, Result<Vec<String>, String>);
 
 /// Fetched versions (or a per-package error message) keyed by package name.
 type FetchedMap = HashMap<String, Result<Vec<String>, String>>;
@@ -248,17 +254,16 @@ impl Checker {
             apply_lockfile(&mut parsed.items, &data);
         }
 
-        // Build the fetch task list, routing JSR-sourced items (Deno `jsr:` deps)
-        // to the JSR fetcher and everything else to the ecosystem fetcher, with a
-        // distinct cache key per registry. Deduplicated by (cache_key, name).
-        let mut seen: HashSet<(&'static str, String)> = HashSet::new();
+        // Build the fetch task list, routing each checkable item to a fetcher:
+        // JSR-sourced items (Deno `jsr:` deps) to the JSR fetcher, items naming a
+        // resolved alternate Rust registry to that registry, and everything else
+        // to the ecosystem fetcher — each with a distinct cache key. Deduplicated
+        // by (cache_key, name).
+        let mut seen: HashSet<(String, String)> = HashSet::new();
         let mut tasks: Vec<FetchTask> = Vec::new();
         for item in parsed.items.iter().filter(|i| i.is_checkable()) {
-            let (task_fetcher, cache_key) = match (item.source, &self.jsr) {
-                (PackageSource::Jsr, Some(jsr)) => (jsr.clone(), JSR_CACHE_KEY),
-                _ => (fetcher.clone(), ecosystem.osv_name()),
-            };
-            if seen.insert((cache_key, item.name.clone())) {
+            let (task_fetcher, cache_key) = self.route_item(item, &fetcher, ecosystem);
+            if seen.insert((cache_key.clone(), item.name.clone())) {
                 tasks.push(FetchTask {
                     name: item.name.clone(),
                     fetcher: task_fetcher,
@@ -289,6 +294,33 @@ impl Checker {
         })
     }
 
+    /// Choose the fetcher and cache namespace for one checkable item. JSR items go
+    /// to the JSR fetcher; an item naming an alternate Rust registry that resolved
+    /// to a fetcher goes there, with a per-alias cache key so same-named crates in
+    /// different registries never collide; everything else uses `default` (the
+    /// ecosystem's fetcher) under the ecosystem's cache key.
+    fn route_item(
+        &self,
+        item: &Item,
+        default: &Arc<dyn RegistryFetcher>,
+        ecosystem: Ecosystem,
+    ) -> (Arc<dyn RegistryFetcher>, String) {
+        if item.source == PackageSource::Jsr
+            && let Some(jsr) = &self.jsr
+        {
+            return (jsr.clone(), JSR_CACHE_KEY.to_string());
+        }
+        if let Some(alias) = &item.registry
+            && let Some(fetcher) = self.rust_registries.get(alias)
+        {
+            return (
+                fetcher.clone(),
+                format!("{}::{alias}", ecosystem.osv_name()),
+            );
+        }
+        (default.clone(), ecosystem.osv_name().to_string())
+    }
+
     /// Run every fetch task concurrently, serving and populating the in-process
     /// versions cache (keyed per registry), and emitting one progress cycle.
     async fn fetch_all(&self, tasks: Vec<FetchTask>) -> FetchedMap {
@@ -298,11 +330,11 @@ impl Checker {
         let mut out: FetchedMap = HashMap::new();
         let mut to_fetch: Vec<FetchTask> = Vec::new();
         for task in tasks {
-            let key = (task.cache_key.to_string(), task.name.clone());
+            let key = (task.cache_key.clone(), task.name.clone());
             if let Some(versions) = self.versions_cache.get(&key).await {
                 out.insert(task.name.clone(), Ok(versions));
             } else if let Some(disk) = &self.disk_cache
-                && let Some(versions) = disk.get(task.cache_key, &task.name).await
+                && let Some(versions) = disk.get(&task.cache_key, &task.name).await
             {
                 // Disk hit: warm the in-process cache so sibling manifests in this
                 // run hit moka instead of re-reading the file.
@@ -342,10 +374,10 @@ impl Checker {
         for (name, cache_key, result) in fetched {
             if let Ok(versions) = &result {
                 self.versions_cache
-                    .insert((cache_key.to_string(), name.clone()), versions.clone())
+                    .insert((cache_key.clone(), name.clone()), versions.clone())
                     .await;
                 if let Some(disk) = &self.disk_cache {
-                    disk.put(cache_key, &name, versions).await;
+                    disk.put(&cache_key, &name, versions).await;
                 }
             }
             out.insert(name, result);
@@ -469,6 +501,8 @@ pub struct CheckerBuilder {
     client: Option<reqwest::Client>,
     rust_registry: String,
     rust_auth: Option<String>,
+    /// Alternate Rust registries: `(alias, sparse index URL, optional token)`.
+    rust_alt_registries: Vec<(String, String, Option<String>)>,
     extra_registries: Vec<(Ecosystem, Arc<dyn RegistryFetcher>)>,
     jsr: Option<Arc<dyn RegistryFetcher>>,
     vulnerabilities: bool,
@@ -488,6 +522,7 @@ impl Default for CheckerBuilder {
             client: None,
             rust_registry: Ecosystem::Rust.default_registry().to_string(),
             rust_auth: None,
+            rust_alt_registries: Vec::new(),
             extra_registries: Vec::new(),
             jsr: None,
             vulnerabilities: true,
@@ -516,6 +551,22 @@ impl CheckerBuilder {
     pub fn rust_registry(mut self, index_url: impl Into<String>, auth: Option<String>) -> Self {
         self.rust_registry = index_url.into();
         self.rust_auth = auth;
+        self
+    }
+
+    /// Register an alternate Rust registry: an `alias` (matched against a
+    /// dependency's `registry = "<alias>"`), its sparse `index_url`, and an
+    /// optional `auth` token sent verbatim as `Authorization: <token>`. Call once
+    /// per registry; the CLI resolves these from `$CARGO_HOME/config.toml` +
+    /// `credentials.toml`. A `sparse+` URL prefix is accepted and stripped.
+    pub fn rust_alt_registry(
+        mut self,
+        alias: impl Into<String>,
+        index_url: impl Into<String>,
+        auth: Option<String>,
+    ) -> Self {
+        self.rust_alt_registries
+            .push((alias.into(), index_url.into(), auth));
         self
     }
 
@@ -617,6 +668,20 @@ impl CheckerBuilder {
             registries.insert(ecosystem, fetcher);
         }
 
+        // Alternate Rust registries, each a crates.io-protocol fetcher against its
+        // own sparse index + token, keyed by the alias dependencies reference.
+        let mut rust_registries: HashMap<String, Arc<dyn RegistryFetcher>> = HashMap::new();
+        for (alias, index_url, auth) in self.rust_alt_registries {
+            rust_registries.insert(
+                alias,
+                Arc::new(CratesIoFetcher::with_registry(
+                    client.clone(),
+                    index_url,
+                    auth,
+                )),
+            );
+        }
+
         let osv = self.vulnerabilities.then(|| {
             Arc::new(OsvClient::with_url(
                 client.clone(),
@@ -635,6 +700,7 @@ impl CheckerBuilder {
 
         Ok(Checker {
             registries,
+            rust_registries,
             jsr: self.jsr,
             osv,
             concurrency: self.concurrency,
