@@ -6,6 +6,7 @@
 
 pub mod ecosystem;
 pub mod error;
+pub mod graph;
 pub mod item;
 pub mod lockfiles;
 pub mod manifest;
@@ -16,6 +17,7 @@ pub mod semver;
 
 pub use ecosystem::Ecosystem;
 pub use error::ParseError;
+pub use graph::{DependencyGraph, Node, NodeKind, Tree, TreeNode, TreeOptions};
 pub use item::{Item, PackageSource};
 pub use lockfiles::{
     LockedPackage, LockfileData, ResolvedLockfile, apply_lockfile, parse_cargo_lock,
