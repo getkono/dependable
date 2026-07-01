@@ -5,6 +5,7 @@ use crate::manifest::{ManifestKind, ParsedManifest};
 
 pub mod cargo_toml;
 pub mod composer_json;
+pub mod csproj;
 pub mod deno_json;
 pub mod go_mod;
 pub mod json_scan;
@@ -17,6 +18,7 @@ pub mod requirements_txt;
 
 pub use cargo_toml::CargoTomlParser;
 pub use composer_json::ComposerJsonParser;
+pub use csproj::CsprojParser;
 pub use deno_json::DenoJsonParser;
 pub use go_mod::GoModParser;
 pub use package_json::PackageJsonParser;
@@ -43,6 +45,7 @@ pub fn parse(kind: ManifestKind, content: &str) -> Result<ParsedManifest, ParseE
         ManifestKind::RequirementsTxt => RequirementsTxtParser.parse(content),
         ManifestKind::PyprojectToml => PyprojectTomlParser.parse(content),
         ManifestKind::PubspecYaml => PubspecYamlParser.parse(content),
+        ManifestKind::Csproj => CsprojParser.parse(content),
         other => Err(ParseError::Unsupported(other)),
     }
 }

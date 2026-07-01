@@ -15,7 +15,7 @@ vulnerabilities — no API key, no cloud backend, a single static binary.
 | pnpm | `pnpm-workspace.yaml` | npm | — | 🧪 Experimental |
 | PHP | `composer.json` | Packagist | `composer.lock` | 🧪 Experimental |
 | Dart / Flutter | `pubspec.yaml` | pub.dev | `pubspec.lock` | 🧪 Experimental |
-| C# / .NET | `*.csproj` | NuGet | — | 🚧 Planned ([#8]) |
+| C# / .NET | `*.csproj`, `Directory.Packages.props` | NuGet | — | 🧪 Experimental |
 | Elixir | `mix.exs` | Hex | `mix.lock` | 🚧 Planned ([#9]) |
 
 **Status legend:**
@@ -28,7 +28,6 @@ vulnerabilities — no API key, no cloud backend, a single static binary.
 V2 reporting features and other deferred work are tracked as GitHub issues; see
 [`docs/SCOPE.md`](docs/SCOPE.md) for the finalized scope and deferral plan.
 
-[#8]: https://github.com/getkono/dependable/issues/8
 [#9]: https://github.com/getkono/dependable/issues/9
 
 ## How it fits alongside your other tools

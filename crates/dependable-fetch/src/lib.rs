@@ -51,8 +51,8 @@ pub use check::{CheckError, Checker, CheckerBuilder, ManifestCheck, ProgressEven
 pub use error::FetchError;
 pub use osv::{OsvClient, OsvQuery};
 pub use registries::{
-    CratesIoFetcher, FetchedVersions, GoProxyFetcher, JsrFetcher, NpmFetcher, PackagistFetcher,
-    PubDevFetcher, PyPiFetcher, RegistryFetcher,
+    CratesIoFetcher, FetchedVersions, GoProxyFetcher, JsrFetcher, NpmFetcher, NuGetFetcher,
+    PackagistFetcher, PubDevFetcher, PyPiFetcher, RegistryFetcher,
 };
 
 // Re-export the core types a consumer needs, so depending on `dependable-fetch`
