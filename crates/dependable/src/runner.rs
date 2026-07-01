@@ -9,7 +9,7 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
-use dependable_fetch::core::parse;
+use dependable_fetch::core::{AlternateRegistryDecl, parse, parse_cargo_config};
 use dependable_fetch::{
     CheckError, Checker, CratesIoFetcher, DependencyStatus, Ecosystem, GoProxyFetcher, HexFetcher,
     JsrFetcher, ManifestKind, NpmFetcher, NuGetFetcher, PackageSource, PackagistFetcher,
@@ -93,6 +93,15 @@ impl Engine {
             .read_lockfiles(settings.check_lockfile)
             .unstable(settings.unstable)
             .disk_cache(settings.cache);
+        // Wire alternate Cargo registries (private index + auth token) resolved
+        // from `$CARGO_HOME`, so a `registry = "..."` dependency is fetched from
+        // and authenticated against its own index. Registries without an index URL
+        // are skipped.
+        for reg in cargo_alt_registries() {
+            if let Some(index_url) = reg.index_url {
+                builder = builder.rust_alt_registry(reg.name, index_url, reg.auth_token);
+            }
+        }
         // Register non-Rust ecosystem fetchers when enabled in config.
         if cfg.go.enabled {
             builder = builder.registry(
@@ -407,6 +416,39 @@ fn collect_manifests(manifest: Option<&Path>, path: Option<&Path>, depth: usize)
     }
     let root = path.map_or_else(|| PathBuf::from("."), Path::to_path_buf);
     discover::find_manifests(&root, depth)
+}
+
+/// Cargo's home directory: `$CARGO_HOME`, else `~/.cargo` (via `$HOME`). Returns
+/// `None` when neither is set, which disables alternate-registry auth gracefully.
+/// Windows path resolution (`%USERPROFILE%`) is hardened separately (Windows work).
+fn cargo_home() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("CARGO_HOME").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(dir));
+    }
+    let home = std::env::var_os("HOME").filter(|v| !v.is_empty())?;
+    Some(PathBuf::from(home).join(".cargo"))
+}
+
+/// Resolve alternate Cargo registries (alias → index URL + token) from
+/// `$CARGO_HOME/config.toml` + `credentials.toml` (falling back to the extension-
+/// less legacy names). Best-effort: any missing or unparseable file simply yields
+/// fewer registries, so a check never fails because of Cargo config.
+fn cargo_alt_registries() -> Vec<AlternateRegistryDecl> {
+    let Some(home) = cargo_home() else {
+        return Vec::new();
+    };
+    let read = |names: [&str; 2]| {
+        names
+            .iter()
+            .find_map(|name| std::fs::read_to_string(home.join(name)).ok())
+    };
+    match read(["config.toml", "config"]) {
+        Some(config) => parse_cargo_config(
+            &config,
+            read(["credentials.toml", "credentials"]).as_deref(),
+        ),
+        None => Vec::new(),
+    }
 }
 
 fn exit_code(reports: &[ManifestReport], fail_on: FailOn) -> ExitCode {
