@@ -117,7 +117,7 @@ Cross-cutting enablers (also V1.1): extend `Ecosystem`/`ManifestKind` enums + `d
 | Q1 | `go.sum` for locked versions | **Use `go.mod` constraints; defer `go.sum`** — it stores module checksums, not one resolved version per module | V1.1 |
 | Q2 | pnpm catalog expansion | **Check `catalog:`/`catalogs:` definitions** in `pnpm-workspace.yaml`; **don't expand `catalog:` refs** back into each `package.json` | V1.1 |
 | Q3 | Rust feature-flag visibility | feature-flags issue | V1.1 |
-| Q4 | `requirements.txt` `-r` includes | tracking issue; informs Python | V1.1 |
+| Q4 | `requirements.txt` `-r` includes | **Don't follow `-r`/`-c` includes recursively in V1.1** — discovery already finds each `requirements*.txt`, so each is checked on its own | V1.1 |
 | Q5 | `pyproject.toml` extras | tracking issue; informs Python | V1.1 |
 | Q6 | NuGet bracket ranges | folded into C# (confirmed needed) | V1.1 |
 | Q7 | Dart SDK constraint | folded into Dart (skip it) | V1.1 |
