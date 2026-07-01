@@ -1,0 +1,28 @@
+# aqua registry metadata for dependable.
+#
+# Install with a local registry entry, or submit this package to
+# https://github.com/aquaproj/aqua-registry. The `asset` template maps aqua's
+# OS/Arch to the Rust target triples used in the release archives uploaded by
+# .github/workflows/release-binaries.yml (`dependable-<target>.tar.gz`).
+packages:
+  - type: github_release
+    repo_owner: getkono
+    repo_name: dependable
+    description: CLI to check dependency versions and scan for known vulnerabilities
+    asset: dependable-{{.Arch}}-{{.OS}}.{{.Format}}
+    format: tar.gz
+    supported_envs:
+      - linux
+      - darwin
+      - windows
+    overrides:
+      - goos: windows
+        format: zip
+    replacements:
+      amd64: x86_64
+      arm64: aarch64
+      linux: unknown-linux-gnu
+      darwin: apple-darwin
+      windows: pc-windows-msvc
+    files:
+      - name: dependable
