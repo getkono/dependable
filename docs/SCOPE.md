@@ -108,7 +108,7 @@ Cross-cutting enablers (also V1.1): extend `Ecosystem`/`ManifestKind` enums + `d
 | D6 | License checking depth | visibility + allowlist in V2; full graph V3 | V2/V3 |
 | D7 | Multi-language output layout | **Grouped per manifest/ecosystem**, ecosystems fetched concurrently, `--depth 3` default (ratifies shipped behavior) | V1.1 |
 | D8 | `"latest"` handling | resolve for display, don't rewrite on `--fix` | V1.1 |
-| D9 | Telemetry | **none** (ratify + document) | V1 (doc) |
+| D9 | Telemetry | **None** — no telemetry in V1/V2; documented in [`README.md`](../README.md#privacy) | V1 (doc) |
 
 ### A5 — Open questions (Q1–Q8, PRD §10)
 
