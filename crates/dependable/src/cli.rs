@@ -96,6 +96,10 @@ pub struct ListArgs {
     pub format: Format,
     #[arg(long, default_value_t = 3)]
     pub depth: usize,
+    /// Show each crate's available feature flags (Rust only; fetches the
+    /// crates.io sparse index, so this makes `list` hit the network).
+    #[arg(long)]
+    pub features: bool,
     #[arg(short, long)]
     pub verbose: bool,
 }

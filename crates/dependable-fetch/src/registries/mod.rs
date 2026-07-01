@@ -35,6 +35,9 @@ pub struct FetchedVersions {
     pub versions: Vec<String>,
     /// The registry's explicit "latest" tag, where available.
     pub latest_tag: Option<String>,
+    /// Available feature-flag names for the newest version, where the registry
+    /// exposes them (crates.io). Empty otherwise; surfaced by `list --features`.
+    pub features: Vec<String>,
     /// A non-fatal note (e.g. deprecation), if any.
     pub error: Option<String>,
 }
@@ -48,8 +51,16 @@ impl FetchedVersions {
         Self {
             versions,
             latest_tag,
+            features: Vec::new(),
             error: None,
         }
+    }
+
+    /// Attach the available feature-flag names (crates.io sparse index).
+    #[must_use]
+    pub fn with_features(mut self, features: Vec<String>) -> Self {
+        self.features = features;
+        self
     }
 
     /// Override the explicit "latest" tag.

@@ -11,9 +11,10 @@ use std::sync::{Arc, Mutex};
 use anyhow::Context;
 use dependable_fetch::core::parse;
 use dependable_fetch::{
-    CheckError, Checker, DependencyStatus, Ecosystem, GoProxyFetcher, HexFetcher, JsrFetcher,
-    ManifestKind, NpmFetcher, NuGetFetcher, PackageSource, PackagistFetcher, ParseError,
-    ProgressEvent, PubDevFetcher, PyPiFetcher, UnstableFilter, build_client,
+    CheckError, Checker, CratesIoFetcher, DependencyStatus, Ecosystem, GoProxyFetcher, HexFetcher,
+    JsrFetcher, ManifestKind, NpmFetcher, NuGetFetcher, PackageSource, PackagistFetcher,
+    ParseError, ProgressEvent, PubDevFetcher, PyPiFetcher, RegistryFetcher, UnstableFilter,
+    build_client,
 };
 use indicatif::{ProgressBar, ProgressStyle};
 
@@ -271,6 +272,16 @@ pub async fn run_list(args: ListArgs) -> anyhow::Result<ExitCode> {
         eprintln!("No supported manifests found.");
         return Ok(ExitCode::SUCCESS);
     }
+    // `--features` fetches crates.io feature flags, so `list` only touches the
+    // network when it is set. Feature data is crates.io-only (Rust manifests).
+    let feature_fetcher = if args.features {
+        Some(CratesIoFetcher::new(
+            build_client().context("building HTTP client")?,
+        ))
+    } else {
+        None
+    };
+
     let mut printed = 0;
     for manifest in &manifests {
         let Some(kind) = ManifestKind::detect(manifest) else {
@@ -318,6 +329,17 @@ pub async fn run_list(args: ListArgs) -> anyhow::Result<ExitCode> {
                 _ => "",
             };
             println!("  {} {}{}", item.name, constraint, note);
+
+            // Under `--features`, show the crate's available feature flags. Only
+            // crates.io exposes them, so this is limited to checkable Rust deps.
+            if let Some(fetcher) = &feature_fetcher
+                && kind.ecosystem() == Ecosystem::Rust
+                && item.is_checkable()
+                && let Ok(fetched) = fetcher.fetch_versions(&item.name).await
+                && !fetched.features.is_empty()
+            {
+                println!("      features: {}", fetched.features.join(", "));
+            }
         }
     }
     Ok(ExitCode::SUCCESS)
