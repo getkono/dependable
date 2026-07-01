@@ -121,7 +121,7 @@ Cross-cutting enablers (also V1.1): extend `Ecosystem`/`ManifestKind` enums + `d
 | Q5 | `pyproject.toml` extras | **Strip `name[extra]`, check the base package** (already shipped in the Python parsers) | V1.1 |
 | Q6 | NuGet bracket ranges | folded into C# (confirmed needed) | V1.1 |
 | Q7 | Dart SDK constraint | folded into Dart (skip it) | V1.1 |
-| Q8 | `no_std` core target | architecture issue | V2 / won't-do |
+| Q8 | `no_std` core target | **Drop the requirement** — `dependable-core` stays `std` (`HashMap`/`String`); no real embedded/WASM demand to justify the `hashbrown`/`alloc` friction | won't-do |
 
 ---
 
@@ -132,4 +132,4 @@ Cross-cutting enablers (also V1.1): extend `Ecosystem`/`ManifestKind` enums + `d
 - **V2:** reports & enterprise (A2) + policy/license decisions, plus the first-party
   editor integration (LSP / VSCode extension over `dependable-fetch`; see
   [`INTEGRATIONS.md`](INTEGRATIONS.md)).
-- **V3:** PDF automation, full license-compatibility graph, `no_std` resolution, and the PRD §9 supply-chain non-goals.
+- **V3:** PDF automation, full license-compatibility graph, and the PRD §9 supply-chain non-goals.
