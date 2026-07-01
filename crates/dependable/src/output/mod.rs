@@ -9,6 +9,7 @@ use crate::cli::Format;
 pub mod json;
 pub mod table;
 pub mod text;
+pub mod tree;
 
 /// The check results for a single manifest.
 pub struct ManifestReport {

@@ -78,6 +78,7 @@ dependable check [PATH]           # check a project (default: current dir)
 dependable check . --format json  # machine-readable output (also: text)
 dependable check . --fail-on vulnerable   # exit non-zero for CI
 dependable list .                 # list dependencies without checking
+dependable tree .                 # render the dependency tree (Rust)
 dependable fix . --dry-run        # preview in-place upgrades
 ```
 
@@ -93,6 +94,38 @@ serde    1.0.100  1.0.228  patch available
 tokio    1.20.0   1.52.3   3 vulnerabilities
 time     0.2.7    0.3.51   1 vulnerability
 ```
+
+## Dependency tree (`tree`)
+
+`dependable tree` renders the workspace's dependency graph in the style of
+`cargo tree`, distinguishing **in-workspace crates** (bold cyan, tagged
+`(workspace)`) from **external** ones — so you can see how crates relate and, with
+`--invert`, what a change to one crate affects downstream. It is **Rust-only and
+fully offline**: the resolved graph is read straight from `Cargo.lock` (no network).
+
+```bash
+dependable tree                    # forest of all workspace members
+dependable tree -p my-crate        # root at a single crate
+dependable tree --invert -p my-lib # who depends on my-lib (downstream impact)
+dependable tree --depth 1          # roots + their direct dependencies
+dependable tree --format json      # nodes + edges, for tooling / IDEs
+dependable tree --format dot | dot -Tsvg > deps.svg   # visual graph
+```
+
+```
+my-app v0.1.0 (workspace)
+├── my-lib v0.1.0 (workspace)
+│   └── serde v1.0.228
+│       └── serde_derive v1.0.228
+├── serde v1.0.228 (*)
+└── gitdep v0.3.0 (git)
+```
+
+Repeated crates are collapsed to `(*)` (pass `--no-dedupe` to expand them). The
+tree is the **resolved union graph** from `Cargo.lock`: unlike `cargo tree --edges`
+it does not distinguish normal/dev/build edges or feature activation. When no
+`Cargo.lock` is present, `tree` prints a warning and falls back to a shallow graph
+of each member plus its direct declared dependencies.
 
 ## Use as a library
 

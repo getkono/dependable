@@ -6,6 +6,7 @@
 
 pub mod ecosystem;
 pub mod error;
+pub mod graph;
 pub mod item;
 pub mod lockfiles;
 pub mod manifest;
@@ -16,17 +17,20 @@ pub mod semver;
 
 pub use ecosystem::Ecosystem;
 pub use error::ParseError;
+pub use graph::{DependencyGraph, Node, NodeKind, Tree, TreeNode, TreeOptions};
 pub use item::{Item, PackageSource};
 pub use lockfiles::{
-    LockfileData, apply_lockfile, parse_cargo_lock, parse_composer_lock, parse_dart_pubspec_lock,
-    parse_lockfile, parse_mix_lock, parse_package_lock,
+    LockedPackage, LockfileData, ResolvedLockfile, apply_lockfile, parse_cargo_lock,
+    parse_cargo_lock_graph, parse_composer_lock, parse_dart_pubspec_lock, parse_lockfile,
+    parse_mix_lock, parse_package_lock,
 };
 pub use manifest::{AlternateRegistryDecl, ManifestKind, ParsedManifest};
 pub use npmrc::{NpmrcConfig, parse_npmrc};
 pub use parsers::{
     CargoTomlParser, ComposerJsonParser, CsprojParser, DenoJsonParser, GoModParser, MixExsParser,
     PackageJsonParser, Parser, PnpmWorkspaceParser, PubspecYamlParser, PyprojectTomlParser,
-    RequirementsTxtParser, parse, parse_cargo_config,
+    RequirementsTxtParser, WorkspaceDecl, parse, parse_cargo_config, parse_package_name,
+    parse_workspace,
 };
 pub use result::{CheckResult, DependencyStatus};
 pub use semver::{Evaluation, UnstableFilter, check_version, is_prerelease, to_semver_constraint};

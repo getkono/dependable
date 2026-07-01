@@ -22,6 +22,8 @@ pub enum Command {
     Check(CheckArgs),
     /// List discovered dependencies without checking versions.
     List(ListArgs),
+    /// Render the workspace dependency tree (Rust; offline, from Cargo.lock).
+    Tree(TreeArgs),
     /// Update versions in place to the latest compatible.
     Fix(FixArgs),
 }
@@ -33,6 +35,7 @@ impl Cli {
         match &self.command {
             Command::Check(args) => args.verbose,
             Command::List(args) => args.verbose,
+            Command::Tree(args) => args.verbose,
             Command::Fix(args) => args.verbose,
         }
     }
@@ -105,6 +108,30 @@ pub struct ListArgs {
 }
 
 #[derive(Args)]
+pub struct TreeArgs {
+    /// Project directory to analyze (default: current directory).
+    pub path: Option<PathBuf>,
+    /// Root the tree at a single crate instead of all workspace members.
+    #[arg(short = 'p', long)]
+    pub package: Option<String>,
+    /// Invert the tree: show what depends on each root (downstream impact).
+    #[arg(long)]
+    pub invert: bool,
+    /// Maximum depth to display (default: unlimited; `0` = roots only).
+    #[arg(long)]
+    pub depth: Option<usize>,
+    /// Show every occurrence of a crate instead of collapsing repeats to `(*)`.
+    #[arg(long)]
+    pub no_dedupe: bool,
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = TreeFormat::Tree)]
+    pub format: TreeFormat,
+    /// Verbose logging.
+    #[arg(short, long)]
+    pub verbose: bool,
+}
+
+#[derive(Args)]
 pub struct FixArgs {
     pub path: Option<PathBuf>,
     #[arg(long)]
@@ -131,6 +158,17 @@ pub enum Format {
     Table,
     Json,
     Text,
+}
+
+/// Output format for the `tree` command.
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum TreeFormat {
+    /// cargo-tree-style ASCII tree (default).
+    Tree,
+    /// A JSON graph of nodes and edges (for tooling / IDEs).
+    Json,
+    /// Graphviz DOT for a visual graph (`… --format dot | dot -Tsvg`).
+    Dot,
 }
 
 /// The result level that triggers a non-zero exit (for CI).

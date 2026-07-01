@@ -1,0 +1,9 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+util = { path = "../util" }
+leftpad = "1"
+gitdep = { git = "https://example.com/gitdep" }

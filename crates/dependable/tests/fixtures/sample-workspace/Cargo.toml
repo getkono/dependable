@@ -1,0 +1,6 @@
+# A demo workspace fixture for `dependable tree` (excluded from the real build
+# via the root Cargo.toml). Two members, app -> util, both depending on leftpad
+# (so it dedupes), plus a git dependency.
+[workspace]
+resolver = "2"
+members = ["crates/app", "crates/util"]

@@ -13,14 +13,15 @@ use dependable_fetch::core::{
     AlternateRegistryDecl, NpmrcConfig, parse, parse_cargo_config, parse_npmrc,
 };
 use dependable_fetch::{
-    CheckError, Checker, CratesIoFetcher, DependencyStatus, Ecosystem, GoProxyFetcher, HexFetcher,
-    JsrFetcher, ManifestKind, NpmFetcher, NuGetFetcher, PackageSource, PackagistFetcher,
-    ParseError, ProgressEvent, PubDevFetcher, PyPiFetcher, RegistryFetcher, ScopedRegistry,
-    UnstableFilter, build_client,
+    CheckError, Checker, CratesIoFetcher, DependencyStatus, Ecosystem, GoProxyFetcher, GraphSource,
+    HexFetcher, JsrFetcher, ManifestKind, NpmFetcher, NuGetFetcher, PackageSource,
+    PackagistFetcher, ParseError, ProgressEvent, PubDevFetcher, PyPiFetcher, RegistryFetcher,
+    ScopedRegistry, TreeOptions, UnstableFilter, WorkspaceGraphOptions, build_client,
+    build_workspace_graph,
 };
 use indicatif::{ProgressBar, ProgressStyle};
 
-use crate::cli::{CheckArgs, FailOn, FixArgs, ListArgs};
+use crate::cli::{CheckArgs, FailOn, FixArgs, ListArgs, TreeArgs};
 use crate::config::{Config, load_config};
 use crate::output::{self, ManifestReport};
 use crate::{discover, fix};
@@ -376,6 +377,37 @@ pub async fn run_list(args: ListArgs) -> anyhow::Result<ExitCode> {
             }
         }
     }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `dependable tree`
+///
+/// Offline: builds the workspace dependency graph from `Cargo.lock` (or a
+/// shallow fallback from manifests) and renders it. No network or async.
+pub fn run_tree(args: TreeArgs) -> anyhow::Result<ExitCode> {
+    let root = args.path.as_deref().unwrap_or_else(|| Path::new("."));
+    let mut opts = WorkspaceGraphOptions::default();
+    opts.package = args.package.clone();
+
+    let built = build_workspace_graph(root, &opts).context("building the dependency graph")?;
+    if built.source == GraphSource::Manifests {
+        eprintln!(
+            "warning: no Cargo.lock found — showing a shallow tree of direct \
+             dependencies only. Run `cargo generate-lockfile` for the full \
+             resolved graph."
+        );
+    }
+
+    let graph = if args.invert {
+        built.graph.inverted()
+    } else {
+        built.graph
+    };
+    let tree_opts = TreeOptions {
+        max_depth: args.depth,
+        dedupe: !args.no_dedupe,
+    };
+    output::tree::render(&graph, args.format, &tree_opts)?;
     Ok(ExitCode::SUCCESS)
 }
 
