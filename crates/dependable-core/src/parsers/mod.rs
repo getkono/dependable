@@ -4,6 +4,7 @@ use crate::error::ParseError;
 use crate::manifest::{ManifestKind, ParsedManifest};
 
 pub mod cargo_toml;
+pub mod cargo_workspace;
 pub mod composer_json;
 pub mod csproj;
 pub mod deno_json;
@@ -18,6 +19,7 @@ pub mod pyproject_toml;
 pub mod requirements_txt;
 
 pub use cargo_toml::{CargoTomlParser, parse_cargo_config};
+pub use cargo_workspace::{WorkspaceDecl, parse_package_name, parse_workspace};
 pub use composer_json::ComposerJsonParser;
 pub use csproj::CsprojParser;
 pub use deno_json::DenoJsonParser;
