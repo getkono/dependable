@@ -106,7 +106,7 @@ Cross-cutting enablers (also V1.1): extend `Ecosystem`/`ManifestKind` enums + `d
 | D4 | PDF export approach | shell to chromium | V3 |
 | D5 | Policy severity model | named bands + numeric `max_cvss` (numeric wins) | V2 |
 | D6 | License checking depth | visibility + allowlist in V2; full graph V3 | V2/V3 |
-| D7 | Multi-language output layout | grouped by ecosystem, depth 3 default | V1.1 |
+| D7 | Multi-language output layout | **Grouped per manifest/ecosystem**, ecosystems fetched concurrently, `--depth 3` default (ratifies shipped behavior) | V1.1 |
 | D8 | `"latest"` handling | resolve for display, don't rewrite on `--fix` | V1.1 |
 | D9 | Telemetry | **none** (ratify + document) | V1 (doc) |
 
