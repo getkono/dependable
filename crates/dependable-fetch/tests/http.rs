@@ -5,7 +5,7 @@ use dependable_fetch::{
     CratesIoFetcher, GoProxyFetcher, HexFetcher, JsrFetcher, NpmFetcher, NuGetFetcher, OsvClient,
     OsvQuery, PackagistFetcher, PubDevFetcher, PyPiFetcher, RegistryFetcher, build_client,
 };
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[tokio::test]
@@ -28,6 +28,29 @@ async fn crates_io_fetch_parses_and_sorts() {
     assert_eq!(fetched.latest_tag.as_deref(), Some("1.2.0"));
     // Feature names come from the newest version (1.2.0), merging features + features2.
     assert_eq!(fetched.features, vec!["default", "derive", "rc"]);
+}
+
+#[tokio::test]
+async fn crates_io_alt_registry_strips_sparse_prefix_and_sends_auth() {
+    let server = MockServer::start().await;
+    let body = "{\"name\":\"private-crate\",\"vers\":\"0.1.0\",\"yanked\":false}\n";
+    // The mock only answers when the Authorization token is presented verbatim, so
+    // a passing fetch proves the header was sent (an absent header yields a 404).
+    Mock::given(method("GET"))
+        .and(path("/pr/iv/private-crate"))
+        .and(header("authorization", "Bearer sekret"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    // `sparse+` scheme prefix and trailing slash are both normalized away.
+    let fetcher = CratesIoFetcher::with_registry(
+        build_client().unwrap(),
+        format!("sparse+{}/", server.uri()),
+        Some("Bearer sekret".to_string()),
+    );
+    let fetched = fetcher.fetch_versions("private-crate").await.unwrap();
+    assert_eq!(fetched.versions, vec!["0.1.0"]);
 }
 
 #[tokio::test]
