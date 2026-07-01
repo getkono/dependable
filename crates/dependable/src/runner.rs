@@ -418,15 +418,36 @@ fn collect_manifests(manifest: Option<&Path>, path: Option<&Path>, depth: usize)
     discover::find_manifests(&root, depth)
 }
 
-/// Cargo's home directory: `$CARGO_HOME`, else `~/.cargo` (via `$HOME`). Returns
-/// `None` when neither is set, which disables alternate-registry auth gracefully.
-/// Windows path resolution (`%USERPROFILE%`) is hardened separately (Windows work).
+/// Cargo's home directory: `$CARGO_HOME`, else `~/.cargo`. Returns `None` when
+/// unresolvable, which disables alternate-registry auth gracefully.
 fn cargo_home() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("CARGO_HOME").filter(|v| !v.is_empty()) {
-        return Some(PathBuf::from(dir));
+    resolve_cargo_home(env_dir("CARGO_HOME"), home_dir())
+}
+
+/// Cargo's home from the resolved directories: an explicit `$CARGO_HOME`, else
+/// `~/.cargo`. Pure (no environment access) so the fallback is testable everywhere.
+fn resolve_cargo_home(cargo_home: Option<PathBuf>, home: Option<PathBuf>) -> Option<PathBuf> {
+    cargo_home.or_else(|| home.map(|h| h.join(".cargo")))
+}
+
+/// A non-empty environment variable as a [`PathBuf`].
+fn env_dir(key: &str) -> Option<PathBuf> {
+    std::env::var_os(key)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+/// The user's home directory, cross-platform: `$HOME` (all platforms), then, on
+/// Windows only, `%USERPROFILE%`. `None` when unresolvable.
+fn home_dir() -> Option<PathBuf> {
+    if let Some(home) = env_dir("HOME") {
+        return Some(home);
     }
-    let home = std::env::var_os("HOME").filter(|v| !v.is_empty())?;
-    Some(PathBuf::from(home).join(".cargo"))
+    #[cfg(windows)]
+    if let Some(profile) = env_dir("USERPROFILE") {
+        return Some(profile);
+    }
+    None
 }
 
 /// Resolve alternate Cargo registries (alias → index URL + token) from
@@ -473,5 +494,26 @@ fn exit_code(reports: &[ManifestReport], fail_on: FailOn) -> ExitCode {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cargo_home_prefers_explicit_env_then_dot_cargo() {
+        // An explicit `$CARGO_HOME` is used verbatim.
+        assert_eq!(
+            resolve_cargo_home(Some("/opt/cargo".into()), Some("/home/u".into())),
+            Some(PathBuf::from("/opt/cargo"))
+        );
+        // Otherwise fall back to `~/.cargo` (built with the platform separator).
+        assert_eq!(
+            resolve_cargo_home(None, Some("/home/u".into())),
+            Some(PathBuf::from("/home/u").join(".cargo"))
+        );
+        // No home at all -> unresolvable, so alt-registry auth is simply disabled.
+        assert_eq!(resolve_cargo_home(None, None), None);
     }
 }
