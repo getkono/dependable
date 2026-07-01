@@ -43,9 +43,15 @@ pub mod check;
 pub mod error;
 pub mod osv;
 pub mod registries;
+pub mod tree;
 
 // High-level entry point (recommended for embedding).
 pub use check::{CheckError, Checker, CheckerBuilder, ManifestCheck, ProgressEvent};
+
+// Workspace dependency graph (offline; reads Cargo.lock / manifests).
+pub use tree::{
+    GraphSource, TreeError, WorkspaceGraph, WorkspaceGraphOptions, build_workspace_graph,
+};
 
 // Low-level building blocks (compose-it-yourself).
 pub use error::FetchError;
@@ -61,8 +67,9 @@ pub use registries::{
 // parsers, `check_version`, ...).
 pub use dependable_core as core;
 pub use dependable_core::{
-    CheckResult, DependencyStatus, Ecosystem, Evaluation, Item, ManifestKind, PackageSource,
-    ParseError, ParsedManifest, UnstableFilter,
+    CheckResult, DependencyGraph, DependencyStatus, Ecosystem, Evaluation, Item, ManifestKind,
+    Node, NodeKind, PackageSource, ParseError, ParsedManifest, Tree, TreeNode, TreeOptions,
+    UnstableFilter,
 };
 
 /// One-import convenience for consumers: `use dependable_fetch::prelude::*;`.
