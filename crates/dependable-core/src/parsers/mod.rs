@@ -9,6 +9,7 @@ pub mod csproj;
 pub mod deno_json;
 pub mod go_mod;
 pub mod json_scan;
+pub mod mix_exs;
 pub mod package_json;
 pub mod pnpm_workspace;
 pub mod position;
@@ -21,6 +22,7 @@ pub use composer_json::ComposerJsonParser;
 pub use csproj::CsprojParser;
 pub use deno_json::DenoJsonParser;
 pub use go_mod::GoModParser;
+pub use mix_exs::MixExsParser;
 pub use package_json::PackageJsonParser;
 pub use pnpm_workspace::PnpmWorkspaceParser;
 pub use pubspec_yaml::PubspecYamlParser;
@@ -46,6 +48,6 @@ pub fn parse(kind: ManifestKind, content: &str) -> Result<ParsedManifest, ParseE
         ManifestKind::PyprojectToml => PyprojectTomlParser.parse(content),
         ManifestKind::PubspecYaml => PubspecYamlParser.parse(content),
         ManifestKind::Csproj => CsprojParser.parse(content),
-        other => Err(ParseError::Unsupported(other)),
+        ManifestKind::MixExs => MixExsParser.parse(content),
     }
 }

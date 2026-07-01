@@ -2,8 +2,8 @@
 //! `#[ignore]`d live smoke tests (run via `mise run test:live`).
 
 use dependable_fetch::{
-    CratesIoFetcher, GoProxyFetcher, JsrFetcher, NpmFetcher, NuGetFetcher, OsvClient, OsvQuery,
-    PackagistFetcher, PubDevFetcher, PyPiFetcher, RegistryFetcher, build_client,
+    CratesIoFetcher, GoProxyFetcher, HexFetcher, JsrFetcher, NpmFetcher, NuGetFetcher, OsvClient,
+    OsvQuery, PackagistFetcher, PubDevFetcher, PyPiFetcher, RegistryFetcher, build_client,
 };
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -272,6 +272,31 @@ async fn nuget_fetch_lowercases_id_inlines_and_follows_pages() {
 async fn live_nuget_newtonsoft_has_versions() {
     let fetcher = NuGetFetcher::new(build_client().unwrap());
     let fetched = fetcher.fetch_versions("Newtonsoft.Json").await.unwrap();
+    assert!(!fetched.versions.is_empty());
+}
+
+#[tokio::test]
+async fn hex_fetch_parses_and_sorts_releases() {
+    let server = MockServer::start().await;
+    let body = r#"{"name":"phoenix","releases":[
+        {"version":"1.7.9"},{"version":"1.7.10"},{"version":"1.6.0"}]}"#;
+    Mock::given(method("GET"))
+        .and(path("/api/packages/phoenix"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let fetcher = HexFetcher::with_registry(build_client().unwrap(), server.uri());
+    let fetched = fetcher.fetch_versions("phoenix").await.unwrap();
+    assert_eq!(fetched.versions, vec!["1.7.10", "1.7.9", "1.6.0"]); // sorted newest-first
+    assert_eq!(fetched.latest_tag.as_deref(), Some("1.7.10"));
+}
+
+#[tokio::test]
+#[ignore = "hits the network (Hex)"]
+async fn live_hex_phoenix_has_versions() {
+    let fetcher = HexFetcher::new(build_client().unwrap());
+    let fetched = fetcher.fetch_versions("phoenix").await.unwrap();
     assert!(!fetched.versions.is_empty());
 }
 

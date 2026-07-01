@@ -1,0 +1,7 @@
+%{
+  "ecto": {:hex, :ecto, "3.10.3", "aaa", [:mix], [{:telemetry, "~> 0.4 or ~> 1.0", [hex: :telemetry, repo: "hexpm", optional: false]}], "hexpm", "bbb"},
+  "ecto_sql": {:hex, :ecto_sql, "3.10.2", "ccc", [:mix], [], "hexpm", "ddd"},
+  "jason": {:hex, :jason, "1.4.1", "eee", [:mix], [], "hexpm", "fff"},
+  "phoenix": {:hex, :phoenix, "1.7.10", "ggg", [:mix], [], "hexpm", "hhh"},
+  "telemetry": {:hex, :telemetry, "1.2.1", "iii", [:rebar3], [], "hexpm", "jjj"},
+}

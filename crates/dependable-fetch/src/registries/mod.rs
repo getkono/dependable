@@ -6,6 +6,7 @@ use crate::error::FetchError;
 
 pub mod crates_io;
 pub mod go_proxy;
+pub mod hex;
 pub mod jsr;
 pub mod npm;
 pub mod nuget;
@@ -15,6 +16,7 @@ pub mod pypi;
 
 pub use crates_io::CratesIoFetcher;
 pub use go_proxy::GoProxyFetcher;
+pub use hex::HexFetcher;
 pub use jsr::JsrFetcher;
 pub use npm::NpmFetcher;
 pub use nuget::NuGetFetcher;

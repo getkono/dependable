@@ -1,6 +1,7 @@
 //! The version comparison engine (built on the `semver` crate).
 
 pub mod checker;
+pub mod elixir;
 pub mod normalize;
 pub mod nuget;
 pub mod python;

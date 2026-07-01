@@ -73,6 +73,7 @@ impl ManifestKind {
             ManifestKind::PackageJson => Some("package-lock.json"),
             ManifestKind::ComposerJson => Some("composer.lock"),
             ManifestKind::PubspecYaml => Some("pubspec.lock"),
+            ManifestKind::MixExs => Some("mix.lock"),
             _ => None,
         }
     }
@@ -171,6 +172,7 @@ mod tests {
             ManifestKind::PubspecYaml.lockfile_name(),
             Some("pubspec.lock")
         );
+        assert_eq!(ManifestKind::MixExs.lockfile_name(), Some("mix.lock"));
         assert_eq!(ManifestKind::GoMod.lockfile_name(), None);
     }
 }
