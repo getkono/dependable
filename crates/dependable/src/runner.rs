@@ -11,9 +11,9 @@ use std::sync::{Arc, Mutex};
 use anyhow::Context;
 use dependable_fetch::core::parse;
 use dependable_fetch::{
-    CheckError, Checker, DependencyStatus, Ecosystem, GoProxyFetcher, JsrFetcher, ManifestKind,
-    NpmFetcher, NuGetFetcher, PackageSource, PackagistFetcher, ParseError, ProgressEvent,
-    PubDevFetcher, PyPiFetcher, UnstableFilter, build_client,
+    CheckError, Checker, DependencyStatus, Ecosystem, GoProxyFetcher, HexFetcher, JsrFetcher,
+    ManifestKind, NpmFetcher, NuGetFetcher, PackageSource, PackagistFetcher, ParseError,
+    ProgressEvent, PubDevFetcher, PyPiFetcher, UnstableFilter, build_client,
 };
 use indicatif::{ProgressBar, ProgressStyle};
 
@@ -145,6 +145,15 @@ impl Engine {
                 Arc::new(NuGetFetcher::with_registry(
                     client.clone(),
                     cfg.csharp.registry.clone(),
+                )),
+            );
+        }
+        if cfg.elixir.enabled {
+            builder = builder.registry(
+                Ecosystem::Elixir,
+                Arc::new(HexFetcher::with_registry(
+                    client.clone(),
+                    cfg.elixir.registry.clone(),
                 )),
             );
         }

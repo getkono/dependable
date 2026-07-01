@@ -6,11 +6,13 @@ use crate::manifest::ManifestKind;
 pub mod cargo_lock;
 pub mod composer_lock;
 pub mod dart_pubspec_lock;
+pub mod mix_lock;
 pub mod package_lock_json;
 
 pub use cargo_lock::{LockfileData, apply_lockfile, parse_cargo_lock};
 pub use composer_lock::parse_composer_lock;
 pub use dart_pubspec_lock::parse_dart_pubspec_lock;
+pub use mix_lock::parse_mix_lock;
 pub use package_lock_json::parse_package_lock;
 
 /// Parse lockfile `content` for a given manifest `kind`, dispatching to the right
@@ -22,6 +24,7 @@ pub fn parse_lockfile(kind: ManifestKind, content: &str) -> Result<LockfileData,
         ManifestKind::PackageJson => parse_package_lock(content),
         ManifestKind::ComposerJson => parse_composer_lock(content),
         ManifestKind::PubspecYaml => parse_dart_pubspec_lock(content),
+        ManifestKind::MixExs => parse_mix_lock(content),
         other => Err(ParseError::Unsupported(other)),
     }
 }

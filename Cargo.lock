@@ -331,6 +331,7 @@ dependencies = [
 name = "dependable-core"
 version = "0.1.0"
 dependencies = [
+ "regex",
  "roxmltree",
  "semver",
  "serde",

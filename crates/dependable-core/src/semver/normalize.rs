@@ -150,6 +150,7 @@ pub fn to_semver_constraint(constraint: &str, ecosystem: Ecosystem) -> String {
     match ecosystem {
         Ecosystem::Python => crate::semver::python::pep440_constraint_to_semver(constraint),
         Ecosystem::CSharp => crate::semver::nuget::nuget_constraint_to_semver(constraint),
+        Ecosystem::Elixir => crate::semver::elixir::hex_constraint_to_semver(constraint),
         _ => normalize_constraint(constraint),
     }
 }

@@ -18,11 +18,11 @@ pub use error::ParseError;
 pub use item::{Item, PackageSource};
 pub use lockfiles::{
     LockfileData, apply_lockfile, parse_cargo_lock, parse_composer_lock, parse_dart_pubspec_lock,
-    parse_lockfile, parse_package_lock,
+    parse_lockfile, parse_mix_lock, parse_package_lock,
 };
 pub use manifest::{AlternateRegistryDecl, ManifestKind, ParsedManifest};
 pub use parsers::{
-    CargoTomlParser, ComposerJsonParser, CsprojParser, DenoJsonParser, GoModParser,
+    CargoTomlParser, ComposerJsonParser, CsprojParser, DenoJsonParser, GoModParser, MixExsParser,
     PackageJsonParser, Parser, PnpmWorkspaceParser, PubspecYamlParser, PyprojectTomlParser,
     RequirementsTxtParser, parse,
 };

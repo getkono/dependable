@@ -32,6 +32,8 @@ pub struct Config {
     #[serde(default)]
     pub csharp: CsharpConfig,
     #[serde(default)]
+    pub elixir: ElixirConfig,
+    #[serde(default)]
     pub vulnerability: VulnConfig,
 }
 
@@ -168,6 +170,22 @@ impl Default for CsharpConfig {
         Self {
             enabled: true,
             registry: "https://api.nuget.org".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ElixirConfig {
+    pub enabled: bool,
+    pub registry: String,
+}
+
+impl Default for ElixirConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            registry: "https://hex.pm".to_string(),
         }
     }
 }
