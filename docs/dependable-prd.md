@@ -1332,16 +1332,23 @@ This would require fetching license metadata from each registry (npm includes `l
 
 ## 9. Non-Goals
 
-The following are explicitly out of scope to keep the project focused:
+The following are explicitly out of scope to keep the project focused. See
+[`INTEGRATIONS.md`](INTEGRATIONS.md) for the full positioning against existing tools —
+what we complement, supersede, and deliberately will not build.
 
-- **VSCode extension** — Dependable is a CLI tool and library. A VSCode extension could use `dependable-core` and `dependable-fetch` as library crates, but that extension is a separate project.
 - **Automatic dependency installation** — we do not run `cargo install`, `npm install`, etc. We only check and optionally update version strings in manifest files.
+- **Scheduled auto-update PR bot / hosted service** — watching repos, running on a cron, and opening pull requests is Dependabot's and Renovate's job; we complement them as the on-demand check/fix engine. See [`INTEGRATIONS.md`](INTEGRATIONS.md).
 - **Private registry authentication for non-Rust ecosystems** — Cargo alternate registries (with tokens) are supported. npm private registries via `.npmrc` auth tokens are V1.1+. Other ecosystems: deferred.
 - **Dependency graph / transitive vulnerabilities** — we only check direct dependencies as declared in manifest files.
 - **Package verification / supply chain** (Sigstore, etc.) — V3 at earliest.
 - **Proprietary cloud backend** — all features work without an API key or paid service.
 - **Windows cross-compilation** — `rustls` makes this possible but we will test and officially support only Linux and macOS in V1. Windows support in V1.1.
-- **Language servers (LSP)** — out of scope, but `dependable-core`'s IO-independence makes a future LSP integration straightforward.
+
+> **Editor integration is a goal, not a non-goal.** A first-party **LSP server and/or
+> VSCode extension** built on `dependable-fetch` (inline outdated/vulnerable hints and
+> quick-fixes) is a committed roadmap item (target V2). The IO-independence of
+> `dependable-core` and the in-memory `Checker::check_manifest` entry point exist
+> precisely to make this straightforward. See [`INTEGRATIONS.md`](INTEGRATIONS.md) §3.
 
 ---
 
