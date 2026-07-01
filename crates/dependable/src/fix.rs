@@ -44,7 +44,19 @@ pub fn apply_fixes(
 ) -> anyhow::Result<Vec<FixRecord>> {
     let content = std::fs::read_to_string(manifest)
         .with_context(|| format!("reading {}", manifest.display()))?;
+    let (updated, records) = plan_fixes(&content, results, all);
+    if !dry_run && !records.is_empty() {
+        std::fs::write(manifest, updated)
+            .with_context(|| format!("writing {}", manifest.display()))?;
+    }
+    Ok(records)
+}
 
+/// Compute the rewritten manifest and the applied records from `content` and the
+/// check `results`, with no filesystem IO (the file boundary lives in
+/// [`apply_fixes`]). Format-agnostic: it edits each recorded version span in place,
+/// so JSON, YAML, and TOML manifests are rewritten without reformatting.
+fn plan_fixes(content: &str, results: &[CheckResult], all: bool) -> (String, Vec<FixRecord>) {
     let mut edits: Vec<Edit> = Vec::new();
     let mut records = Vec::new();
     for result in results {
@@ -89,12 +101,12 @@ pub fn apply_fixes(
         });
     }
 
-    if !dry_run && !edits.is_empty() {
-        let updated = apply_edits(&content, &edits);
-        std::fs::write(manifest, updated)
-            .with_context(|| format!("writing {}", manifest.display()))?;
-    }
-    Ok(records)
+    let updated = if edits.is_empty() {
+        content.to_string()
+    } else {
+        apply_edits(content, &edits)
+    };
+    (updated, records)
 }
 
 /// Build a new constraint from `original`, preserving its leading operator/`v`
