@@ -344,6 +344,90 @@ async fn vulnerabilities_disabled_skips_osv() {
 }
 
 #[tokio::test]
+async fn disk_cache_serves_a_second_checker() {
+    let server = MockServer::start().await;
+    mount_index(&server).await;
+    let dir = tempfile::tempdir().unwrap();
+
+    // First checker fetches serde + time and populates the on-disk cache.
+    let first = Checker::builder()
+        .http_client(build_client().unwrap())
+        .rust_registry(server.uri(), None)
+        .vulnerabilities(false)
+        .disk_cache_dir(dir.path())
+        .build()
+        .unwrap();
+    first
+        .check_manifest(ManifestKind::CargoToml, MANIFEST, Some(LOCK))
+        .await
+        .unwrap();
+    let after_first = server.received_requests().await.unwrap().len();
+    assert_eq!(
+        after_first, 2,
+        "serde + time fetched once (local-thing skipped)"
+    );
+
+    // A second checker has a fresh in-process cache but shares the disk dir, so it
+    // serves both packages from disk and makes no new registry requests.
+    let second = Checker::builder()
+        .http_client(build_client().unwrap())
+        .rust_registry(server.uri(), None)
+        .vulnerabilities(false)
+        .disk_cache_dir(dir.path())
+        .build()
+        .unwrap();
+    second
+        .check_manifest(ManifestKind::CargoToml, MANIFEST, Some(LOCK))
+        .await
+        .unwrap();
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        after_first,
+        "second checker should hit the disk cache, not the registry"
+    );
+}
+
+#[tokio::test]
+async fn no_cache_forces_a_refetch() {
+    let server = MockServer::start().await;
+    mount_index(&server).await;
+    let dir = tempfile::tempdir().unwrap();
+
+    // Disk cache disabled: even sharing a dir, a fresh checker re-fetches everything.
+    let first = Checker::builder()
+        .http_client(build_client().unwrap())
+        .rust_registry(server.uri(), None)
+        .vulnerabilities(false)
+        .disk_cache(false)
+        .disk_cache_dir(dir.path())
+        .build()
+        .unwrap();
+    first
+        .check_manifest(ManifestKind::CargoToml, MANIFEST, Some(LOCK))
+        .await
+        .unwrap();
+    let after_first = server.received_requests().await.unwrap().len();
+
+    let second = Checker::builder()
+        .http_client(build_client().unwrap())
+        .rust_registry(server.uri(), None)
+        .vulnerabilities(false)
+        .disk_cache(false)
+        .disk_cache_dir(dir.path())
+        .build()
+        .unwrap();
+    second
+        .check_manifest(ManifestKind::CargoToml, MANIFEST, Some(LOCK))
+        .await
+        .unwrap();
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        after_first * 2,
+        "with --no-cache the second checker re-fetches every package"
+    );
+}
+
+#[tokio::test]
 async fn ghsa_filtering_respects_include_flag() {
     let server = MockServer::start().await;
     mount_index(&server).await;
