@@ -130,6 +130,12 @@ fn rewrite_constraint(original: &str, new_version: &str) -> Option<String> {
     if rest.contains([' ', '\t', '|']) {
         return None;
     }
+    // A dist-tag / channel name (`latest`, `next`, `beta`, …) starts with a letter
+    // once any operator prefix is removed — it names a channel, not a version
+    // range, so it must never be pinned to a concrete version (npm D8).
+    if rest.starts_with(|c: char| c.is_ascii_alphabetic()) {
+        return None;
+    }
     Some(format!("{prefix}{new_version}"))
 }
 
@@ -195,6 +201,17 @@ mod tests {
     #[test]
     fn rewrite_skips_multi_constraint() {
         assert_eq!(rewrite_constraint(">=1.0,<2.0", "1.5.0"), None);
+    }
+
+    #[test]
+    fn rewrite_skips_dist_tags() {
+        // npm dist-tags / channels are not version ranges — never pin them, so a
+        // `"latest"` dependency keeps tracking the channel after `--fix`.
+        assert_eq!(rewrite_constraint("latest", "2.3.0"), None);
+        assert_eq!(rewrite_constraint("next", "2.3.0"), None);
+        assert_eq!(rewrite_constraint("beta", "2.3.0"), None);
+        // The wildcard `*` is still rewritten (it resolves to a concrete version).
+        assert_eq!(rewrite_constraint("*", "2.3.0").as_deref(), Some("2.3.0"));
     }
 
     #[test]
