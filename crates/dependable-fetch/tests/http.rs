@@ -3,7 +3,7 @@
 
 use dependable_fetch::{
     CratesIoFetcher, GoProxyFetcher, JsrFetcher, NpmFetcher, OsvClient, OsvQuery, PackagistFetcher,
-    PyPiFetcher, RegistryFetcher, build_client,
+    PubDevFetcher, PyPiFetcher, RegistryFetcher, build_client,
 };
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -202,6 +202,31 @@ async fn packagist_fetch_parses_versions_and_strips_v() {
 async fn live_packagist_monolog_has_versions() {
     let fetcher = PackagistFetcher::new(build_client().unwrap());
     let fetched = fetcher.fetch_versions("monolog/monolog").await.unwrap();
+    assert!(!fetched.versions.is_empty());
+}
+
+#[tokio::test]
+async fn pub_dev_fetch_parses_versions_and_latest() {
+    let server = MockServer::start().await;
+    let body = r#"{"name":"http","latest":{"version":"1.1.0"},
+        "versions":[{"version":"1.0.0"},{"version":"1.1.0"},{"version":"0.13.5"}]}"#;
+    Mock::given(method("GET"))
+        .and(path("/api/packages/http"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let fetcher = PubDevFetcher::with_registry(build_client().unwrap(), server.uri());
+    let fetched = fetcher.fetch_versions("http").await.unwrap();
+    assert_eq!(fetched.versions, vec!["1.1.0", "1.0.0", "0.13.5"]); // sorted newest-first
+    assert_eq!(fetched.latest_tag.as_deref(), Some("1.1.0"));
+}
+
+#[tokio::test]
+#[ignore = "hits the network (pub.dev)"]
+async fn live_pub_dev_http_has_versions() {
+    let fetcher = PubDevFetcher::new(build_client().unwrap());
+    let fetched = fetcher.fetch_versions("http").await.unwrap();
     assert!(!fetched.versions.is_empty());
 }
 

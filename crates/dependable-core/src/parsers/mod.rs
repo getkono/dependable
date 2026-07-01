@@ -11,6 +11,7 @@ pub mod json_scan;
 pub mod package_json;
 pub mod pnpm_workspace;
 pub mod position;
+pub mod pubspec_yaml;
 pub mod pyproject_toml;
 pub mod requirements_txt;
 
@@ -20,6 +21,7 @@ pub use deno_json::DenoJsonParser;
 pub use go_mod::GoModParser;
 pub use package_json::PackageJsonParser;
 pub use pnpm_workspace::PnpmWorkspaceParser;
+pub use pubspec_yaml::PubspecYamlParser;
 pub use pyproject_toml::PyprojectTomlParser;
 pub use requirements_txt::RequirementsTxtParser;
 
@@ -40,6 +42,7 @@ pub fn parse(kind: ManifestKind, content: &str) -> Result<ParsedManifest, ParseE
         ManifestKind::ComposerJson => ComposerJsonParser.parse(content),
         ManifestKind::RequirementsTxt => RequirementsTxtParser.parse(content),
         ManifestKind::PyprojectToml => PyprojectTomlParser.parse(content),
+        ManifestKind::PubspecYaml => PubspecYamlParser.parse(content),
         other => Err(ParseError::Unsupported(other)),
     }
 }

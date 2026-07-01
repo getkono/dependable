@@ -9,6 +9,7 @@ pub mod go_proxy;
 pub mod jsr;
 pub mod npm;
 pub mod packagist;
+pub mod pub_dev;
 pub mod pypi;
 
 pub use crates_io::CratesIoFetcher;
@@ -16,6 +17,7 @@ pub use go_proxy::GoProxyFetcher;
 pub use jsr::JsrFetcher;
 pub use npm::NpmFetcher;
 pub use packagist::PackagistFetcher;
+pub use pub_dev::PubDevFetcher;
 pub use pypi::PyPiFetcher;
 
 /// The versions fetched from a registry for one package.

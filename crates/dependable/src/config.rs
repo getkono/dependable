@@ -28,6 +28,8 @@ pub struct Config {
     #[serde(default)]
     pub php: PhpConfig,
     #[serde(default)]
+    pub dart: DartConfig,
+    #[serde(default)]
     pub vulnerability: VulnConfig,
 }
 
@@ -132,6 +134,22 @@ impl Default for PhpConfig {
         Self {
             enabled: true,
             registry: "https://repo.packagist.org".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DartConfig {
+    pub enabled: bool,
+    pub registry: String,
+}
+
+impl Default for DartConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            registry: "https://pub.dev".to_string(),
         }
     }
 }
