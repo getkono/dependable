@@ -37,6 +37,14 @@ vulnerable** dependencies across the ecosystems it supports, with no cloud backe
 no API key. See [`docs/INTEGRATIONS.md`](docs/INTEGRATIONS.md) for the full positioning
 against existing dev tools.
 
+## Privacy
+
+`dependable` collects **no telemetry** — no analytics, no usage tracking, no
+phone-home of any kind. The only network requests it makes are to the package
+registries and the [OSV](https://osv.dev) vulnerability database required to check
+your dependencies. No API key, no account, no cloud backend. This stance holds for
+both V1 and V2 (decision D9 in [`docs/SCOPE.md`](docs/SCOPE.md)).
+
 ## Prerequisites
 
 - [rustup](https://rustup.rs) — the Rust toolchain is pinned by `rust-toolchain.toml`.

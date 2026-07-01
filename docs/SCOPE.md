@@ -102,26 +102,26 @@ Cross-cutting enablers (also V1.1): extend `Ecosystem`/`ManifestKind` enums + `d
 |---|---|---|---|
 | D1 | Disk cache in V1 or V1.1 | → V1.1 (disk-cache issue) | V1.1 |
 | D2 | `--fix` format scope | Cargo.toml in V1; JSON/YAML in V1.1 | V1.1 |
-| D3 | `serde_yaml` vs `marked_yaml` | tracking issue; recommend `serde_yaml` | V1.1 |
+| D3 | `serde_yaml` vs `marked_yaml` | **`serde_yaml` + line scanner** (shipped for pnpm/Dart); revisit only if its `unsafe` becomes a concern | V1.1 |
 | D4 | PDF export approach | shell to chromium | V3 |
 | D5 | Policy severity model | named bands + numeric `max_cvss` (numeric wins) | V2 |
 | D6 | License checking depth | visibility + allowlist in V2; full graph V3 | V2/V3 |
-| D7 | Multi-language output layout | grouped by ecosystem, depth 3 default | V1.1 |
+| D7 | Multi-language output layout | **Grouped per manifest/ecosystem**, ecosystems fetched concurrently, `--depth 3` default (ratifies shipped behavior) | V1.1 |
 | D8 | `"latest"` handling | resolve for display, don't rewrite on `--fix` | V1.1 |
-| D9 | Telemetry | **none** (ratify + document) | V1 (doc) |
+| D9 | Telemetry | **None** — no telemetry in V1/V2; documented in [`README.md`](../README.md#privacy) | V1 (doc) |
 
 ### A5 — Open questions (Q1–Q8, PRD §10)
 
 | ID | Question | Disposition | Milestone |
 |---|---|---|---|
-| Q1 | `go.sum` for locked versions | tracking issue; informs Go | V1.1 |
-| Q2 | pnpm catalog expansion | tracking issue; informs pnpm/npm | V1.1 |
+| Q1 | `go.sum` for locked versions | **Use `go.mod` constraints; defer `go.sum`** — it stores module checksums, not one resolved version per module | V1.1 |
+| Q2 | pnpm catalog expansion | **Check `catalog:`/`catalogs:` definitions** in `pnpm-workspace.yaml`; **don't expand `catalog:` refs** back into each `package.json` | V1.1 |
 | Q3 | Rust feature-flag visibility | feature-flags issue | V1.1 |
-| Q4 | `requirements.txt` `-r` includes | tracking issue; informs Python | V1.1 |
-| Q5 | `pyproject.toml` extras | tracking issue; informs Python | V1.1 |
+| Q4 | `requirements.txt` `-r` includes | **Don't follow `-r`/`-c` includes recursively in V1.1** — discovery already finds each `requirements*.txt`, so each is checked on its own | V1.1 |
+| Q5 | `pyproject.toml` extras | **Strip `name[extra]`, check the base package** (already shipped in the Python parsers) | V1.1 |
 | Q6 | NuGet bracket ranges | folded into C# (confirmed needed) | V1.1 |
 | Q7 | Dart SDK constraint | folded into Dart (skip it) | V1.1 |
-| Q8 | `no_std` core target | architecture issue | V2 / won't-do |
+| Q8 | `no_std` core target | **Drop the requirement** — `dependable-core` stays `std` (`HashMap`/`String`); no real embedded/WASM demand to justify the `hashbrown`/`alloc` friction | won't-do |
 
 ---
 
@@ -132,4 +132,4 @@ Cross-cutting enablers (also V1.1): extend `Ecosystem`/`ManifestKind` enums + `d
 - **V2:** reports & enterprise (A2) + policy/license decisions, plus the first-party
   editor integration (LSP / VSCode extension over `dependable-fetch`; see
   [`INTEGRATIONS.md`](INTEGRATIONS.md)).
-- **V3:** PDF automation, full license-compatibility graph, `no_std` resolution, and the PRD §9 supply-chain non-goals.
+- **V3:** PDF automation, full license-compatibility graph, and the PRD §9 supply-chain non-goals.
