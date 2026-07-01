@@ -3,9 +3,34 @@
 A fast, open-source CLI and Rust library for checking dependency versions and known
 vulnerabilities — no API key, no cloud backend, a single static binary.
 
-> **Status:** V1 targets the **Rust / Crates.io** ecosystem as a working MVP. The
-> nine other ecosystems and the V2 reporting features are tracked as GitHub issues.
-> See [`docs/SCOPE.md`](docs/SCOPE.md) for the finalized scope and deferral plan.
+## Supported languages
+
+| Language | Manifest(s) | Registry | Lockfile | Status |
+| --- | --- | --- | --- | --- |
+| Rust | `Cargo.toml` | crates.io | `Cargo.lock` | ✅ Stable |
+| JavaScript / TypeScript | `package.json` | npm | `package-lock.json` | ✅ Stable |
+| Python | `requirements*.txt`, `pyproject.toml`, `pixi.toml` | PyPI | — | ✅ Stable |
+| Go | `go.mod` | Go proxy | — | 🧪 Experimental |
+| Deno / JSR | `deno.json(c)` | JSR | — | 🧪 Experimental |
+| pnpm | `pnpm-workspace.yaml` | npm | — | 🧪 Experimental |
+| PHP | `composer.json` | Packagist | `composer.lock` | 🧪 Experimental |
+| Dart / Flutter | `pubspec.yaml` | pub.dev | `pubspec.lock` | 🚧 Planned ([#7]) |
+| C# / .NET | `*.csproj` | NuGet | — | 🚧 Planned ([#8]) |
+| Elixir | `mix.exs` | Hex | `mix.lock` | 🚧 Planned ([#9]) |
+
+**Status legend:**
+
+- **✅ Stable** — maintainer-tested and used in anger.
+- **🧪 Experimental** — implemented but not battle-tested by the maintainer; please
+  [open an issue](https://github.com/getkono/dependable/issues) if you hit a rough edge.
+- **🚧 Planned** — tracked, not yet shipped.
+
+V2 reporting features and other deferred work are tracked as GitHub issues; see
+[`docs/SCOPE.md`](docs/SCOPE.md) for the finalized scope and deferral plan.
+
+[#7]: https://github.com/getkono/dependable/issues/7
+[#8]: https://github.com/getkono/dependable/issues/8
+[#9]: https://github.com/getkono/dependable/issues/9
 
 ## How it fits alongside your other tools
 
