@@ -5,6 +5,10 @@ This document finalizes what **V1** delivers and enumerates everything deferred 
 issue under a milestone (`V1.1`, `V2`, `V3`); filter the issue tracker by milestone or
 by label (`ecosystem`, `report`, `decision`, …).
 
+For **where `dependable` sits among existing dev tools** — what it complements
+(Dependabot/Renovate), supersedes, and deliberately will not build — see
+[`INTEGRATIONS.md`](INTEGRATIONS.md).
+
 ---
 
 ## 1. V1 deliverables (finalized)
@@ -70,6 +74,7 @@ Cross-cutting enablers (also V1.1): extend `Ecosystem`/`ManifestKind` enums + `d
 | Policy enforcement | `[policy]`: `max_cvss`, `max_major_behind`, deny/min-version; exit 0/1/2 | `policy.rs` | §6.4 |
 | GitHub Actions integration | PR annotations + job summary + published action | — | §6.3 |
 | GitLab Code Quality | Code Quality JSON report | `serde_json` | §6.3 |
+| First-party editor integration | Official LSP server and/or VSCode extension over `dependable-fetch`: inline outdated/vulnerable hints + quick-fixes | new crate / extension | §9, [`INTEGRATIONS.md`](INTEGRATIONS.md) §3 |
 | Workspace / monorepo | Cross-manifest dedup, rollup, `--manifest-glob`, `workspace = true` inheritance | runner/cache | §6.5 |
 | License visibility + allowlist | Show declared license in `list`; enforce `allowed_licenses` | registry fields | §6.4, §8 D6 |
 | PDF export | `--pdf` via headless chromium (HTML stays self-contained) — **V3** | system chromium | §6.1, §8 D4 |
@@ -119,5 +124,7 @@ Cross-cutting enablers (also V1.1): extend `Ecosystem`/`ManifestKind` enums + `d
 
 - **V1 (shipping):** Rust / crates.io MVP — the deliverables in §1. No issues; this is the baseline.
 - **V1.1:** the 9 ecosystems + 2 core enablers (A1), the polish items (A3), and the V1.1 decisions/questions (A4/A5). Suggested order by demand: npm → Go → Python → the rest.
-- **V2:** reports & enterprise (A2) + policy/license decisions.
-- **V3:** PDF automation, full license-compatibility graph, `no_std` resolution, and the PRD §9 supply-chain / LSP non-goals.
+- **V2:** reports & enterprise (A2) + policy/license decisions, plus the first-party
+  editor integration (LSP / VSCode extension over `dependable-fetch`; see
+  [`INTEGRATIONS.md`](INTEGRATIONS.md)).
+- **V3:** PDF automation, full license-compatibility graph, `no_std` resolution, and the PRD §9 supply-chain non-goals.

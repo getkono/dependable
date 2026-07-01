@@ -7,6 +7,15 @@ vulnerabilities — no API key, no cloud backend, a single static binary.
 > nine other ecosystems and the V2 reporting features are tracked as GitHub issues.
 > See [`docs/SCOPE.md`](docs/SCOPE.md) for the finalized scope and deferral plan.
 
+## How it fits alongside your other tools
+
+`dependable` **complements** Dependabot and Renovate rather than replacing them: they
+own scheduled auto-update PRs, while `dependable` is the fast, on-demand check + `fix`
++ CI gate you run locally or in a pipeline — one tool that flags **outdated and
+vulnerable** dependencies across the ecosystems it supports, with no cloud backend and
+no API key. See [`docs/INTEGRATIONS.md`](docs/INTEGRATIONS.md) for the full positioning
+against existing dev tools.
+
 ## Prerequisites
 
 - [rustup](https://rustup.rs) — the Rust toolchain is pinned by `rust-toolchain.toml`.
