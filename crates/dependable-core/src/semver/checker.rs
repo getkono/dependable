@@ -27,6 +27,12 @@ pub fn to_version_req(constraint: &str) -> Result<VersionReq, ::semver::Error> {
     VersionReq::parse(&normalize_constraint(constraint))
 }
 
+/// Whether `constraint` is an npm dist-tag that tracks the newest release
+/// (currently just `latest`) rather than a version range.
+fn is_latest_tag(constraint: &str) -> bool {
+    constraint.trim() == "latest"
+}
+
 /// Classify a dependency.
 ///
 /// `versions` may be in any order; `locked_at` is the resolved version from a
@@ -51,7 +57,15 @@ pub fn check_version(constraint: &str, versions: &[String], locked_at: Option<&s
         };
     };
 
-    let req = to_version_req(constraint).ok();
+    // An npm dist-tag such as `latest` isn't a version range; treat it as `*` so
+    // it resolves to the newest available release (D8) rather than failing to
+    // parse and being misreported. `--fix` still never rewrites the tag (see the
+    // fix layer), so the manifest keeps tracking the channel.
+    let req = match to_version_req(constraint) {
+        Ok(req) => Some(req),
+        Err(_) if is_latest_tag(constraint) => Some(VersionReq::STAR),
+        Err(_) => None,
+    };
     let latest_compatible = req
         .as_ref()
         .and_then(|r| parsed.iter().rev().find(|v| r.matches(v)).cloned());
@@ -137,6 +151,31 @@ mod tests {
     #[test]
     fn unparseable_versions_yield_error() {
         let e = check_version("1", &vers(&["not-a-version"]), None);
+        assert!(matches!(e.status, DependencyStatus::Error(_)));
+    }
+
+    #[test]
+    fn latest_dist_tag_resolves_to_newest_and_is_up_to_date() {
+        // `latest` tracks the channel: resolve it to the newest release and report
+        // up-to-date, instead of failing to parse as a version requirement.
+        let e = check_version("latest", &vers(&["1.0.0", "2.3.0", "2.1.0"]), None);
+        assert_eq!(e.status, DependencyStatus::UpToDate);
+        assert_eq!(e.latest_compatible.as_deref(), Some("2.3.0"));
+        assert_eq!(e.latest_available.as_deref(), Some("2.3.0"));
+    }
+
+    #[test]
+    fn latest_dist_tag_with_older_lockfile_is_update_available() {
+        // With a lockfile pinned behind the newest release, a re-install would bump
+        // it, so `latest` surfaces as an available update (resolved to the newest).
+        let e = check_version("latest", &vers(&["1.0.0", "2.3.0"]), Some("1.0.0"));
+        assert_eq!(e.status, DependencyStatus::UpdateAvailable);
+        assert_eq!(e.latest_compatible.as_deref(), Some("2.3.0"));
+    }
+
+    #[test]
+    fn latest_dist_tag_with_no_versions_still_errors() {
+        let e = check_version("latest", &vers(&["not-a-version"]), None);
         assert!(matches!(e.status, DependencyStatus::Error(_)));
     }
 }
