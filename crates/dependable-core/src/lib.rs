@@ -9,6 +9,7 @@ pub mod error;
 pub mod item;
 pub mod lockfiles;
 pub mod manifest;
+pub mod npmrc;
 pub mod parsers;
 pub mod result;
 pub mod semver;
@@ -21,6 +22,7 @@ pub use lockfiles::{
     parse_lockfile, parse_mix_lock, parse_package_lock,
 };
 pub use manifest::{AlternateRegistryDecl, ManifestKind, ParsedManifest};
+pub use npmrc::{NpmrcConfig, parse_npmrc};
 pub use parsers::{
     CargoTomlParser, ComposerJsonParser, CsprojParser, DenoJsonParser, GoModParser, MixExsParser,
     PackageJsonParser, Parser, PnpmWorkspaceParser, PubspecYamlParser, PyprojectTomlParser,

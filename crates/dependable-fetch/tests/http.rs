@@ -3,7 +3,8 @@
 
 use dependable_fetch::{
     CratesIoFetcher, GoProxyFetcher, HexFetcher, JsrFetcher, NpmFetcher, NuGetFetcher, OsvClient,
-    OsvQuery, PackagistFetcher, PubDevFetcher, PyPiFetcher, RegistryFetcher, build_client,
+    OsvQuery, PackagistFetcher, PubDevFetcher, PyPiFetcher, RegistryFetcher, ScopedRegistry,
+    build_client,
 };
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -187,6 +188,47 @@ async fn npm_fetch_parses_versions_and_latest_tag() {
     let fetched = fetcher.fetch_versions("react").await.unwrap();
     assert_eq!(fetched.versions, vec!["18.2.0", "18.1.0", "18.0.0"]);
     assert_eq!(fetched.latest_tag.as_deref(), Some("18.2.0"));
+}
+
+#[tokio::test]
+async fn npm_scoped_package_routes_to_private_registry_with_bearer() {
+    use std::collections::HashMap;
+
+    // The scope's private registry answers only when the bearer token is present,
+    // and returns versions distinct from the default registry below.
+    let scoped = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(header("authorization", "Bearer corp-secret"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"dist-tags":{"latest":"2.0.0"},"versions":{"1.0.0":{},"2.0.0":{}}}"#,
+        ))
+        .mount(&scoped)
+        .await;
+
+    // The default registry returns a different version (and needs no auth), so a
+    // routing mistake would show up as `9.9.9` in the assertion.
+    let default = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"versions":{"9.9.9":{}}}"#))
+        .mount(&default)
+        .await;
+
+    let mut scopes = HashMap::new();
+    scopes.insert(
+        "@corp".to_string(),
+        ScopedRegistry {
+            registry: scoped.uri(),
+            token: Some("corp-secret".to_string()),
+        },
+    );
+    let fetcher =
+        NpmFetcher::with_registry(build_client().unwrap(), default.uri()).with_auth(None, scopes);
+
+    let fetched = fetcher.fetch_versions("@corp/widget").await.unwrap();
+    // 2.0.0/1.0.0 come from the scoped registry; `9.9.9` would mean it wrongly hit
+    // the default registry (proving both routing and bearer auth).
+    assert_eq!(fetched.versions, vec!["2.0.0", "1.0.0"]);
+    assert_eq!(fetched.latest_tag.as_deref(), Some("2.0.0"));
 }
 
 #[tokio::test]

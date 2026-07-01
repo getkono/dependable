@@ -50,6 +50,7 @@ pub use check::{CheckError, Checker, CheckerBuilder, ManifestCheck, ProgressEven
 // Low-level building blocks (compose-it-yourself).
 pub use error::FetchError;
 pub use osv::{OsvClient, OsvQuery};
+pub use registries::npm::ScopedRegistry;
 pub use registries::{
     CratesIoFetcher, FetchedVersions, GoProxyFetcher, HexFetcher, JsrFetcher, NpmFetcher,
     NuGetFetcher, PackagistFetcher, PubDevFetcher, PyPiFetcher, RegistryFetcher,
