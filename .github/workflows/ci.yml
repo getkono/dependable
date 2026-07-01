@@ -47,6 +47,26 @@ jobs:
       - name: Test
         run: mise run test
 
+  # Run the hermetic test suite on Windows and macOS so those targets are
+  # officially supported. Format/lint are platform-agnostic and stay on the Linux
+  # `check` job (CRLF checkouts would otherwise false-fail `fmt:check`). No mise
+  # here — the test task is just `cargo test`, so we skip installing the auxiliary
+  # tools and run the toolchain (pinned by rust-toolchain.toml) directly.
+  test-os:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Materialize Rust toolchain
+        run: rustup show active-toolchain || rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --workspace
+
   coverage:
     name: Coverage
     runs-on: ubuntu-latest
