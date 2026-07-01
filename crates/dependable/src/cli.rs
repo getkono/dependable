@@ -58,6 +58,9 @@ pub struct CheckArgs {
     /// Skip vulnerability scanning.
     #[arg(long)]
     pub no_vuln: bool,
+    /// Ignore the on-disk registry cache (always fetch fresh).
+    #[arg(long)]
+    pub no_cache: bool,
     /// Include GHSA advisories in the vulnerability scan.
     #[arg(long)]
     pub include_ghsa: bool,
