@@ -22,8 +22,9 @@ pub use lockfiles::{
 };
 pub use manifest::{AlternateRegistryDecl, ManifestKind, ParsedManifest};
 pub use parsers::{
-    CargoTomlParser, ComposerJsonParser, DenoJsonParser, GoModParser, PackageJsonParser, Parser,
-    PnpmWorkspaceParser, PubspecYamlParser, PyprojectTomlParser, RequirementsTxtParser, parse,
+    CargoTomlParser, ComposerJsonParser, CsprojParser, DenoJsonParser, GoModParser,
+    PackageJsonParser, Parser, PnpmWorkspaceParser, PubspecYamlParser, PyprojectTomlParser,
+    RequirementsTxtParser, parse,
 };
 pub use result::{CheckResult, DependencyStatus};
 pub use semver::{Evaluation, UnstableFilter, check_version, is_prerelease, to_semver_constraint};

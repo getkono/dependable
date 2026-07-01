@@ -2,8 +2,8 @@
 //! `#[ignore]`d live smoke tests (run via `mise run test:live`).
 
 use dependable_fetch::{
-    CratesIoFetcher, GoProxyFetcher, JsrFetcher, NpmFetcher, OsvClient, OsvQuery, PackagistFetcher,
-    PubDevFetcher, PyPiFetcher, RegistryFetcher, build_client,
+    CratesIoFetcher, GoProxyFetcher, JsrFetcher, NpmFetcher, NuGetFetcher, OsvClient, OsvQuery,
+    PackagistFetcher, PubDevFetcher, PyPiFetcher, RegistryFetcher, build_client,
 };
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -227,6 +227,51 @@ async fn pub_dev_fetch_parses_versions_and_latest() {
 async fn live_pub_dev_http_has_versions() {
     let fetcher = PubDevFetcher::new(build_client().unwrap());
     let fetched = fetcher.fetch_versions("http").await.unwrap();
+    assert!(!fetched.versions.is_empty());
+}
+
+#[tokio::test]
+async fn nuget_fetch_lowercases_id_inlines_and_follows_pages() {
+    let server = MockServer::start().await;
+    // The index inlines one page and references a second by `@id`.
+    let index = format!(
+        r#"{{"items":[
+            {{"items":[
+                {{"catalogEntry":{{"version":"12.0.3"}}}},
+                {{"catalogEntry":{{"version":"13.0.1"}}}}
+            ]}},
+            {{"@id":"{}/page2.json"}}
+        ]}}"#,
+        server.uri()
+    );
+    Mock::given(method("GET"))
+        // The package id is lowercased for the registration path.
+        .and(path(
+            "/v3/registration5-gz-semver2/newtonsoft.json/index.json",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_string(index))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/page2.json"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"items":[{"catalogEntry":{"version":"13.0.3"}}]}"#),
+        )
+        .mount(&server)
+        .await;
+
+    let fetcher = NuGetFetcher::with_registry(build_client().unwrap(), server.uri());
+    let fetched = fetcher.fetch_versions("Newtonsoft.Json").await.unwrap();
+    assert_eq!(fetched.versions, vec!["13.0.3", "13.0.1", "12.0.3"]); // sorted newest-first
+    assert_eq!(fetched.latest_tag.as_deref(), Some("13.0.3"));
+}
+
+#[tokio::test]
+#[ignore = "hits the network (NuGet)"]
+async fn live_nuget_newtonsoft_has_versions() {
+    let fetcher = NuGetFetcher::new(build_client().unwrap());
+    let fetched = fetcher.fetch_versions("Newtonsoft.Json").await.unwrap();
     assert!(!fetched.versions.is_empty());
 }
 

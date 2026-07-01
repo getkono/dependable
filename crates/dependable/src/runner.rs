@@ -12,8 +12,8 @@ use anyhow::Context;
 use dependable_fetch::core::parse;
 use dependable_fetch::{
     CheckError, Checker, DependencyStatus, Ecosystem, GoProxyFetcher, JsrFetcher, ManifestKind,
-    NpmFetcher, PackageSource, PackagistFetcher, ParseError, ProgressEvent, PubDevFetcher,
-    PyPiFetcher, UnstableFilter, build_client,
+    NpmFetcher, NuGetFetcher, PackageSource, PackagistFetcher, ParseError, ProgressEvent,
+    PubDevFetcher, PyPiFetcher, UnstableFilter, build_client,
 };
 use indicatif::{ProgressBar, ProgressStyle};
 
@@ -136,6 +136,15 @@ impl Engine {
                 Arc::new(PubDevFetcher::with_registry(
                     client.clone(),
                     cfg.dart.registry.clone(),
+                )),
+            );
+        }
+        if cfg.csharp.enabled {
+            builder = builder.registry(
+                Ecosystem::CSharp,
+                Arc::new(NuGetFetcher::with_registry(
+                    client.clone(),
+                    cfg.csharp.registry.clone(),
                 )),
             );
         }

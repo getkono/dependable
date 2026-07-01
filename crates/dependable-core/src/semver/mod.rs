@@ -2,6 +2,7 @@
 
 pub mod checker;
 pub mod normalize;
+pub mod nuget;
 pub mod python;
 
 pub use checker::{Evaluation, check_version, to_version_req};

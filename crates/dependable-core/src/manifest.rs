@@ -101,6 +101,7 @@ impl ManifestKind {
             "pyproject.toml" | "pixi.toml" => ManifestKind::PyprojectToml,
             "pubspec.yaml" => ManifestKind::PubspecYaml,
             "mix.exs" => ManifestKind::MixExs,
+            "Directory.Packages.props" => ManifestKind::Csproj,
             _ if is_requirements_file(name) => ManifestKind::RequirementsTxt,
             _ if name.ends_with(".csproj") => ManifestKind::Csproj,
             _ => return None,
@@ -137,6 +138,7 @@ mod tests {
             ("pubspec.yaml", ManifestKind::PubspecYaml),
             ("mix.exs", ManifestKind::MixExs),
             ("App.csproj", ManifestKind::Csproj),
+            ("Directory.Packages.props", ManifestKind::Csproj),
         ];
         for (path, expected) in cases {
             assert_eq!(

@@ -30,6 +30,8 @@ pub struct Config {
     #[serde(default)]
     pub dart: DartConfig,
     #[serde(default)]
+    pub csharp: CsharpConfig,
+    #[serde(default)]
     pub vulnerability: VulnConfig,
 }
 
@@ -150,6 +152,22 @@ impl Default for DartConfig {
         Self {
             enabled: true,
             registry: "https://pub.dev".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CsharpConfig {
+    pub enabled: bool,
+    pub registry: String,
+}
+
+impl Default for CsharpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            registry: "https://api.nuget.org".to_string(),
         }
     }
 }
