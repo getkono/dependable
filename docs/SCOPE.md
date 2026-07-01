@@ -20,9 +20,30 @@ end-to-end and establishes the type model + traits that later ecosystems plug in
 |---|---|---|
 | `dependable-core` | library | Pure, IO-free: parse `Cargo.toml` + `Cargo.lock`, the core data model, and the semver comparison engine. Zero filesystem/network/async. |
 | `dependable-fetch` | library | The high-level, public end-to-end entry point: the `Checker` (parse → fetch → evaluate → OSV scan) over the crates.io sparse-index fetcher, OSV vulnerability client, and moka in-process cache. Re-exports the core types so external consumers depend on this crate alone. |
-| `dependable` | application | CLI: `check` / `list` / `fix`, with `table` / `json` / `text` output, `.dependable.toml` + `DEPENDABLE_*` config, and `--fail-on` CI exit codes. |
+| `dependable` | application | CLI: `check` / `list` / `tree` / `fix`, with `table` / `json` / `text` output, `.dependable.toml` + `DEPENDABLE_*` config, and `--fail-on` CI exit codes. |
 
 `dependable-report` (the V2 crate) is **not** created in V1.
+
+### 1a. Dependency tree (`tree`) — Rust, offline
+
+`dependable tree` renders the workspace's resolved dependency graph like `cargo tree`,
+distinguishing **in-workspace crates** from **external** ones (`Workspace` / `Registry`
+/ `Git` / `Path`) and supporting `--invert` (downstream-impact / reverse dependencies),
+`-p <crate>`, `--depth`, `--no-dedupe`, and `tree` / `json` / `dot` output. Its purpose
+is understanding crate relationships and the blast radius of a change.
+
+- **Offline, no network.** The full resolved graph is read from `Cargo.lock`
+  (`parse_cargo_lock_graph` in core); in-workspace crates are the packages with no
+  `source` whose name is a workspace member. If no `Cargo.lock` exists, `tree` warns and
+  falls back to a shallow graph (members + their direct declared deps).
+- **Resolved union graph.** `Cargo.lock`'s `dependencies` arrays carry no per-kind
+  (normal/dev/build), per-feature, or per-target information, so — unlike
+  `cargo tree --edges` — those distinctions are not rendered. For the relationship /
+  downstream-impact use case the union is the right view.
+- **Language-agnostic core.** The graph model, traversals, and renderers
+  (`dependable_core::graph`) are ecosystem-independent; only the `Cargo.lock`/workspace
+  *builder* (`dependable_fetch::tree`) is Rust-specific, so other ecosystems can plug in
+  a builder later. Non-Rust `tree` support is deferred.
 
 ## 2. V1 feature-complete criteria
 

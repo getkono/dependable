@@ -13,7 +13,9 @@ for what is deferred and why.
   plus async IO (crates.io sparse index, OSV client, moka cache). Depends on and
   re-exports `dependable-core`, so external consumers (e.g. an IDE) need only this crate.
 - **`dependable`** (`crates/dependable`) — the CLI binary (clap); a thin wrapper over
-  `dependable-fetch::Checker` that owns only discovery, config, output, fix, and exit codes.
+  `dependable-fetch` that owns only discovery, config, output, fix, and exit codes. The
+  `tree` command renders the workspace dependency graph offline via
+  `dependable_fetch::build_workspace_graph` (no `Checker`, no network).
 
 ## Quality
 
