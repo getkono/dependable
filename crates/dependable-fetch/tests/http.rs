@@ -12,8 +12,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 async fn crates_io_fetch_parses_and_sorts() {
     let server = MockServer::start().await;
     let body = concat!(
-        "{\"name\":\"serde\",\"vers\":\"1.0.0\",\"yanked\":false}\n",
-        "{\"name\":\"serde\",\"vers\":\"1.2.0\",\"yanked\":false}\n",
+        "{\"name\":\"serde\",\"vers\":\"1.0.0\",\"yanked\":false,\"features\":{\"std\":[]}}\n",
+        "{\"name\":\"serde\",\"vers\":\"1.2.0\",\"yanked\":false,\"features\":{\"default\":[\"std\"],\"derive\":[\"serde_derive\"]},\"features2\":{\"rc\":[]}}\n",
         "{\"name\":\"serde\",\"vers\":\"1.1.0\",\"yanked\":true}\n",
     );
     Mock::given(method("GET"))
@@ -26,6 +26,8 @@ async fn crates_io_fetch_parses_and_sorts() {
     let fetched = fetcher.fetch_versions("serde").await.unwrap();
     assert_eq!(fetched.versions, vec!["1.2.0", "1.0.0"]);
     assert_eq!(fetched.latest_tag.as_deref(), Some("1.2.0"));
+    // Feature names come from the newest version (1.2.0), merging features + features2.
+    assert_eq!(fetched.features, vec!["default", "derive", "rc"]);
 }
 
 #[tokio::test]

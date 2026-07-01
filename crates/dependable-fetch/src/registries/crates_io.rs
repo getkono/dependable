@@ -1,5 +1,7 @@
 //! The crates.io sparse-index fetcher.
 
+use std::collections::BTreeMap;
+
 use ::semver::Version;
 use futures::FutureExt;
 use futures::future::BoxFuture;
@@ -23,6 +25,28 @@ struct IndexLine {
     vers: String,
     #[serde(default)]
     yanked: bool,
+    /// Feature name → the features/deps it enables.
+    #[serde(default)]
+    features: BTreeMap<String, Vec<String>>,
+    /// Newer index table for features that enable optional dependencies; merged
+    /// with `features` so the full set is reported.
+    #[serde(default)]
+    features2: BTreeMap<String, Vec<String>>,
+}
+
+impl IndexLine {
+    /// The sorted, de-duplicated feature-flag names this version declares.
+    fn feature_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .features
+            .keys()
+            .chain(self.features2.keys())
+            .cloned()
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
 }
 
 impl CratesIoFetcher {
@@ -80,25 +104,32 @@ impl RegistryFetcher for CratesIoFetcher {
     }
 }
 
-/// Parse the newline-delimited JSON index body into versions, newest-first,
-/// with yanked releases filtered out.
+/// Parse the newline-delimited JSON index body into versions, newest-first, with
+/// yanked releases filtered out. The newest version's declared feature flags are
+/// attached for `list --features`.
 fn parse_index(body: &str) -> FetchedVersions {
-    let mut versions: Vec<String> = body
+    let mut entries: Vec<IndexLine> = body
         .lines()
         .filter(|line| !line.trim().is_empty())
         .filter_map(|line| serde_json::from_str::<IndexLine>(line).ok())
         .filter(|line| !line.yanked)
-        .map(|line| line.vers)
         .collect();
-    sort_desc(&mut versions);
-    FetchedVersions::new(versions)
+    entries.sort_by(|a, b| cmp_vers_desc(&a.vers, &b.vers));
+    let features = entries
+        .first()
+        .map(IndexLine::feature_names)
+        .unwrap_or_default();
+    let versions: Vec<String> = entries.into_iter().map(|line| line.vers).collect();
+    FetchedVersions::new(versions).with_features(features)
 }
 
-fn sort_desc(versions: &mut [String]) {
-    versions.sort_by(|a, b| match (Version::parse(a), Version::parse(b)) {
+/// Order two version strings newest-first, falling back to reverse lexical order
+/// for anything that does not parse as semver.
+fn cmp_vers_desc(a: &str, b: &str) -> std::cmp::Ordering {
+    match (Version::parse(a), Version::parse(b)) {
         (Ok(va), Ok(vb)) => vb.cmp(&va),
         _ => b.cmp(a),
-    });
+    }
 }
 
 /// Compute the crates.io sparse-index path for a crate name (PRD §5.4).
@@ -138,5 +169,18 @@ mod tests {
         let fetched = parse_index(body);
         assert_eq!(fetched.versions, vec!["1.2.0", "1.0.0"]);
         assert_eq!(fetched.latest_tag.as_deref(), Some("1.2.0"));
+        assert!(fetched.features.is_empty()); // no features declared
+    }
+
+    #[test]
+    fn parses_features_from_the_newest_version() {
+        let body = concat!(
+            "{\"name\":\"x\",\"vers\":\"1.0.0\",\"yanked\":false,\"features\":{\"legacy\":[]}}\n",
+            "{\"name\":\"x\",\"vers\":\"2.0.0\",\"yanked\":false,\"features\":{\"default\":[\"std\"],\"derive\":[\"x-derive\"]},\"features2\":{\"rc\":[\"dep:rc\"]}}\n",
+        );
+        let fetched = parse_index(body);
+        assert_eq!(fetched.versions, vec!["2.0.0", "1.0.0"]);
+        // Newest version (2.0.0) only, merging `features` + `features2`, sorted.
+        assert_eq!(fetched.features, vec!["default", "derive", "rc"]);
     }
 }
