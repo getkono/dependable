@@ -1,13 +1,13 @@
 //! End-to-end: a manifest whose ecosystem has no checker yet is skipped with a
 //! warning, never aborting the run. Hermetic — the unsupported manifest is
-//! dropped before any network access. Uses Dart (`pubspec.yaml`), which is
-//! detected but has no parser/fetcher.
+//! dropped before any network access. Uses Elixir (`mix.exs`), which is detected
+//! but has no parser/fetcher.
 
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
-const PUBSPEC: &str = "name: sample\ndependencies:\n  http: ^1.0.0\n";
+const MIX_EXS: &str = "defmodule Sample.MixProject do\n  use Mix.Project\nend\n";
 
 fn workdir(name: &str) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
@@ -25,8 +25,8 @@ fn run(args: &[&str]) -> std::process::Output {
 
 #[test]
 fn check_skips_unsupported_manifest() {
-    let dir = workdir("skip_check_dart");
-    fs::write(dir.join("pubspec.yaml"), PUBSPEC).unwrap();
+    let dir = workdir("skip_check_elixir");
+    fs::write(dir.join("mix.exs"), MIX_EXS).unwrap();
 
     let output = run(&["check", dir.to_str().unwrap(), "--no-vuln"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -40,8 +40,8 @@ fn check_skips_unsupported_manifest() {
 
 #[test]
 fn list_skips_unsupported_manifest() {
-    let dir = workdir("skip_list_dart");
-    fs::write(dir.join("pubspec.yaml"), PUBSPEC).unwrap();
+    let dir = workdir("skip_list_elixir");
+    fs::write(dir.join("mix.exs"), MIX_EXS).unwrap();
 
     let output = run(&["list", dir.to_str().unwrap()]);
     let stderr = String::from_utf8_lossy(&output.stderr);

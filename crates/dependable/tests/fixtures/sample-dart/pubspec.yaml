@@ -1,0 +1,19 @@
+name: sample_app
+description: A sample Dart/Flutter app fixture.
+version: 1.0.0
+
+environment:
+  sdk: ">=2.12.0 <3.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  http: ^1.1.0
+  provider: "6.0.5"
+  local_pkg:
+    path: ../local_pkg
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  test: ^1.24.0
