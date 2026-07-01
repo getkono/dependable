@@ -48,6 +48,11 @@ V1 is "done" when `dependable check .` runs end-to-end on a real Cargo project a
 
 Each ecosystem ships as one unit: manifest parser + registry fetcher + lockfile parser (where applicable) + any version-format conversion. All target **V1.1**.
 
+> **Status update:** Go, npm/JS-TS, Deno/JSR, pnpm, PHP, and Python are now implemented
+> end-to-end (marked 🧪 Experimental until battle-tested); Dart, C#/.NET, and Elixir remain
+> in progress. See the **Supported languages** table in [`README.md`](../README.md) for the
+> current, authoritative per-language status.
+
 | Ecosystem | Parser crate | Manifest(s) | Lockfile | Registry endpoint | Version conversion | OSV name | PRD |
 |---|---|---|---|---|---|---|---|
 | Go | custom line | `go.mod` | — (`go.sum`?, see Q1) | `proxy.golang.org/<mod>/@v/list` (+ `/@latest`) | v-prefix normalize | `Go` | §5.1–5.4 |
