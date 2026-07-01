@@ -67,17 +67,18 @@ impl DiskCache {
         Self { root, ttl }
     }
 
-    /// The default cache root: `$XDG_CACHE_HOME/dependable`, else
-    /// `$HOME/.cache/dependable`. Returns `None` when neither is set, which
-    /// disables the disk cache gracefully. Windows cache-dir resolution
-    /// (`%LOCALAPPDATA%`) is handled separately (see the Windows-support work).
+    /// The default cache root, in priority order: `$XDG_CACHE_HOME/dependable` if
+    /// set, else `%LOCALAPPDATA%\dependable\cache` on Windows, else
+    /// `$HOME/.cache/dependable` (with `%USERPROFILE%` as the Windows home
+    /// fallback). Returns `None` when none resolve, which disables the disk cache
+    /// gracefully.
     #[must_use]
     pub(crate) fn default_root() -> Option<PathBuf> {
-        if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME").filter(|v| !v.is_empty()) {
-            return Some(PathBuf::from(xdg).join("dependable"));
-        }
-        let home = std::env::var_os("HOME").filter(|v| !v.is_empty())?;
-        Some(PathBuf::from(home).join(".cache").join("dependable"))
+        resolve_cache_root(
+            env_dir("XDG_CACHE_HOME"),
+            windows_localappdata(),
+            home_dir(),
+        )
     }
 
     /// The on-disk path for one `(ecosystem, name)` entry. The name is hashed so
@@ -127,6 +128,56 @@ impl DiskCache {
             let _ = tokio::fs::write(&path, bytes).await;
         }
     }
+}
+
+/// Choose the disk-cache root from the resolved directories, in priority order:
+/// an explicit `$XDG_CACHE_HOME`, then Windows `%LOCALAPPDATA%`, then `~/.cache`.
+/// Pure (no environment access) so the priority logic is testable everywhere.
+fn resolve_cache_root(
+    xdg_cache_home: Option<PathBuf>,
+    local_app_data: Option<PathBuf>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some(xdg) = xdg_cache_home {
+        return Some(xdg.join("dependable"));
+    }
+    if let Some(local) = local_app_data {
+        return Some(local.join("dependable").join("cache"));
+    }
+    Some(home?.join(".cache").join("dependable"))
+}
+
+/// A non-empty environment variable as a [`PathBuf`].
+fn env_dir(key: &str) -> Option<PathBuf> {
+    std::env::var_os(key)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+/// `%LOCALAPPDATA%` on Windows; `None` elsewhere, so Unix falls back to
+/// `~/.cache` exactly as before.
+fn windows_localappdata() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        env_dir("LOCALAPPDATA")
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// The user's home directory, cross-platform: `$HOME` (all platforms), then, on
+/// Windows only, `%USERPROFILE%`. `None` when unresolvable.
+fn home_dir() -> Option<PathBuf> {
+    if let Some(home) = env_dir("HOME") {
+        return Some(home);
+    }
+    #[cfg(windows)]
+    if let Some(profile) = env_dir("USERPROFILE") {
+        return Some(profile);
+    }
+    None
 }
 
 /// Wall-clock Unix seconds, saturating to 0 before the epoch (never panics).
@@ -182,5 +233,26 @@ mod tests {
             cache.get("npm", "right-pad").await,
             Some(vec!["1.0.1".into()])
         );
+    }
+
+    #[test]
+    fn cache_root_prefers_xdg_then_localappdata_then_home() {
+        // `$XDG_CACHE_HOME` wins outright.
+        assert_eq!(
+            resolve_cache_root(Some("/x".into()), Some("/l".into()), Some("/h".into())),
+            Some(PathBuf::from("/x").join("dependable"))
+        );
+        // Without XDG, Windows `%LOCALAPPDATA%` is used (nested under `cache`).
+        assert_eq!(
+            resolve_cache_root(None, Some("/l".into()), Some("/h".into())),
+            Some(PathBuf::from("/l").join("dependable").join("cache"))
+        );
+        // Otherwise fall back to `~/.cache/dependable`.
+        assert_eq!(
+            resolve_cache_root(None, None, Some("/h".into())),
+            Some(PathBuf::from("/h").join(".cache").join("dependable"))
+        );
+        // Nothing resolvable -> the disk cache is disabled.
+        assert_eq!(resolve_cache_root(None, None, None), None);
     }
 }
