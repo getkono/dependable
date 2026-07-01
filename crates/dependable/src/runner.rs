@@ -9,12 +9,14 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
-use dependable_fetch::core::{AlternateRegistryDecl, parse, parse_cargo_config};
+use dependable_fetch::core::{
+    AlternateRegistryDecl, NpmrcConfig, parse, parse_cargo_config, parse_npmrc,
+};
 use dependable_fetch::{
     CheckError, Checker, CratesIoFetcher, DependencyStatus, Ecosystem, GoProxyFetcher, HexFetcher,
     JsrFetcher, ManifestKind, NpmFetcher, NuGetFetcher, PackageSource, PackagistFetcher,
-    ParseError, ProgressEvent, PubDevFetcher, PyPiFetcher, RegistryFetcher, UnstableFilter,
-    build_client,
+    ParseError, ProgressEvent, PubDevFetcher, PyPiFetcher, RegistryFetcher, ScopedRegistry,
+    UnstableFilter, build_client,
 };
 use indicatif::{ProgressBar, ProgressStyle};
 
@@ -113,13 +115,36 @@ impl Engine {
             );
         }
         if cfg.npm.enabled {
+            // Layer `.npmrc` on top of config: its `registry=` (if any) overrides
+            // the configured default, and its `_authToken`s become bearer auth for
+            // the default and per-scope private registries.
+            let npmrc = npmrc_config();
+            let registry = npmrc
+                .default_registry
+                .clone()
+                .unwrap_or_else(|| cfg.npm.registry.clone());
+            let default_token = npmrc.token_for(&registry).map(str::to_owned);
+            let scopes = npmrc
+                .scope_registries
+                .iter()
+                .map(|(scope, url)| {
+                    let token = npmrc.token_for(url).map(str::to_owned);
+                    (
+                        scope.clone(),
+                        ScopedRegistry {
+                            registry: url.clone(),
+                            token,
+                        },
+                    )
+                })
+                .collect();
             builder = builder
                 .registry(
                     Ecosystem::Npm,
-                    Arc::new(NpmFetcher::with_registry(
-                        client.clone(),
-                        cfg.npm.registry.clone(),
-                    )),
+                    Arc::new(
+                        NpmFetcher::with_registry(client.clone(), registry)
+                            .with_auth(default_token, scopes),
+                    ),
                 )
                 .jsr_registry(Arc::new(JsrFetcher::with_registry(
                     client.clone(),
@@ -472,6 +497,49 @@ fn cargo_alt_registries() -> Vec<AlternateRegistryDecl> {
     }
 }
 
+/// Load and merge npm's `.npmrc` auth config: the user `~/.npmrc` overlaid by the
+/// project `./.npmrc` (project wins). `${VAR}` references expand from the
+/// environment. Best-effort: missing/unreadable files contribute nothing.
+fn npmrc_config() -> NpmrcConfig {
+    let load = |content: String| parse_npmrc(&expand_env(&content));
+    let user = home_dir()
+        .and_then(|home| std::fs::read_to_string(home.join(".npmrc")).ok())
+        .map(load)
+        .unwrap_or_default();
+    let project = std::fs::read_to_string(".npmrc")
+        .ok()
+        .map(load)
+        .unwrap_or_default();
+    user.merge(project)
+}
+
+/// Expand `${VAR}` references in `.npmrc` content from the environment. An unset
+/// variable expands to empty (npm's behavior), so a stale placeholder is never
+/// sent as a token; an unterminated `${` is emitted verbatim.
+fn expand_env(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut rest = content;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        match after.find('}') {
+            Some(end) => {
+                if let Ok(value) = std::env::var(&after[..end]) {
+                    out.push_str(&value);
+                }
+                rest = &after[end + 1..];
+            }
+            None => {
+                out.push_str("${");
+                out.push_str(after);
+                return out;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 fn exit_code(reports: &[ManifestReport], fail_on: FailOn) -> ExitCode {
     let triggered = reports
         .iter()
@@ -515,5 +583,18 @@ mod tests {
         );
         // No home at all -> unresolvable, so alt-registry auth is simply disabled.
         assert_eq!(resolve_cargo_home(None, None), None);
+    }
+
+    #[test]
+    fn expand_env_substitutes_blanks_unset_and_passes_through() {
+        // No placeholders -> verbatim.
+        assert_eq!(expand_env("registry=https://x/"), "registry=https://x/");
+        // An unset variable expands to empty (never sends a stale placeholder).
+        assert_eq!(
+            expand_env("//x/:_authToken=${DEPENDABLE_NPMRC_UNSET_XYZ}"),
+            "//x/:_authToken="
+        );
+        // An unterminated `${` is emitted verbatim.
+        assert_eq!(expand_env("a=${OPEN"), "a=${OPEN");
     }
 }
