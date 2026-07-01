@@ -40,7 +40,36 @@ pub struct ResolvedLockfile {
     by_name: HashMap<String, Vec<usize>>,
 }
 
+impl LockedPackage {
+    /// Construct a package entry directly — used when synthesizing a graph from
+    /// manifests (e.g. the shallow fallback when no `Cargo.lock` is present).
+    #[must_use]
+    pub fn new(
+        name: String,
+        version: String,
+        source: Option<String>,
+        dependencies: Vec<String>,
+    ) -> Self {
+        Self {
+            name,
+            version,
+            source,
+            dependencies,
+        }
+    }
+}
+
 impl ResolvedLockfile {
+    /// Build from an explicit package list, indexing names for [`Self::resolve`].
+    #[must_use]
+    pub fn from_packages(packages: Vec<LockedPackage>) -> Self {
+        let mut by_name: HashMap<String, Vec<usize>> = HashMap::new();
+        for (i, pkg) in packages.iter().enumerate() {
+            by_name.entry(pkg.name.clone()).or_default().push(i);
+        }
+        Self { packages, by_name }
+    }
+
     /// Resolve a `dependencies` entry to an index into [`Self::packages`].
     ///
     /// Cargo writes the shortest unambiguous form: `"name"` when the name is
@@ -68,7 +97,6 @@ impl ResolvedLockfile {
 pub fn parse_cargo_lock_graph(content: &str) -> Result<ResolvedLockfile, ParseError> {
     let doc = ImDocument::parse(content.to_owned())?;
     let mut packages: Vec<LockedPackage> = Vec::new();
-    let mut by_name: HashMap<String, Vec<usize>> = HashMap::new();
     if let Some(pkgs) = doc
         .as_table()
         .get("package")
@@ -94,19 +122,15 @@ pub fn parse_cargo_lock_graph(content: &str) -> Result<ResolvedLockfile, ParseEr
                         .collect()
                 })
                 .unwrap_or_default();
-            by_name
-                .entry(name.to_owned())
-                .or_default()
-                .push(packages.len());
-            packages.push(LockedPackage {
-                name: name.to_owned(),
-                version: version.to_owned(),
+            packages.push(LockedPackage::new(
+                name.to_owned(),
+                version.to_owned(),
                 source,
                 dependencies,
-            });
+            ));
         }
     }
-    Ok(ResolvedLockfile { packages, by_name })
+    Ok(ResolvedLockfile::from_packages(packages))
 }
 
 #[cfg(test)]
