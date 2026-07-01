@@ -110,8 +110,10 @@ fn plan_fixes(content: &str, results: &[CheckResult], all: bool) -> (String, Vec
 }
 
 /// Build a new constraint from `original`, preserving its leading operator/`v`
-/// prefix and substituting `new_version`. Returns `None` for multi-constraint
-/// forms (containing `,`), which can't be rewritten to a single version.
+/// prefix and substituting `new_version`. Returns `None` for compound forms that
+/// can't be rewritten to a single version without changing their meaning: a
+/// comma-separated range (Cargo `>=1.0, <2.0`), a space-separated range
+/// (npm/pubspec `>=1.0.0 <2.0.0`), or a `||` alternation (`^1 || ^2`).
 fn rewrite_constraint(original: &str, new_version: &str) -> Option<String> {
     let trimmed = original.trim();
     if trimmed.contains(',') {
@@ -122,6 +124,12 @@ fn rewrite_constraint(original: &str, new_version: &str) -> Option<String> {
         .chars()
         .take_while(|c| OP_CHARS.contains(c))
         .collect();
+    // After the leading operator prefix, a further space or `|` means a second
+    // clause (range upper bound or alternative) we'd silently drop — leave it be.
+    let rest = &trimmed[prefix.len()..];
+    if rest.contains([' ', '\t', '|']) {
+        return None;
+    }
     Some(format!("{prefix}{new_version}"))
 }
 
@@ -187,6 +195,19 @@ mod tests {
     #[test]
     fn rewrite_skips_multi_constraint() {
         assert_eq!(rewrite_constraint(">=1.0,<2.0", "1.5.0"), None);
+    }
+
+    #[test]
+    fn rewrite_skips_space_and_pipe_compound_constraints() {
+        // npm / pubspec space-separated ranges and `||` alternations can't collapse
+        // to a single version without dropping a clause, so they are left untouched.
+        assert_eq!(rewrite_constraint(">=1.0.0 <2.0.0", "1.5.0"), None);
+        assert_eq!(rewrite_constraint("^1.0.0 || ^2.0.0", "1.5.0"), None);
+        // A single constraint that merely spaces its operator is still rewritten.
+        assert_eq!(
+            rewrite_constraint(">= 1.0.0", "1.5.0").as_deref(),
+            Some(">= 1.5.0")
+        );
     }
 
     #[test]
