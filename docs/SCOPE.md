@@ -102,7 +102,7 @@ Cross-cutting enablers (also V1.1): extend `Ecosystem`/`ManifestKind` enums + `d
 |---|---|---|---|
 | D1 | Disk cache in V1 or V1.1 | → V1.1 (disk-cache issue) | V1.1 |
 | D2 | `--fix` format scope | Cargo.toml in V1; JSON/YAML in V1.1 | V1.1 |
-| D3 | `serde_yaml` vs `marked_yaml` | tracking issue; recommend `serde_yaml` | V1.1 |
+| D3 | `serde_yaml` vs `marked_yaml` | **`serde_yaml` + line scanner** (shipped for pnpm/Dart); revisit only if its `unsafe` becomes a concern | V1.1 |
 | D4 | PDF export approach | shell to chromium | V3 |
 | D5 | Policy severity model | named bands + numeric `max_cvss` (numeric wins) | V2 |
 | D6 | License checking depth | visibility + allowlist in V2; full graph V3 | V2/V3 |
