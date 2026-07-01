@@ -3,6 +3,22 @@
 A fast, open-source CLI and Rust library for checking dependency versions and known
 vulnerabilities — no API key, no cloud backend, a single static binary.
 
+## Installation
+
+```sh
+# Homebrew (macOS / Linux)
+brew install getkono/tap/dependable
+
+# aqua
+aqua g -i getkono/dependable
+
+# Cargo (from source)
+cargo install --locked --git https://github.com/getkono/dependable dependable
+```
+
+Or download a prebuilt binary for your platform from the
+[latest release](https://github.com/getkono/dependable/releases/latest).
+
 ## Supported languages
 
 | Language | Manifest(s) | Registry | Lockfile | Status |

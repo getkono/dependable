@@ -1,0 +1,55 @@
+name: Release-plz
+
+# release-plz drives versioning: it opens/updates a Release PR from Conventional
+# Commits, and — once that PR merges — tags the commit and creates the GitHub
+# Release. The binary + packaging workflows trigger off that published Release.
+on:
+  push:
+    branches: [master]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  # Open or refresh the Release PR (version bump + changelog). Serialized so two
+  # pushes can't race on the same PR.
+  release-pr:
+    name: Release PR
+    if: github.repository_owner == 'getkono'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: release-plz-pr-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # rust-toolchain.toml pins the toolchain; rustup installs it on first use.
+      - name: Materialize Rust toolchain
+        run: rustup show active-toolchain || rustup show
+      - name: Run release-plz release-pr
+        uses: release-plz/action@v0
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # When a Release PR merges (or any changelog-worthy commit lands), tag the
+  # commit and create the GitHub Release.
+  release:
+    name: Release
+    if: github.repository_owner == 'getkono'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Materialize Rust toolchain
+        run: rustup show active-toolchain || rustup show
+      - name: Run release-plz release
+        uses: release-plz/action@v0
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

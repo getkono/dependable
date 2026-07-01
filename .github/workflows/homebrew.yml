@@ -1,0 +1,29 @@
+name: Homebrew
+
+# Bump the build-from-source formula in getkono/homebrew-tap to the released tag.
+# Prerequisites (one-time): seed packaging/homebrew/dependable.rb into the tap as
+# Formula/dependable.rb, and add a HOMEBREW_TAP_TOKEN secret (a PAT with write
+# access to getkono/homebrew-tap).
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  bump-formula:
+    name: Bump Homebrew formula
+    if: github.repository_owner == 'getkono'
+    runs-on: ubuntu-latest
+    steps:
+      # Rewrites the formula's `url` + `sha256` to the new tag's source tarball and
+      # opens a PR (or commits) on the tap. Skips pre-releases automatically.
+      - name: Bump getkono/homebrew-tap
+        uses: mislav/bump-homebrew-formula-action@v3
+        with:
+          formula-name: dependable
+          homebrew-tap: getkono/homebrew-tap
+          download-url: https://github.com/getkono/dependable/archive/refs/tags/${{ github.event.release.tag_name }}.tar.gz
+        env:
+          COMMITTER_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
