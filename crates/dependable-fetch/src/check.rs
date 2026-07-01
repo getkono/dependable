@@ -18,7 +18,7 @@ use dependable_core::{
 use futures::stream::{self, StreamExt};
 
 use crate::build_client;
-use crate::cache::{VersionsCache, versions_cache};
+use crate::cache::{DISK_CACHE_TTL, DiskCache, VersionsCache, versions_cache};
 use crate::error::FetchError;
 use crate::osv::{OsvClient, OsvQuery};
 use crate::registries::{CratesIoFetcher, RegistryFetcher};
@@ -139,6 +139,9 @@ pub struct Checker {
     read_lockfiles: bool,
     unstable: UnstableFilter,
     versions_cache: VersionsCache,
+    /// Persistent on-disk cache, consulted below the in-process cache. `None`
+    /// disables it (`--no-cache`, or no resolvable cache directory).
+    disk_cache: Option<Arc<DiskCache>>,
     progress: Option<ProgressSink>,
 }
 
@@ -298,6 +301,13 @@ impl Checker {
             let key = (task.cache_key.to_string(), task.name.clone());
             if let Some(versions) = self.versions_cache.get(&key).await {
                 out.insert(task.name.clone(), Ok(versions));
+            } else if let Some(disk) = &self.disk_cache
+                && let Some(versions) = disk.get(task.cache_key, &task.name).await
+            {
+                // Disk hit: warm the in-process cache so sibling manifests in this
+                // run hit moka instead of re-reading the file.
+                self.versions_cache.insert(key, versions.clone()).await;
+                out.insert(task.name.clone(), Ok(versions));
             } else {
                 to_fetch.push(task);
             }
@@ -334,6 +344,9 @@ impl Checker {
                 self.versions_cache
                     .insert((cache_key.to_string(), name.clone()), versions.clone())
                     .await;
+                if let Some(disk) = &self.disk_cache {
+                    disk.put(cache_key, &name, versions).await;
+                }
             }
             out.insert(name, result);
         }
@@ -464,6 +477,8 @@ pub struct CheckerBuilder {
     concurrency: usize,
     read_lockfiles: bool,
     unstable: UnstableFilter,
+    disk_cache: bool,
+    disk_cache_dir: Option<PathBuf>,
     progress: Option<ProgressSink>,
 }
 
@@ -481,6 +496,8 @@ impl Default for CheckerBuilder {
             concurrency: DEFAULT_CONCURRENCY,
             read_lockfiles: true,
             unstable: UnstableFilter::default(),
+            disk_cache: true,
+            disk_cache_dir: None,
             progress: None,
         }
     }
@@ -553,6 +570,22 @@ impl CheckerBuilder {
         self
     }
 
+    /// Enable or disable the persistent on-disk registry cache (default: enabled).
+    /// When enabled, registry version lists are cached under the OS cache directory
+    /// with a short TTL so repeat and CI runs avoid re-fetching. Maps to `--no-cache`.
+    pub fn disk_cache(mut self, enabled: bool) -> Self {
+        self.disk_cache = enabled;
+        self
+    }
+
+    /// Override the on-disk cache directory (default: the OS cache directory).
+    /// Mainly for tests and embedders that want an isolated cache location; has no
+    /// effect when [`CheckerBuilder::disk_cache`] is disabled.
+    pub fn disk_cache_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.disk_cache_dir = Some(dir.into());
+        self
+    }
+
     /// Register a progress sink. Both check methods emit through it; external
     /// callers that don't need progress can ignore this.
     pub fn on_progress(mut self, sink: Arc<dyn Fn(ProgressEvent) + Send + Sync>) -> Self {
@@ -592,6 +625,14 @@ impl CheckerBuilder {
             ))
         });
 
+        // Resolve the disk cache: enabled + a usable directory (explicit override
+        // or the OS default). If no directory resolves, the disk cache is simply off.
+        let disk_cache = self
+            .disk_cache
+            .then(|| self.disk_cache_dir.or_else(DiskCache::default_root))
+            .flatten()
+            .map(|dir| Arc::new(DiskCache::new(dir, DISK_CACHE_TTL)));
+
         Ok(Checker {
             registries,
             jsr: self.jsr,
@@ -600,6 +641,7 @@ impl CheckerBuilder {
             read_lockfiles: self.read_lockfiles,
             unstable: self.unstable,
             versions_cache: versions_cache(),
+            disk_cache,
             progress: self.progress,
         })
     }

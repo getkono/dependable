@@ -28,6 +28,7 @@ struct Settings {
     depth: usize,
     check_lockfile: bool,
     check_vuln: bool,
+    cache: bool,
     include_ghsa: bool,
     fail_on: FailOn,
     unstable: UnstableFilter,
@@ -37,6 +38,7 @@ struct Settings {
 
 fn resolve_check_settings(args: &CheckArgs, cfg: &Config) -> Settings {
     let env_no_vuln = std::env::var_os("DEPENDABLE_NO_VULN").is_some();
+    let env_no_cache = std::env::var_os("DEPENDABLE_NO_CACHE").is_some();
     let env_ghsa = std::env::var_os("DEPENDABLE_INCLUDE_GHSA").is_some();
     let env_concurrency = std::env::var("DEPENDABLE_CONCURRENCY")
         .ok()
@@ -60,6 +62,7 @@ fn resolve_check_settings(args: &CheckArgs, cfg: &Config) -> Settings {
         depth: args.depth,
         check_lockfile: !args.no_lock_file && cfg.global.lock_file,
         check_vuln: cfg.vulnerability.enabled && !args.no_vuln && !env_no_vuln,
+        cache: !args.no_cache && !env_no_cache,
         include_ghsa: args.include_ghsa || cfg.global.include_ghsa || env_ghsa,
         fail_on,
         unstable: args
@@ -87,7 +90,8 @@ impl Engine {
             .osv_url(settings.osv_url.clone())
             .concurrency(settings.concurrency)
             .read_lockfiles(settings.check_lockfile)
-            .unstable(settings.unstable);
+            .unstable(settings.unstable)
+            .disk_cache(settings.cache);
         // Register non-Rust ecosystem fetchers when enabled in config.
         if cfg.go.enabled {
             builder = builder.registry(
@@ -327,6 +331,7 @@ pub async fn run_fix(args: FixArgs) -> anyhow::Result<ExitCode> {
         depth: args.depth,
         check_lockfile: cfg.global.lock_file,
         check_vuln: false,
+        cache: true,
         include_ghsa: false,
         fail_on: FailOn::None,
         unstable: cfg.global.unstable.into(),
