@@ -21,6 +21,7 @@ async fn main() -> ExitCode {
     let result = match cli.command {
         Command::Check(args) => runner::run_check(args).await,
         Command::List(args) => runner::run_list(args).await,
+        Command::Tree(args) => runner::run_tree(args),
         Command::Fix(args) => runner::run_fix(args).await,
     };
 
