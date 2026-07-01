@@ -4,12 +4,14 @@ use crate::error::ParseError;
 use crate::manifest::ManifestKind;
 
 pub mod cargo_lock;
+pub mod cargo_lock_graph;
 pub mod composer_lock;
 pub mod dart_pubspec_lock;
 pub mod mix_lock;
 pub mod package_lock_json;
 
 pub use cargo_lock::{LockfileData, apply_lockfile, parse_cargo_lock};
+pub use cargo_lock_graph::{LockedPackage, ResolvedLockfile, parse_cargo_lock_graph};
 pub use composer_lock::parse_composer_lock;
 pub use dart_pubspec_lock::parse_dart_pubspec_lock;
 pub use mix_lock::parse_mix_lock;

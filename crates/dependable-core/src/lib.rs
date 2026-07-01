@@ -18,8 +18,9 @@ pub use ecosystem::Ecosystem;
 pub use error::ParseError;
 pub use item::{Item, PackageSource};
 pub use lockfiles::{
-    LockfileData, apply_lockfile, parse_cargo_lock, parse_composer_lock, parse_dart_pubspec_lock,
-    parse_lockfile, parse_mix_lock, parse_package_lock,
+    LockedPackage, LockfileData, ResolvedLockfile, apply_lockfile, parse_cargo_lock,
+    parse_cargo_lock_graph, parse_composer_lock, parse_dart_pubspec_lock, parse_lockfile,
+    parse_mix_lock, parse_package_lock,
 };
 pub use manifest::{AlternateRegistryDecl, ManifestKind, ParsedManifest};
 pub use npmrc::{NpmrcConfig, parse_npmrc};
