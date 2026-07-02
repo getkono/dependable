@@ -311,7 +311,7 @@ checksum = "092966b41edc516079bdf31ec78a2e0588d1d0c08f78b91d8307215928642b2b"
 
 [[package]]
 name = "dependable"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -329,7 +329,7 @@ dependencies = [
 
 [[package]]
 name = "dependable-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "regex",
  "roxmltree",
@@ -341,7 +341,7 @@ dependencies = [
 
 [[package]]
 name = "dependable-fetch"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "dependable-core",
  "futures",
