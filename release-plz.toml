@@ -6,25 +6,33 @@
 # tags the commit and creates the GitHub Release — which the binary and packaging
 # workflows then attach assets to and publish from.
 #
-# crates.io publishing is disabled: dependable ships as a CLI (GitHub Releases,
-# Homebrew, aqua), not as a published crate. Flip `publish` to `true` and add a
-# `CARGO_REGISTRY_TOKEN` secret if the libraries are later published.
+# crates.io publishing is enabled: all three crates are published so both library
+# consumers (dependable-core, dependable-fetch) and `cargo install dependable`
+# work. release-plz publishes in dependency order (core → fetch → dependable).
+#
+# Auth is crates.io Trusted Publishing (OIDC) only — the `release` job carries
+# `id-token: write` and release-plz mints a short-lived token per run. We never
+# store or accept a `CARGO_REGISTRY_TOKEN` secret. Caveat: crates.io cannot
+# Trusted-Publish a crate that doesn't exist yet, so the FIRST publish of each
+# crate is performed manually (`cargo publish`); release-plz then owns every
+# subsequent release automatically.
 
 [workspace]
-# Maintain changelogs for every crate, but don't tag/release/publish them
-# individually — the CLI drives a single product release below.
+# Maintain changelogs and publish every crate, but tag/release only the CLI (the
+# user-facing product) so there's a single `v{version}` tag + GitHub Release.
 changelog_update = true
 git_tag_enable = false
 git_release_enable = false
-publish = false
+publish = true
 # The release commit is created by release-plz; dependency-update churn is noise
 # in a CLI's changelog.
 dependencies_update = false
 
 # The CLI is the user-facing product: one tag `v{version}` and one GitHub Release.
+# It also publishes to crates.io (inherits `publish = true`) so `cargo install
+# dependable` works.
 [[package]]
 name = "dependable"
 git_tag_enable = true
 git_tag_name = "v{{ version }}"
 git_release_enable = true
-publish = false

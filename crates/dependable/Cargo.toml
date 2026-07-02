@@ -13,7 +13,7 @@ name = "dependable"
 path = "src/main.rs"
 
 [dependencies]
-dependable-fetch = { path = "../dependable-fetch" }
+dependable-fetch.workspace = true
 toml_edit.workspace = true
 clap.workspace = true
 tokio.workspace = true

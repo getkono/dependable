@@ -19,6 +19,10 @@ authors = ["Justin Chung"]
 
 # Shared dependency catalogue for the Rust/Crates.io MVP.
 [workspace.dependencies]
+# --- internal crates (published to crates.io together; version kept in lockstep
+# with [workspace.package] by release-plz) ---
+dependable-core = { version = "0.1.0", path = "crates/dependable-core" }
+dependable-fetch = { version = "0.1.0", path = "crates/dependable-fetch" }
 # --- dependable-core (pure) ---
 toml_edit = "0.22"
 roxmltree = "0.20"
