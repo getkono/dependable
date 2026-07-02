@@ -29,7 +29,7 @@ jobs:
       - name: Materialize Rust toolchain
         run: rustup show active-toolchain || rustup show
       - name: Run release-plz release-pr
-        uses: release-plz/action@v0
+        uses: release-plz/action@v0.5
         with:
           command: release-pr
         env:
@@ -48,7 +48,7 @@ jobs:
       - name: Materialize Rust toolchain
         run: rustup show active-toolchain || rustup show
       - name: Run release-plz release
-        uses: release-plz/action@v0
+        uses: release-plz/action@v0.5
         with:
           command: release
         env:
