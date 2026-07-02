@@ -8,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-dependable-core = { path = "../dependable-core" }
+dependable-core.workspace = true
 semver.workspace = true
 reqwest.workspace = true
 tokio = { workspace = true, features = ["fs"] }
