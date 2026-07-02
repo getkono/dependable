@@ -8,9 +8,14 @@
 #
 # crates.io publishing is enabled: all three crates are published so both library
 # consumers (dependable-core, dependable-fetch) and `cargo install dependable`
-# work. This requires a `CARGO_REGISTRY_TOKEN` secret with publish rights to the
-# crate names; without it the `release` job fails and no tag/Release is cut.
-# release-plz publishes in dependency order (core → fetch → dependable).
+# work. release-plz publishes in dependency order (core → fetch → dependable).
+#
+# Auth is crates.io Trusted Publishing (OIDC) only — the `release` job carries
+# `id-token: write` and release-plz mints a short-lived token per run. We never
+# store or accept a `CARGO_REGISTRY_TOKEN` secret. Caveat: crates.io cannot
+# Trusted-Publish a crate that doesn't exist yet, so the FIRST publish of each
+# crate is performed manually (`cargo publish`); release-plz then owns every
+# subsequent release automatically.
 
 [workspace]
 # Maintain changelogs and publish every crate, but tag/release only the CLI (the

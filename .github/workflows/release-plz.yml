@@ -7,9 +7,9 @@ on:
   push:
     branches: [master]
 
-permissions:
-  contents: write
-  pull-requests: write
+# Permissions are scoped per job (least privilege): only the `release` job needs
+# `id-token: write`, which lets release-plz mint a short-lived crates.io token via
+# OIDC Trusted Publishing. No `CARGO_REGISTRY_TOKEN` secret exists or is accepted.
 
 jobs:
   # Open or refresh the Release PR (version bump + changelog). Serialized so two
@@ -18,6 +18,9 @@ jobs:
     name: Release PR
     if: github.repository_owner == 'getkono'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
     concurrency:
       group: release-plz-pr-${{ github.ref }}
       cancel-in-progress: false
@@ -41,12 +44,20 @@ jobs:
     name: Release
     if: github.repository_owner == 'getkono'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # tag the commit + create the GitHub Release
+      id-token: write # OIDC: mint a short-lived crates.io token (Trusted Publishing)
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - name: Materialize Rust toolchain
         run: rustup show active-toolchain || rustup show
+      # release-plz performs the crates.io OIDC token exchange itself (the same API
+      # calls as rust-lang/crates-io-auth-action) using the `id-token: write`
+      # permission above — so we deliberately pass NO CARGO_REGISTRY_TOKEN. crates.io
+      # can't Trusted-Publish a brand-new crate, so the first publish of each crate
+      # is done manually; every release after that flows through this job.
       - name: Run release-plz release
         uses: release-plz/action@v0.5
         with:
