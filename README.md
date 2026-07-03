@@ -1,5 +1,7 @@
 # dependable
 
+> Status: Alpha - API is aggressively being stabilized.
+
 A fast, open-source CLI and Rust library for checking dependency versions and known
 vulnerabilities — no API key, no cloud backend, a single static binary.
 
