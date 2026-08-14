@@ -27,10 +27,11 @@ pub use lockfiles::{
 pub use manifest::{AlternateRegistryDecl, ManifestKind, ParsedManifest};
 pub use npmrc::{NpmrcConfig, parse_npmrc};
 pub use parsers::{
-    CargoTomlParser, ComposerJsonParser, CsprojParser, DenoJsonParser, GoModParser, MixExsParser,
-    PackageJsonParser, Parser, PnpmWorkspaceParser, PubspecYamlParser, PyprojectTomlParser,
-    RequirementsTxtParser, WorkspaceDecl, parse, parse_cargo_config, parse_package_name,
-    parse_workspace,
+    AutoTargets, CargoPackageManifest, CargoTarget, CargoTargetKind, CargoTomlParser,
+    CfgDependencyTable, ComposerJsonParser, CsprojParser, DenoJsonParser, DependencySection,
+    GoModParser, MixExsParser, PackageField, PackageJsonParser, Parser, PnpmWorkspaceParser,
+    PubspecYamlParser, PyprojectTomlParser, RequirementsTxtParser, WorkspaceDecl, parse,
+    parse_cargo_config, parse_package_manifest, parse_package_name, parse_workspace,
 };
 pub use result::{CheckResult, DependencyStatus};
 pub use semver::{Evaluation, UnstableFilter, check_version, is_prerelease, to_semver_constraint};

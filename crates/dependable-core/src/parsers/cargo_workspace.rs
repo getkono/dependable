@@ -5,6 +5,8 @@
 //! is done in the IO layer ([`dependable_fetch`]). These readers only turn
 //! `&str` manifest content into plain data.
 
+use std::collections::BTreeMap;
+
 use toml_edit::{ImDocument, Item as TomlItem};
 
 /// The `[workspace]` table of a Cargo manifest.
@@ -17,6 +19,13 @@ pub struct WorkspaceDecl {
     pub default_members: Vec<String>,
     /// `exclude` globs/paths, exactly as written.
     pub exclude: Vec<String>,
+    /// The scalar string values of `[workspace.package]`, the inheritance source for a
+    /// member's `field.workspace = true`.
+    ///
+    /// Only string-valued keys are captured — `version`, `edition`, `rust-version`,
+    /// `license`, and the like. Array-valued keys (`authors`, `keywords`, `categories`)
+    /// are omitted, since no consumer of this reader resolves them today.
+    pub package_defaults: BTreeMap<String, String>,
 }
 
 /// Parse the `[workspace]` table from a `Cargo.toml`, or `None` if the manifest
@@ -32,7 +41,20 @@ pub fn parse_workspace(content: &str) -> Option<WorkspaceDecl> {
         members: string_array(ws.get("members")),
         default_members: string_array(ws.get("default-members")),
         exclude: string_array(ws.get("exclude")),
+        package_defaults: string_table(ws.get("package")),
     })
+}
+
+/// Collect a TOML table's string-valued entries, ignoring every other value type.
+fn string_table(item: Option<&TomlItem>) -> BTreeMap<String, String> {
+    item.and_then(TomlItem::as_table_like)
+        .map(|table| {
+            table
+                .iter()
+                .filter_map(|(key, value)| Some((key.to_owned(), value.as_str()?.to_owned())))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Parse `[package] name` from a `Cargo.toml`, or `None` for a virtual manifest
@@ -111,5 +133,42 @@ members = ["sub"]
         assert!(ws.members.is_empty());
         assert!(ws.default_members.is_empty());
         assert!(ws.exclude.is_empty());
+        assert!(ws.package_defaults.is_empty());
+    }
+
+    #[test]
+    fn collects_string_valued_workspace_package_defaults() {
+        let toml = r#"
+[workspace]
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.5.0"
+edition = "2024"
+rust-version = "1.92"
+license = "MIT OR Apache-2.0"
+authors = ["Someone"]
+keywords = ["tui", "editor"]
+"#;
+        let ws = parse_workspace(toml).unwrap();
+        assert_eq!(
+            ws.package_defaults.get("version").map(String::as_str),
+            Some("0.5.0")
+        );
+        assert_eq!(
+            ws.package_defaults.get("edition").map(String::as_str),
+            Some("2024")
+        );
+        assert_eq!(
+            ws.package_defaults.get("rust-version").map(String::as_str),
+            Some("1.92")
+        );
+        assert_eq!(
+            ws.package_defaults.get("license").map(String::as_str),
+            Some("MIT OR Apache-2.0")
+        );
+        // Array-valued keys are deliberately omitted.
+        assert!(!ws.package_defaults.contains_key("authors"));
+        assert!(!ws.package_defaults.contains_key("keywords"));
     }
 }

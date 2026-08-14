@@ -3,6 +3,7 @@
 use crate::error::ParseError;
 use crate::manifest::{ManifestKind, ParsedManifest};
 
+pub mod cargo_package;
 pub mod cargo_toml;
 pub mod cargo_workspace;
 pub mod composer_json;
@@ -18,6 +19,10 @@ pub mod pubspec_yaml;
 pub mod pyproject_toml;
 pub mod requirements_txt;
 
+pub use cargo_package::{
+    AutoTargets, CargoPackageManifest, CargoTarget, CargoTargetKind, CfgDependencyTable,
+    DependencySection, PackageField, parse_package_manifest,
+};
 pub use cargo_toml::{CargoTomlParser, parse_cargo_config};
 pub use cargo_workspace::{WorkspaceDecl, parse_package_name, parse_workspace};
 pub use composer_json::ComposerJsonParser;
