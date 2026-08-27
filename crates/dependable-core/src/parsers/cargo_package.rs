@@ -15,14 +15,15 @@
 //! inheritance markers ([`PackageField::Workspace`]) the caller resolves against
 //! [`WorkspaceDecl::package_defaults`](super::cargo_workspace::WorkspaceDecl). The
 //! [`auto_targets`](CargoPackageManifest::auto_targets) flags say whether Cargo's
-//! own discovery is even enabled — the `auto*` keys and the edition-2015 rule that
-//! suppresses discovery for a kind the manifest declares — so a caller with filesystem
-//! access knows when to run it. An inherited `edition` is one input those flags cannot
-//! read, so they assume 2018 or later whenever it is inherited.
+//! own discovery is even enabled — the `auto*` keys, the edition-2015 rule that suppresses
+//! discovery for a kind the manifest declares, and the `lib` declaration that outranks
+//! both — so a caller with filesystem access knows when to run it. An inherited `edition`
+//! is one input those flags cannot read, so they assume 2018 or later whenever it is
+//! inherited.
 
 use std::collections::BTreeMap;
 
-use toml_edit::{ImDocument, Item as TomlItem, TableLike};
+use toml_edit::{ImDocument, Item as TomlItem, TableLike, Value};
 
 use super::cargo_toml::collect_dependencies;
 use super::position::line_starts;
@@ -154,8 +155,14 @@ pub struct CfgDependencyTable {
 /// Otherwise the flag is Cargo's `true`, except under **edition 2015** — which an absent
 /// `edition` key also means — where declaring a target of a kind turns that kind's
 /// discovery off. The suppression is per kind: a 2015 package declaring only a `[[bin]]`
-/// still discovers `tests/` and `examples/`. [`Default`] is Cargo's all-`true`, the answer
-/// for a manifest that declares no targets.
+/// still discovers `tests/` and `examples/`. What declares a kind is the key itself, not a
+/// usable target under it: an empty `test = []` suppresses `tests/` exactly as a filled-in
+/// `[[test]]` does. [`Default`] is Cargo's all-`true`, the answer for a manifest that
+/// declares no targets.
+///
+/// [`lib`](Self::lib) is the one kind that does not read this way, because a package builds
+/// at most one library: a declared `lib` key settles which file that is, so it suppresses
+/// `src/lib.rs` under **every** edition and outranks `autolib` rather than yielding to it.
 ///
 /// `edition.workspace = true` cannot be resolved from one manifest, so an inherited edition
 /// is *assumed* to be 2018 or later and no suppression is applied. A caller holding the
@@ -165,7 +172,8 @@ pub struct CfgDependencyTable {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct AutoTargets {
-    /// `autolib` — discover `src/lib.rs`. A declared `[lib]` suppresses it under edition 2015.
+    /// `autolib` — discover `src/lib.rs`. A declared `lib` key suppresses it in every
+    /// edition, `autolib = true` notwithstanding.
     pub lib: bool,
     /// `autobins` — discover `src/main.rs` and `src/bin/`. A declared `[[bin]]` suppresses it
     /// under edition 2015.
@@ -285,10 +293,12 @@ const TARGET_SECTIONS: &[(&str, DependencySection)] = &[
 /// optional"), so only these two can ever produce a feature.
 const IMPLICIT_FEATURE_SECTIONS: &[&str] = &["dependencies", "build-dependencies"];
 
-/// The one edition that suppresses auto-discovery for a kind the manifest declares.
+/// The one edition that suppresses auto-discovery for a kind the manifest declares —
+/// `lib` aside, which a declaration suppresses in every edition.
 const EDITION_2015: &str = "2015";
 
-/// Kinds declared as arrays of tables (`[[bin]]`), paired with their table name.
+/// Kinds declared as arrays — `[[bin]]` or the `bin = [{ … }]` inline form — paired with
+/// their table name.
 const ARRAY_TARGETS: &[(&str, CargoTargetKind)] = &[
     ("bin", CargoTargetKind::Bin),
     ("test", CargoTargetKind::Test),
@@ -309,11 +319,10 @@ pub fn parse_package_manifest(content: &str) -> Result<CargoPackageManifest, Par
     let starts = line_starts(content);
     let package = root.get("package").and_then(TomlItem::as_table_like);
 
-    // Discovery is settled by the edition and the declared targets as much as by the
-    // `auto*` keys, so both are read before the value is built.
+    // Discovery is settled by the edition as much as by the `auto*` keys, so it is read
+    // before the value is built rather than moved into the field first.
     let edition = package.and_then(|p| package_field(p, "edition"));
-    let targets = targets(root, package);
-    let auto_targets = auto_targets(package, edition.as_ref(), &targets);
+    let auto_targets = auto_targets(root, package, edition.as_ref());
 
     Ok(CargoPackageManifest {
         name: package
@@ -325,7 +334,7 @@ pub fn parse_package_manifest(content: &str) -> Result<CargoPackageManifest, Par
         rust_version: package.and_then(|p| package_field(p, "rust-version")),
         features: features_table(root),
         optional_dependencies: optional_dependencies(root),
-        targets,
+        targets: targets(root, package),
         auto_targets,
         cfg_dependency_tables: cfg_dependency_tables(root, &starts),
     })
@@ -423,10 +432,15 @@ fn targets(root: &dyn TableLike, package: Option<&dyn TableLike>) -> Vec<CargoTa
 
     for (key, kind) in ARRAY_TARGETS {
         let Some(item) = root.get(key) else { continue };
-        // `[[bin]]` is an array of tables; a lone `[bin]` table is malformed but cheap
-        // to accept, so both shapes are read.
+        // `[[bin]]` is an array of tables; `bin = [{ … }]` is a value array of inline
+        // tables, which Cargo accepts just the same; a lone `[bin]` table is malformed but
+        // cheap to accept. All three shapes are read.
         if let Some(array) = item.as_array_of_tables() {
             for table in array {
+                targets.push(target_from(*kind, table));
+            }
+        } else if let Some(array) = item.as_array() {
+            for table in array.iter().filter_map(Value::as_inline_table) {
                 targets.push(target_from(*kind, table));
             }
         } else if let Some(table) = item.as_table_like() {
@@ -499,25 +513,35 @@ fn target_from(kind: CargoTargetKind, table: &dyn TableLike) -> CargoTarget {
 
 /// Read the discovery flags — the `auto*` keys and `build`.
 ///
-/// An `auto*` key settles its kind outright. Without one the flag is Cargo's `true`, except
-/// under edition 2015, where a declared target of a kind turns that kind's discovery off;
-/// `declared` is [`targets`] so the two answers cannot drift apart.
+/// For the four multi-target kinds an `auto*` key settles the kind outright; without one the
+/// flag is Cargo's `true`, except under edition 2015, where declaring the kind turns its
+/// discovery off. `lib` inverts that order: at most one library exists, so declaring it wins
+/// over `autolib` in every edition.
+///
+/// What counts as declaring a kind is the presence of its key on the root table — Cargo's
+/// own test, which an empty `test = []` passes even though it yields no target. A key of the
+/// same name under `[package]` declares nothing and is ignored here as Cargo ignores it.
 fn auto_targets(
+    root: &dyn TableLike,
     package: Option<&dyn TableLike>,
     edition: Option<&PackageField>,
-    declared: &[CargoTarget],
 ) -> AutoTargets {
     // An absent `edition` key means 2015. An inherited one resolves only against the
     // workspace root, so it is assumed to be 2018 or later and suppresses nothing.
     let edition_2015 = edition.is_none_or(|e| e.literal() == Some(EDITION_2015));
+    let declares = |kind: CargoTargetKind| root.get(kind.table_name()).is_some();
+    let explicit = |key: &str| package.and_then(|p| p.get(key)).and_then(TomlItem::as_bool);
     let flag = |key: &str, kind: CargoTargetKind| {
-        if let Some(explicit) = package.and_then(|p| p.get(key)).and_then(TomlItem::as_bool) {
+        if let Some(explicit) = explicit(key) {
             return explicit;
         }
-        !(edition_2015 && declared.iter().any(|t| t.kind == kind))
+        !(edition_2015 && declares(kind))
     };
     AutoTargets {
-        lib: flag("autolib", CargoTargetKind::Lib),
+        // A declared `lib` names the one library the package has, leaving `src/lib.rs`
+        // nothing to be — so it suppresses discovery whatever the edition, and whatever
+        // `autolib` says. Only without it does the key, then Cargo's `true`, decide.
+        lib: !declares(CargoTargetKind::Lib) && explicit("autolib").unwrap_or(true),
         bins: flag("autobins", CargoTargetKind::Bin),
         tests: flag("autotests", CargoTargetKind::Test),
         benches: flag("autobenches", CargoTargetKind::Bench),
@@ -891,8 +915,9 @@ path = "other/test.rs"
 
     #[test]
     fn edition_2018_or_later_discovers_alongside_declared_targets() {
-        // Only 2015 suppresses: a later edition discovers `src/bin/`, `tests/`, and the
-        // rest even where the manifest declares targets of the same kind.
+        // Only 2015 suppresses these four kinds: a later edition discovers `src/bin/`,
+        // `tests/`, and the rest even where the manifest declares targets of the same kind.
+        // `lib` is the exception and is checked on its own below.
         let manifest = parse(
             r#"
 [package]
@@ -919,7 +944,101 @@ name = "declared-example"
 path = "other/example.rs"
 "#,
         );
+        assert!(manifest.auto_targets.bins);
+        assert!(manifest.auto_targets.tests);
+        assert!(manifest.auto_targets.benches);
+        assert!(manifest.auto_targets.examples);
+        // The declared `[lib]` is already the package's one library, so `src/lib.rs` is not
+        // discovered beside it even here.
+        assert!(!manifest.auto_targets.lib);
+    }
+
+    #[test]
+    fn a_declared_lib_suppresses_discovery_in_every_edition() {
+        // A package builds at most one library, so `[lib] path = "other/lib.rs"` leaves
+        // `src/lib.rs` nothing to be — under 2021 as much as under 2015.
+        for edition in ["", "edition = \"2015\"\n", "edition = \"2021\"\n"] {
+            let manifest = parse(&format!(
+                "[package]\nname = \"x\"\n{edition}\n[lib]\npath = \"other/lib.rs\"\n"
+            ));
+            assert!(!manifest.auto_targets.lib, "edition line: {edition:?}");
+        }
+    }
+
+    #[test]
+    fn autolib_does_not_override_a_declared_lib() {
+        // The declaration outranks the key, the one place an `auto*` key does not win.
+        let declared = parse(
+            r#"
+[package]
+name = "x"
+edition = "2021"
+autolib = true
+
+[lib]
+path = "other/lib.rs"
+"#,
+        );
+        assert!(!declared.auto_targets.lib);
+
+        // Without a declaration the key decides as usual, in both directions.
+        let opted_out = parse("[package]\nname = \"x\"\nedition = \"2021\"\nautolib = false\n");
+        assert!(!opted_out.auto_targets.lib);
+        let opted_in = parse("[package]\nname = \"x\"\nautolib = true\n");
+        assert!(opted_in.auto_targets.lib);
+    }
+
+    #[test]
+    fn an_empty_target_array_still_suppresses_discovery() {
+        // Cargo asks whether the key is written, not whether it yields a target: under
+        // edition 2015 a bare `test = []` turns `tests/` discovery off just the same.
+        let manifest = parse("test = []\n\n[package]\nname = \"x\"\n");
+        assert!(manifest.targets.is_empty());
+        assert!(!manifest.auto_targets.tests);
+        assert!(manifest.auto_targets.bins);
+        assert!(manifest.auto_targets.lib);
+    }
+
+    #[test]
+    fn a_key_under_package_declares_nothing() {
+        // Only a root key declares targets. `[package] test` is a different key, which
+        // Cargo ignores — and so leaves `tests/` discovering.
+        let manifest = parse("[package]\nname = \"x\"\ntest = []\n");
+        assert!(manifest.targets.is_empty());
         assert_eq!(manifest.auto_targets, AutoTargets::default());
+    }
+
+    #[test]
+    fn targets_declared_as_inline_tables_are_read() {
+        // `bin = [{ … }]` is a value array rather than an array of tables, and
+        // `lib = { … }` an inline table rather than a `[lib]` header — Cargo builds both,
+        // so both must reach the caller and suppress discovery of their kind.
+        let manifest = parse(
+            r#"
+lib = { path = "other/lib.rs" }
+bin = [{ name = "declared-bin", path = "other/b.rs" }, { name = "second" }]
+
+[package]
+name = "x"
+"#,
+        );
+        let bins: Vec<_> = manifest
+            .targets
+            .iter()
+            .filter(|t| t.kind == CargoTargetKind::Bin)
+            .collect();
+        assert_eq!(bins.len(), 2);
+        assert_eq!(bins[0].name.as_deref(), Some("declared-bin"));
+        assert_eq!(bins[0].path.as_deref(), Some("other/b.rs"));
+        assert_eq!(bins[1].name.as_deref(), Some("second"));
+        let lib = manifest
+            .targets
+            .iter()
+            .find(|t| t.kind == CargoTargetKind::Lib)
+            .expect("lib target");
+        assert_eq!(lib.path.as_deref(), Some("other/lib.rs"));
+        assert!(!manifest.auto_targets.bins);
+        assert!(!manifest.auto_targets.lib);
     }
 
     #[test]
