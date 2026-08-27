@@ -79,7 +79,7 @@ mise run build
 dependable check [PATH]           # check a project (default: current dir)
 dependable check . --format json  # machine-readable output (also: text)
 dependable check . --fail-on vulnerable   # exit non-zero for CI
-dependable list .                 # list dependencies without checking
+dependable list .                 # every project and what it declares (offline)
 dependable tree .                 # render the dependency tree (Rust)
 dependable fix . --dry-run        # preview in-place upgrades
 ```
@@ -96,6 +96,68 @@ serde    1.0.100  1.0.228  patch available
 tokio    1.20.0   1.52.3   3 vulnerabilities
 time     0.2.7    0.3.51   1 vulnerability
 ```
+
+## Project inventory (`list`)
+
+`dependable list` answers "what lives in this repository" — every manifest it
+discovers, what that manifest calls itself, and what it declares — without touching
+the network. `--format json` emits it as one self-describing document, which is the
+form to hand to a script or an agent:
+
+```bash
+dependable list                    # human-readable, one block per project
+dependable list --format json      # the full inventory
+dependable list --format text      # one tab-separated record per dependency
+dependable list --no-lock-file     # skip lockfiles (no locked versions)
+```
+
+```json
+{
+  "schema": "dependable.list/v1",
+  "root": ".",
+  "summary": { "projects": 4, "dependencies": 53, "by_ecosystem": { "Rust": 4 } },
+  "projects": [
+    {
+      "name": "dependable-core",
+      "version": "0.1.2",
+      "version_inherited": true,
+      "ecosystem": "Rust",
+      "role": "package",
+      "manifest": "crates/dependable-core/Cargo.toml",
+      "lockfile": "Cargo.lock",
+      "dependencies": [
+        {
+          "name": "serde",
+          "constraint": "1",
+          "kind": "normal",
+          "direct": true,
+          "source": "registry",
+          "locked": "1.0.228",
+          "registry": null,
+          "inherited": true
+        }
+      ]
+    }
+  ]
+}
+```
+
+Each dependency's `kind` is the section that declared it — `normal`, `dev`, `build`,
+`optional`, `peer`, `workspace` (a central declaration such as Cargo's
+`[workspace.dependencies]`, a pnpm catalog, or a NuGet `PackageVersion`), or
+`indirect` (a `go.mod` requirement marked `// indirect`). The last two are not
+dependencies of the package itself, which is what `direct` says outright. A manifest
+that declares only central versions — a virtual Cargo workspace root,
+`pnpm-workspace.yaml`, `Directory.Packages.props` — has `"role": "workspace"` and no
+name of its own.
+
+Values a single manifest cannot supply are resolved from the repository and marked as
+such: `version_inherited` for a Cargo `version.workspace = true`, `inherited` for a
+constraint taken from `[workspace.dependencies]`, and `lockfile` for the lockfile that
+supplied the locked versions — a workspace keeps one at its root, above its members.
+
+Only *declared* dependencies are listed. The full resolved graph, transitive
+dependencies included, is what `tree` renders.
 
 ## Dependency tree (`tree`)
 
