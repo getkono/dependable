@@ -30,8 +30,9 @@ pub use parsers::{
     AutoTargets, CargoPackageManifest, CargoTarget, CargoTargetKind, CargoTomlParser,
     CfgDependencyTable, ComposerJsonParser, CsprojParser, DenoJsonParser, DependencySection,
     GoModParser, MixExsParser, PackageField, PackageJsonParser, Parser, PnpmWorkspaceParser,
-    PubspecYamlParser, PyprojectTomlParser, RequirementsTxtParser, WorkspaceDecl, parse,
-    parse_cargo_config, parse_package_manifest, parse_package_name, parse_workspace,
+    ProjectMeta, ProjectRole, PubspecYamlParser, PyprojectTomlParser, RequirementsTxtParser,
+    WorkspaceDecl, parse, parse_cargo_config, parse_package_manifest, parse_package_name,
+    parse_project, parse_workspace,
 };
 pub use result::{CheckResult, DependencyStatus};
 pub use semver::{Evaluation, UnstableFilter, check_version, is_prerelease, to_semver_constraint};
