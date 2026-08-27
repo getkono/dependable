@@ -80,7 +80,8 @@ pub enum CargoTargetKind {
     Bench,
     /// `[[example]]`.
     Example,
-    /// The `[package] build = "…"` script.
+    /// The `[package] build` script, however it is written (`build = "…"` or the
+    /// `build = true` shorthand for a root `build.rs`).
     BuildScript,
 }
 
@@ -142,7 +143,9 @@ pub struct CfgDependencyTable {
 /// Whether Cargo's filesystem target auto-discovery is enabled, per target kind.
 ///
 /// All default to `true`, matching Cargo. A caller with filesystem access uses these to
-/// decide whether to look for `src/lib.rs`, `src/bin/*.rs`, `tests/*.rs`, and so on.
+/// decide whether to look for `src/lib.rs`, `src/bin/*.rs`, `tests/*.rs`, `build.rs`, and
+/// so on. Every flag reads the same way: `true` means "Cargo will discover this kind from
+/// the filesystem, so you should too".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct AutoTargets {
@@ -156,10 +159,12 @@ pub struct AutoTargets {
     pub benches: bool,
     /// `autoexamples` — discover `examples/`.
     pub examples: bool,
-    /// `build` — discover a `build.rs` at the package root. `false` only when the
-    /// manifest writes `build = false`, which turns the build script off outright; a
-    /// declared `build = "…"` leaves this `true` because discovery is moot once the
-    /// script is named in [`targets`](CargoPackageManifest::targets).
+    /// `build` — discover a `build.rs` at the package root. `true` only when the manifest
+    /// writes no `build` key at all, which is the one case Cargo answers from the
+    /// filesystem. Every explicit value settles the question in the manifest instead:
+    /// `build = false` turns the script off outright, while `build = true` and
+    /// `build = "…"` name it in [`targets`](CargoPackageManifest::targets). In all three
+    /// a caller must *not* discover, or it would attach a root `build.rs` Cargo never runs.
     pub build: bool,
 }
 
@@ -400,20 +405,30 @@ fn targets(root: &dyn TableLike, package: Option<&dyn TableLike>) -> Vec<CargoTa
         }
     }
 
-    // `build = "build.rs"` declares a script; `build = false` disables the implicit one
-    // and is reported through [`AutoTargets::build`] instead.
-    if let Some(build) = package.and_then(|p| p.get("build"))
-        && let Some(path) = build.as_str()
-    {
+    // `build = "…"` and `build = true` both declare a script; `build = false` declares
+    // none and is reported through [`AutoTargets::build`] instead.
+    if let Some(path) = package.and_then(|p| p.get("build")).and_then(build_script) {
         targets.push(CargoTarget {
             kind: CargoTargetKind::BuildScript,
             name: None,
-            path: Some(path.to_owned()),
+            path: Some(path),
             required_features: Vec::new(),
         });
     }
 
     targets
+}
+
+/// The path a `[package] build` value declares, or `None` for `build = false`.
+///
+/// A string is the path as written; `build = true` is Cargo's shorthand for a `build.rs`
+/// at the package root, which it expands to the same declared target.
+fn build_script(build: &TomlItem) -> Option<String> {
+    match (build.as_str(), build.as_bool()) {
+        (Some(path), _) => Some(path.to_owned()),
+        (None, Some(true)) => Some("build.rs".to_owned()),
+        (None, _) => None,
+    }
 }
 
 /// Read one target table's `name`, `path`, and `required-features`.
@@ -451,10 +466,11 @@ fn auto_targets(package: Option<&dyn TableLike>) -> AutoTargets {
         tests: flag("autotests"),
         benches: flag("autobenches"),
         examples: flag("autoexamples"),
-        // `build` is the one non-boolean key here: only `build = false` disables
-        // discovery, and a declared `build = "build.rs"` reads as `None` and so stays
-        // `true` — which is what a caller wants, the script already being declared.
-        build: flag("build"),
+        // `build` is the one key here that is not a discovery flag at all — it is the
+        // script declaration — so it cannot use `flag`, which would read `build = true`
+        // and a declared path alike as "discover". Only an absent key leaves anything to
+        // discover; every explicit value either names the script or turns it off.
+        build: package.is_none_or(|p| p.get("build").is_none()),
     }
 }
 
@@ -685,7 +701,8 @@ name = "integration"
             .find(|t| t.kind == CargoTargetKind::BuildScript)
             .expect("build script");
         assert_eq!(build.path.as_deref(), Some("build.rs"));
-        assert!(manifest.auto_targets.build);
+        // The script is declared, so there is nothing left for a caller to discover.
+        assert!(!manifest.auto_targets.build);
     }
 
     #[test]
@@ -703,28 +720,37 @@ name = "integration"
     }
 
     #[test]
-    fn build_discovery_stays_enabled_unless_explicitly_disabled() {
-        // Absent key: Cargo looks for `build.rs` itself.
-        assert!(parse("[package]\nname = \"x\"\n").auto_targets.build);
-        // A declared script leaves the flag alone — discovery is moot once the path is
-        // written out, and the target says so.
-        let declared = parse("[package]\nname = \"x\"\nbuild = \"build.rs\"\n");
-        assert!(declared.auto_targets.build);
-        assert_eq!(
-            declared
+    fn build_discovery_is_enabled_only_when_the_key_is_absent() {
+        let script_paths = |manifest: &CargoPackageManifest| -> Vec<Option<String>> {
+            manifest
                 .targets
                 .iter()
                 .filter(|t| t.kind == CargoTargetKind::BuildScript)
-                .map(|t| t.path.as_deref())
-                .collect::<Vec<_>>(),
-            [Some("build.rs")]
-        );
-        // `build = true` is not valid Cargo; read it as the default, discovery enabled.
-        assert!(
-            parse("[package]\nname = \"x\"\nbuild = true\n")
-                .auto_targets
-                .build
-        );
+                .map(|t| t.path.clone())
+                .collect()
+        };
+
+        // Absent key: Cargo looks for a root `build.rs` itself, so a caller should too.
+        let absent = parse("[package]\nname = \"x\"\n");
+        assert!(script_paths(&absent).is_empty());
+        assert!(absent.auto_targets.build);
+
+        // `build = false`: no script at all, nothing to discover.
+        let disabled = parse("[package]\nname = \"x\"\nbuild = false\n");
+        assert!(script_paths(&disabled).is_empty());
+        assert!(!disabled.auto_targets.build);
+
+        // `build = true`: Cargo's shorthand for a root `build.rs`, declared outright —
+        // the target exists even when no `build.rs` is on disk, and discovery is moot.
+        let shorthand = parse("[package]\nname = \"x\"\nbuild = true\n");
+        assert_eq!(script_paths(&shorthand), [Some("build.rs".to_owned())]);
+        assert!(!shorthand.auto_targets.build);
+
+        // A named path: declared just the same, and discovery must stay off or a caller
+        // would attach a root `build.rs` Cargo never runs.
+        let named = parse("[package]\nname = \"x\"\nbuild = \"scripts/build.rs\"\n");
+        assert_eq!(script_paths(&named), [Some("scripts/build.rs".to_owned())]);
+        assert!(!named.auto_targets.build);
     }
 
     #[test]
