@@ -23,6 +23,8 @@ pub struct Item {
     pub registry: Option<String>,
     /// Resolved locked version from a lockfile, if available.
     pub locked_version: Option<String>,
+    /// Which manifest section declared the dependency.
+    pub kind: DependencyKind,
 }
 
 impl Item {
@@ -39,6 +41,66 @@ impl Item {
     #[must_use]
     pub fn is_checkable(&self) -> bool {
         matches!(self.source, PackageSource::Registry | PackageSource::Jsr)
+    }
+}
+
+/// Which manifest section a dependency was declared in.
+///
+/// Manifests distinguish dependencies a package needs at runtime from ones only its
+/// own development, build, or optional configurations need. The distinction is not
+/// used for version checking — every checkable item is checked the same way — but a
+/// consumer taking inventory of a repository needs it to tell a runtime dependency
+/// from a test-only one.
+///
+/// Ecosystems that expose no section signal (`deno.json` imports, `mix.exs` deps,
+/// `requirements.txt` lines) report [`DependencyKind::Normal`]; guessing from a file
+/// name or an `only:` option would be a heuristic, not a reading of the manifest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum DependencyKind {
+    /// A runtime dependency (`[dependencies]`, `dependencies`, `require`, …).
+    #[default]
+    Normal,
+    /// Needed only to develop or test the package (`[dev-dependencies]`,
+    /// `devDependencies`, `require-dev`, Poetry/PEP 735 groups, …).
+    Dev,
+    /// Needed only to build the package (Cargo `[build-dependencies]`).
+    Build,
+    /// Installed only when an extra or optional feature is enabled (PEP 621
+    /// `optional-dependencies`, npm `optionalDependencies`, …).
+    Optional,
+    /// An npm `peerDependencies` entry: required of the *consumer*, not installed.
+    Peer,
+    /// A central version declaration rather than a dependency of this package —
+    /// Cargo's `[workspace.dependencies]`, pnpm catalogs, NuGet `PackageVersion`.
+    /// Members opt in by name, so the declaration alone means nothing is depended on.
+    Workspace,
+    /// A transitive dependency the manifest records explicitly (`go.mod`'s
+    /// `// indirect`). Not a direct dependency of the module.
+    Indirect,
+}
+
+impl DependencyKind {
+    /// A stable lowercase token for machine-readable output.
+    #[must_use]
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Dev => "dev",
+            Self::Build => "build",
+            Self::Optional => "optional",
+            Self::Peer => "peer",
+            Self::Workspace => "workspace",
+            Self::Indirect => "indirect",
+        }
+    }
+
+    /// Whether this is a dependency the package itself pulls in — everything except a
+    /// central declaration ([`Workspace`](Self::Workspace)) and a recorded transitive
+    /// ([`Indirect`](Self::Indirect)).
+    #[must_use]
+    pub fn is_direct(self) -> bool {
+        !matches!(self, Self::Workspace | Self::Indirect)
     }
 }
 

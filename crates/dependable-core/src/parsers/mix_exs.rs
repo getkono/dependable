@@ -14,7 +14,7 @@ use regex::Regex;
 use super::Parser;
 use super::position::{line_starts, offset_to_line_col};
 use crate::error::ParseError;
-use crate::item::{Item, PackageSource};
+use crate::item::{DependencyKind, Item, PackageSource};
 use crate::manifest::{ManifestKind, ParsedManifest};
 
 /// Parses `mix.exs`.
@@ -47,6 +47,9 @@ impl Parser for MixExsParser {
                 version_col_end: version_col_start + text.len(),
                 registry: None,
                 locked_version: None,
+                // `only: :dev` / `only: :test` options live outside the matched tuple
+                // prefix, so the regex cannot tell a dev dependency from a runtime one.
+                kind: DependencyKind::Normal,
             });
         }
         Ok(ParsedManifest {

@@ -8,10 +8,13 @@ use super::Parser;
 use super::json_scan::scan_strings;
 use super::position::{line_starts, offset_to_line_col};
 use crate::error::ParseError;
-use crate::item::{Item, PackageSource};
+use crate::item::{DependencyKind, Item, PackageSource};
 use crate::manifest::{ManifestKind, ParsedManifest};
 
-const DEP_SECTIONS: &[&str] = &["require", "require-dev"];
+const DEP_SECTIONS: &[(&str, DependencyKind)] = &[
+    ("require", DependencyKind::Normal),
+    ("require-dev", DependencyKind::Dev),
+];
 
 /// Parses `composer.json`.
 pub struct ComposerJsonParser;
@@ -22,7 +25,7 @@ impl Parser for ComposerJsonParser {
         let mut items = Vec::new();
         for entry in scan_strings(content) {
             if let [section, name] = entry.path.as_slice()
-                && DEP_SECTIONS.contains(&section.as_str())
+                && let Some((_, kind)) = DEP_SECTIONS.iter().find(|(key, _)| key == section)
                 && is_packagist_package(name)
             {
                 let (line, col_start) = offset_to_line_col(&starts, entry.content_start);
@@ -36,6 +39,7 @@ impl Parser for ComposerJsonParser {
                         + entry.content_end.saturating_sub(entry.content_start),
                     registry: None,
                     locked_version: None,
+                    kind: *kind,
                 });
             }
         }
@@ -71,6 +75,18 @@ mod tests {
     fn sliced<'a>(content: &'a str, item: &Item) -> &'a str {
         let line = content.lines().nth(item.version_line).unwrap();
         &line[item.version_col_start..item.version_col_end]
+    }
+
+    #[test]
+    fn require_dev_is_a_dev_dependency() {
+        let content = r#"{
+  "require": { "monolog/monolog": "^3.0" },
+  "require-dev": { "phpunit/phpunit": "^10.0" }
+}"#;
+        let m = parse(content);
+        let find = |name: &str| m.items.iter().find(|i| i.name == name).unwrap();
+        assert_eq!(find("monolog/monolog").kind, DependencyKind::Normal);
+        assert_eq!(find("phpunit/phpunit").kind, DependencyKind::Dev);
     }
 
     #[test]

@@ -67,9 +67,9 @@ pub use registries::{
 // parsers, `check_version`, ...).
 pub use dependable_core as core;
 pub use dependable_core::{
-    CheckResult, DependencyGraph, DependencyStatus, Ecosystem, Evaluation, Item, ManifestKind,
-    Node, NodeKind, PackageSource, ParseError, ParsedManifest, Tree, TreeNode, TreeOptions,
-    UnstableFilter,
+    CheckResult, DependencyGraph, DependencyKind, DependencyStatus, Ecosystem, Evaluation, Item,
+    ManifestKind, Node, NodeKind, PackageSource, ParseError, ParsedManifest, Tree, TreeNode,
+    TreeOptions, UnstableFilter,
 };
 
 /// One-import convenience for consumers: `use dependable_fetch::prelude::*;`.

@@ -8,7 +8,7 @@ use super::Parser;
 use super::json_scan::{JsonStringValue, scan_strings};
 use super::position::{line_starts, offset_to_line_col};
 use crate::error::ParseError;
-use crate::item::{Item, PackageSource};
+use crate::item::{DependencyKind, Item, PackageSource};
 use crate::manifest::{ManifestKind, ParsedManifest};
 
 /// Parses `deno.json` and `deno.jsonc`.
@@ -66,6 +66,8 @@ fn build_item(entry: &JsonStringValue, starts: &[usize]) -> Option<Item> {
         version_col_end: col_start + entry.content_end.saturating_sub(global_start),
         registry: None,
         locked_version: None,
+        // `imports`/`scopes` are one flat map with no dev/build distinction to read.
+        kind: DependencyKind::Normal,
     })
 }
 

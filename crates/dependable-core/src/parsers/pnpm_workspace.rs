@@ -8,7 +8,7 @@
 
 use super::Parser;
 use crate::error::ParseError;
-use crate::item::{Item, PackageSource};
+use crate::item::{DependencyKind, Item, PackageSource};
 use crate::manifest::{ManifestKind, ParsedManifest};
 
 /// Parses `pnpm-workspace.yaml`.
@@ -54,6 +54,9 @@ impl Parser for PnpmWorkspaceParser {
                     version_col_end: value_col + version.len(),
                     registry: None,
                     locked_version: None,
+                    // A catalog entry declares one version for the workspace; a package
+                    // depends on it only by writing `catalog:` in its own manifest.
+                    kind: DependencyKind::Workspace,
                 });
             }
         }
@@ -128,6 +131,13 @@ mod tests {
     fn sliced<'a>(content: &'a str, item: &Item) -> &'a str {
         let line = content.lines().nth(item.version_line).unwrap();
         &line[item.version_col_start..item.version_col_end]
+    }
+
+    #[test]
+    fn catalog_entries_are_declarations() {
+        let content = "catalog:\n  react: ^18.0.0\n";
+        let m = parse(content);
+        assert_eq!(m.items[0].kind, DependencyKind::Workspace);
     }
 
     #[test]
