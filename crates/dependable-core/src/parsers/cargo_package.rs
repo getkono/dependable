@@ -189,9 +189,12 @@ pub struct CargoPackageManifest {
     /// The `[features]` table: each feature mapped to the features and optional
     /// dependencies it enables, exactly as written (including `dep:` and `pkg/feat` forms).
     pub features: BTreeMap<String, Vec<String>>,
-    /// Dependencies marked `optional = true`, sorted and deduplicated. Each one Cargo
-    /// turns into an implicit feature of the same name unless some feature already
-    /// refers to it as `dep:<name>`.
+    /// Dependencies marked `optional = true` in a section that gives them an implicit
+    /// feature — `dependencies` and `build-dependencies`, top-level or under a
+    /// `[target.<predicate>.…]` table — sorted and deduplicated. Each one Cargo turns
+    /// into an implicit feature of the same name unless some feature already refers to
+    /// it as `dep:<name>`. `dev-dependencies` never contributes: Cargo rejects an
+    /// optional dev-dependency outright.
     pub optional_dependencies: Vec<String>,
     /// Explicitly declared build targets, grouped by kind in [`CargoTargetKind`]
     /// declaration order and, within a kind, in manifest order.
@@ -211,7 +214,8 @@ impl CargoPackageManifest {
     }
 
     /// Every feature name a consumer may enable: the declared features plus the
-    /// implicit one each optional dependency creates.
+    /// implicit one each entry of [`optional_dependencies`](Self::optional_dependencies)
+    /// creates.
     ///
     /// An optional dependency referred to as `dep:<name>` by some feature does *not*
     /// get an implicit feature, matching Cargo's rule.
@@ -240,6 +244,15 @@ const TARGET_SECTIONS: &[(&str, DependencySection)] = &[
     ("dev-dependencies", DependencySection::Dev),
     ("build-dependencies", DependencySection::Build),
 ];
+
+/// Sections whose optional dependencies gain an implicit feature.
+///
+/// Deliberately *not* [`TARGET_SECTIONS`]: the two section sets answer different
+/// questions. Every one of the three sections holds real dependencies, so
+/// [`cfg_dependency_tables`] reads all of them — but Cargo refuses to load a manifest
+/// with an optional dev-dependency at all ("dev-dependencies are not allowed to be
+/// optional"), so only these two can ever produce a feature.
+const IMPLICIT_FEATURE_SECTIONS: &[&str] = &["dependencies", "build-dependencies"];
 
 /// Kinds declared as arrays of tables (`[[bin]]`), paired with their table name.
 const ARRAY_TARGETS: &[(&str, CargoTargetKind)] = &[
@@ -315,13 +328,12 @@ fn features_table(root: &dyn TableLike) -> BTreeMap<String, Vec<String>> {
         .collect()
 }
 
-/// Every dependency marked `optional = true`, across all three top-level sections.
+/// Every dependency marked `optional = true` in a section that gives it an implicit
+/// feature: [`IMPLICIT_FEATURE_SECTIONS`] at the top level, and the same sections under
+/// every `[target.<predicate>.…]` table.
 fn optional_dependencies(root: &dyn TableLike) -> Vec<String> {
     let mut optional = Vec::new();
-    for (section, _) in TARGET_SECTIONS {
-        let Some(table) = root.get(section).and_then(TomlItem::as_table_like) else {
-            continue;
-        };
+    let mut collect = |table: &dyn TableLike| {
         for (name, item) in table.iter() {
             let is_optional = item
                 .as_table_like()
@@ -332,7 +344,29 @@ fn optional_dependencies(root: &dyn TableLike) -> Vec<String> {
                 optional.push(name.to_owned());
             }
         }
+    };
+
+    for section in IMPLICIT_FEATURE_SECTIONS {
+        if let Some(table) = root.get(section).and_then(TomlItem::as_table_like) {
+            collect(table);
+        }
     }
+
+    // A `cfg`-gated optional dependency creates the same implicit feature its top-level
+    // twin would; the predicate only gates whether the dependency is pulled in.
+    if let Some(targets) = root.get("target").and_then(TomlItem::as_table_like) {
+        for (_, item) in targets.iter() {
+            let Some(entry) = item.as_table_like() else {
+                continue;
+            };
+            for section in IMPLICIT_FEATURE_SECTIONS {
+                if let Some(table) = entry.get(section).and_then(TomlItem::as_table_like) {
+                    collect(table);
+                }
+            }
+        }
+    }
+
     optional.sort();
     optional.dedup();
     optional
@@ -535,7 +569,7 @@ view = ["dep:ratatui"]
     }
 
     #[test]
-    fn optional_dependencies_span_dev_and_build_sections() {
+    fn optional_build_dependencies_count_but_dev_ones_do_not() {
         let manifest = parse(
             r#"
 [dev-dependencies]
@@ -545,7 +579,43 @@ tempfile = { version = "3", optional = true }
 cc = { version = "1", optional = true }
 "#,
         );
-        assert_eq!(manifest.optional_dependencies, ["cc", "tempfile"]);
+        // Cargo rejects an optional dev-dependency outright, so `tempfile` never becomes
+        // a feature — only the build-dependency does.
+        assert_eq!(manifest.optional_dependencies, ["cc"]);
+        assert_eq!(manifest.feature_names(), ["cc"]);
+    }
+
+    #[test]
+    fn cfg_gated_optional_dependency_becomes_an_implicit_feature() {
+        let manifest = parse(
+            r#"
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true }
+
+[target.'cfg(windows)'.build-dependencies]
+cc = { version = "1", optional = true }
+
+[target.'cfg(windows)'.dev-dependencies]
+tempfile = { version = "3", optional = true }
+"#,
+        );
+        assert_eq!(manifest.optional_dependencies, ["cc", "libc"]);
+        assert_eq!(manifest.feature_names(), ["cc", "libc"]);
+    }
+
+    #[test]
+    fn dep_reference_suppresses_a_cfg_gated_implicit_feature() {
+        let manifest = parse(
+            r#"
+[features]
+unix-support = ["dep:libc"]
+
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true }
+"#,
+        );
+        assert_eq!(manifest.optional_dependencies, ["libc"]);
+        assert_eq!(manifest.feature_names(), ["unix-support"]);
     }
 
     #[test]
