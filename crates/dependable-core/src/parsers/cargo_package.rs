@@ -15,7 +15,10 @@
 //! inheritance markers ([`PackageField::Workspace`]) the caller resolves against
 //! [`WorkspaceDecl::package_defaults`](super::cargo_workspace::WorkspaceDecl). The
 //! [`auto_targets`](CargoPackageManifest::auto_targets) flags say whether Cargo's
-//! own discovery is even enabled, so a caller with filesystem access knows when to run it.
+//! own discovery is even enabled — the `auto*` keys and the edition-2015 rule that
+//! suppresses discovery for a kind the manifest declares — so a caller with filesystem
+//! access knows when to run it. An inherited `edition` is one input those flags cannot
+//! read, so they assume 2018 or later whenever it is inherited.
 
 use std::collections::BTreeMap;
 
@@ -143,22 +146,37 @@ pub struct CfgDependencyTable {
 
 /// Whether Cargo's filesystem target auto-discovery is enabled, per target kind.
 ///
-/// All default to `true`, matching Cargo. A caller with filesystem access uses these to
-/// decide whether to look for `src/lib.rs`, `src/bin/*.rs`, `tests/*.rs`, `build.rs`, and
-/// so on. Every flag reads the same way: `true` means "Cargo will discover this kind from
-/// the filesystem, so you should too".
+/// A caller with filesystem access uses these to decide whether to look for `src/lib.rs`,
+/// `src/bin/*.rs`, `tests/*.rs`, `build.rs`, and so on. Every flag reads the same way:
+/// `true` means "Cargo will discover this kind from the filesystem, so you should too".
+///
+/// Two things settle a kind's flag. Its `auto*` key wins wherever the manifest writes one.
+/// Otherwise the flag is Cargo's `true`, except under **edition 2015** — which an absent
+/// `edition` key also means — where declaring a target of a kind turns that kind's
+/// discovery off. The suppression is per kind: a 2015 package declaring only a `[[bin]]`
+/// still discovers `tests/` and `examples/`. [`Default`] is Cargo's all-`true`, the answer
+/// for a manifest that declares no targets.
+///
+/// `edition.workspace = true` cannot be resolved from one manifest, so an inherited edition
+/// is *assumed* to be 2018 or later and no suppression is applied. A caller holding the
+/// workspace root's
+/// [`package_defaults`](super::cargo_workspace::WorkspaceDecl::package_defaults) can
+/// resolve the edition and re-apply the rule itself when it turns out to be 2015.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct AutoTargets {
-    /// `autolib` — discover `src/lib.rs`.
+    /// `autolib` — discover `src/lib.rs`. A declared `[lib]` suppresses it under edition 2015.
     pub lib: bool,
-    /// `autobins` — discover `src/main.rs` and `src/bin/`.
+    /// `autobins` — discover `src/main.rs` and `src/bin/`. A declared `[[bin]]` suppresses it
+    /// under edition 2015.
     pub bins: bool,
-    /// `autotests` — discover `tests/`.
+    /// `autotests` — discover `tests/`. A declared `[[test]]` suppresses it under edition 2015.
     pub tests: bool,
-    /// `autobenches` — discover `benches/`.
+    /// `autobenches` — discover `benches/`. A declared `[[bench]]` suppresses it under edition
+    /// 2015.
     pub benches: bool,
-    /// `autoexamples` — discover `examples/`.
+    /// `autoexamples` — discover `examples/`. A declared `[[example]]` suppresses it under
+    /// edition 2015.
     pub examples: bool,
     /// `build` — discover a `build.rs` at the package root. `true` only when the manifest
     /// writes no `build` key at all, which is the one case Cargo answers from the
@@ -267,6 +285,9 @@ const TARGET_SECTIONS: &[(&str, DependencySection)] = &[
 /// optional"), so only these two can ever produce a feature.
 const IMPLICIT_FEATURE_SECTIONS: &[&str] = &["dependencies", "build-dependencies"];
 
+/// The one edition that suppresses auto-discovery for a kind the manifest declares.
+const EDITION_2015: &str = "2015";
+
 /// Kinds declared as arrays of tables (`[[bin]]`), paired with their table name.
 const ARRAY_TARGETS: &[(&str, CargoTargetKind)] = &[
     ("bin", CargoTargetKind::Bin),
@@ -288,18 +309,24 @@ pub fn parse_package_manifest(content: &str) -> Result<CargoPackageManifest, Par
     let starts = line_starts(content);
     let package = root.get("package").and_then(TomlItem::as_table_like);
 
+    // Discovery is settled by the edition and the declared targets as much as by the
+    // `auto*` keys, so both are read before the value is built.
+    let edition = package.and_then(|p| package_field(p, "edition"));
+    let targets = targets(root, package);
+    let auto_targets = auto_targets(package, edition.as_ref(), &targets);
+
     Ok(CargoPackageManifest {
         name: package
             .and_then(|p| p.get("name"))
             .and_then(TomlItem::as_str)
             .map(str::to_owned),
         version: package.and_then(|p| package_field(p, "version")),
-        edition: package.and_then(|p| package_field(p, "edition")),
+        edition,
         rust_version: package.and_then(|p| package_field(p, "rust-version")),
         features: features_table(root),
         optional_dependencies: optional_dependencies(root),
-        targets: targets(root, package),
-        auto_targets: auto_targets(package),
+        targets,
+        auto_targets,
         cfg_dependency_tables: cfg_dependency_tables(root, &starts),
     })
 }
@@ -470,21 +497,31 @@ fn target_from(kind: CargoTargetKind, table: &dyn TableLike) -> CargoTarget {
     }
 }
 
-/// Read the discovery flags — the `auto*` keys and `build` — each defaulting to Cargo's
-/// `true`.
-fn auto_targets(package: Option<&dyn TableLike>) -> AutoTargets {
-    let flag = |key: &str| {
-        package
-            .and_then(|p| p.get(key))
-            .and_then(TomlItem::as_bool)
-            .unwrap_or(true)
+/// Read the discovery flags — the `auto*` keys and `build`.
+///
+/// An `auto*` key settles its kind outright. Without one the flag is Cargo's `true`, except
+/// under edition 2015, where a declared target of a kind turns that kind's discovery off;
+/// `declared` is [`targets`] so the two answers cannot drift apart.
+fn auto_targets(
+    package: Option<&dyn TableLike>,
+    edition: Option<&PackageField>,
+    declared: &[CargoTarget],
+) -> AutoTargets {
+    // An absent `edition` key means 2015. An inherited one resolves only against the
+    // workspace root, so it is assumed to be 2018 or later and suppresses nothing.
+    let edition_2015 = edition.is_none_or(|e| e.literal() == Some(EDITION_2015));
+    let flag = |key: &str, kind: CargoTargetKind| {
+        if let Some(explicit) = package.and_then(|p| p.get(key)).and_then(TomlItem::as_bool) {
+            return explicit;
+        }
+        !(edition_2015 && declared.iter().any(|t| t.kind == kind))
     };
     AutoTargets {
-        lib: flag("autolib"),
-        bins: flag("autobins"),
-        tests: flag("autotests"),
-        benches: flag("autobenches"),
-        examples: flag("autoexamples"),
+        lib: flag("autolib", CargoTargetKind::Lib),
+        bins: flag("autobins", CargoTargetKind::Bin),
+        tests: flag("autotests", CargoTargetKind::Test),
+        benches: flag("autobenches", CargoTargetKind::Bench),
+        examples: flag("autoexamples", CargoTargetKind::Example),
         // `build` is the one key here that is not a discovery flag at all — it is the
         // script declaration — so it cannot use `flag`, which would read `build = true`
         // and a declared path alike as "discover". Only an absent key leaves anything to
@@ -807,6 +844,124 @@ autotests = false
         assert!(manifest.auto_targets.lib);
         assert!(manifest.auto_targets.benches);
         assert!(manifest.auto_targets.examples);
+    }
+
+    #[test]
+    fn edition_2015_suppresses_discovery_only_for_the_kinds_it_declares() {
+        // No `edition` key is edition 2015, where declaring a target of a kind turns that
+        // kind's discovery off — and Cargo leaves every other kind discovering.
+        let manifest = parse(
+            r#"
+[package]
+name = "x"
+
+[[bin]]
+name = "declared"
+path = "other/bin.rs"
+"#,
+        );
+        assert!(!manifest.auto_targets.bins);
+        assert!(manifest.auto_targets.lib);
+        assert!(manifest.auto_targets.tests);
+        assert!(manifest.auto_targets.benches);
+        assert!(manifest.auto_targets.examples);
+    }
+
+    #[test]
+    fn an_explicit_edition_2015_reads_like_an_absent_one() {
+        let declarations = r#"
+[lib]
+path = "other/lib.rs"
+
+[[test]]
+name = "declared"
+path = "other/test.rs"
+"#;
+        let absent = parse(&format!("[package]\nname = \"x\"\n{declarations}"));
+        let explicit = parse(&format!(
+            "[package]\nname = \"x\"\nedition = \"2015\"\n{declarations}"
+        ));
+        assert_eq!(absent.auto_targets, explicit.auto_targets);
+        assert!(!explicit.auto_targets.lib);
+        assert!(!explicit.auto_targets.tests);
+        assert!(explicit.auto_targets.bins);
+        assert!(explicit.auto_targets.benches);
+        assert!(explicit.auto_targets.examples);
+    }
+
+    #[test]
+    fn edition_2018_or_later_discovers_alongside_declared_targets() {
+        // Only 2015 suppresses: a later edition discovers `src/bin/`, `tests/`, and the
+        // rest even where the manifest declares targets of the same kind.
+        let manifest = parse(
+            r#"
+[package]
+name = "x"
+edition = "2021"
+
+[lib]
+path = "other/lib.rs"
+
+[[bin]]
+name = "declared-bin"
+path = "other/bin.rs"
+
+[[test]]
+name = "declared-test"
+path = "other/test.rs"
+
+[[bench]]
+name = "declared-bench"
+path = "other/bench.rs"
+
+[[example]]
+name = "declared-example"
+path = "other/example.rs"
+"#,
+        );
+        assert_eq!(manifest.auto_targets, AutoTargets::default());
+    }
+
+    #[test]
+    fn an_explicit_auto_key_outranks_the_edition_rule() {
+        // Edition 2015 with a declared `[[bin]]`, but `autobins = true` asks for discovery
+        // anyway — and Cargo obliges, picking up `src/main.rs` and `src/bin/` as well.
+        let opted_in = parse(
+            r#"
+[package]
+name = "x"
+autobins = true
+
+[[bin]]
+name = "declared"
+path = "other/bin.rs"
+"#,
+        );
+        assert!(opted_in.auto_targets.bins);
+
+        // The key wins in the other direction too: a later edition declaring nothing still
+        // turns discovery off when asked.
+        let opted_out = parse("[package]\nname = \"x\"\nedition = \"2021\"\nautobins = false\n");
+        assert!(!opted_out.auto_targets.bins);
+    }
+
+    #[test]
+    fn an_inherited_edition_is_assumed_to_be_2018_or_later() {
+        // `edition.workspace = true` needs the workspace root to resolve, which an IO-free
+        // reader has not got, so the flags stay on rather than guess a suppression.
+        let manifest = parse(
+            r#"
+[package]
+name = "x"
+edition.workspace = true
+
+[[bin]]
+name = "declared"
+path = "other/bin.rs"
+"#,
+        );
+        assert_eq!(manifest.edition, Some(PackageField::Workspace));
+        assert!(manifest.auto_targets.bins);
     }
 
     #[test]
