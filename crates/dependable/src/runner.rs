@@ -4,25 +4,28 @@
 //! [`dependable_fetch::Checker`]. This module owns only CLI concerns: config
 //! layering, manifest discovery, progress UX, output rendering, and exit codes.
 
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use dependable_fetch::core::{
-    AlternateRegistryDecl, NpmrcConfig, parse, parse_cargo_config, parse_npmrc,
+    AlternateRegistryDecl, NpmrcConfig, PackageField, ProjectMeta, WorkspaceDecl, apply_lockfile,
+    parse, parse_cargo_config, parse_lockfile, parse_npmrc, parse_project, parse_workspace,
 };
 use dependable_fetch::{
-    CheckError, Checker, CratesIoFetcher, DependencyStatus, Ecosystem, GoProxyFetcher, GraphSource,
-    HexFetcher, JsrFetcher, ManifestKind, NpmFetcher, NuGetFetcher, PackageSource,
-    PackagistFetcher, ParseError, ProgressEvent, PubDevFetcher, PyPiFetcher, RegistryFetcher,
-    ScopedRegistry, TreeOptions, UnstableFilter, WorkspaceGraphOptions, build_client,
-    build_workspace_graph,
+    CheckError, Checker, CratesIoFetcher, DependencyKind, DependencyStatus, Ecosystem,
+    GoProxyFetcher, GraphSource, HexFetcher, Item, JsrFetcher, ManifestKind, NpmFetcher,
+    NuGetFetcher, PackageSource, PackagistFetcher, ParseError, ProgressEvent, PubDevFetcher,
+    PyPiFetcher, RegistryFetcher, ScopedRegistry, TreeOptions, UnstableFilter,
+    WorkspaceGraphOptions, build_client, build_workspace_graph,
 };
 use indicatif::{ProgressBar, ProgressStyle};
 
 use crate::cli::{CheckArgs, FailOn, FixArgs, ListArgs, TreeArgs};
 use crate::config::{Config, load_config};
+use crate::output::list::ProjectReport;
 use crate::output::{self, ManifestReport};
 use crate::{discover, fix};
 
@@ -301,7 +304,11 @@ pub async fn run_check(args: CheckArgs) -> anyhow::Result<ExitCode> {
 }
 
 /// `dependable list`
+///
+/// Offline by default: every manifest is parsed, its declared identity read, and any
+/// sibling lockfile applied. Only `--features` touches the network.
 pub async fn run_list(args: ListArgs) -> anyhow::Result<ExitCode> {
+    let root = args.path.clone().unwrap_or_else(|| PathBuf::from("."));
     let manifests = collect_manifests(args.manifest.as_deref(), args.path.as_deref(), args.depth);
     if manifests.is_empty() {
         eprintln!("No supported manifests found.");
@@ -317,14 +324,14 @@ pub async fn run_list(args: ListArgs) -> anyhow::Result<ExitCode> {
         None
     };
 
-    let mut printed = 0;
+    let mut reports = Vec::new();
     for manifest in &manifests {
         let Some(kind) = ManifestKind::detect(manifest) else {
             continue;
         };
         let content = std::fs::read_to_string(manifest)
             .with_context(|| format!("reading {}", manifest.display()))?;
-        let parsed = match parse(kind, &content) {
+        let mut parsed = match parse(kind, &content) {
             Ok(parsed) => parsed,
             Err(ParseError::Unsupported(_)) => {
                 eprintln!(
@@ -340,44 +347,212 @@ pub async fn run_list(args: ListArgs) -> anyhow::Result<ExitCode> {
                 );
             }
         };
-        if printed > 0 {
-            println!();
-        }
-        printed += 1;
-        println!(
-            "{} — {} ({} dependencies)",
-            manifest.display(),
-            kind.ecosystem().display_name(),
-            parsed.items.len()
-        );
-        for item in &parsed.items {
-            let constraint = if item.version_constraint.is_empty() {
-                "—"
-            } else {
-                &item.version_constraint
-            };
-            let note = match item.source {
-                PackageSource::Local => " (local)",
-                PackageSource::Git => " (git)",
-                PackageSource::Jsr => " (jsr)",
-                PackageSource::Registry => "",
-                _ => "",
-            };
-            println!("  {} {}{}", item.name, constraint, note);
 
-            // Under `--features`, show the crate's available feature flags. Only
-            // crates.io exposes them, so this is limited to checkable Rust deps.
-            if let Some(fetcher) = &feature_fetcher
-                && kind.ecosystem() == Ecosystem::Rust
-                && item.is_checkable()
-                && let Ok(fetched) = fetcher.fetch_versions(&item.name).await
-                && !fetched.features.is_empty()
-            {
-                println!("      features: {}", fetched.features.join(", "));
+        let lockfile = (!args.no_lock_file)
+            .then(|| apply_nearest_lockfile(manifest, kind, &root, &mut parsed.items))
+            .flatten();
+        // A member writing `dep.workspace = true` states no version of its own; the
+        // constraint lives in the workspace root.
+        let inherited = inherit_workspace_constraints(manifest, kind, &mut parsed.items);
+        let meta = parse_project(kind, &content);
+        let (version, version_inherited) = resolve_version(manifest, kind, &meta);
+
+        let mut features = BTreeMap::new();
+        if let Some(fetcher) = &feature_fetcher {
+            for item in &parsed.items {
+                if kind.ecosystem() == Ecosystem::Rust
+                    && item.is_checkable()
+                    && let Ok(fetched) = fetcher.fetch_versions(&item.name).await
+                    && !fetched.features.is_empty()
+                {
+                    features.insert(item.name.clone(), fetched.features);
+                }
             }
         }
+
+        reports.push(ProjectReport {
+            relative: relative_to(&root, manifest),
+            ecosystem: kind.ecosystem(),
+            // A `*.csproj` is named by its file, which the IO-free reader cannot see.
+            name: meta.name.clone().or_else(|| csproj_name(manifest, kind)),
+            version,
+            version_inherited,
+            role: meta.role,
+            lockfile,
+            inherited,
+            items: parsed.items,
+            features,
+        });
     }
+
+    output::list::render(args.format, &reports, &root)?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// Apply the nearest lockfile at or above the manifest, returning its path relative to
+/// `root` when one was read.
+///
+/// A workspace keeps one lockfile at its root, so a member's locked versions are only
+/// found by walking up. The walk stops at the repository root (the first ancestor
+/// holding a `.git`) so a stray lockfile outside the project is never read, and the
+/// path that was used is reported rather than assumed.
+fn apply_nearest_lockfile(
+    manifest: &Path,
+    kind: ManifestKind,
+    root: &Path,
+    items: &mut [Item],
+) -> Option<String> {
+    let name = kind.lockfile_name()?;
+    let mut dir = manifest.parent()?;
+    loop {
+        let candidate = dir.join(name);
+        if let Ok(content) = std::fs::read_to_string(&candidate)
+            && let Ok(resolved) = parse_lockfile(kind, &content)
+        {
+            apply_lockfile(items, &resolved);
+            return Some(relative_to(root, &candidate).display().to_string());
+        }
+        if dir.join(".git").exists() {
+            return None;
+        }
+        dir = dir.parent()?;
+    }
+}
+
+/// Fill in the constraints a member inherits from `[workspace.dependencies]`, returning
+/// the names that were resolved that way.
+///
+/// A `dep.workspace = true` entry parses as a local dependency with no constraint —
+/// correct for version checking, which must skip it, but an inventory that reported it
+/// that way would hide both the version in force and the fact that the crate comes from
+/// a registry. The workspace root's own declaration supplies all of it.
+fn inherit_workspace_constraints(
+    manifest: &Path,
+    kind: ManifestKind,
+    items: &mut [Item],
+) -> Vec<String> {
+    if kind != ManifestKind::CargoToml {
+        return Vec::new();
+    }
+    let Some(declared) = workspace_declarations(manifest) else {
+        return Vec::new();
+    };
+    let mut inherited = Vec::new();
+    for item in items {
+        // Only an entry with nothing of its own to say can be inheriting.
+        if !item.version_constraint.is_empty() || item.source != PackageSource::Local {
+            continue;
+        }
+        let Some(source) = declared.get(&item.name) else {
+            continue;
+        };
+        item.version_constraint
+            .clone_from(&source.version_constraint);
+        item.source = source.source;
+        item.registry.clone_from(&source.registry);
+        inherited.push(item.name.clone());
+    }
+    inherited
+}
+
+/// The `[workspace.dependencies]` entries of the nearest ancestor workspace root, keyed
+/// by package name.
+fn workspace_declarations(manifest: &Path) -> Option<HashMap<String, Item>> {
+    let (_, content) = nearest_workspace_root(manifest)?;
+    let parsed = parse(ManifestKind::CargoToml, &content).ok()?;
+    Some(
+        parsed
+            .items
+            .into_iter()
+            .filter(|item| item.kind == DependencyKind::Workspace)
+            .map(|item| (item.name.clone(), item))
+            .collect(),
+    )
+}
+
+/// The manifest's version, resolving a Cargo `version.workspace = true` against the
+/// nearest ancestor `[workspace.package]` table. Returns the version and whether it was
+/// inherited.
+fn resolve_version(
+    manifest: &Path,
+    kind: ManifestKind,
+    meta: &ProjectMeta,
+) -> (Option<String>, bool) {
+    match &meta.version {
+        None => (None, false),
+        Some(PackageField::Literal(version)) => (Some(version.clone()), false),
+        Some(PackageField::Workspace) => {
+            let inherited = workspace_package_defaults(manifest, kind)
+                .and_then(|defaults| defaults.get("version").cloned());
+            (inherited, true)
+        }
+        // A future inheritance form resolves to nothing rather than a wrong version.
+        _ => (None, true),
+    }
+}
+
+/// `[workspace.package]` from the nearest ancestor `Cargo.toml` declaring a workspace.
+fn workspace_package_defaults(
+    manifest: &Path,
+    kind: ManifestKind,
+) -> Option<BTreeMap<String, String>> {
+    if kind != ManifestKind::CargoToml {
+        return None;
+    }
+    let (workspace, _) = nearest_workspace_root(manifest)?;
+    Some(workspace.package_defaults)
+}
+
+/// The nearest ancestor `Cargo.toml` declaring a `[workspace]`, with its content.
+///
+/// The manifest itself is excluded: a member inherits from a root above it, and a root
+/// that is also a package declares its own values literally. The walk stops at the
+/// repository root so inheritance never resolves against a manifest outside the project.
+fn nearest_workspace_root(manifest: &Path) -> Option<(WorkspaceDecl, String)> {
+    let mut dir = manifest.parent()?;
+    loop {
+        let candidate = dir.join("Cargo.toml");
+        if !same_file(&candidate, manifest)
+            && let Ok(content) = std::fs::read_to_string(&candidate)
+            && let Some(workspace) = parse_workspace(&content)
+        {
+            return Some((workspace, content));
+        }
+        if dir.join(".git").exists() {
+            return None;
+        }
+        dir = dir.parent()?;
+    }
+}
+
+/// Whether two paths name the same file. Compared after canonicalization, since a
+/// discovered manifest (`./Cargo.toml`) and a candidate built while walking up
+/// (`Cargo.toml`) can spell one file two ways.
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
+/// A `*.csproj`'s project name is its file stem; `Directory.Packages.props` is a central
+/// version file and keeps no name.
+fn csproj_name(manifest: &Path, kind: ManifestKind) -> Option<String> {
+    if kind != ManifestKind::Csproj {
+        return None;
+    }
+    let name = manifest.file_name()?.to_str()?;
+    if name == "Directory.Packages.props" {
+        return None;
+    }
+    Some(manifest.file_stem()?.to_string_lossy().into_owned())
+}
+
+/// `manifest` relative to the scanned `root`, falling back to the path as given.
+fn relative_to(root: &Path, manifest: &Path) -> PathBuf {
+    manifest
+        .strip_prefix(root)
+        .map_or_else(|_| manifest.to_path_buf(), Path::to_path_buf)
 }
 
 /// `dependable tree`
