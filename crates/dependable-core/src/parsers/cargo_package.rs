@@ -80,8 +80,9 @@ pub enum CargoTargetKind {
     Bench,
     /// `[[example]]`.
     Example,
-    /// The `[package] build` script, however it is written (`build = "…"` or the
-    /// `build = true` shorthand for a root `build.rs`).
+    /// The `[package] build` script, however it is written (`build = "…"`, the
+    /// `build = true` shorthand for a root `build.rs`, or one entry of a
+    /// `multiple-build-scripts` array).
     BuildScript,
 }
 
@@ -162,9 +163,10 @@ pub struct AutoTargets {
     /// `build` — discover a `build.rs` at the package root. `true` only when the manifest
     /// writes no `build` key at all, which is the one case Cargo answers from the
     /// filesystem. Every explicit value settles the question in the manifest instead:
-    /// `build = false` turns the script off outright, while `build = true` and
-    /// `build = "…"` name it in [`targets`](CargoPackageManifest::targets). In all three
-    /// a caller must *not* discover, or it would attach a root `build.rs` Cargo never runs.
+    /// `build = false` turns the script off outright, while `build = true`, `build = "…"`,
+    /// and an array of paths name the scripts in
+    /// [`targets`](CargoPackageManifest::targets). In all of them a caller must *not*
+    /// discover, or it would attach a root `build.rs` Cargo never runs.
     pub build: bool,
 }
 
@@ -405,9 +407,14 @@ fn targets(root: &dyn TableLike, package: Option<&dyn TableLike>) -> Vec<CargoTa
         }
     }
 
-    // `build = "…"` and `build = true` both declare a script; `build = false` declares
-    // none and is reported through [`AutoTargets::build`] instead.
-    if let Some(path) = package.and_then(|p| p.get("build")).and_then(build_script) {
+    // `build = "…"`, `build = true`, and the `multiple-build-scripts` array all declare
+    // scripts — one target per path; `build = false` declares none and is reported
+    // through [`AutoTargets::build`] instead.
+    let scripts = package
+        .and_then(|p| p.get("build"))
+        .map(build_scripts)
+        .unwrap_or_default();
+    for path in scripts {
         targets.push(CargoTarget {
             kind: CargoTargetKind::BuildScript,
             name: None,
@@ -419,16 +426,28 @@ fn targets(root: &dyn TableLike, package: Option<&dyn TableLike>) -> Vec<CargoTa
     targets
 }
 
-/// The path a `[package] build` value declares, or `None` for `build = false`.
+/// Every script path a `[package] build` value declares, in manifest order.
 ///
-/// A string is the path as written; `build = true` is Cargo's shorthand for a `build.rs`
-/// at the package root, which it expands to the same declared target.
-fn build_script(build: &TomlItem) -> Option<String> {
-    match (build.as_str(), build.as_bool()) {
-        (Some(path), _) => Some(path.to_owned()),
-        (None, Some(true)) => Some("build.rs".to_owned()),
-        (None, _) => None,
+/// A string is the one path as written; `build = true` is Cargo's shorthand for a
+/// `build.rs` at the package root, which it expands to the same declared target; an array
+/// of paths is the `multiple-build-scripts` form, which declares one target each.
+/// `build = false` declares none, and so does every remaining TOML type — Cargo refuses
+/// to load a manifest whose `build` is an integer or a table (`invalid type: integer`,
+/// `invalid type: map`), so there is nothing there for a caller to be told about.
+fn build_scripts(build: &TomlItem) -> Vec<String> {
+    if let Some(path) = build.as_str() {
+        return vec![path.to_owned()];
     }
+    if let Some(paths) = build.as_array() {
+        return paths
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect();
+    }
+    if build.as_bool() == Some(true) {
+        return vec!["build.rs".to_owned()];
+    }
+    Vec::new()
 }
 
 /// Read one target table's `name`, `path`, and `required-features`.
@@ -550,6 +569,9 @@ rust-version = "1.92"
         assert_eq!(manifest.name, None);
         assert!(manifest.features.is_empty());
         assert!(manifest.targets.is_empty());
+        // No `[package]` table settles nothing, so every flag — `build` included — keeps
+        // Cargo's default: a caller with the filesystem still decides.
+        assert_eq!(manifest.auto_targets, AutoTargets::default());
     }
 
     #[test]
@@ -751,6 +773,19 @@ name = "integration"
         let named = parse("[package]\nname = \"x\"\nbuild = \"scripts/build.rs\"\n");
         assert_eq!(script_paths(&named), [Some("scripts/build.rs".to_owned())]);
         assert!(!named.auto_targets.build);
+
+        // The `multiple-build-scripts` array: one target per path, in manifest order.
+        let several = parse("[package]\nname = \"x\"\nbuild = [\"build.rs\", \"b2.rs\"]\n");
+        assert_eq!(
+            script_paths(&several),
+            [Some("build.rs".to_owned()), Some("b2.rs".to_owned())]
+        );
+        assert!(!several.auto_targets.build);
+
+        // Any other type declares nothing — Cargo refuses to load such a manifest at
+        // all, so no caller ever sees the answer.
+        let rejected = parse("[package]\nname = \"x\"\nbuild = 3\n");
+        assert!(script_paths(&rejected).is_empty());
     }
 
     #[test]
