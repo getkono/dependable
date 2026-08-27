@@ -29,7 +29,7 @@ impl Parser for CargoTomlParser {
         // [dependencies], [dev-dependencies], [build-dependencies]
         for &section in DEP_SECTIONS {
             if let Some(table) = root.get(section).and_then(|i| i.as_table_like()) {
-                collect(table, &starts, &mut items);
+                collect_dependencies(table, &starts, &mut items);
             }
         }
 
@@ -40,7 +40,7 @@ impl Parser for CargoTomlParser {
             .and_then(|ws| ws.get("dependencies"))
             .and_then(|i| i.as_table_like())
         {
-            collect(deps, &starts, &mut items);
+            collect_dependencies(deps, &starts, &mut items);
         }
 
         // [registries.*] — alternate registry index URLs
@@ -144,7 +144,12 @@ fn registries_in(content: &str) -> Vec<(String, Option<String>, Option<String>)>
         .collect()
 }
 
-fn collect(table: &dyn TableLike, starts: &[usize], items: &mut Vec<Item>) {
+/// Parse every dependency in one dependency table into `items`.
+///
+/// Shared with [`cargo_package`](super::cargo_package), so a `cfg`-gated table under
+/// `[target.…]` yields exactly the same [`Item`]s — version positions included — as a
+/// top-level `[dependencies]` table.
+pub(super) fn collect_dependencies(table: &dyn TableLike, starts: &[usize], items: &mut Vec<Item>) {
     for (name, item) in table.iter() {
         if let Some(parsed) = parse_dependency(name, item, starts) {
             items.push(parsed);

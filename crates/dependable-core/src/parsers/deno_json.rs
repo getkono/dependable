@@ -47,11 +47,12 @@ fn build_item(entry: &JsonStringValue, starts: &[usize]) -> Option<Item> {
     {
         let (n, c, off) = split_alias(rest, "jsr:".len());
         (n, c, PackageSource::Jsr, off)
-    } else if let Some(rest) = value.strip_prefix("npm:") {
+    } else {
+        // Anything that is not a `jsr:` or `npm:` specifier is a URL, a relative path,
+        // or a `node:`/`file:`/`data:` scheme — none of which name a registry package.
+        let rest = value.strip_prefix("npm:")?;
         let (n, c, off) = split_alias(rest, "npm:".len());
         (n, c, PackageSource::Registry, off)
-    } else {
-        return None;
     };
 
     let global_start = entry.content_start + version_offset;
