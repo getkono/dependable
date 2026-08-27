@@ -33,7 +33,7 @@ pub struct ProjectReport {
     /// Whether this is a package, a central-version manifest, or an unnamed list.
     pub role: ProjectRole,
     /// The lockfile that supplied locked versions, relative to the scanned root.
-    pub lockfile: Option<String>,
+    pub lockfile: Option<PathBuf>,
     /// Dependencies whose constraint was inherited from a workspace root.
     pub inherited: Vec<String>,
     /// The declared dependencies, in manifest order.
@@ -119,7 +119,7 @@ fn table(reports: &[ProjectReport]) {
 fn text(reports: &[ProjectReport]) {
     for report in reports {
         let label = report.label();
-        let manifest = report.relative.display().to_string();
+        let manifest = posix(&report.relative);
         for item in &report.items {
             println!(
                 "{label}\t{}\t{manifest}\t{}\t{}\t{}\t{}\t{}",
@@ -153,8 +153,8 @@ fn json(reports: &[ProjectReport], root: &Path) -> anyhow::Result<()> {
             version_inherited: report.version_inherited,
             ecosystem: report.ecosystem.display_name(),
             role: role_token(report.role),
-            manifest: report.relative.display().to_string(),
-            lockfile: report.lockfile.as_deref(),
+            manifest: posix(&report.relative),
+            lockfile: report.lockfile.as_deref().map(posix),
             dependencies: report
                 .items
                 .iter()
@@ -176,7 +176,7 @@ fn json(reports: &[ProjectReport], root: &Path) -> anyhow::Result<()> {
 
     let output = Output {
         schema: SCHEMA,
-        root: root.display().to_string(),
+        root: posix(root),
         summary: SummaryDto {
             projects: reports.len(),
             dependencies,
@@ -211,7 +211,7 @@ struct ProjectDto<'a> {
     ecosystem: &'static str,
     role: &'static str,
     manifest: String,
-    lockfile: Option<&'a str>,
+    lockfile: Option<String>,
     dependencies: Vec<DependencyDto<'a>>,
 }
 
@@ -230,6 +230,18 @@ struct DependencyDto<'a> {
     inherited: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     features: Option<&'a [String]>,
+}
+
+/// A path with `/` separators, whatever the platform uses.
+///
+/// The machine-readable formats are consumed by tooling that joins these paths with
+/// paths from elsewhere (git, a config file, another tool's output), all of which speak
+/// `/` — so a Windows run must not produce a differently-shaped document.
+fn posix(path: &Path) -> String {
+    path.components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// A stable token for a project's role.

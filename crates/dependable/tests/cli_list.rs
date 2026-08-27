@@ -61,6 +61,8 @@ fn reports_every_project_in_a_workspace_with_its_identity() {
     let app = project(&doc, "app");
     assert_eq!(app["version"], "0.1.0");
     assert_eq!(app["role"], "package");
+    // Paths are `/`-separated on every platform: the document is consumed by tooling
+    // that joins them with paths from git and other tools, which speak `/`.
     assert_eq!(app["manifest"], "crates/app/Cargo.toml");
 
     // The workspace root declares no package of its own.

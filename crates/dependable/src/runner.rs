@@ -401,7 +401,7 @@ fn apply_nearest_lockfile(
     kind: ManifestKind,
     root: &Path,
     items: &mut [Item],
-) -> Option<String> {
+) -> Option<PathBuf> {
     let name = kind.lockfile_name()?;
     let mut dir = manifest.parent()?;
     loop {
@@ -410,7 +410,7 @@ fn apply_nearest_lockfile(
             && let Ok(resolved) = parse_lockfile(kind, &content)
         {
             apply_lockfile(items, &resolved);
-            return Some(relative_to(root, &candidate).display().to_string());
+            return Some(relative_to(root, &candidate));
         }
         if dir.join(".git").exists() {
             return None;
