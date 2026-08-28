@@ -76,8 +76,9 @@ pub use registries::{
 pub use dependable_core as core;
 pub use dependable_core::{
     CheckResult, DependencyGraph, DependencyKind, DependencyStatus, Ecosystem, Evaluation, Item,
-    LockfileKind, ManifestKind, Node, NodeKind, PackageSource, ParseError, ParsedManifest, Tree,
-    TreeNode, TreeOptions, UnstableFilter,
+    LockfileKind, ManifestKind, Node, NodeKind, PackageSource, ParseError, ParsedManifest,
+    PathPredicate, Placement, Tree, TreeNode, TreeOptions, UnstableFilter, Visit, Visitor,
+    WalkOptions,
 };
 
 /// One-import convenience for consumers: `use dependable_fetch::prelude::*;`.

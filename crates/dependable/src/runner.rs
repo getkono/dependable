@@ -628,6 +628,7 @@ pub fn run_tree(args: TreeArgs) -> anyhow::Result<ExitCode> {
     let tree_opts = TreeOptions {
         max_depth: args.depth,
         dedupe: !args.no_dedupe,
+        ..TreeOptions::default()
     };
     output::tree::render(&graph, args.format, &tree_opts)?;
     Ok(ExitCode::SUCCESS)

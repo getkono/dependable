@@ -99,7 +99,7 @@ fn label(graph: &DependencyGraph, node: &TreeNode) -> String {
         NodeKind::Path => text.push_str(" (path)"),
         _ => {}
     }
-    if node.deduped {
+    if node.deduped() {
         text.push_str(" (*)");
     }
     let mut style = match n.kind {
@@ -108,7 +108,7 @@ fn label(graph: &DependencyGraph, node: &TreeNode) -> String {
         NodeKind::Path => Style::new().yellow(),
         _ => Style::new(),
     };
-    if node.deduped {
+    if node.deduped() {
         style = style.dimmed();
     }
     format!(
@@ -301,6 +301,7 @@ source = "registry+https://x"
         let opts = TreeOptions {
             max_depth: Some(0),
             dedupe: true,
+            ..TreeOptions::default()
         };
         let out = ascii(&sample(), &opts);
         assert!(out.contains("app v0.1.0 (workspace)"));

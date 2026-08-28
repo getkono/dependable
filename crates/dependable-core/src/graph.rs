@@ -62,6 +62,9 @@ pub struct TreeOptions {
     pub max_depth: Option<usize>,
     /// Collapse a package's second and later appearances to a `(*)` marker.
     pub dedupe: bool,
+    /// Collapse a crate that has a tree of its own in this forest to a pointer
+    /// at that tree, rather than repeating its subtree wherever it is reached.
+    pub collapse_roots: bool,
 }
 
 impl Default for TreeOptions {
@@ -69,6 +72,119 @@ impl Default for TreeOptions {
         Self {
             max_depth: None,
             dedupe: true,
+            collapse_roots: false,
+        }
+    }
+}
+
+/// Why an appearance of a node does or does not show its dependencies below it.
+///
+/// Every reason a walk stops is named, rather than collapsed into one flag,
+/// because they are different things to tell a reader: a repeat is shown in
+/// full elsewhere, a cycle is shown higher on this same path, and a root has a
+/// tree of its own in the forest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Placement {
+    /// Shown in full; its dependencies, if any, follow it.
+    Full,
+    /// Already expanded elsewhere in this walk, collapsed by
+    /// [`WalkOptions::dedupe`]. Its dependencies are at its first appearance.
+    Repeat,
+    /// Already on the path from the root to here. Expanding it would not
+    /// terminate, so the back-edge is cut — always, whatever the options say.
+    Cycle,
+    /// One of the forest's own roots, reached below the top level. Its subtree
+    /// is shown at its own root entry, so this appearance points there.
+    Root {
+        /// Index into [`DependencyGraph::roots`] of the entry it points at.
+        root: usize,
+    },
+    /// [`WalkOptions::max_depth`] stopped the walk here. Whether anything lies
+    /// below is unknown from this appearance alone.
+    Depth,
+    /// [`WalkOptions::expand`] declined to open it — a closed row in an
+    /// interactive tree. Never produced when no predicate is given.
+    Collapsed,
+}
+
+/// One node, as a walk reaches it.
+///
+/// Handed to a [`Visitor`] by reference and valid only for that call: `path`
+/// borrows the walk's own buffer, which is rewritten as the walk moves on.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct Visit<'a> {
+    /// Where this appearance sits: [`WalkOptions::prefix`], then the index of
+    /// each *slot* taken from there — the position within the parent's
+    /// dependency list, which is stable whatever the walk chooses to expand.
+    pub path: &'a [usize],
+    /// Edge depth below the forest's roots; a root is `0`.
+    pub depth: usize,
+    /// Index into [`DependencyGraph::nodes`].
+    pub node: usize,
+    /// Whether this appearance is expanded, and if not, why not.
+    pub placement: Placement,
+    /// How many direct dependencies the node has *in the graph*, whether or not
+    /// this appearance shows them.
+    pub degree: usize,
+}
+
+/// Receives each node a walk reaches.
+///
+/// [`Self::enter`] and [`Self::leave`] are called in matched pairs around every
+/// node the walk emits, so an implementor can build a nested structure without
+/// tracking depth itself. `leave` is called even for a node not descended into.
+pub trait Visitor {
+    /// Called on arriving at a node, before any of its dependencies.
+    fn enter(&mut self, visit: &Visit<'_>);
+
+    /// Called after the node's dependencies, if any were walked.
+    fn leave(&mut self, node: usize) {
+        let _ = node;
+    }
+}
+
+/// A question a walk asks about the node at a given [`Visit::path`].
+pub type PathPredicate<'a> = &'a dyn Fn(&[usize]) -> bool;
+
+/// How a walk decides what to expand.
+///
+/// The defaults are what an offline `tree` render wants, so a caller states
+/// only its differences.
+#[non_exhaustive]
+pub struct WalkOptions<'a> {
+    /// Maximum edge depth. `Some(0)` = roots only; `None` = unlimited.
+    pub max_depth: Option<usize>,
+    /// Collapse a node's second and later appearances to [`Placement::Repeat`].
+    pub dedupe: bool,
+    /// Collapse a node that is one of the forest's own roots, reached below the
+    /// top level, to [`Placement::Root`] instead of expanding a second copy.
+    pub collapse_roots: bool,
+    /// Prepended to every [`Visit::path`], for a caller whose paths are rooted
+    /// above this graph.
+    pub prefix: &'a [usize],
+    /// Whether the node at this path should be expanded. `None` = always.
+    ///
+    /// Consulted last, so a repeat, a cycle, or a root is never expanded even
+    /// when this says yes.
+    pub expand: Option<PathPredicate<'a>>,
+    /// Whether the node at this path should be emitted at all. `None` = always.
+    ///
+    /// A node this rejects is skipped along with its whole subtree, but its
+    /// siblings keep their slot indices.
+    pub include: Option<PathPredicate<'a>>,
+}
+
+impl Default for WalkOptions<'_> {
+    fn default() -> Self {
+        Self {
+            max_depth: None,
+            dedupe: true,
+            collapse_roots: true,
+            prefix: &[],
+            expand: None,
+            include: None,
         }
     }
 }
@@ -85,11 +201,23 @@ pub struct Tree {
 pub struct TreeNode {
     /// Index into [`DependencyGraph::nodes`].
     pub node: usize,
-    /// Expanded children (empty when deduped, cut by a cycle, or depth-limited).
+    /// Expanded children. Empty for a leaf and for every collapsed appearance —
+    /// see [`Self::placement`] for which.
     pub children: Vec<TreeNode>,
-    /// Whether this appearance was collapsed (`(*)`): a repeat under dedupe or a
-    /// cycle back-edge. Its children are shown at its first, full appearance.
-    pub deduped: bool,
+    /// Whether this appearance is expanded, and if not, why not.
+    pub placement: Placement,
+}
+
+impl TreeNode {
+    /// Whether this appearance was collapsed to the `(*)` repeat marker: a
+    /// dedupe repeat, or a cycle back-edge.
+    ///
+    /// A crate shown at its own root entry is deliberately *not* one of these:
+    /// it is a pointer to another tree, not a copy suppressed within this one.
+    #[must_use]
+    pub fn deduped(&self) -> bool {
+        matches!(self.placement, Placement::Repeat | Placement::Cycle)
+    }
 }
 
 impl DependencyGraph {
@@ -217,65 +345,160 @@ impl DependencyGraph {
         }
     }
 
-    /// Expand the graph into a [`Tree`] from its roots. Cycles (legal in Cargo
-    /// via dev-dependencies) always terminate: a node already on the current
-    /// path is cut as a back-edge, independent of `dedupe`.
+    /// Expand the graph into a [`Tree`] from its roots.
+    ///
+    /// A thin assembly over [`Self::walk`], which owns every rule about what is
+    /// expanded where.
     #[must_use]
     pub fn tree(&self, opts: &TreeOptions) -> Tree {
-        let mut expanded: HashSet<usize> = HashSet::new();
-        let mut on_path: HashSet<usize> = HashSet::new();
-        let roots = self
-            .roots
-            .iter()
-            .map(|&r| self.build(r, 0, opts, &mut expanded, &mut on_path))
-            .collect();
-        Tree { roots }
+        let walk = WalkOptions {
+            max_depth: opts.max_depth,
+            dedupe: opts.dedupe,
+            collapse_roots: opts.collapse_roots,
+            ..WalkOptions::default()
+        };
+        let mut builder = TreeBuilder::default();
+        self.walk(&walk, &mut builder);
+        Tree {
+            roots: builder.roots,
+        }
     }
 
-    fn build(
-        &self,
-        idx: usize,
-        depth: usize,
-        opts: &TreeOptions,
-        expanded: &mut HashSet<usize>,
-        on_path: &mut HashSet<usize>,
-    ) -> TreeNode {
-        // Cut a cycle (already on this path) or a dedupe repeat (seen elsewhere).
-        if on_path.contains(&idx) || (opts.dedupe && expanded.contains(&idx)) {
-            return TreeNode {
-                node: idx,
-                children: Vec::new(),
-                deduped: true,
-            };
+    /// Walk the forest depth-first, reporting every node reached to `visitor`.
+    ///
+    /// The single traversal behind both the rendered `tree` and the interactive
+    /// UI: the rules for cycles, repeats, roots and the depth limit live here
+    /// once, so the two cannot drift apart. Cycles (legal in Cargo via
+    /// dev-dependencies) always terminate the walk, whatever the options say.
+    ///
+    /// Only subtrees that [`WalkOptions::expand`] admits are descended into, so
+    /// a caller showing a mostly-closed tree pays for what it shows rather than
+    /// for what the graph holds.
+    pub fn walk(&self, opts: &WalkOptions<'_>, visitor: &mut dyn Visitor) {
+        let mut walker = Walker {
+            graph: self,
+            opts,
+            path: opts.prefix.to_vec(),
+            expanded: HashSet::new(),
+            on_path: HashSet::new(),
+        };
+        for (slot, &root) in self.roots.iter().enumerate() {
+            walker.path.push(slot);
+            walker.visit(root, 0, visitor);
+            walker.path.pop();
         }
-        // Depth-truncated: render as a leaf but do NOT mark it seen, so a
-        // shallower path elsewhere can still expand its subtree.
-        if opts.max_depth.is_some_and(|m| depth >= m) {
-            return TreeNode {
-                node: idx,
-                children: Vec::new(),
-                deduped: false,
-            };
+    }
+}
+
+/// The state one [`DependencyGraph::walk`] carries down the forest.
+struct Walker<'a> {
+    graph: &'a DependencyGraph,
+    opts: &'a WalkOptions<'a>,
+    /// The path to the node currently being visited.
+    path: Vec<usize>,
+    /// Nodes already expanded anywhere in this walk, for `dedupe`.
+    expanded: HashSet<usize>,
+    /// Nodes on the path from a root to here, for cutting cycles.
+    on_path: HashSet<usize>,
+}
+
+impl Walker<'_> {
+    fn visit(&mut self, node: usize, depth: usize, visitor: &mut dyn Visitor) {
+        if let Some(include) = self.opts.include
+            && !include(&self.path)
+        {
+            return;
         }
-        // Rendered fully (leaf or with children) — count it as seen for dedupe.
-        expanded.insert(idx);
-        if self.edges[idx].is_empty() {
-            return TreeNode {
-                node: idx,
-                children: Vec::new(),
-                deduped: false,
-            };
+        // Copied out of `self` so the child list stays borrowed from the graph
+        // rather than from the walker, which the recursion below borrows anew.
+        let deps: &[usize] = &self.graph.edges[node];
+        let degree = deps.len();
+        let placement = self.placement(node, depth, degree);
+        visitor.enter(&Visit {
+            path: &self.path,
+            depth,
+            node,
+            placement,
+            degree,
+        });
+        if placement == Placement::Full {
+            // Only a full appearance counts as seen: a depth-truncated one must
+            // stay expandable from a shallower path elsewhere.
+            if self.opts.dedupe {
+                self.expanded.insert(node);
+            }
+            if degree > 0 {
+                self.on_path.insert(node);
+                for (slot, &child) in deps.iter().enumerate() {
+                    self.path.push(slot);
+                    self.visit(child, depth + 1, visitor);
+                    self.path.pop();
+                }
+                self.on_path.remove(&node);
+            }
         }
-        on_path.insert(idx);
-        let children = self.edges[idx]
-            .iter()
-            .map(|&c| self.build(c, depth + 1, opts, expanded, on_path))
-            .collect();
-        on_path.remove(&idx);
-        TreeNode {
-            node: idx,
-            children,
-            deduped: false,
+        visitor.leave(node);
+    }
+
+    /// Decide how this appearance of `node` is shown.
+    ///
+    /// The order is the whole contract. A cycle is cut first, so a back-edge to
+    /// a crate the reader is already standing inside is reported as the cycle it
+    /// is rather than sent somewhere else. A root is recognised before a repeat,
+    /// so a crate reached after its own entry still points at that entry instead
+    /// of degrading to `(*)`. The depth limit comes after both and, as ever,
+    /// does not mark the node seen — a shallower path elsewhere may still
+    /// expand it.
+    fn placement(&self, node: usize, depth: usize, degree: usize) -> Placement {
+        if self.on_path.contains(&node) {
+            return Placement::Cycle;
+        }
+        if self.opts.collapse_roots
+            && depth > 0
+            && let Some(root) = self.graph.root_slot(node)
+        {
+            return Placement::Root { root };
+        }
+        if self.opts.dedupe && self.expanded.contains(&node) {
+            return Placement::Repeat;
+        }
+        if self.opts.max_depth.is_some_and(|max| depth >= max) {
+            return Placement::Depth;
+        }
+        if degree > 0
+            && let Some(expand) = self.opts.expand
+            && !expand(&self.path)
+        {
+            return Placement::Collapsed;
+        }
+        Placement::Full
+    }
+}
+
+/// Assembles a [`Tree`] from a walk, using the matched `enter`/`leave` pairs to
+/// rebuild the nesting without tracking depth.
+#[derive(Default)]
+struct TreeBuilder {
+    /// One frame per node currently open; the last is the node being filled.
+    stack: Vec<TreeNode>,
+    /// Completed root trees, in walk order.
+    roots: Vec<TreeNode>,
+}
+
+impl Visitor for TreeBuilder {
+    fn enter(&mut self, visit: &Visit<'_>) {
+        self.stack.push(TreeNode {
+            node: visit.node,
+            children: Vec::new(),
+            placement: visit.placement,
+        });
+    }
+
+    fn leave(&mut self, _node: usize) {
+        let done = self.stack.pop().expect("leave is paired with enter");
+        match self.stack.last_mut() {
+            Some(parent) => parent.children.push(done),
+            None => self.roots.push(done),
         }
     }
 }
@@ -320,7 +543,7 @@ mod tests {
     fn flatten<'a>(g: &'a DependencyGraph, t: &Tree) -> Vec<(&'a str, &'a str, bool)> {
         fn walk<'a>(g: &'a DependencyGraph, n: &TreeNode, out: &mut Vec<(&'a str, &'a str, bool)>) {
             let node = &g.nodes()[n.node];
-            out.push((&node.name, &node.version, n.deduped));
+            out.push((&node.name, &node.version, n.deduped()));
             for c in &n.children {
                 walk(g, c, out);
             }
@@ -529,6 +752,7 @@ source = "registry+https://x"
         let no_dedupe = TreeOptions {
             max_depth: None,
             dedupe: false,
+            ..TreeOptions::default()
         };
         let flat2 = flatten(&g, &g.tree(&no_dedupe));
         assert_eq!(
@@ -559,6 +783,7 @@ dependencies = ["a"]
             &g.tree(&TreeOptions {
                 max_depth: None,
                 dedupe: false,
+                ..TreeOptions::default()
             }),
         );
         assert_eq!(
@@ -619,12 +844,14 @@ source = "registry+https://x"
         let roots_only = g.tree(&TreeOptions {
             max_depth: Some(0),
             dedupe: true,
+            ..TreeOptions::default()
         });
         assert_eq!(flatten(&g, &roots_only), vec![("app", "0.1.0", false)]);
 
         let one_deep = g.tree(&TreeOptions {
             max_depth: Some(1),
             dedupe: true,
+            ..TreeOptions::default()
         });
         assert_eq!(
             flatten(&g, &one_deep),

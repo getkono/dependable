@@ -17,7 +17,10 @@ pub mod semver;
 
 pub use ecosystem::Ecosystem;
 pub use error::ParseError;
-pub use graph::{DependencyGraph, Node, NodeKind, Tree, TreeNode, TreeOptions};
+pub use graph::{
+    DependencyGraph, Node, NodeKind, PathPredicate, Placement, Tree, TreeNode, TreeOptions, Visit,
+    Visitor, WalkOptions,
+};
 pub use item::{DependencyKind, Item, PackageSource};
 pub use lockfiles::{
     LockedPackage, LockfileData, ResolvedLockfile, apply_lockfile, parse_bun_lock,
