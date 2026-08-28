@@ -3,6 +3,8 @@
 use crate::error::ParseError;
 use crate::manifest::{LockfileKind, ManifestKind};
 
+pub mod bun_lock;
+pub mod bun_lock_graph;
 pub mod cargo_lock;
 pub mod cargo_lock_graph;
 pub mod composer_lock;
@@ -13,6 +15,8 @@ pub mod mix_lock_graph;
 pub mod package_lock_graph;
 pub mod package_lock_json;
 
+pub use bun_lock::parse_bun_lock;
+pub use bun_lock_graph::parse_bun_lock_graph;
 pub use cargo_lock::{LockfileData, apply_lockfile, parse_cargo_lock};
 pub use cargo_lock_graph::{LockedPackage, ResolvedLockfile, parse_cargo_lock_graph};
 pub use composer_lock::parse_composer_lock;
@@ -36,6 +40,7 @@ pub fn parse_lockfile_kind(kind: LockfileKind, content: &str) -> Result<Lockfile
     match kind {
         LockfileKind::CargoLock => parse_cargo_lock(content),
         LockfileKind::PackageLockJson => parse_package_lock(content),
+        LockfileKind::BunLock => parse_bun_lock(content),
         LockfileKind::ComposerLock => parse_composer_lock(content),
         LockfileKind::PubspecLock => parse_dart_pubspec_lock(content),
         LockfileKind::MixLock => parse_mix_lock(content),

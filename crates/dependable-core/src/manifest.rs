@@ -74,7 +74,11 @@ impl ManifestKind {
     pub fn lockfiles(self) -> &'static [LockfileKind] {
         match self {
             ManifestKind::CargoToml => &[LockfileKind::CargoLock],
-            ManifestKind::PackageJson => &[LockfileKind::PackageLockJson],
+            // `package-lock.json` first: a repository carrying both has been
+            // through a migration, and npm's is what every existing caller
+            // already resolved to. A bun-only project has only `bun.lock`, so
+            // the order costs it nothing.
+            ManifestKind::PackageJson => &[LockfileKind::PackageLockJson, LockfileKind::BunLock],
             ManifestKind::ComposerJson => &[LockfileKind::ComposerLock],
             ManifestKind::PubspecYaml => &[LockfileKind::PubspecLock],
             ManifestKind::MixExs => &[LockfileKind::MixLock],
@@ -128,6 +132,12 @@ pub enum LockfileKind {
     CargoLock,
     /// npm's `package-lock.json`.
     PackageLockJson,
+    /// Bun's text lockfile, `bun.lock`.
+    ///
+    /// Bun's older binary format, `bun.lockb`, is deliberately absent: it is not
+    /// a text format and cannot be read. It is detected during discovery and
+    /// reported, rather than being silently treated as a missing lockfile.
+    BunLock,
     /// Composer's `composer.lock`.
     ComposerLock,
     /// Dart's `pubspec.lock`.
@@ -143,6 +153,7 @@ impl LockfileKind {
         match self {
             LockfileKind::CargoLock => "Cargo.lock",
             LockfileKind::PackageLockJson => "package-lock.json",
+            LockfileKind::BunLock => "bun.lock",
             LockfileKind::ComposerLock => "composer.lock",
             LockfileKind::PubspecLock => "pubspec.lock",
             LockfileKind::MixLock => "mix.lock",
@@ -156,6 +167,7 @@ impl LockfileKind {
         [
             LockfileKind::CargoLock,
             LockfileKind::PackageLockJson,
+            LockfileKind::BunLock,
             LockfileKind::ComposerLock,
             LockfileKind::PubspecLock,
             LockfileKind::MixLock,
@@ -222,7 +234,10 @@ mod tests {
     #[test]
     fn lockfile_names() {
         assert_eq!(names(ManifestKind::CargoToml), ["Cargo.lock"]);
-        assert_eq!(names(ManifestKind::PackageJson), ["package-lock.json"]);
+        assert_eq!(
+            names(ManifestKind::PackageJson),
+            ["package-lock.json", "bun.lock"]
+        );
         assert_eq!(names(ManifestKind::ComposerJson), ["composer.lock"]);
         assert_eq!(names(ManifestKind::PubspecYaml), ["pubspec.lock"]);
         assert_eq!(names(ManifestKind::MixExs), ["mix.lock"]);

@@ -15,9 +15,9 @@ use std::path::{Path, PathBuf};
 
 use dependable_core::{
     CargoTomlParser, DependencyGraph, LockedPackage, LockfileKind, ManifestKind, PackageSource,
-    ParseError, Parser, ResolvedLockfile, parse, parse_cargo_lock_graph, parse_composer_lock_graph,
-    parse_mix_lock_graph, parse_package_lock_graph, parse_package_name, parse_project,
-    parse_workspace,
+    ParseError, Parser, ResolvedLockfile, parse, parse_bun_lock_graph, parse_cargo_lock_graph,
+    parse_composer_lock_graph, parse_mix_lock_graph, parse_package_lock_graph, parse_package_name,
+    parse_project, parse_workspace,
 };
 use thiserror::Error;
 
@@ -342,6 +342,7 @@ type GraphParser = fn(&str) -> Result<ResolvedLockfile, ParseError>;
 fn graph_parser(kind: LockfileKind) -> Option<GraphParser> {
     match kind {
         LockfileKind::PackageLockJson => Some(parse_package_lock_graph),
+        LockfileKind::BunLock => Some(parse_bun_lock_graph),
         LockfileKind::ComposerLock => Some(parse_composer_lock_graph),
         LockfileKind::MixLock => Some(parse_mix_lock_graph),
         _ => None,
