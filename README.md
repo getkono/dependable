@@ -76,6 +76,7 @@ mise run build
 ## Usage
 
 ```bash
+dependable                        # explore dependencies interactively (TUI)
 dependable check [PATH]           # check a project (default: current dir)
 dependable check . --format json  # machine-readable output (also: text)
 dependable check . --fail-on vulnerable   # exit non-zero for CI
@@ -83,6 +84,38 @@ dependable list .                 # every project and what it declares (offline)
 dependable tree .                 # render the dependency tree (Rust)
 dependable fix . --dry-run        # preview in-place upgrades
 ```
+
+## Interactive UI
+
+Run `dependable` in a terminal and it opens a browser over your dependency graph:
+every project in the repository, expanded to whatever depth you care to descend,
+with each package's public metadata beside it.
+
+```
+┌ dependencies — 4 of 11 ──────────────────┐┌ details ─────────────────────────┐
+│v Cargo.toml                              ││regex                             │
+│  v dependable-core 0.1.2 (workspace)     ││   resolved  1.12.4               │
+│    v regex 1.12.4 update                 ││     latest  1.13.1               │
+│      v aho-corasick 1.1.4 patch          ││     status  update available     │
+│          memchr 2.8.2                    ││ advisories  none known           │
+│      > regex-automata 0.4.18             ││ repository  github.com/rust-lang │
+│    > serde 1.0.228                       ││    license  MIT OR Apache-2.0    │
+│    > toml_edit 0.22.27                   ││  downloads  1.1B                 │
+└──────────────────────────────────────────┘└──────────────────────────────────┘
+```
+
+Press `?` for the keys. `/` searches by glob — `serde*`, `@types/*`,
+`{tokio,hyper}*` — and opens the tree along every path that matches, so a package
+buried six levels down is one query away.
+
+The tree is built offline from your lockfiles, so it appears instantly; the
+network is touched only for the package you actually select. Resolved transitive
+graphs are available for **Rust, npm, PHP, and Elixir**; other ecosystems show
+their directly declared dependencies and say why.
+
+Piped or in CI, a bare `dependable` prints help and exits 2 exactly as before —
+the UI only starts when there is a terminal on both ends. `dependable tui` is the
+explicit form.
 
 `check` parses every `Cargo.toml` it finds, reads `Cargo.lock`, fetches versions
 from the crates.io sparse index, classifies each dependency, and scans

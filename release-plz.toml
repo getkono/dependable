@@ -6,9 +6,10 @@
 # tags the commit and creates the GitHub Release — which the binary and packaging
 # workflows then attach assets to and publish from.
 #
-# crates.io publishing is enabled: all three crates are published so both library
+# crates.io publishing is enabled: every crate is published so both library
 # consumers (dependable-core, dependable-fetch) and `cargo install dependable`
-# work. release-plz publishes in dependency order (core → fetch → dependable).
+# work. release-plz publishes in dependency order
+# (core → fetch → tui → dependable).
 #
 # Auth is crates.io Trusted Publishing (OIDC) only — the `release` job carries
 # `id-token: write` and release-plz mints a short-lived token per run. We never
