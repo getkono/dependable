@@ -20,7 +20,8 @@ end-to-end and establishes the type model + traits that later ecosystems plug in
 |---|---|---|
 | `dependable-core` | library | Pure, IO-free: parse `Cargo.toml` + `Cargo.lock`, the core data model, and the semver comparison engine. Zero filesystem/network/async. |
 | `dependable-fetch` | library | The high-level, public end-to-end entry point: the `Checker` (parse → fetch → evaluate → OSV scan) over the crates.io sparse-index fetcher, OSV vulnerability client, and moka in-process cache. Re-exports the core types so external consumers depend on this crate alone. |
-| `dependable` | application | CLI: `check` / `list` / `tree` / `fix`, with `table` / `json` / `text` output, `.dependable.toml` + `DEPENDABLE_*` config, and `--fail-on` CI exit codes. |
+| `dependable-tui` | library | The interactive terminal UI (ratatui): the dependency forest, recursive drill-down, glob search, and the package detail pane. Holds no IO of its own — it drives `dependable-fetch`. |
+| `dependable` | application | CLI: `check` / `list` / `tree` / `fix` / `tui`, with `table` / `json` / `text` output, `.dependable.toml` + `DEPENDABLE_*` config, and `--fail-on` CI exit codes. A bare `dependable` in a terminal opens the TUI. |
 
 `dependable-report` (the V2 crate) is **not** created in V1.
 
@@ -44,6 +45,43 @@ is understanding crate relationships and the blast radius of a change.
   (`dependable_core::graph`) are ecosystem-independent; only the `Cargo.lock`/workspace
   *builder* (`dependable_fetch::tree`) is Rust-specific, so other ecosystems can plug in
   a builder later. Non-Rust `tree` support is deferred.
+
+### 1b. Interactive UI (`dependable`, `dependable tui`)
+
+Running `dependable` in a terminal opens the flagship interactive surface. It lists every
+project discovered in the repository, expands each one's **resolved** dependency graph to
+any depth, and shows what is known about whichever package is selected: repository,
+homepage, documentation, license, owners, description, current-vs-latest version, OSV
+advisories, downloads, publish recency, and yanked status.
+
+- **Offline first, lazy after.** The forest is built from lockfiles with no network at
+  all, so it appears immediately. Registry data is fetched only for the package actually
+  selected, once the selection settles, and is cached — browsing costs a request per
+  package *looked at*, not per package present.
+- **Only where there is a user.** Both stdin and stdout must be a terminal. Piped, in a
+  script, or in CI, a bare `dependable` reproduces its previous behavior exactly: long
+  help on stderr, nothing on stdout, exit 2. `dependable tui` refuses a pipe outright
+  rather than entering raw mode.
+- **Search is glob-based.** `serde*`, `@types/*`, `{tokio,hyper}*`. `*` deliberately
+  spans `/` so scoped npm and vendor-prefixed Composer names work; a bare word with no
+  glob syntax is a substring search.
+- **Honest about what it does not know.** A field the registry never published reads
+  "not published"; a failed lookup says so and offers a retry; an ecosystem whose
+  lockfile carries no edges says that, rather than letting an empty child list read as
+  "no dependencies".
+
+### 1c. Resolved graphs beyond Cargo
+
+`tree` remains Rust-only, but the **graph builders** are no longer Cargo-only:
+`dependable_fetch::build_project_graph` assembles a resolved transitive graph for **Rust,
+npm, PHP, and Elixir**, whose lockfiles record per-package edges.
+
+Dart and Go are *not* deferred work — `pubspec.lock` and `go.sum` record resolved
+versions but never which package required which, so no transitive graph exists to read
+offline. Python, C#, pnpm, and Deno need a lockfile parser first. All of these report
+`GraphSource::Unsupported` and fall back to directly declared dependencies.
+
+---
 
 ## 2. V1 feature-complete criteria
 

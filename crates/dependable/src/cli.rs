@@ -12,8 +12,14 @@ use serde::{Deserialize, Serialize};
     about = "Check dependency versions and known vulnerabilities"
 )]
 pub struct Cli {
+    /// The subcommand, or `None` for a bare `dependable`.
+    ///
+    /// Optional so that running `dependable` with no arguments can open the TUI.
+    /// Making it optional is also what turns off clap's implicit
+    /// `subcommand_required` + `arg_required_else_help`, so `main` reproduces the
+    /// old help-and-exit behavior itself when the session is not interactive.
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -26,6 +32,8 @@ pub enum Command {
     Tree(TreeArgs),
     /// Update versions in place to the latest compatible.
     Fix(FixArgs),
+    /// Explore dependencies interactively (the default when run in a terminal).
+    Tui(TuiArgs),
 }
 
 impl Cli {
@@ -33,10 +41,12 @@ impl Cli {
     #[must_use]
     pub fn verbose(&self) -> bool {
         match &self.command {
-            Command::Check(args) => args.verbose,
-            Command::List(args) => args.verbose,
-            Command::Tree(args) => args.verbose,
-            Command::Fix(args) => args.verbose,
+            Some(Command::Check(args)) => args.verbose,
+            Some(Command::List(args)) => args.verbose,
+            Some(Command::Tree(args)) => args.verbose,
+            Some(Command::Fix(args)) => args.verbose,
+            Some(Command::Tui(args)) => args.verbose,
+            None => false,
         }
     }
 }
@@ -158,6 +168,33 @@ pub struct FixArgs {
     pub concurrency: Option<usize>,
     #[arg(short, long)]
     pub verbose: bool,
+}
+
+#[derive(Args)]
+pub struct TuiArgs {
+    /// Project directory to explore (default: current directory).
+    pub path: Option<PathBuf>,
+    /// Config file path.
+    #[arg(long, default_value = ".dependable.toml")]
+    pub config: PathBuf,
+    /// How many directories deep to search for manifests.
+    #[arg(long, default_value_t = 3)]
+    pub depth: usize,
+    /// Verbose logging. Suppressed while the UI owns the screen.
+    #[arg(short, long)]
+    pub verbose: bool,
+}
+
+impl Default for TuiArgs {
+    /// The same defaults clap applies, for a bare `dependable`.
+    fn default() -> Self {
+        Self {
+            path: None,
+            config: PathBuf::from(".dependable.toml"),
+            depth: 3,
+            verbose: false,
+        }
+    }
 }
 
 /// Output format.

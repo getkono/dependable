@@ -70,6 +70,7 @@ what exists today vs. what is roadmapped (tracked as GitHub issues; see
 
 | Surface | What it is | Status |
 |---|---|---|
+| **Interactive UI (`dependable`)** | Running `dependable` in a terminal opens a TUI over the resolved dependency graph: browse every project in the repository, descend into sub-dependencies, search by glob, and read each package's public metadata, freshness, and advisories. The graph is built offline from lockfiles; the network is touched only for the package on screen. | **Shipping** |
 | **Library (`dependable-fetch::Checker`)** | The recommended embedding point. `check_manifest(kind, &str, Option<&str>)` accepts in-memory content — ideal for **unsaved editor buffers** — while `check_path` reads from disk. Emits `ProgressEvent`s for UI progress; a `RegistryFetcher` trait makes new ecosystems purely additive; public types are `#[non_exhaustive]` for forward-compatibility. | **Shipping** |
 | **CLI JSON output** (`--format json`) | A stable machine schema: a `summary` object plus a `results` array with `status` tokens (`OK`/`PATCH`/`UPDATE`/`OUTDATED`/`VULN`/`ERROR`/`LOCAL`/`GIT`). The generic path for scripting and non-GitHub CI. | **Shipping** |
 | **CI exit codes** (`--fail-on none\|outdated\|vulnerable\|any`) | `0` = clean / threshold not met, `1` = threshold met, `2` = tool/fatal error. Also settable via `.dependable.toml` and `DEPENDABLE_FAIL_ON`. | **Shipping** |
@@ -91,9 +92,8 @@ a fast, local, single-binary engine.
   Renovate's job. We do not watch repos, run on a cron, or open pull requests.
 - **Package installation or build steps.** We never run `cargo install`, `npm install`,
   etc. We check and optionally rewrite version strings — nothing more.
-- **Transitive dependency graphs / SBOMs / container scanning.** We check the direct
-  dependencies declared in a manifest. Full-graph and image scanning belong to
-  Trivy/Grype/OWASP-style tools.
+- **SBOM generation / container scanning.** We do not emit CycloneDX or SPDX documents,
+  and we never scan images. Those belong to Trivy/Grype/OWASP-style tools.
 - **Supply-chain attestation** (Sigstore, provenance verification). V3 at the earliest;
   out of scope today.
 - **A proprietary cloud backend, account, or telemetry.** Everything works without an

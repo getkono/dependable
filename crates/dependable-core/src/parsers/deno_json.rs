@@ -19,10 +19,10 @@ impl Parser for DenoJsonParser {
         let starts = line_starts(content);
         let mut items = Vec::new();
         for entry in scan_strings(content) {
-            if is_import_entry(&entry.path) {
-                if let Some(item) = build_item(&entry, &starts) {
-                    items.push(item);
-                }
+            if is_import_entry(&entry.path)
+                && let Some(item) = build_item(&entry, &starts)
+            {
+                items.push(item);
             }
         }
         Ok(ParsedManifest {

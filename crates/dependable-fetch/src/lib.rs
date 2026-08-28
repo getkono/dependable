@@ -40,6 +40,7 @@ use std::time::Duration;
 
 pub mod cache;
 pub mod check;
+pub mod discover;
 pub mod error;
 pub mod osv;
 pub mod registries;
@@ -48,9 +49,13 @@ pub mod tree;
 // High-level entry point (recommended for embedding).
 pub use check::{CheckError, Checker, CheckerBuilder, ManifestCheck, ProgressEvent};
 
+// Manifest discovery (filesystem; shared by every frontend).
+pub use discover::{find_lockfile, find_manifests, locate_lockfile};
+
 // Workspace dependency graph (offline; reads Cargo.lock / manifests).
 pub use tree::{
-    GraphSource, TreeError, WorkspaceGraph, WorkspaceGraphOptions, build_workspace_graph,
+    GraphSource, TreeError, WorkspaceGraph, WorkspaceGraphOptions, build_project_graph,
+    build_workspace_graph,
 };
 
 // Low-level building blocks (compose-it-yourself).
@@ -59,7 +64,7 @@ pub use osv::{OsvClient, OsvQuery};
 pub use registries::npm::ScopedRegistry;
 pub use registries::{
     CratesIoFetcher, FetchedVersions, GoProxyFetcher, HexFetcher, JsrFetcher, NpmFetcher,
-    NuGetFetcher, PackagistFetcher, PubDevFetcher, PyPiFetcher, RegistryFetcher,
+    NuGetFetcher, PackageMetadata, PackagistFetcher, PubDevFetcher, PyPiFetcher, RegistryFetcher,
 };
 
 // Re-export the core types a consumer needs, so depending on `dependable-fetch`

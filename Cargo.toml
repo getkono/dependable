@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/dependable-core",
     "crates/dependable-fetch",
+    "crates/dependable-tui",
     "crates/dependable",
 ]
 # Test fixtures contain their own Cargo.toml/Cargo.lock and are parsed as data,
@@ -12,7 +13,7 @@ exclude = ["crates/dependable/tests/fixtures"]
 [workspace.package]
 version = "0.1.2"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/getkono/dependable"
 authors = ["Justin Chung"]
@@ -23,6 +24,7 @@ authors = ["Justin Chung"]
 # with [workspace.package] by release-plz) ---
 dependable-core = { version = "0.1.2", path = "crates/dependable-core" }
 dependable-fetch = { version = "0.1.2", path = "crates/dependable-fetch" }
+dependable-tui = { version = "0.1.2", path = "crates/dependable-tui" }
 # --- dependable-core (pure) ---
 toml_edit = "0.22"
 roxmltree = "0.20"
@@ -49,6 +51,10 @@ figment = { version = "0.10", features = ["toml", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 anyhow = "1"
+# --- dependable-tui (terminal UI; not pulled in by the libraries) ---
+ratatui = "0.30"
+globset = "0.4"
+jiff = "0.2"
 # dev
 wiremock = "0.6"
 tempfile = "3"

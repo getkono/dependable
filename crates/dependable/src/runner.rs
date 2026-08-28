@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::Context;
 use dependable_fetch::core::{
     AlternateRegistryDecl, NpmrcConfig, PackageField, ProjectMeta, WorkspaceDecl, apply_lockfile,
-    parse, parse_cargo_config, parse_lockfile, parse_npmrc, parse_project, parse_workspace,
+    parse, parse_cargo_config, parse_npmrc, parse_project, parse_workspace,
 };
 use dependable_fetch::{
     CheckError, Checker, CratesIoFetcher, DependencyKind, DependencyStatus, Ecosystem,
@@ -21,13 +21,14 @@ use dependable_fetch::{
     PyPiFetcher, RegistryFetcher, ScopedRegistry, TreeOptions, UnstableFilter,
     WorkspaceGraphOptions, build_client, build_workspace_graph,
 };
+use dependable_tui::TuiOptions;
 use indicatif::{ProgressBar, ProgressStyle};
 
-use crate::cli::{CheckArgs, FailOn, FixArgs, ListArgs, TreeArgs};
+use crate::cli::{CheckArgs, FailOn, FixArgs, ListArgs, TreeArgs, TuiArgs};
 use crate::config::{Config, load_config};
+use crate::fix;
 use crate::output::list::ProjectReport;
 use crate::output::{self, ManifestReport};
-use crate::{discover, fix};
 
 /// Effective settings after layering CLI flags over env vars over config.
 struct Settings {
@@ -402,21 +403,9 @@ fn apply_nearest_lockfile(
     root: &Path,
     items: &mut [Item],
 ) -> Option<PathBuf> {
-    let name = kind.lockfile_name()?;
-    let mut dir = manifest.parent()?;
-    loop {
-        let candidate = dir.join(name);
-        if let Ok(content) = std::fs::read_to_string(&candidate)
-            && let Ok(resolved) = parse_lockfile(kind, &content)
-        {
-            apply_lockfile(items, &resolved);
-            return Some(relative_to(root, &candidate));
-        }
-        if dir.join(".git").exists() {
-            return None;
-        }
-        dir = dir.parent()?;
-    }
+    let (path, resolved) = dependable_fetch::find_lockfile(manifest, kind)?;
+    apply_lockfile(items, &resolved);
+    Some(relative_to(root, &path))
 }
 
 /// Fill in the constraints a member inherits from `[workspace.dependencies]`, returning
@@ -555,6 +544,48 @@ fn relative_to(root: &Path, manifest: &Path) -> PathBuf {
         .map_or_else(|_| manifest.to_path_buf(), Path::to_path_buf)
 }
 
+/// `dependable tui` (and a bare `dependable` in a terminal)
+///
+/// Builds the same fully-wired [`Checker`] the other commands use — every enabled
+/// ecosystem, alternate registries, `.npmrc` auth — and hands it to the UI, which
+/// only ever asks it about the one package on screen.
+///
+/// # Errors
+/// Returns an error if the checker cannot be built or the terminal cannot be
+/// configured.
+pub async fn run_tui(args: TuiArgs) -> anyhow::Result<ExitCode> {
+    let cfg = load_config(&args.config);
+    let settings = tui_settings(&cfg);
+    // No progress bar: the UI draws its own screen.
+    let engine = Engine::new(&settings, &cfg, false)?;
+
+    let options = TuiOptions {
+        path: args.path.unwrap_or_else(|| PathBuf::from(".")),
+        depth: args.depth,
+    };
+    dependable_tui::run(options, Arc::new(engine.checker))
+        .await
+        .context("running the interactive UI")?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Settings for the UI: the config file's choices, with none of the check-only
+/// flags (there is no `--fail-on` or output format to honor here).
+fn tui_settings(cfg: &Config) -> Settings {
+    Settings {
+        concurrency: cfg.global.concurrency.max(1),
+        depth: 3,
+        check_lockfile: cfg.global.lock_file,
+        check_vuln: cfg.vulnerability.enabled,
+        cache: true,
+        include_ghsa: cfg.global.include_ghsa,
+        fail_on: FailOn::None,
+        unstable: cfg.global.unstable.into(),
+        registry: cfg.rust.registry.clone(),
+        osv_url: cfg.vulnerability.osv_batch_url.clone(),
+    }
+}
+
 /// `dependable tree`
 ///
 /// Offline: builds the workspace dependency graph from `Cargo.lock` (or a
@@ -647,7 +678,7 @@ fn collect_manifests(manifest: Option<&Path>, path: Option<&Path>, depth: usize)
         return vec![manifest.to_path_buf()];
     }
     let root = path.map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-    discover::find_manifests(&root, depth)
+    dependable_fetch::find_manifests(&root, depth)
 }
 
 /// Cargo's home directory: `$CARGO_HOME`, else `~/.cargo`. Returns `None` when

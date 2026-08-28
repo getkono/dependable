@@ -7,7 +7,7 @@ use futures::FutureExt;
 use futures::future::BoxFuture;
 use serde::Deserialize;
 
-use super::{FetchedVersions, RegistryFetcher};
+use super::{FetchedVersions, PackageMetadata, RegistryFetcher};
 use crate::error::FetchError;
 
 const DEFAULT_REGISTRY: &str = "https://registry.npmjs.org";
@@ -104,6 +104,51 @@ impl NpmFetcher {
     }
 }
 
+/// The **full** packument, narrowed to what we render.
+///
+/// Version checking asks for the abbreviated document, which omits all of this;
+/// metadata therefore needs its own request without that `Accept` header.
+#[derive(Deserialize)]
+struct FullPackument {
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    homepage: Option<String>,
+    #[serde(default)]
+    license: Option<String>,
+    #[serde(default)]
+    repository: Option<Repository>,
+    #[serde(default)]
+    maintainers: Vec<Maintainer>,
+    #[serde(default)]
+    time: HashMap<String, String>,
+    #[serde(default, rename = "dist-tags")]
+    dist_tags: DistTags,
+}
+
+/// npm writes `repository` either as an object or as a bare shorthand string.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Repository {
+    Url { url: String },
+    Shorthand(String),
+}
+
+impl Repository {
+    fn into_url(self) -> String {
+        match self {
+            Self::Url { url } => url,
+            Self::Shorthand(s) => s,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct Maintainer {
+    #[serde(default)]
+    name: Option<String>,
+}
+
 impl RegistryFetcher for NpmFetcher {
     fn fetch_versions<'a>(
         &'a self,
@@ -142,6 +187,63 @@ impl RegistryFetcher for NpmFetcher {
                 fetched = fetched.with_latest_tag(latest);
             }
             Ok(fetched)
+        }
+        .boxed()
+    }
+
+    fn fetch_metadata<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> BoxFuture<'a, Result<Option<PackageMetadata>, FetchError>> {
+        async move {
+            let (registry, token) = self.resolve(name);
+            let url = format!("{}/{}", registry, encode_name(name));
+            // No abbreviated `Accept` header: that form carries none of this.
+            let mut req = self.client.get(&url);
+            if let Some(token) = token {
+                req = req.header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            let resp = req.send().await?;
+            let status = resp.status();
+            if status == reqwest::StatusCode::NOT_FOUND {
+                return Err(FetchError::NotFound(name.to_string()));
+            }
+            if !status.is_success() {
+                return Err(FetchError::Status {
+                    code: status.as_u16(),
+                    package: name.to_string(),
+                });
+            }
+            let body: FullPackument = resp.json().await.map_err(|e| FetchError::Decode {
+                package: name.to_string(),
+                detail: e.to_string(),
+            })?;
+
+            // `time` is keyed by version, plus `created`/`modified` entries; the
+            // publish date we want is the one for the version tagged `latest`.
+            let last_published = body
+                .dist_tags
+                .latest
+                .as_deref()
+                .and_then(|v| body.time.get(v).cloned())
+                .or_else(|| body.time.get("modified").cloned());
+
+            Ok(Some(PackageMetadata {
+                description: body.description,
+                repository: body.repository.map(Repository::into_url),
+                homepage: body.homepage,
+                documentation: None,
+                license: body.license,
+                authors: body
+                    .maintainers
+                    .into_iter()
+                    .filter_map(|m| m.name)
+                    .collect(),
+                downloads: None,
+                last_published,
+                yanked: false,
+                msrv: None,
+            }))
         }
         .boxed()
     }

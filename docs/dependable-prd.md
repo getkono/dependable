@@ -1339,7 +1339,7 @@ what we complement, supersede, and deliberately will not build.
 - **Automatic dependency installation** — we do not run `cargo install`, `npm install`, etc. We only check and optionally update version strings in manifest files.
 - **Scheduled auto-update PR bot / hosted service** — watching repos, running on a cron, and opening pull requests is Dependabot's and Renovate's job; we complement them as the on-demand check/fix engine. See [`INTEGRATIONS.md`](INTEGRATIONS.md).
 - **Private registry authentication for non-Rust ecosystems** — Cargo alternate registries (with tokens) are supported. npm private registries via `.npmrc` auth tokens are V1.1+. Other ecosystems: deferred.
-- **Dependency graph / transitive vulnerabilities** — we only check direct dependencies as declared in manifest files.
+- **Transitive *version checking* / SBOMs** — `check` and `fix` still act only on the direct dependencies a manifest declares. Reading the **resolved graph** is no longer a non-goal: `tree` renders it and the TUI navigates it (see the TUI section), for the ecosystems whose lockfile records edges. We still do not emit SBOMs or scan container images.
 - **Package verification / supply chain** (Sigstore, etc.) — V3 at earliest.
 - **Proprietary cloud backend** — all features work without an API key or paid service.
 - **Windows cross-compilation** — `rustls` makes this possible but we will test and officially support only Linux and macOS in V1. Windows support in V1.1.
