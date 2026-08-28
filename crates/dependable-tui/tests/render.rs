@@ -91,6 +91,30 @@ fn render(app: &mut App) -> String {
         .join("\n")
 }
 
+/// Render `app` and return the screen as lines, with the geometry that frame
+/// reported for resolving pointer positions.
+fn render_with_geometry(app: &mut App) -> (Vec<String>, ui::Geometry) {
+    let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("terminal");
+    let mut geometry = ui::Geometry::default();
+    terminal
+        .draw(|frame| {
+            geometry = ui::draw(frame, app);
+        })
+        .expect("draw succeeds");
+    let lines = terminal
+        .backend()
+        .buffer()
+        .content()
+        .chunks(100)
+        .map(|row| {
+            row.iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect::<String>()
+        })
+        .collect();
+    (lines, geometry)
+}
+
 /// Render `app` and return every styled cell on screen.
 fn styled_cells(app: &mut App) -> Vec<ratatui::buffer::Cell> {
     let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("terminal");
@@ -655,4 +679,49 @@ fn switching_to_a_package_with_less_to_say_leaves_nothing_behind() {
             "{fragment:?} survived from the previous package:\n{screen}"
         );
     }
+}
+
+#[test]
+fn a_click_lands_on_the_row_the_frame_actually_drew() {
+    // The regression this guards: the pointer mapping was written before the
+    // tree grew a column header, and only the table learned about it. Every
+    // click and hover then resolved one row too high, so clicking a parent
+    // selected the child underneath it.
+    //
+    // Asserted against the buffer rather than against a second guess at the
+    // layout: the only claim `Geometry` makes is about where this frame put
+    // things, so the frame is what has to be asked.
+    let mut app = App::new(vec![project(GraphSource::Lockfile)]);
+    app.apply(Action::Move(1));
+    app.apply(Action::Expand);
+
+    let names: Vec<String> = app.rows().iter().map(|row| row.name.clone()).collect();
+    assert_eq!(names, ["Cargo.toml", "app", "serde"], "the fixture");
+
+    let (lines, geometry) = render_with_geometry(&mut app);
+    // Only the tree's half of each line: the detail pane names the selection
+    // too, and a row must be found by where it was drawn, not by its text.
+    let tree_of = |line: &str| line.chars().take(50).collect::<String>();
+
+    for (index, name) in names.iter().enumerate() {
+        let y = lines
+            .iter()
+            .position(|line| tree_of(line).contains(name.as_str()))
+            .unwrap_or_else(|| panic!("{name} is on screen:\n{}", lines.join("\n")));
+        assert_eq!(
+            geometry.row_at(3, u16::try_from(y).expect("in range")),
+            Some(index),
+            "clicking the line {name} was drawn on selects {name}"
+        );
+    }
+
+    let header = lines
+        .iter()
+        .position(|line| tree_of(line).contains("NAME"))
+        .expect("the column header is on screen");
+    assert_eq!(
+        geometry.row_at(3, u16::try_from(header).expect("in range")),
+        None,
+        "the column header is not a row"
+    );
 }

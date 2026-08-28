@@ -249,7 +249,7 @@ mod tests {
                 height: 12,
             },
             tree_offset: 0,
-            tree_height: 10,
+            tree_height: 9,
             row_count: 20,
         }
     }
@@ -289,9 +289,10 @@ mod tests {
 
     #[test]
     fn clicking_a_row_selects_it() {
+        // The first row is drawn at y=2, below the border and the column header.
         // Row 1 is at depth 1, so its marker is indented past column 10.
         assert_eq!(
-            action_for_mouse(click(10, 2), Mode::Browse, &geometry(), &rows(), false),
+            action_for_mouse(click(10, 3), Mode::Browse, &geometry(), &rows(), false),
             Some(Action::Select(1))
         );
     }
@@ -300,12 +301,12 @@ mod tests {
     fn clicking_the_marker_expands_rather_than_only_selecting() {
         // Row 0 is at depth 0, so its marker is the first two body columns.
         assert_eq!(
-            action_for_mouse(click(1, 1), Mode::Browse, &geometry(), &rows(), false),
+            action_for_mouse(click(1, 2), Mode::Browse, &geometry(), &rows(), false),
             Some(Action::ToggleAt(0))
         );
         // The name beside it only selects.
         assert_eq!(
-            action_for_mouse(click(6, 1), Mode::Browse, &geometry(), &rows(), false),
+            action_for_mouse(click(6, 2), Mode::Browse, &geometry(), &rows(), false),
             Some(Action::Select(0))
         );
     }
@@ -314,12 +315,12 @@ mod tests {
     fn the_marker_moves_with_the_rows_indent() {
         // Row 2 is at depth 2, so its marker sits four columns further right.
         assert_eq!(
-            action_for_mouse(click(1, 3), Mode::Browse, &geometry(), &rows(), false),
+            action_for_mouse(click(1, 4), Mode::Browse, &geometry(), &rows(), false),
             Some(Action::Select(2)),
             "the indent before a deep row is not its marker"
         );
         assert_eq!(
-            action_for_mouse(click(5, 3), Mode::Browse, &geometry(), &rows(), false),
+            action_for_mouse(click(5, 4), Mode::Browse, &geometry(), &rows(), false),
             Some(Action::ToggleAt(2))
         );
     }
@@ -402,6 +403,11 @@ mod tests {
             action_for_mouse(click(10, 0), Mode::Browse, &g, &rows(), false),
             None,
             "on the border"
+        );
+        assert_eq!(
+            action_for_mouse(click(10, 1), Mode::Browse, &g, &rows(), false),
+            None,
+            "on the column header"
         );
     }
 

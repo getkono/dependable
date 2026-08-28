@@ -12,6 +12,23 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use crate::app::{App, Mode};
 use crate::theme::{self, Token};
 
+/// The tree table's column header, which occupies the first row of the pane's
+/// interior.
+///
+/// It is not a row the pointer can select, and it is not a row the viewport can
+/// scroll a selection into, so both calculations have to step over it.
+const TREE_HEADER: u16 = 1;
+
+/// How many rows the tree body can show inside a pane `height` rows tall.
+///
+/// The single source for both the viewport handed to [`App::scroll_into_view`]
+/// and the [`Geometry`] a pointer is resolved against. Deriving them separately
+/// is how they drifted apart: the header was added to the tree long after the
+/// pointer mapping was written, and only one of the two learned about it.
+fn tree_viewport(height: u16) -> u16 {
+    height.saturating_sub(2 + TREE_HEADER)
+}
+
 /// Where the last frame put things, so a pointer position can be resolved back
 /// to what the user was pointing at.
 ///
@@ -88,11 +105,12 @@ impl Geometry {
         u16::try_from(u32::from(offset) * 100 / u32::from(total)).unwrap_or(100)
     }
 
-    /// The tree pane's interior, excluding its border.
+    /// The rows of the tree pane: its interior, less the border and the column
+    /// header above them.
     fn tree_body(&self) -> Rect {
         Rect {
             x: self.tree.x.saturating_add(1),
-            y: self.tree.y.saturating_add(1),
+            y: self.tree.y.saturating_add(1 + TREE_HEADER),
             width: self.tree.width.saturating_sub(2),
             height: self.tree_height,
         }
@@ -119,9 +137,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) -> Geometry {
         ])
         .split(chunks[1]);
 
-    // The border and title take two rows off the usable height.
-    let viewport = panes[0].height.saturating_sub(2) as usize;
-    app.scroll_into_view(viewport);
+    // The border, the title, and the column header all take rows off the height
+    // the tree can actually fill.
+    let viewport = tree_viewport(panes[0].height);
+    app.scroll_into_view(usize::from(viewport));
 
     draw_header(frame, chunks[0], app);
     tree::draw(frame, panes[0], app);
@@ -137,7 +156,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) -> Geometry {
         tree: panes[0],
         detail: panes[1],
         tree_offset: app.offset,
-        tree_height: panes[0].height.saturating_sub(2),
+        tree_height: viewport,
         row_count: app.rows().len(),
     }
 }
@@ -306,7 +325,7 @@ mod tests {
                 height: 12,
             },
             tree_offset: 5,
-            tree_height: 10,
+            tree_height: tree_viewport(12),
             row_count: 100,
         }
     }
@@ -314,11 +333,29 @@ mod tests {
     #[test]
     fn a_click_in_the_body_resolves_to_the_row_under_it() {
         let g = geometry();
-        // The first body row sits at y=1, just inside the top border, and shows
-        // the row the offset starts at.
-        assert_eq!(g.row_at(10, 1), Some(5));
-        assert_eq!(g.row_at(10, 2), Some(6));
-        assert_eq!(g.row_at(10, 10), Some(14));
+        // The first body row sits at y=2: below the top border, and below the
+        // column header the table draws under it. It shows the row the offset
+        // starts at.
+        assert_eq!(g.row_at(10, 2), Some(5));
+        assert_eq!(g.row_at(10, 3), Some(6));
+        assert_eq!(g.row_at(10, 10), Some(13));
+    }
+
+    #[test]
+    fn the_column_header_is_not_a_row() {
+        // The table draws NAME / VERSION / AGE / STATUS on the first interior
+        // row. Reading it as a row shifted every click and hover down one, so a
+        // click on a parent selected the child beneath it.
+        assert_eq!(geometry().row_at(10, 1), None);
+    }
+
+    #[test]
+    fn the_body_stops_where_the_table_stops_drawing_rows() {
+        // Three rows go to the border, the title, and the header, so the last
+        // row of a twelve-row pane is at y=10, not y=11.
+        let g = geometry();
+        assert_eq!(g.row_at(10, 10), Some(13), "the last drawn row");
+        assert_eq!(g.row_at(10, 11), None, "the bottom border");
     }
 
     #[test]
@@ -345,8 +382,18 @@ mod tests {
             tree_offset: 0,
             ..geometry()
         };
-        assert_eq!(short.row_at(10, 3), Some(2), "the last row");
-        assert_eq!(short.row_at(10, 4), None, "the empty space below it");
+        assert_eq!(short.row_at(10, 4), Some(2), "the last row");
+        assert_eq!(short.row_at(10, 5), None, "the empty space below it");
+    }
+
+    #[test]
+    fn the_viewport_leaves_room_for_the_border_and_the_header() {
+        // The value `scroll_into_view` is given and the one a pointer is
+        // resolved against are the same number, so a selection can never scroll
+        // to a row a click cannot reach.
+        assert_eq!(tree_viewport(12), 9);
+        assert_eq!(tree_viewport(3), 0, "no room for any row");
+        assert_eq!(tree_viewport(0), 0, "a pane dragged away entirely");
     }
 
     #[test]
