@@ -15,7 +15,9 @@ use std::path::{Path, PathBuf};
 
 use dependable_core::{
     CargoTomlParser, DependencyGraph, LockedPackage, ManifestKind, PackageSource, ParseError,
-    Parser, ResolvedLockfile, parse_cargo_lock_graph, parse_package_name, parse_workspace,
+    Parser, ResolvedLockfile, parse, parse_cargo_lock_graph, parse_composer_lock_graph,
+    parse_mix_lock_graph, parse_package_lock_graph, parse_package_name, parse_project,
+    parse_workspace,
 };
 use thiserror::Error;
 
@@ -24,13 +26,20 @@ const SKIP_DIRS: &[&str] = &["target", "node_modules", ".git", "vendor"];
 
 /// Where a workspace graph's edges came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum GraphSource {
-    /// The full resolved transitive graph, read from `Cargo.lock`.
+    /// The full resolved transitive graph, read from the ecosystem's lockfile.
     Lockfile,
-    /// A shallow graph from manifests only — no `Cargo.lock` was found, so this
-    /// is members plus their *direct* declared dependencies, versions
-    /// unresolved.
+    /// A shallow graph from manifests only — no lockfile was found, so this is
+    /// members plus their *direct* declared dependencies, versions unresolved.
     Manifests,
+    /// A shallow graph because the ecosystem's lockfile **cannot** express edges.
+    ///
+    /// `pubspec.lock` and `go.sum` record resolved versions but not which package
+    /// required which, so no transitive graph exists to read offline. This is
+    /// distinct from [`Self::Manifests`], where a lockfile would have helped and
+    /// simply was not there.
+    Unsupported,
 }
 
 /// The result of [`build_workspace_graph`]: the graph plus how it was built.
@@ -240,4 +249,161 @@ fn read(path: &Path) -> Result<String, TreeError> {
         path: path.to_path_buf(),
         source,
     })
+}
+
+/// Build a dependency graph for the project declared by `manifest`.
+///
+/// This is the ecosystem-aware entry point. A `Cargo.toml` is delegated to
+/// [`build_workspace_graph`], which understands Cargo workspaces. Ecosystems whose
+/// lockfile records edges — npm, Composer, Mix — get their full resolved transitive
+/// graph. Everything else gets the project plus its *direct* declared dependencies,
+/// reported as [`GraphSource::Unsupported`] so a caller can say why rather than
+/// implying the packages have no dependencies of their own.
+///
+/// # Errors
+/// Returns [`TreeError::NoManifest`] if `manifest` is not a recognized manifest,
+/// [`TreeError::Io`] if it cannot be read, or [`TreeError::Parse`] if it or its
+/// lockfile is malformed.
+pub fn build_project_graph(
+    manifest: &Path,
+    opts: &WorkspaceGraphOptions,
+) -> Result<WorkspaceGraph, TreeError> {
+    let kind = ManifestKind::detect(manifest)
+        .ok_or_else(|| TreeError::NoManifest(manifest.to_path_buf()))?;
+    if kind == ManifestKind::CargoToml {
+        let dir = manifest.parent().unwrap_or(Path::new("."));
+        return build_workspace_graph(dir, opts);
+    }
+
+    let content = read(manifest)?;
+    let meta = parse_project(kind, &content);
+    let root_name = meta
+        .name
+        .clone()
+        .or_else(|| project_name_from_path(manifest))
+        .unwrap_or_else(|| kind.ecosystem().display_name().to_owned());
+    let root_version = meta.literal_version().unwrap_or_default().to_owned();
+
+    // The project's own declared dependencies, used as the root's edges whenever the
+    // lockfile carries no entry for the project itself.
+    let direct: Vec<String> = parse(kind, &content)
+        .map(|parsed| parsed.items.into_iter().map(|i| i.name).collect())
+        .unwrap_or_default();
+
+    let workspace_names: HashSet<String> = std::iter::once(root_name.clone()).collect();
+    let roots: Vec<String> = match &opts.package {
+        Some(pkg) => vec![pkg.clone()],
+        None => vec![root_name.clone()],
+    };
+
+    let Some(parser) = graph_parser(kind) else {
+        let graph = direct_graph(&root_name, &root_version, &direct, &workspace_names, &roots);
+        return Ok(WorkspaceGraph {
+            graph,
+            source: GraphSource::Unsupported,
+        });
+    };
+
+    let Some(lock_path) = crate::discover::locate_lockfile(manifest, kind) else {
+        let graph = direct_graph(&root_name, &root_version, &direct, &workspace_names, &roots);
+        return Ok(WorkspaceGraph {
+            graph,
+            source: GraphSource::Manifests,
+        });
+    };
+
+    let resolved = parser(&read(&lock_path)?)?;
+    let resolved = with_root(resolved, &root_name, &root_version, direct);
+    Ok(WorkspaceGraph {
+        graph: DependencyGraph::from_resolved(&resolved, &workspace_names, &roots),
+        source: GraphSource::Lockfile,
+    })
+}
+
+/// A lockfile parser that preserves dependency edges.
+type GraphParser = fn(&str) -> Result<ResolvedLockfile, ParseError>;
+
+/// The graph-preserving lockfile parser for `kind`, or `None` when the ecosystem's
+/// lockfile cannot express edges (Dart, Go) or has no parser yet.
+fn graph_parser(kind: ManifestKind) -> Option<GraphParser> {
+    match kind {
+        ManifestKind::PackageJson => Some(parse_package_lock_graph),
+        ManifestKind::ComposerJson => Some(parse_composer_lock_graph),
+        ManifestKind::MixExs => Some(parse_mix_lock_graph),
+        _ => None,
+    }
+}
+
+/// Ensure the project itself is a node, so the graph has a root to render from.
+///
+/// npm records the root as the `""` entry, so it is already present; Composer and
+/// Mix lockfiles describe only dependencies, so the root is synthesized from what
+/// the manifest declares.
+fn with_root(
+    resolved: ResolvedLockfile,
+    root_name: &str,
+    root_version: &str,
+    direct: Vec<String>,
+) -> ResolvedLockfile {
+    if resolved
+        .packages
+        .iter()
+        .any(|p| p.name == root_name && p.source.is_none())
+    {
+        return resolved;
+    }
+    let mut packages = vec![LockedPackage::new(
+        root_name.to_owned(),
+        root_version.to_owned(),
+        None,
+        direct,
+    )];
+    packages.extend(resolved.packages);
+    ResolvedLockfile::from_packages(packages)
+}
+
+/// A two-level graph: the project and the dependencies it declares, versions
+/// unresolved. Used when no resolved graph is available.
+fn direct_graph(
+    root_name: &str,
+    root_version: &str,
+    direct: &[String],
+    workspace_names: &HashSet<String>,
+    roots: &[String],
+) -> DependencyGraph {
+    let mut packages = vec![LockedPackage::new(
+        root_name.to_owned(),
+        root_version.to_owned(),
+        None,
+        direct.to_vec(),
+    )];
+    let mut seen: HashSet<&str> = HashSet::new();
+    for name in direct {
+        if name != root_name && seen.insert(name.as_str()) {
+            packages.push(LockedPackage::new(
+                name.clone(),
+                String::new(),
+                Some("registry+".to_owned()),
+                Vec::new(),
+            ));
+        }
+    }
+    let resolved = ResolvedLockfile::from_packages(packages);
+    DependencyGraph::from_resolved(&resolved, workspace_names, roots)
+}
+
+/// A project name inferred from its manifest's directory, for manifests that
+/// declare none (`requirements.txt`, a `*.csproj` named by its file).
+fn project_name_from_path(manifest: &Path) -> Option<String> {
+    if manifest.extension().is_some_and(|e| e == "csproj") {
+        return manifest
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(str::to_owned);
+    }
+    manifest
+        .parent()?
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(str::to_owned)
 }

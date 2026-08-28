@@ -57,6 +57,27 @@ fn walk(dir: &Path, depth_left: usize, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Locate the lockfile governing `manifest` without reading it.
+///
+/// Same upward walk as [`find_lockfile`] — the manifest's own directory first, then
+/// each ancestor, stopping at a `.git` boundary — but it answers only "where is it",
+/// which is what callers that need a different parse of the same file want.
+#[must_use]
+pub fn locate_lockfile(manifest: &Path, kind: ManifestKind) -> Option<PathBuf> {
+    let name = kind.lockfile_name()?;
+    let mut dir = manifest.parent()?;
+    loop {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        if dir.join(".git").exists() {
+            return None;
+        }
+        dir = dir.parent()?;
+    }
+}
+
 /// Locate and read the lockfile governing `manifest`, searching its own directory
 /// first and then each ancestor.
 ///

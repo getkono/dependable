@@ -50,11 +50,12 @@ pub mod tree;
 pub use check::{CheckError, Checker, CheckerBuilder, ManifestCheck, ProgressEvent};
 
 // Manifest discovery (filesystem; shared by every frontend).
-pub use discover::{find_lockfile, find_manifests};
+pub use discover::{find_lockfile, find_manifests, locate_lockfile};
 
 // Workspace dependency graph (offline; reads Cargo.lock / manifests).
 pub use tree::{
-    GraphSource, TreeError, WorkspaceGraph, WorkspaceGraphOptions, build_workspace_graph,
+    GraphSource, TreeError, WorkspaceGraph, WorkspaceGraphOptions, build_project_graph,
+    build_workspace_graph,
 };
 
 // Low-level building blocks (compose-it-yourself).
