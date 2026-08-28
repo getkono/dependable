@@ -282,10 +282,11 @@ impl App {
                 };
             }
             Action::OpenLink => match self.selected_url() {
-                Some(url) => self.open_request = Some(url.to_owned()),
+                Some(url) => self.open_request = Some(url),
                 // Saying so beats a key that silently does nothing.
                 None => {
-                    self.message = Some("no link published for this package".to_owned());
+                    self.message =
+                        Some("nothing to open: this did not come from a registry".to_owned());
                 }
             },
             Action::Select(index) => self.select(index),
@@ -502,19 +503,30 @@ impl App {
     /// The URL the selected package is best identified by.
     ///
     /// Ordered by how likely it is to be what the reader wants: the source
-    /// repository first, then the project's own page, then its documentation.
-    /// Returns `None` for a package with no lookup yet, or one the registry
-    /// published no links for.
+    /// repository first, then the project's own page, then its documentation,
+    /// and finally the package's page on its own registry. That last one is
+    /// derived rather than fetched, so `o` works the instant a package is
+    /// selected and on one whose registry published no links at all.
+    ///
+    /// Returns `None` only for a row with no registry package behind it — a
+    /// project, a workspace member, or a git or path dependency.
     #[must_use]
-    pub fn selected_url(&self) -> Option<&str> {
-        let PackageData::Ready(facts) = self.packages.get(&self.selected_key()?)? else {
-            return None;
+    pub fn selected_url(&self) -> Option<String> {
+        let row = self.selected()?;
+        let key = self.selected_key()?;
+        let published = match self.packages.get(&key) {
+            Some(PackageData::Ready(facts)) => facts.metadata.as_ref().and_then(|meta| {
+                meta.repository
+                    .as_deref()
+                    .or(meta.homepage.as_deref())
+                    .or(meta.documentation.as_deref())
+                    // Registries store URLs in their own ecosystem's shape; npm's
+                    // `git+https://…` is not a scheme a browser knows.
+                    .map(crate::ui::link::target_url)
+            }),
+            _ => None,
         };
-        let meta = facts.metadata.as_ref()?;
-        meta.repository
-            .as_deref()
-            .or(meta.homepage.as_deref())
-            .or(meta.documentation.as_deref())
+        Some(published.unwrap_or_else(|| self.ecosystem_of(row).package_url(&row.name)))
     }
 
     /// Take the URL the user asked to open, if any.

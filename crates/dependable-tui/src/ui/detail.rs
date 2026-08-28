@@ -4,7 +4,7 @@
 //! "not published", never as a blank line that looks like missing data, and a
 //! lookup that failed says so rather than looking like an empty package.
 
-use dependable_fetch::{DependencyStatus, NodeKind, Owner, OwnerKind, PackageMetadata};
+use dependable_fetch::{DependencyStatus, Ecosystem, NodeKind, Owner, OwnerKind, PackageMetadata};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
@@ -112,13 +112,25 @@ fn project_lines(app: &App, index: usize) -> Content {
 /// What we know about the selected package.
 fn package_lines(app: &App, row: &crate::rows::Row, width: u16) -> Content {
     let mut content = Content::default();
+    let ecosystem = app.ecosystem_of(row);
+    // Only a package that came from the registry has pages there. The same name
+    // on a workspace member or a git dependency belongs to someone else.
+    let published = row.node_kind == Some(NodeKind::Registry);
+
     content.push(heading(&row.name));
     if row.version.is_empty() {
         // A shallow graph resolves no versions, so there is nothing to look up.
         content.push(dim("version not resolved — no lockfile for this project"));
         return content;
     }
-    content.push(field("resolved", &row.version));
+    if published {
+        // The version the project uses, not the newest one: the package page
+        // describes a release this project may be years behind.
+        let url = ecosystem.version_url(&row.name, &row.version);
+        linked_field(&mut content, "resolved", &row.version, &url);
+    } else {
+        content.push(field("resolved", &row.version));
+    }
     content.push(Line::raw(""));
 
     // A package that did not come from the registry is not the registry's package
@@ -126,6 +138,13 @@ fn package_lines(app: &App, row: &crate::rows::Row, width: u16) -> Content {
     if let Some(origin) = local_origin(row) {
         content.push(dim(origin));
         return content;
+    }
+
+    if published {
+        // Derived from the name rather than fetched, so it is on screen while
+        // everything below it is still being looked up.
+        link_field(&mut content, "registry", &ecosystem.package_url(&row.name));
+        content.push(Line::raw(""));
     }
 
     match app.selected_data() {
@@ -138,16 +157,24 @@ fn package_lines(app: &App, row: &crate::rows::Row, width: u16) -> Content {
             ));
             content.push(dim("press r to try again"));
         }
-        Some(PackageData::Ready(facts)) => facts_lines(&mut content, facts, &row.version, width),
+        Some(PackageData::Ready(facts)) => {
+            facts_lines(&mut content, facts, row, ecosystem, width);
+        }
     }
     content
 }
 
 /// Render a completed lookup.
 ///
-/// `resolved` is the version the project actually uses, which is what the
-/// publish date must describe.
-fn facts_lines(content: &mut Content, facts: &PackageFacts, resolved: &str, width: u16) {
+/// `row` carries the version the project actually uses, which is what the
+/// publish date must describe and which version's pages to link.
+fn facts_lines(
+    content: &mut Content,
+    facts: &PackageFacts,
+    row: &crate::rows::Row,
+    ecosystem: Ecosystem,
+    width: u16,
+) {
     // Freshness first: it is the question most often being asked.
     if let Some(latest) = &facts.latest {
         content.push(field("latest", latest));
@@ -181,7 +208,7 @@ fn facts_lines(content: &mut Content, facts: &PackageFacts, resolved: &str, widt
     content.push(Line::raw(""));
     match &facts.metadata {
         None => content.push(dim("this registry publishes no package metadata")),
-        Some(meta) => metadata_lines(content, meta, resolved, width),
+        Some(meta) => metadata_lines(content, meta, row, ecosystem, width),
     }
 
     for warning in &facts.warnings {
@@ -195,7 +222,14 @@ fn osv_url(id: &str) -> String {
 }
 
 /// The public metadata block.
-fn metadata_lines(content: &mut Content, meta: &PackageMetadata, resolved: &str, width: u16) {
+fn metadata_lines(
+    content: &mut Content,
+    meta: &PackageMetadata,
+    row: &crate::rows::Row,
+    ecosystem: Ecosystem,
+    width: u16,
+) {
+    let resolved = row.version.as_str();
     if let Some(description) = &meta.description {
         // Registry descriptions are often hard-wrapped; the embedded newlines
         // would run words together, and the pane no longer wraps for us.
@@ -207,7 +241,14 @@ fn metadata_lines(content: &mut Content, meta: &PackageMetadata, resolved: &str,
     }
     url_field(content, "repository", meta.repository.as_deref());
     url_field(content, "homepage", meta.homepage.as_deref());
-    url_field(content, "docs", meta.documentation.as_deref());
+    // Where an ecosystem builds documentation is a fact about the ecosystem
+    // rather than something the registry had to record, so a package that
+    // declared no `documentation` URL still has a page worth pointing at.
+    let docs = meta
+        .documentation
+        .clone()
+        .or_else(|| ecosystem.docs_url(&row.name, resolved));
+    url_field(content, "docs", docs.as_deref());
     content.push(optional("license", meta.license.as_deref()));
     content.push(optional("msrv", meta.msrv.as_deref()));
 
@@ -257,18 +298,29 @@ fn metadata_lines(content: &mut Content, meta: &PackageMetadata, resolved: &str,
     }
 }
 
-/// A URL field: shown by its readable form, and clickable.
-fn url_field(content: &mut Content, name: &str, url: Option<&str>) {
-    let Some(url) = url else {
-        content.push(optional(name, None));
-        return;
-    };
-    let text = link::display_url(url);
-    content.link(LABEL_WIDTH, url, &text);
+/// A field whose value is a link, labelled by `text` rather than by the URL.
+///
+/// A link claims the rest of its row — see [`link::write`] — so nothing may be
+/// added to the line this pushes.
+fn linked_field(content: &mut Content, name: &str, text: &str, url: &str) {
+    content.link(LABEL_WIDTH, url, text);
     content.push(Line::from(vec![
         label(name),
-        Span::styled(text, theme::fg(Token::Link)),
+        Span::styled(text.to_owned(), theme::fg(Token::Link)),
     ]));
+}
+
+/// A URL field: shown by its readable form, and clickable.
+fn link_field(content: &mut Content, name: &str, url: &str) {
+    linked_field(content, name, &link::display_url(url), url);
+}
+
+/// A URL field the registry may not have published.
+fn url_field(content: &mut Content, name: &str, url: Option<&str>) {
+    match url {
+        Some(url) => link_field(content, name, url),
+        None => content.push(optional(name, None)),
+    }
 }
 
 /// Greedily wrap `text` to `width` columns, breaking on whitespace.

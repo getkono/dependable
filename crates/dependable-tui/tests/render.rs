@@ -423,11 +423,16 @@ fn a_url_is_written_as_a_clickable_link_showing_its_readable_form() {
         .expect("draw succeeds");
     let buffer = terminal.backend().buffer();
 
+    // By its URL, not by position: the pane writes several links, and this is
+    // an assertion about how one of them is built.
     let link = buffer
         .content()
         .iter()
-        .find(|cell| cell.symbol().contains("\u{1b}]8;;"))
-        .expect("a hyperlink was written");
+        .find(|cell| {
+            cell.symbol()
+                .contains("\u{1b}]8;;https://github.com/serde-rs/serde")
+        })
+        .expect("the repository was written as a hyperlink");
 
     assert!(
         link.symbol()
@@ -493,7 +498,7 @@ fn a_link_does_not_change_how_many_columns_the_pane_uses() {
 fn pressing_o_asks_for_the_packages_repository() {
     let mut app = app_with_serde_metadata();
     assert_eq!(
-        app.selected_url(),
+        app.selected_url().as_deref(),
         Some("https://github.com/serde-rs/serde"),
         "the repository is the link a reader most likely wants"
     );
@@ -723,5 +728,101 @@ fn a_click_lands_on_the_row_the_frame_actually_drew() {
         geometry.row_at(3, u16::try_from(header).expect("in range")),
         None,
         "the column header is not a row"
+    );
+}
+
+/// Every hyperlink target on screen for `app`.
+fn link_targets(app: &mut App) -> Vec<String> {
+    styled_cells(app)
+        .iter()
+        .filter_map(|cell| {
+            let symbol = cell.symbol();
+            let rest = symbol.strip_prefix("\u{1b}]8;;")?;
+            Some(rest.split('\u{1b}').next()?.to_owned())
+        })
+        .filter(|url| !url.is_empty())
+        .collect()
+}
+
+#[test]
+fn a_package_links_to_its_own_page_on_the_registry() {
+    // The one URL that always exists. It is derived from the name rather than
+    // fetched, so it is on screen before anything has been looked up.
+    let mut app = App::new(vec![project(GraphSource::Lockfile)]);
+    app.apply(Action::Move(1));
+    app.apply(Action::Expand);
+    app.apply(Action::Move(1)); // serde, with no metadata loaded
+
+    let screen = render(&mut app);
+    assert!(screen.contains("registry"), "{screen}");
+    assert!(screen.contains("crates.io/crates/serde"), "{screen}");
+    assert!(
+        link_targets(&mut app).contains(&"https://crates.io/crates/serde".to_owned()),
+        "and it is clickable"
+    );
+}
+
+#[test]
+fn the_resolved_version_links_to_that_versions_page() {
+    // The package page describes the newest release, which is a different set
+    // of facts when the project is several versions behind.
+    let mut app = app_with_serde_metadata();
+    assert!(
+        link_targets(&mut app).contains(&"https://crates.io/crates/serde/1.0.0".to_owned()),
+        "the resolved version, not the latest one"
+    );
+}
+
+#[test]
+fn a_package_that_published_no_docs_url_still_links_to_docs_rs() {
+    // docs.rs builds documentation for every crate it hosts, so the page is a
+    // fact about the ecosystem rather than a claim about the registry record.
+    let mut app = app_with_serde_metadata();
+    assert_eq!(
+        metadata().documentation,
+        None,
+        "the fixture publishes no documentation URL"
+    );
+
+    let screen = render(&mut app);
+    assert!(screen.contains("docs.rs/serde/1.0.0"), "{screen}");
+    assert!(
+        link_targets(&mut app).contains(&"https://docs.rs/serde/1.0.0".to_owned()),
+        "and the ecosystem's own docs host is what it points at"
+    );
+}
+
+#[test]
+fn a_workspace_member_is_never_linked_to_a_registry_page() {
+    // `app 0.1.0` is this repository's own crate; crates.io has an unrelated
+    // crate called `app`, and linking to it would send the reader somewhere
+    // actively wrong.
+    let mut app = App::new(vec![project(GraphSource::Lockfile)]);
+    app.apply(Action::Move(1));
+
+    let screen = render(&mut app);
+    assert!(!screen.contains("crates.io"), "{screen}");
+    assert!(
+        link_targets(&mut app).is_empty(),
+        "and nothing is clickable"
+    );
+
+    app.apply(Action::OpenLink);
+    assert_eq!(app.take_open_request(), None, "and `o` opens nothing");
+}
+
+#[test]
+fn pressing_o_falls_back_to_the_registry_page() {
+    // A package the registry published no links for, and one nothing has been
+    // looked up for yet, both still have somewhere to send the reader.
+    let mut app = App::new(vec![project(GraphSource::Lockfile)]);
+    app.apply(Action::Move(1));
+    app.apply(Action::Expand);
+    app.apply(Action::Move(1)); // serde, unfetched
+
+    app.apply(Action::OpenLink);
+    assert_eq!(
+        app.take_open_request().as_deref(),
+        Some("https://crates.io/crates/serde")
     );
 }
