@@ -1,0 +1,155 @@
+//! End-to-end: `dependable list` reports the projects in a repository and the
+//! dependencies each declares. Hermetic — `list` parses manifests and lockfiles from
+//! disk and never touches the network unless `--features` is passed.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use serde_json::Value;
+
+fn fixture(rel: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(rel)
+}
+
+fn run(args: &[&str]) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_dependable"))
+        .args(args)
+        .output()
+        .expect("run dependable");
+    assert!(
+        output.status.success(),
+        "list failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("utf-8 output")
+}
+
+fn list_json(path: &Path, extra: &[&str]) -> Value {
+    let mut args = vec!["list", path.to_str().unwrap(), "--format", "json"];
+    args.extend_from_slice(extra);
+    serde_json::from_str(&run(&args)).expect("valid JSON")
+}
+
+/// One project by name, or a panic naming what was found instead.
+fn project<'a>(doc: &'a Value, name: &str) -> &'a Value {
+    doc["projects"]
+        .as_array()
+        .expect("projects array")
+        .iter()
+        .find(|p| p["name"] == name)
+        .unwrap_or_else(|| panic!("no project {name} in {}", doc["projects"]))
+}
+
+fn dependency<'a>(project: &'a Value, name: &str) -> &'a Value {
+    project["dependencies"]
+        .as_array()
+        .expect("dependencies array")
+        .iter()
+        .find(|d| d["name"] == name)
+        .unwrap_or_else(|| panic!("no dependency {name}"))
+}
+
+#[test]
+fn reports_every_project_in_a_workspace_with_its_identity() {
+    let doc = list_json(&fixture("sample-workspace"), &[]);
+    assert_eq!(doc["schema"], "dependable.list/v1");
+    assert_eq!(doc["summary"]["projects"], 3);
+    assert_eq!(doc["summary"]["by_ecosystem"]["Rust"], 3);
+
+    let app = project(&doc, "app");
+    assert_eq!(app["version"], "0.1.0");
+    assert_eq!(app["role"], "package");
+    // Paths are `/`-separated on every platform: the document is consumed by tooling
+    // that joins them with paths from git and other tools, which speak `/`.
+    assert_eq!(app["manifest"], "crates/app/Cargo.toml");
+
+    // The workspace root declares no package of its own.
+    let root = doc["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["manifest"] == "Cargo.toml")
+        .expect("workspace root");
+    assert_eq!(root["role"], "workspace");
+    assert_eq!(root["name"], Value::Null);
+}
+
+/// Every dependency carries where it came from and whether the package itself depends
+/// on it — the distinctions an inventory exists to make.
+#[test]
+fn dependencies_carry_source_kind_and_locked_version() {
+    let doc = list_json(&fixture("sample-workspace"), &[]);
+    let app = project(&doc, "app");
+
+    let leftpad = dependency(app, "leftpad");
+    assert_eq!(leftpad["source"], "registry");
+    assert_eq!(leftpad["kind"], "normal");
+    assert_eq!(leftpad["direct"], true);
+    // The workspace lockfile sits above the member, and is reported by path.
+    assert_eq!(leftpad["locked"], "1.2.0");
+    assert_eq!(app["lockfile"], "Cargo.lock");
+
+    assert_eq!(dependency(app, "util")["source"], "local");
+    assert_eq!(dependency(app, "gitdep")["source"], "git");
+}
+
+#[test]
+fn no_lock_file_omits_locked_versions() {
+    let doc = list_json(&fixture("sample-workspace"), &["--no-lock-file"]);
+    let app = project(&doc, "app");
+    assert_eq!(app["lockfile"], Value::Null);
+    assert_eq!(dependency(app, "leftpad")["locked"], Value::Null);
+}
+
+/// npm splits runtime from development dependencies, and an inventory has to preserve
+/// the split — a `devDependencies` entry ships with nobody.
+#[test]
+fn npm_dev_dependencies_are_distinguished() {
+    let doc = list_json(&fixture("sample-npm"), &[]);
+    let app = project(&doc, "sample-app");
+    assert_eq!(app["version"], "0.1.0");
+    assert_eq!(app["ecosystem"], "npm");
+
+    assert_eq!(dependency(app, "react")["kind"], "normal");
+    assert_eq!(dependency(app, "typescript")["kind"], "dev");
+    assert_eq!(dependency(app, "typescript")["locked"], "5.4.2");
+    assert_eq!(dependency(app, "local-ui")["source"], "local");
+}
+
+/// The text format is one tab-separated record per dependency, project first.
+#[test]
+fn text_format_emits_one_line_per_dependency() {
+    let path = fixture("sample-npm");
+    let out = run(&["list", path.to_str().unwrap(), "--format", "text"]);
+    let react = out
+        .lines()
+        .find(|l| l.contains("\treact\t"))
+        .expect("a react line");
+    let fields: Vec<&str> = react.split('\t').collect();
+    assert_eq!(fields[0], "sample-app");
+    assert_eq!(fields[1], "npm");
+    assert_eq!(fields[2], "package.json");
+    assert_eq!(fields[3], "react");
+    assert_eq!(fields[4], "^18.0.0");
+    assert_eq!(fields[5], "normal");
+    assert_eq!(fields[6], "registry");
+    assert_eq!(fields[7], "18.0.0");
+    assert_eq!(out.lines().count(), 4);
+}
+
+/// The default format stays human-readable, and now names the package it describes.
+#[test]
+fn table_format_labels_each_project() {
+    let path = fixture("sample-npm");
+    let out = run(&["list", path.to_str().unwrap()]);
+    assert!(
+        out.starts_with("package.json — sample-app v0.1.0 — npm (4 dependencies)"),
+        "unexpected header: {out}"
+    );
+    assert!(
+        out.contains("typescript ~5.4.0 (locked 5.4.2) (dev)"),
+        "{out}"
+    );
+}

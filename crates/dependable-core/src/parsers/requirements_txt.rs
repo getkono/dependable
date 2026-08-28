@@ -8,7 +8,7 @@
 
 use super::Parser;
 use crate::error::ParseError;
-use crate::item::{Item, PackageSource};
+use crate::item::{DependencyKind, Item, PackageSource};
 use crate::manifest::{ManifestKind, ParsedManifest};
 
 /// Parses `requirements.txt`.
@@ -66,6 +66,9 @@ fn parse_line(line: &str, line_idx: usize) -> Option<Item> {
         version_col_end: abs_constraint_start + constraint.len(),
         registry: None,
         locked_version: None,
+        // A requirements file has no sections; `requirements-dev.txt` names a dev set by
+        // convention only, and the file name is not visible to this parser.
+        kind: DependencyKind::Normal,
     })
 }
 

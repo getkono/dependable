@@ -30,6 +30,7 @@ struct ResultDto<'a> {
     latest_compatible: Option<&'a str>,
     latest_available: Option<&'a str>,
     status: &'static str,
+    kind: &'static str,
     vulnerabilities: &'a [String],
     locked_at: Option<&'a str>,
 }
@@ -52,6 +53,7 @@ pub fn render(reports: &[ManifestReport]) -> anyhow::Result<()> {
                 latest_compatible: result.latest_compatible.as_deref(),
                 latest_available: result.latest_available.as_deref(),
                 status: result.status.token(),
+                kind: result.item.kind.token(),
                 vulnerabilities: &result.current_vulnerabilities,
                 locked_at: result.item.locked_version.as_deref(),
             });

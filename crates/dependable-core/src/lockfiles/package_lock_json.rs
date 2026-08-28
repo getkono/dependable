@@ -37,7 +37,7 @@ fn package_name(key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::item::{Item, PackageSource};
+    use crate::item::{DependencyKind, Item, PackageSource};
     use crate::lockfiles::apply_lockfile;
 
     fn item(name: &str, constraint: &str) -> Item {
@@ -50,6 +50,7 @@ mod tests {
             version_col_end: 0,
             registry: None,
             locked_version: None,
+            kind: DependencyKind::Normal,
         }
     }
 

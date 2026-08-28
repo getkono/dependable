@@ -9,7 +9,7 @@
 
 use super::Parser;
 use crate::error::ParseError;
-use crate::item::{Item, PackageSource};
+use crate::item::{DependencyKind, Item, PackageSource};
 use crate::manifest::{ManifestKind, ParsedManifest};
 
 /// Parses `pubspec.yaml`.
@@ -18,7 +18,8 @@ pub struct PubspecYamlParser;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Section {
     None,
-    Dependencies,
+    /// Inside `dependencies:` or `dev_dependencies:`, carrying which one.
+    Dependencies(DependencyKind),
 }
 
 impl Parser for PubspecYamlParser {
@@ -33,14 +34,15 @@ impl Parser for PubspecYamlParser {
             let indent = line.len() - line.trim_start().len();
             if indent == 0 {
                 section = match top_level_key(line) {
-                    "dependencies" | "dev_dependencies" => Section::Dependencies,
+                    "dependencies" => Section::Dependencies(DependencyKind::Normal),
+                    "dev_dependencies" => Section::Dependencies(DependencyKind::Dev),
                     _ => Section::None,
                 };
                 continue;
             }
-            if section == Section::None {
+            let Section::Dependencies(kind) = section else {
                 continue;
-            }
+            };
             // Only direct children (2-space indent) are dependency entries. Deeper
             // lines belong to a nested map (`sdk:`/`path:`/`git:`) — skip them.
             if indent != 2 {
@@ -60,6 +62,7 @@ impl Parser for PubspecYamlParser {
                     version_col_end: value_col + version.len(),
                     registry: None,
                     locked_version: None,
+                    kind,
                 });
             }
         }
@@ -180,6 +183,15 @@ mod tests {
         let provider = m.items.iter().find(|i| i.name == "provider").unwrap();
         assert_eq!(provider.version_constraint, "6.0.5");
         assert_eq!(sliced(content, provider), "6.0.5"); // quotes excluded
+    }
+
+    #[test]
+    fn dev_dependencies_are_distinguished() {
+        let content = "dependencies:\n  http: ^1.1.0\n\ndev_dependencies:\n  test: ^1.24.0\n";
+        let m = parse(content);
+        let find = |name: &str| m.items.iter().find(|i| i.name == name).unwrap();
+        assert_eq!(find("http").kind, DependencyKind::Normal);
+        assert_eq!(find("test").kind, DependencyKind::Dev);
     }
 
     #[test]

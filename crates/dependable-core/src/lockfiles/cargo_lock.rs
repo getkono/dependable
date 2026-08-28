@@ -70,7 +70,7 @@ fn pick_locked(versions: &[String], constraint: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::item::PackageSource;
+    use crate::item::{DependencyKind, PackageSource};
 
     fn item(name: &str, constraint: &str) -> Item {
         Item {
@@ -82,6 +82,7 @@ mod tests {
             version_col_end: 0,
             registry: None,
             locked_version: None,
+            kind: DependencyKind::Normal,
         }
     }
 

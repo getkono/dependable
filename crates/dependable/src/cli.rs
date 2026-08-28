@@ -20,7 +20,7 @@ pub struct Cli {
 pub enum Command {
     /// Check dependencies against the registry and OSV.
     Check(CheckArgs),
-    /// List discovered dependencies without checking versions.
+    /// List the projects in a repository and the dependencies each declares.
     List(ListArgs),
     /// Render the workspace dependency tree (Rust; offline, from Cargo.lock).
     Tree(TreeArgs),
@@ -92,13 +92,21 @@ pub struct CheckArgs {
 
 #[derive(Args)]
 pub struct ListArgs {
+    /// Project directory to scan (default: current directory).
     pub path: Option<PathBuf>,
+    /// List a single manifest file instead of discovering them.
     #[arg(long)]
     pub manifest: Option<PathBuf>,
+    /// Output format: `table` for reading, `json` for the full inventory, `text` for
+    /// one tab-separated line per dependency.
     #[arg(long, value_enum, default_value_t = Format::Table)]
     pub format: Format,
+    /// How many directories deep to search.
     #[arg(long, default_value_t = 3)]
     pub depth: usize,
+    /// Ignore sibling lockfiles (do not report locked versions).
+    #[arg(long)]
+    pub no_lock_file: bool,
     /// Show each crate's available feature flags (Rust only; fetches the
     /// crates.io sparse index, so this makes `list` hit the network).
     #[arg(long)]

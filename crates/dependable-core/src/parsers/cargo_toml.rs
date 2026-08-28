@@ -11,13 +11,17 @@ use toml_edit::{ImDocument, Item as TomlItem, TableLike};
 use super::Parser;
 use super::position::{line_starts, offset_to_line_col};
 use crate::error::ParseError;
-use crate::item::{Item, PackageSource};
+use crate::item::{DependencyKind, Item, PackageSource};
 use crate::manifest::{AlternateRegistryDecl, ManifestKind, ParsedManifest};
 
 /// Parses `Cargo.toml`, recording version positions for in-place fixes.
 pub struct CargoTomlParser;
 
-const DEP_SECTIONS: &[&str] = &["dependencies", "dev-dependencies", "build-dependencies"];
+const DEP_SECTIONS: &[(&str, DependencyKind)] = &[
+    ("dependencies", DependencyKind::Normal),
+    ("dev-dependencies", DependencyKind::Dev),
+    ("build-dependencies", DependencyKind::Build),
+];
 
 impl Parser for CargoTomlParser {
     fn parse(&self, content: &str) -> Result<ParsedManifest, ParseError> {
@@ -27,9 +31,9 @@ impl Parser for CargoTomlParser {
         let mut items = Vec::new();
 
         // [dependencies], [dev-dependencies], [build-dependencies]
-        for &section in DEP_SECTIONS {
+        for &(section, kind) in DEP_SECTIONS {
             if let Some(table) = root.get(section).and_then(|i| i.as_table_like()) {
-                collect_dependencies(table, &starts, &mut items);
+                collect_dependencies(table, kind, &starts, &mut items);
             }
         }
 
@@ -40,7 +44,9 @@ impl Parser for CargoTomlParser {
             .and_then(|ws| ws.get("dependencies"))
             .and_then(|i| i.as_table_like())
         {
-            collect_dependencies(deps, &starts, &mut items);
+            // A `[workspace.dependencies]` entry is a version declaration members opt
+            // into by name, not a dependency of the manifest that declares it.
+            collect_dependencies(deps, DependencyKind::Workspace, &starts, &mut items);
         }
 
         // [registries.*] — alternate registry index URLs
@@ -149,15 +155,25 @@ fn registries_in(content: &str) -> Vec<(String, Option<String>, Option<String>)>
 /// Shared with [`cargo_package`](super::cargo_package), so a `cfg`-gated table under
 /// `[target.…]` yields exactly the same [`Item`]s — version positions included — as a
 /// top-level `[dependencies]` table.
-pub(super) fn collect_dependencies(table: &dyn TableLike, starts: &[usize], items: &mut Vec<Item>) {
+pub(super) fn collect_dependencies(
+    table: &dyn TableLike,
+    kind: DependencyKind,
+    starts: &[usize],
+    items: &mut Vec<Item>,
+) {
     for (name, item) in table.iter() {
-        if let Some(parsed) = parse_dependency(name, item, starts) {
+        if let Some(parsed) = parse_dependency(name, item, kind, starts) {
             items.push(parsed);
         }
     }
 }
 
-fn parse_dependency(name: &str, item: &TomlItem, starts: &[usize]) -> Option<Item> {
+fn parse_dependency(
+    name: &str,
+    item: &TomlItem,
+    kind: DependencyKind,
+    starts: &[usize],
+) -> Option<Item> {
     // String form: `serde = "1.0"`
     if let Some(value) = item.as_value()
         && let Some(version) = value.as_str()
@@ -169,6 +185,7 @@ fn parse_dependency(name: &str, item: &TomlItem, starts: &[usize]) -> Option<Ite
             span,
             PackageSource::Registry,
             None,
+            kind,
             starts,
         ));
     }
@@ -176,13 +193,13 @@ fn parse_dependency(name: &str, item: &TomlItem, starts: &[usize]) -> Option<Ite
     // Table-like form: inline `{ version = "1.0", ... }` or `[dependencies.serde]`
     if let Some(table) = item.as_table_like() {
         if table.get("workspace").and_then(TomlItem::as_bool) == Some(true) {
-            return Some(skip_item(name, PackageSource::Local));
+            return Some(skip_item(name, PackageSource::Local, kind));
         }
         if table.contains_key("path") {
-            return Some(skip_item(name, PackageSource::Local));
+            return Some(skip_item(name, PackageSource::Local, kind));
         }
         if table.contains_key("git") {
-            return Some(skip_item(name, PackageSource::Git));
+            return Some(skip_item(name, PackageSource::Git, kind));
         }
         let registry = table
             .get("registry")
@@ -198,6 +215,7 @@ fn parse_dependency(name: &str, item: &TomlItem, starts: &[usize]) -> Option<Ite
                 span,
                 PackageSource::Registry,
                 registry,
+                kind,
                 starts,
             ));
         }
@@ -211,6 +229,7 @@ fn make_item(
     span: Range<usize>,
     source: PackageSource,
     registry: Option<String>,
+    kind: DependencyKind,
     starts: &[usize],
 ) -> Item {
     // `span` covers the quoted string; strip the surrounding quotes.
@@ -227,10 +246,11 @@ fn make_item(
         version_col_end: col_end,
         registry,
         locked_version: None,
+        kind,
     }
 }
 
-fn skip_item(name: &str, source: PackageSource) -> Item {
+fn skip_item(name: &str, source: PackageSource, kind: DependencyKind) -> Item {
     Item {
         name: name.to_owned(),
         version_constraint: String::new(),
@@ -240,6 +260,7 @@ fn skip_item(name: &str, source: PackageSource) -> Item {
         version_col_end: 0,
         registry: None,
         locked_version: None,
+        kind,
     }
 }
 
@@ -296,6 +317,26 @@ mod tests {
         assert_eq!(find(&m, "local").source, PackageSource::Local);
         assert_eq!(find(&m, "fromgit").source, PackageSource::Git);
         assert_eq!(find(&m, "shared").source, PackageSource::Local);
+    }
+
+    #[test]
+    fn section_determines_dependency_kind() {
+        let content = "[dependencies]\nserde = \"1\"\n\n[dev-dependencies]\ncriterion = \"0.5\"\n\n[build-dependencies]\ncc = \"1\"\n";
+        let m = parse(content);
+        assert_eq!(find(&m, "serde").kind, DependencyKind::Normal);
+        assert_eq!(find(&m, "criterion").kind, DependencyKind::Dev);
+        assert_eq!(find(&m, "cc").kind, DependencyKind::Build);
+    }
+
+    /// A `[workspace.dependencies]` entry declares a version members may opt into; the
+    /// manifest declaring it does not itself depend on the crate.
+    #[test]
+    fn workspace_dependencies_are_declarations_not_dependencies() {
+        let content = "[workspace.dependencies]\nserde = \"1\"\n";
+        let m = parse(content);
+        let it = find(&m, "serde");
+        assert_eq!(it.kind, DependencyKind::Workspace);
+        assert!(!it.kind.is_direct());
     }
 
     #[test]

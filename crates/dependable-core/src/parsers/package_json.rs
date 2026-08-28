@@ -8,15 +8,16 @@ use super::Parser;
 use super::json_scan::{JsonStringValue, scan_strings};
 use super::position::{line_starts, offset_to_line_col};
 use crate::error::ParseError;
-use crate::item::{Item, PackageSource};
+use crate::item::{DependencyKind, Item, PackageSource};
 use crate::manifest::{ManifestKind, ParsedManifest};
 
-/// Object keys whose entries are `name → version-spec` dependency maps.
-const DEP_SECTIONS: &[&str] = &[
-    "dependencies",
-    "devDependencies",
-    "peerDependencies",
-    "optionalDependencies",
+/// Object keys whose entries are `name → version-spec` dependency maps, paired with
+/// the kind an entry under each one gets.
+const DEP_SECTIONS: &[(&str, DependencyKind)] = &[
+    ("dependencies", DependencyKind::Normal),
+    ("devDependencies", DependencyKind::Dev),
+    ("peerDependencies", DependencyKind::Peer),
+    ("optionalDependencies", DependencyKind::Optional),
 ];
 
 /// Parses `package.json`.
@@ -27,8 +28,8 @@ impl Parser for PackageJsonParser {
         let starts = line_starts(content);
         let mut items = Vec::new();
         for entry in scan_strings(content) {
-            if let Some(key) = dependency_key(&entry.path) {
-                items.push(build_item(key, &entry, &starts));
+            if let Some((key, kind)) = dependency_key(&entry.path) {
+                items.push(build_item(key, kind, &entry, &starts));
             }
         }
         Ok(ParsedManifest {
@@ -39,24 +40,33 @@ impl Parser for PackageJsonParser {
     }
 }
 
-/// Return the dependency name if `path` points at a dependency entry: a member of
-/// a `*dependencies`/`catalog` map, or a `catalogs.<name>.<dep>` entry.
-fn dependency_key(path: &[String]) -> Option<&str> {
+/// Return the dependency name and its kind if `path` points at a dependency entry: a
+/// member of a `*dependencies`/`catalog` map, or a `catalogs.<name>.<dep>` entry.
+///
+/// A catalog entry is a version declaration workspace packages opt into by name, so it
+/// is [`DependencyKind::Workspace`] rather than a dependency of this manifest.
+fn dependency_key(path: &[String]) -> Option<(&str, DependencyKind)> {
     match path {
-        [section, dep] if DEP_SECTIONS.contains(&section.as_str()) || section == "catalog" => {
-            Some(dep)
+        [section, dep] => DEP_SECTIONS
+            .iter()
+            .find(|(name, _)| name == section)
+            .map(|(_, kind)| (dep.as_str(), *kind))
+            .or_else(|| {
+                (section == "catalog").then_some((dep.as_str(), DependencyKind::Workspace))
+            }),
+        [section, _catalog, dep] if section == "catalogs" => {
+            Some((dep.as_str(), DependencyKind::Workspace))
         }
-        [section, _catalog, dep] if section == "catalogs" => Some(dep),
         _ => None,
     }
 }
 
 /// Build an [`Item`] for one dependency entry, resolving aliases and recording the
 /// version sub-span for `--fix`.
-fn build_item(key: &str, entry: &JsonStringValue, starts: &[usize]) -> Item {
+fn build_item(key: &str, kind: DependencyKind, entry: &JsonStringValue, starts: &[usize]) -> Item {
     let value = &entry.value;
     match resolve(key, value) {
-        Resolved::Skip(source) => skip_item(key, source),
+        Resolved::Skip(source) => skip_item(key, source, kind),
         Resolved::Dep {
             name,
             constraint,
@@ -75,6 +85,7 @@ fn build_item(key: &str, entry: &JsonStringValue, starts: &[usize]) -> Item {
                 version_col_end: col_start + global_end.saturating_sub(global_start),
                 registry: None,
                 locked_version: None,
+                kind,
             }
         }
     }
@@ -148,7 +159,7 @@ fn split_alias(rest: &str, prefix_len: usize) -> (String, String, usize) {
     }
 }
 
-fn skip_item(name: &str, source: PackageSource) -> Item {
+fn skip_item(name: &str, source: PackageSource, kind: DependencyKind) -> Item {
     Item {
         name: name.to_owned(),
         version_constraint: String::new(),
@@ -158,6 +169,7 @@ fn skip_item(name: &str, source: PackageSource) -> Item {
         version_col_end: 0,
         registry: None,
         locked_version: None,
+        kind,
     }
 }
 
@@ -236,6 +248,23 @@ mod tests {
         assert_eq!(find(&m, "fromgit").source, PackageSource::Git);
         assert_eq!(find(&m, "catdep").source, PackageSource::Local);
         assert!(!find(&m, "linked").is_checkable());
+    }
+
+    #[test]
+    fn section_determines_dependency_kind() {
+        let content = r#"{
+  "dependencies": { "react": "^18.0.0" },
+  "devDependencies": { "vitest": "^1.0.0" },
+  "peerDependencies": { "react-dom": "^18.0.0" },
+  "optionalDependencies": { "fsevents": "^2.3.0" },
+  "catalog": { "lodash": "^4.17.21" }
+}"#;
+        let m = parse(content);
+        assert_eq!(find(&m, "react").kind, DependencyKind::Normal);
+        assert_eq!(find(&m, "vitest").kind, DependencyKind::Dev);
+        assert_eq!(find(&m, "react-dom").kind, DependencyKind::Peer);
+        assert_eq!(find(&m, "fsevents").kind, DependencyKind::Optional);
+        assert_eq!(find(&m, "lodash").kind, DependencyKind::Workspace);
     }
 
     #[test]

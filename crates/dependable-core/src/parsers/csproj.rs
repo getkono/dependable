@@ -10,7 +10,7 @@
 use super::Parser;
 use super::position::{line_starts, offset_to_line_col};
 use crate::error::ParseError;
-use crate::item::{Item, PackageSource};
+use crate::item::{DependencyKind, Item, PackageSource};
 use crate::manifest::{ManifestKind, ParsedManifest};
 
 /// Parses `*.csproj` / `Directory.Packages.props`.
@@ -25,9 +25,13 @@ impl Parser for CsprojParser {
 
         for node in doc.descendants() {
             let tag = node.tag_name().name();
-            if tag != "PackageReference" && tag != "PackageVersion" {
-                continue;
-            }
+            // `Directory.Packages.props` declares central versions with `PackageVersion`;
+            // a project opts in by naming the package in a `PackageReference`.
+            let kind = match tag {
+                "PackageReference" => DependencyKind::Normal,
+                "PackageVersion" => DependencyKind::Workspace,
+                _ => continue,
+            };
             let Some(name) = node
                 .attribute("Include")
                 .or_else(|| node.attribute("Update"))
@@ -55,6 +59,7 @@ impl Parser for CsprojParser {
                 version_col_end: version_col_start + (range.end - range.start),
                 registry: None,
                 locked_version: None,
+                kind,
             });
         }
 
@@ -97,6 +102,17 @@ mod tests {
         let serilog = m.items.iter().find(|i| i.name == "Serilog").unwrap();
         assert_eq!(serilog.version_constraint, "[2.10.0,3.0.0)");
         assert_eq!(sliced(content, serilog), "[2.10.0,3.0.0)");
+    }
+
+    /// A central `PackageVersion` declares a version for the repository; only a
+    /// `PackageReference` makes a project depend on the package.
+    #[test]
+    fn central_versions_and_references_differ_in_kind() {
+        let content = "<Project>\n  <ItemGroup>\n    <PackageReference Include=\"Serilog\" Version=\"2.10.0\" />\n    <PackageVersion Include=\"xunit\" Version=\"2.6.1\" />\n  </ItemGroup>\n</Project>\n";
+        let m = parse(content);
+        let find = |name: &str| m.items.iter().find(|i| i.name == name).unwrap();
+        assert_eq!(find("Serilog").kind, DependencyKind::Normal);
+        assert_eq!(find("xunit").kind, DependencyKind::Workspace);
     }
 
     #[test]

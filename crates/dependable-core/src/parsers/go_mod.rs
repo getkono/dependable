@@ -7,7 +7,7 @@
 
 use super::Parser;
 use crate::error::ParseError;
-use crate::item::{Item, PackageSource};
+use crate::item::{DependencyKind, Item, PackageSource};
 use crate::manifest::{ManifestKind, ParsedManifest};
 use crate::semver::normalize_version;
 
@@ -73,6 +73,14 @@ struct Token<'a> {
 fn parse_entry(line: &str, from: usize, line_idx: usize) -> Option<Item> {
     let code_end = line.find("//").unwrap_or(line.len());
     let code = &line[..code_end];
+    // `go mod tidy` marks every requirement no package in the module imports directly
+    // with a trailing `// indirect`, so the comment is the module's own record of
+    // which requirements are transitive.
+    let kind = if line[code_end..].contains("indirect") {
+        DependencyKind::Indirect
+    } else {
+        DependencyKind::Normal
+    };
     let module = next_token(code, from)?;
     let version = next_token(code, module.end)?;
     Some(Item {
@@ -84,6 +92,7 @@ fn parse_entry(line: &str, from: usize, line_idx: usize) -> Option<Item> {
         version_col_end: version.end,
         registry: None,
         locked_version: Some(normalize_version(version.text)),
+        kind,
     })
 }
 
@@ -123,6 +132,18 @@ mod tests {
     fn sliced<'a>(content: &'a str, item: &Item) -> &'a str {
         let line = content.lines().nth(item.version_line).unwrap();
         &line[item.version_col_start..item.version_col_end]
+    }
+
+    /// `go mod tidy` marks requirements no package imports directly as `// indirect`;
+    /// those are transitive, not direct dependencies of the module.
+    #[test]
+    fn indirect_requirements_are_marked() {
+        let content = "module example.com/m\n\nrequire (\n\tgithub.com/foo/bar v1.2.3\n\tgolang.org/x/sync v0.7.0 // indirect\n)\n";
+        let m = parse(content);
+        assert_eq!(find(&m, "github.com/foo/bar").kind, DependencyKind::Normal);
+        let indirect = find(&m, "golang.org/x/sync");
+        assert_eq!(indirect.kind, DependencyKind::Indirect);
+        assert!(!indirect.kind.is_direct());
     }
 
     #[test]

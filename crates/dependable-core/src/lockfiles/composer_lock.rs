@@ -48,7 +48,7 @@ fn strip_v(version: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::item::{Item, PackageSource};
+    use crate::item::{DependencyKind, Item, PackageSource};
     use crate::lockfiles::apply_lockfile;
 
     #[test]
@@ -81,6 +81,7 @@ mod tests {
             version_col_end: 0,
             registry: None,
             locked_version: None,
+            kind: DependencyKind::Normal,
         }];
         apply_lockfile(&mut items, &data);
         assert_eq!(items[0].locked_version.as_deref(), Some("2.1.0"));

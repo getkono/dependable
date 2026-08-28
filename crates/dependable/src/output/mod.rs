@@ -7,6 +7,7 @@ use dependable_fetch::{CheckResult, DependencyStatus, Ecosystem};
 use crate::cli::Format;
 
 pub mod json;
+pub mod list;
 pub mod table;
 pub mod text;
 pub mod tree;

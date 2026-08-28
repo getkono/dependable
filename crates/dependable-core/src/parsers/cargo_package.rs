@@ -28,7 +28,7 @@ use toml_edit::{ImDocument, Item as TomlItem, TableLike, Value};
 use super::cargo_toml::collect_dependencies;
 use super::position::line_starts;
 use crate::error::ParseError;
-use crate::item::Item;
+use crate::item::{DependencyKind, Item};
 
 /// A `[package]` field that may be inherited from the workspace root.
 ///
@@ -129,6 +129,18 @@ pub enum DependencySection {
     Dev,
     /// `[build-dependencies]`.
     Build,
+}
+
+impl DependencySection {
+    /// The [`DependencyKind`] recorded on items collected from this section.
+    #[must_use]
+    pub fn kind(self) -> DependencyKind {
+        match self {
+            Self::Normal => DependencyKind::Normal,
+            Self::Dev => DependencyKind::Dev,
+            Self::Build => DependencyKind::Build,
+        }
+    }
 }
 
 /// One `[target.<predicate>.<section>]` table.
@@ -564,15 +576,15 @@ fn cfg_dependency_tables(root: &dyn TableLike, starts: &[usize]) -> Vec<CfgDepen
         let Some(entry) = item.as_table_like() else {
             continue;
         };
-        for (section, kind) in TARGET_SECTIONS {
-            let Some(deps) = entry.get(section).and_then(TomlItem::as_table_like) else {
+        for (name, section) in TARGET_SECTIONS {
+            let Some(deps) = entry.get(name).and_then(TomlItem::as_table_like) else {
                 continue;
             };
             let mut items = Vec::new();
-            collect_dependencies(deps, starts, &mut items);
+            collect_dependencies(deps, section.kind(), starts, &mut items);
             tables.push(CfgDependencyTable {
                 predicate: predicate.to_owned(),
-                section: *kind,
+                section: *section,
                 items,
             });
         }

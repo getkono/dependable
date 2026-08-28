@@ -34,7 +34,7 @@ pub fn parse_mix_lock(content: &str) -> Result<LockfileData, ParseError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::item::{Item, PackageSource};
+    use crate::item::{DependencyKind, Item, PackageSource};
     use crate::lockfiles::apply_lockfile;
 
     const LOCK: &str = "%{\n  \"phoenix\": {:hex, :phoenix, \"1.7.10\", \"abc\", [:mix], [{:telemetry, \"~> 1.0\", [hex: :telemetry]}], \"hexpm\", \"def\"},\n  \"telemetry\": {:hex, :telemetry, \"1.2.1\", \"aaa\", [:rebar3], [], \"hexpm\", \"bbb\"},\n  \"forked\": {:git, \"https://example.com/forked.git\", \"a1b2\", []},\n}\n";
@@ -60,6 +60,7 @@ mod tests {
             version_col_end: 0,
             registry: None,
             locked_version: None,
+            kind: DependencyKind::Normal,
         }];
         apply_lockfile(&mut items, &data);
         assert_eq!(items[0].locked_version.as_deref(), Some("1.7.10"));
