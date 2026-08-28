@@ -9,7 +9,7 @@
 
 use std::collections::HashSet;
 
-use dependable_fetch::NodeKind;
+use dependable_fetch::{NodeKind, Placement, Visit, Visitor, WalkOptions};
 
 use crate::filter::Filter;
 use crate::model::Project;
@@ -100,81 +100,61 @@ pub fn visible(
             path: path.clone(),
         });
         if is_open {
-            let roots: Vec<usize> = project.graph.roots().to_vec();
-            walk(
+            let is_expanded = |path: &[usize]| {
+                expanded.contains(path) || found.as_ref().is_some_and(|f| f.open.contains(path))
+            };
+            let is_kept = |path: &[usize]| found.as_ref().is_none_or(|f| f.keep.contains(path));
+            let opts = WalkOptions {
+                // A package opened under `tokio` is not the one under `clap`, so
+                // a second appearance is expanded on its own terms.
+                dedupe: false,
+                collapse_roots: false,
+                prefix: &path,
+                expand: Some(&is_expanded),
+                include: Some(&is_kept),
+                ..WalkOptions::default()
+            };
+            let mut builder = RowBuilder {
                 project,
-                index,
-                &roots,
-                &path,
-                1,
-                &mut HashSet::new(),
-                expanded,
-                found.as_ref(),
-                &mut out,
-            );
+                project_index: index,
+                found: found.as_ref(),
+                out: &mut out,
+            };
+            project.graph.walk(&opts, &mut builder);
         }
     }
     out
 }
 
-/// Emit `children` and, for each expanded one, its own children.
-#[allow(clippy::too_many_arguments)]
-fn walk(
-    project: &Project,
+/// Turns the shared walk into the flat rows the tree pane draws.
+struct RowBuilder<'a> {
+    project: &'a Project,
     project_index: usize,
-    children: &[usize],
-    parent: &RowPath,
-    depth: usize,
-    ancestors: &mut HashSet<usize>,
-    expanded: &HashSet<RowPath>,
-    found: Option<&Found>,
-    out: &mut Vec<Row>,
-) {
-    for (slot, &node) in children.iter().enumerate() {
-        let mut path = parent.clone();
-        path.push(slot);
-        if found.is_some_and(|f| !f.keep.contains(&path)) {
-            continue;
-        }
-        let info = &project.graph.nodes()[node];
-        // Expanding a node already on this path would recurse forever.
-        let cyclic = ancestors.contains(&node);
-        let deps = project.graph.deps_of(node);
-        let has_children = !deps.is_empty() && !cyclic;
-        let is_open = has_children
-            && (expanded.contains(&path) || found.is_some_and(|f| f.open.contains(&path)));
+    found: Option<&'a Found>,
+    out: &'a mut Vec<Row>,
+}
 
-        out.push(Row {
-            depth,
+impl Visitor for RowBuilder<'_> {
+    fn enter(&mut self, visit: &Visit<'_>) {
+        let info = &self.project.graph.nodes()[visit.node];
+        let expandable =
+            visit.degree > 0 && matches!(visit.placement, Placement::Full | Placement::Collapsed);
+        self.out.push(Row {
+            // The walk counts a graph root as depth 0; the project row above it
+            // is the tree's own 0.
+            depth: visit.depth + 1,
             kind: RowKind::Package,
-            project: project_index,
-            node: Some(node),
+            project: self.project_index,
+            node: Some(visit.node),
             name: info.name.clone(),
             version: info.version.clone(),
             node_kind: Some(info.kind),
-            has_children,
-            expanded: is_open,
-            cyclic,
-            matched: found.is_some_and(|f| f.matched.contains(&path)),
-            path: path.clone(),
+            has_children: expandable,
+            expanded: visit.placement == Placement::Full && visit.degree > 0,
+            cyclic: visit.placement == Placement::Cycle,
+            matched: self.found.is_some_and(|f| f.matched.contains(visit.path)),
+            path: visit.path.to_vec(),
         });
-
-        if is_open {
-            let deps: Vec<usize> = deps.to_vec();
-            ancestors.insert(node);
-            walk(
-                project,
-                project_index,
-                &deps,
-                &path,
-                depth + 1,
-                ancestors,
-                expanded,
-                found,
-                out,
-            );
-            ancestors.remove(&node);
-        }
     }
 }
 

@@ -151,8 +151,7 @@ pub type PathPredicate<'a> = &'a dyn Fn(&[usize]) -> bool;
 /// How a walk decides what to expand.
 ///
 /// The defaults are what an offline `tree` render wants, so a caller states
-/// only its differences.
-#[non_exhaustive]
+/// only its differences and leaves the rest to `..WalkOptions::default()`.
 pub struct WalkOptions<'a> {
     /// Maximum edge depth. `Some(0)` = roots only; `None` = unlimited.
     pub max_depth: Option<usize>,
