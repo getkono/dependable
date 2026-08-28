@@ -204,3 +204,22 @@ fn a_tiny_terminal_does_not_panic() {
             .unwrap_or_else(|e| panic!("{w}x{h} failed: {e}"));
     }
 }
+
+#[test]
+fn a_workspace_member_is_never_shown_registry_data() {
+    // Regression: `app 0.1.0` is this repository's own crate. crates.io has an
+    // unrelated crate called `app`, and showing its description, license and
+    // "update available" here would be actively misleading.
+    let mut app = App::new(vec![project(GraphSource::Lockfile)]);
+    app.apply(Action::Move(1)); // the workspace member
+    let screen = render(&mut app);
+    // Asserted on a fragment short enough not to wrap in the test pane.
+    assert!(
+        screen.contains("member of this workspace"),
+        "it must say why nothing is shown: {screen}"
+    );
+    assert!(
+        !screen.contains("loading"),
+        "and must not sit there pretending to fetch: {screen}"
+    );
+}

@@ -4,7 +4,7 @@
 //! "not published", never as a blank line that looks like missing data, and a
 //! lookup that failed says so rather than looking like an empty package.
 
-use dependable_fetch::{DependencyStatus, PackageMetadata};
+use dependable_fetch::{DependencyStatus, NodeKind, PackageMetadata};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -20,7 +20,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
     let lines = match app.selected() {
         None => vec![dim("nothing selected")],
         Some(row) if row.kind == RowKind::Project => project_lines(app, row.project),
-        Some(row) => package_lines(app, &row.name, &row.version),
+        Some(row) => package_lines(app, row),
     };
     frame.render_widget(
         Paragraph::new(lines)
@@ -50,15 +50,22 @@ fn project_lines(app: &App, index: usize) -> Vec<Line<'static>> {
 }
 
 /// What we know about the selected package.
-fn package_lines(app: &App, name: &str, version: &str) -> Vec<Line<'static>> {
-    let mut lines = vec![heading(name)];
-    if version.is_empty() {
+fn package_lines(app: &App, row: &crate::rows::Row) -> Vec<Line<'static>> {
+    let mut lines = vec![heading(&row.name)];
+    if row.version.is_empty() {
         // A shallow graph resolves no versions, so there is nothing to look up.
         lines.push(dim("version not resolved — no lockfile for this project"));
         return lines;
     }
-    lines.push(field("resolved", version));
+    lines.push(field("resolved", &row.version));
     lines.push(Line::raw(""));
+
+    // A package that did not come from the registry is not the registry's package
+    // of the same name, so nothing is fetched and nothing is claimed.
+    if let Some(origin) = local_origin(row) {
+        lines.push(dim(origin));
+        return lines;
+    }
 
     match app.selected_data() {
         None | Some(PackageData::Unloaded) => lines.push(dim("loading…")),
@@ -156,6 +163,16 @@ fn metadata_lines(meta: &PackageMetadata) -> Vec<Line<'static>> {
         ));
     }
     lines
+}
+
+/// Why a package is not looked up, when it did not come from a registry.
+fn local_origin(row: &crate::rows::Row) -> Option<&'static str> {
+    match row.node_kind? {
+        NodeKind::Workspace => Some("a member of this workspace — not fetched from a registry"),
+        NodeKind::Path => Some("a local path dependency — not fetched from a registry"),
+        NodeKind::Git => Some("a git dependency — not fetched from a registry"),
+        _ => None,
+    }
 }
 
 fn status_style(status: &DependencyStatus) -> Style {

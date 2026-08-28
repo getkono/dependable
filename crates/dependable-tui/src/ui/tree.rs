@@ -129,7 +129,11 @@ fn kind_tag(row: &Row) -> Option<&'static str> {
 fn status_badge<'a>(app: &App, row: &Row) -> Option<Span<'a>> {
     use dependable_fetch::DependencyStatus;
 
-    if row.kind != RowKind::Package || row.version.is_empty() {
+    // Only registry packages are ever looked up, so only they can carry a badge.
+    if row.kind != RowKind::Package
+        || row.version.is_empty()
+        || row.node_kind != Some(NodeKind::Registry)
+    {
         return None;
     }
     let key = crate::model::key(app.ecosystem_of(row), &row.name, &row.version);

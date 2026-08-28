@@ -276,17 +276,28 @@ fn inverting_shows_what_depends_on_a_package() {
 }
 
 #[test]
-fn only_a_versioned_package_row_is_worth_looking_up() {
+fn only_a_registry_package_is_worth_looking_up() {
     let mut app = sample();
     assert_eq!(
         app.selected_key(),
         None,
         "a project row has nothing to fetch"
     );
-    app.apply(Action::Move(1));
+
+    app.apply(Action::Move(1)); // `app` — a workspace member, not a registry package
     assert_eq!(
         app.selected_key(),
-        Some((Ecosystem::Rust, "app".to_owned(), "0.1.0".to_owned()))
+        None,
+        "a workspace member must never be looked up: the registry may hold an \
+         unrelated package of the same name, whose description, license and \
+         versions would then be shown as if they were this one's"
+    );
+
+    app.apply(Action::Expand);
+    app.apply(Action::Move(1)); // `tokio` — actually resolved from the registry
+    assert_eq!(
+        app.selected_key(),
+        Some((Ecosystem::Rust, "tokio".to_owned(), "1.0.0".to_owned()))
     );
 }
 

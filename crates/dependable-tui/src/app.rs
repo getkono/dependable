@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 
-use dependable_fetch::Ecosystem;
+use dependable_fetch::{Ecosystem, NodeKind};
 
 use crate::filter::Filter;
 use crate::model::{PackageData, PackageKey, PackageStore, Project, key};
@@ -148,14 +148,21 @@ impl App {
         self.rows.get(self.selected)
     }
 
-    /// The package the selection identifies, for a package row with a version.
+    /// The package the selection identifies, for a row a registry can answer about.
     ///
-    /// A project row, or a node whose version is unknown (a shallow graph), has
-    /// nothing to look up.
+    /// Only [`NodeKind::Registry`] nodes qualify. A workspace member, a git
+    /// dependency, or a path dependency did not come from the registry, and its
+    /// name may well belong to an unrelated published package — looking it up
+    /// would show someone else's description, license, and version history as if
+    /// they were this package's. A project row, or a node whose version is unknown
+    /// (a shallow graph), has nothing to look up either.
     #[must_use]
     pub fn selected_key(&self) -> Option<PackageKey> {
         let row = self.selected()?;
-        if row.kind != RowKind::Package || row.version.is_empty() {
+        if row.kind != RowKind::Package
+            || row.version.is_empty()
+            || row.node_kind != Some(NodeKind::Registry)
+        {
             return None;
         }
         Some(key(self.ecosystem_of(row), &row.name, &row.version))
