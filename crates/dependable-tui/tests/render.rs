@@ -538,3 +538,81 @@ fn the_header_omits_a_path_it_was_never_given() {
     let header = screen.lines().next().expect("a header row");
     assert_eq!(header.trim(), "dependable", "{header:?}");
 }
+
+/// The character column a substring starts at.
+///
+/// Not the byte offset: the panes are drawn with box-drawing characters, which
+/// are three bytes each, so byte offsets do not line up with screen columns.
+fn column_of(line: &str, needle: &str) -> Option<usize> {
+    let byte = line.find(needle)?;
+    Some(line[..byte].chars().count())
+}
+
+/// The tree pane's share of a rendered line, as characters.
+fn tree_part(line: &str, width: usize) -> String {
+    line.chars().take(width).collect()
+}
+
+#[test]
+fn the_tree_is_laid_out_in_aligned_columns() {
+    let mut app = App::new(vec![project(GraphSource::Lockfile)]);
+    app.apply(Action::Move(1));
+    app.apply(Action::Expand);
+
+    let screen = render(&mut app);
+    let heading = screen
+        .lines()
+        .find(|line| line.contains("NAME"))
+        .expect("a column heading row");
+
+    let name = column_of(heading, "NAME").expect("NAME");
+    let version = column_of(heading, "VERSION").expect("VERSION");
+    let age = column_of(heading, "AGE").expect("AGE");
+    let status = column_of(heading, "STATUS").expect("STATUS");
+    assert!(
+        name < version && version < age && age < status,
+        "columns are ordered left to right: {heading:?}"
+    );
+
+    // Every version sits under the VERSION heading, which is the whole point of
+    // the layout: a reader scans one column instead of hunting along each row.
+    // Only the tree pane is searched -- the detail pane prints versions too.
+    let tree_width = status + "STATUS".len();
+    let versions: Vec<usize> = screen
+        .lines()
+        .map(|line| tree_part(line, tree_width))
+        .filter_map(|line| column_of(&line, "0.1.0").or_else(|| column_of(&line, "1.0.0")))
+        .collect();
+    assert!(!versions.is_empty(), "some versions render: {screen}");
+    for column in versions {
+        assert_eq!(column, version, "a version is out of its column: {screen}");
+    }
+}
+
+#[test]
+fn a_local_package_reports_its_origin_in_the_status_column() {
+    // The freshness badge and the origin never apply to the same row, so they
+    // share a column rather than the origin crowding out the name.
+    let mut app = App::new(vec![project(GraphSource::Lockfile)]);
+    app.apply(Action::Move(1));
+    app.apply(Action::Expand);
+
+    let screen = render(&mut app);
+    let heading = screen
+        .lines()
+        .find(|line| line.contains("NAME"))
+        .expect("a column heading row");
+    let status = column_of(heading, "STATUS").expect("STATUS");
+
+    let row = screen
+        .lines()
+        // Wide enough to include the whole status column, not just its heading.
+        .map(|line| tree_part(line, status + "workspace".len()))
+        .find(|line| line.contains("workspace"))
+        .expect("the workspace member");
+    assert_eq!(
+        column_of(&row, "workspace"),
+        Some(status),
+        "the origin sits in the status column: {row:?}"
+    );
+}

@@ -137,6 +137,29 @@ fn calendar_date(timestamp: &str) -> Option<String> {
     Some(then.to_zoned(jiff::tz::TimeZone::UTC).date().to_string())
 }
 
+/// Format an RFC 3339 timestamp as an age narrow enough for a column: `3d`,
+/// `5mo`, `2y`.
+///
+/// The tree shows one of these per row, so the width has to be bounded and the
+/// same for every row; the detail pane spells the same fact out in full.
+/// Returns an empty string when the timestamp cannot be read, because a column
+/// of noise is worse than a column of gaps.
+#[must_use]
+pub fn compact_age(timestamp: &str) -> String {
+    let Ok(then) = timestamp.parse::<jiff::Timestamp>() else {
+        return String::new();
+    };
+    const DAY: i64 = 24 * 60 * 60;
+    let days = (jiff::Timestamp::now().as_second() - then.as_second()) / DAY;
+    match days {
+        d if d < 0 => String::new(),
+        0 => "today".to_owned(),
+        d if d < 30 => format!("{d}d"),
+        d if d < 365 => format!("{}mo", d / 30),
+        d => format!("{}y", d / 365),
+    }
+}
+
 /// `1 month ago` / `4 months ago`.
 fn plural(n: i64, unit: &str) -> String {
     if n == 1 {
@@ -178,6 +201,27 @@ mod tests {
     fn a_recent_timestamp_reads_as_days() {
         let two_days_ago = jiff::Timestamp::now() - jiff::SignedDuration::from_hours(48);
         assert_eq!(relative_age(&two_days_ago.to_string()), "2 days ago");
+    }
+
+    #[test]
+    fn a_compact_age_stays_narrow_enough_for_a_column() {
+        let now = jiff::Timestamp::now();
+        let day = jiff::SignedDuration::from_hours(24);
+        assert_eq!(compact_age(&now.to_string()), "today");
+        assert_eq!(compact_age(&(now - day * 3).to_string()), "3d");
+        assert_eq!(compact_age(&(now - day * 70).to_string()), "2mo");
+        assert_eq!(compact_age(&(now - day * 400).to_string()), "1y");
+
+        for age in [1, 40, 400, 4000] {
+            let rendered = compact_age(&(now - day * age).to_string());
+            assert!(rendered.len() <= 5, "{rendered:?} is too wide for a column");
+        }
+    }
+
+    #[test]
+    fn an_unreadable_timestamp_leaves_the_age_column_empty() {
+        // A column of raw timestamps would be worse than a column of gaps.
+        assert_eq!(compact_age("not a date"), "");
     }
 
     #[test]
