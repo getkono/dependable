@@ -20,12 +20,14 @@ pub use error::ParseError;
 pub use graph::{DependencyGraph, Node, NodeKind, Tree, TreeNode, TreeOptions};
 pub use item::{DependencyKind, Item, PackageSource};
 pub use lockfiles::{
-    LockedPackage, LockfileData, ResolvedLockfile, apply_lockfile, parse_cargo_lock,
-    parse_cargo_lock_graph, parse_composer_lock, parse_composer_lock_graph,
-    parse_dart_pubspec_lock, parse_lockfile, parse_mix_lock, parse_mix_lock_graph,
-    parse_package_lock, parse_package_lock_graph,
+    LockedPackage, LockfileData, ResolvedLockfile, apply_lockfile, parse_bun_lock,
+    parse_bun_lock_graph, parse_cargo_lock, parse_cargo_lock_graph, parse_composer_lock,
+    parse_composer_lock_graph, parse_dart_pubspec_lock, parse_lockfile, parse_lockfile_kind,
+    parse_mix_lock, parse_mix_lock_graph, parse_package_lock, parse_package_lock_graph,
 };
-pub use manifest::{AlternateRegistryDecl, ManifestKind, ParsedManifest};
+pub use manifest::{
+    AlternateRegistryDecl, LockfileKind, ManifestKind, ParsedManifest, UnreadableLockfile,
+};
 pub use npmrc::{NpmrcConfig, parse_npmrc};
 pub use parsers::{
     AutoTargets, CargoPackageManifest, CargoTarget, CargoTargetKind, CargoTomlParser,

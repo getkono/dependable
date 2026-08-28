@@ -52,7 +52,11 @@ Running `dependable` in a terminal opens the flagship interactive surface. It li
 project discovered in the repository, expands each one's **resolved** dependency graph to
 any depth, and shows what is known about whichever package is selected: repository,
 homepage, documentation, license, owners, description, current-vs-latest version, OSV
-advisories, downloads, publish recency, and yanked status.
+advisories, downloads, publish recency, and yanked status. Every URL among them is a
+link, alongside two derived from the package's name rather than fetched: its page on the
+registry, which is on screen before anything has been looked up, and — for the
+ecosystems that build documentation for everything they host — its documentation, which
+is offered whether or not the package declared one.
 
 - **Offline first, lazy after.** The forest is built from lockfiles with no network at
   all, so it appears immediately. Registry data is fetched only for the package actually
@@ -69,17 +73,32 @@ advisories, downloads, publish recency, and yanked status.
   "not published"; a failed lookup says so and offers a retry; an ecosystem whose
   lockfile carries no edges says that, rather than letting an empty child list read as
   "no dependencies".
+- **Waiting is visible.** Discovery and every in-flight lookup turn a spinner, so a slow
+  registry cannot be mistaken for a UI that has stopped. The event loop polls faster only
+  while something is actually turning; idle costs nothing.
 
 ### 1c. Resolved graphs beyond Cargo
 
 `tree` remains Rust-only, but the **graph builders** are no longer Cargo-only:
 `dependable_fetch::build_project_graph` assembles a resolved transitive graph for **Rust,
-npm, PHP, and Elixir**, whose lockfiles record per-package edges.
+npm (including Bun), PHP, and Elixir**, whose lockfiles record per-package edges.
+
+A manifest may name several candidate lockfiles (`ManifestKind::lockfiles`), and the
+parser is chosen from the file actually found rather than from the manifest beside it —
+a `package.json` says nothing about which package manager wrote the lockfile next to it.
+Candidates are tried in precedence order within a directory before the walk moves up, so
+proximity decides.
 
 Dart and Go are *not* deferred work — `pubspec.lock` and `go.sum` record resolved
 versions but never which package required which, so no transitive graph exists to read
 offline. Python, C#, pnpm, and Deno need a lockfile parser first. All of these report
 `GraphSource::Unsupported` and fall back to directly declared dependencies.
+
+**Lockfiles we recognise but cannot read.** Bun's binary `bun.lockb` is listed in
+`ManifestKind::unreadable_lockfiles` and reported by `dependable_fetch::lockfile_notices`
+rather than passed over. A project whose only lockfile is one of these reports
+`GraphSource::UnreadableLockfile`, which is distinct from having none: the user has
+something they can act on.
 
 ---
 

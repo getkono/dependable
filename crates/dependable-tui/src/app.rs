@@ -54,6 +54,20 @@ pub enum Action {
     Refresh,
     /// Show or hide the help overlay.
     ToggleHelp,
+    /// Open the selected package's primary URL in a browser.
+    OpenLink,
+    /// Select the row at this index, as a click does.
+    Select(usize),
+    /// Select the row at this index and expand or collapse it.
+    ToggleAt(usize),
+    /// Start dragging the divider between the panes.
+    BeginDrag,
+    /// Stop dragging.
+    EndDrag,
+    /// Set the tree pane's share of the width, as a percentage.
+    SetSplit(u16),
+    /// The row the pointer is over, or `None` when it is over nothing.
+    Hover(Option<usize>),
     /// Leave the application.
     Quit,
 }
@@ -90,6 +104,12 @@ pub struct App {
     selected: usize,
     /// First visible row, tracked so the selection stays on screen.
     pub offset: usize,
+    /// The tree pane's share of the width, as a percentage.
+    ///
+    /// Held here rather than fixed in the layout so the divider between the
+    /// panes can be dragged; clamped to [`App::SPLIT_RANGE`] so neither pane can
+    /// be dragged away entirely.
+    pub split: u16,
     /// The current search text.
     pub query: String,
     /// The compiled search, when the query is not blank.
@@ -102,9 +122,59 @@ pub struct App {
     pub quit: bool,
     /// A transient message shown in the status bar.
     pub message: Option<String>,
+    /// The directory that was scanned, shown in the header.
+    ///
+    /// `None` in tests and before discovery reports back; the header simply
+    /// omits it rather than inventing a path.
+    pub root: Option<std::path::PathBuf>,
+    /// The row the pointer is resting on.
+    ///
+    /// Distinct from the selection, and styled more weakly: it follows the
+    /// pointer rather than the cursor, and must not be mistaken for what the
+    /// keyboard would act on.
+    pub hover: Option<usize>,
+    /// When the pointer arrived on [`Self::hover`], for the marker's fade in.
+    ///
+    /// The one piece of wall-clock state here. It is a clock reading rather
+    /// than IO, and keeping it beside the hover it describes is what lets the
+    /// renderer stay a pure function of this type.
+    hover_since: Option<std::time::Instant>,
+    /// Whether the divider is being dragged.
+    ///
+    /// A drag has to be attributed to where it began: the pointer wanders well
+    /// off the divider mid-drag, and a drag that started in the tree must not
+    /// resize anything.
+    pub dragging: bool,
+    /// A URL the user asked to open, for the event loop to hand to the browser.
+    ///
+    /// Parked here rather than opened directly because this type is free of IO;
+    /// the loop takes it with [`App::take_open_request`].
+    open_request: Option<String>,
+    /// Whether projects are still being discovered.
+    ///
+    /// The event loop sets this, because only it knows discovery is running.
+    /// Held here rather than written into [`Self::message`] every frame — which
+    /// is what it took, since applying any action clears that message.
+    pub scanning: bool,
+    /// When this UI started, which is the phase every spinner is drawn from.
+    started: std::time::Instant,
+    /// The spinner frame for the frame currently being drawn.
+    ///
+    /// Snapshotted by [`Self::tick`] rather than read from the clock at each
+    /// call, so the badge in the tree and the line in the detail pane always
+    /// show the same frame — even when the draw between them happens to
+    /// straddle a period boundary.
+    frame: &'static str,
 }
 
 impl App {
+    /// The tree pane's default share of the width.
+    pub const DEFAULT_SPLIT: u16 = 55;
+    /// How far the divider may be dragged, either way.
+    pub const SPLIT_RANGE: std::ops::RangeInclusive<u16> = 20..=80;
+    /// How long the hover marker takes to reach its colour.
+    pub const HOVER_FADE: std::time::Duration = std::time::Duration::from_millis(150);
+
     /// Build the state for a set of discovered projects.
     ///
     /// Every project starts expanded: a tree whose first interaction must be
@@ -119,12 +189,21 @@ impl App {
             rows: Vec::new(),
             selected: 0,
             offset: 0,
+            split: Self::DEFAULT_SPLIT,
             query: String::new(),
             filter: None,
             mode: Mode::Browse,
             packages: PackageStore::new(),
             quit: false,
             message: None,
+            root: None,
+            hover: None,
+            hover_since: None,
+            dragging: false,
+            open_request: None,
+            scanning: false,
+            started: std::time::Instant::now(),
+            frame: crate::spinner::frame(std::time::Duration::ZERO),
         };
         app.rebuild();
         app
@@ -219,6 +298,34 @@ impl App {
                 } else {
                     Mode::Help
                 };
+            }
+            Action::OpenLink => match self.selected_url() {
+                Some(url) => self.open_request = Some(url),
+                // Saying so beats a key that silently does nothing.
+                None => {
+                    self.message =
+                        Some("nothing to open: this did not come from a registry".to_owned());
+                }
+            },
+            Action::Select(index) => self.select(index),
+            Action::ToggleAt(index) => {
+                self.select(index);
+                self.apply(Action::Toggle);
+            }
+            Action::Hover(row) => {
+                let row = row.filter(|i| *i < self.rows.len());
+                // Restarting the clock on an unchanged hover would hold the
+                // marker at the start of its fade while the pointer moved
+                // along a single row.
+                if row != self.hover {
+                    self.hover_since = row.is_some().then(std::time::Instant::now);
+                    self.hover = row;
+                }
+            }
+            Action::BeginDrag => self.dragging = true,
+            Action::EndDrag => self.dragging = false,
+            Action::SetSplit(percent) => {
+                self.split = percent.clamp(*Self::SPLIT_RANGE.start(), *Self::SPLIT_RANGE.end());
             }
             Action::Quit => self.quit = true,
         }
@@ -366,6 +473,119 @@ impl App {
         {
             self.selected = index;
         }
+    }
+
+    /// How many packages are known across every discovered project.
+    ///
+    /// Counts graph nodes, so a package pulled in by two projects counts once
+    /// per project — which is what "how much is in front of me" means here.
+    #[must_use]
+    pub fn package_count(&self) -> usize {
+        self.projects.iter().map(|p| p.graph.nodes().len()).sum()
+    }
+
+    /// How many looked-up packages carry at least one advisory.
+    ///
+    /// Only packages actually fetched can be counted, so this grows as the user
+    /// browses. It is a floor, never a total, and the header says so.
+    #[must_use]
+    pub fn vulnerable_count(&self) -> usize {
+        self.packages
+            .values()
+            .filter(|data| match data {
+                PackageData::Ready(facts) => !facts.vulnerabilities.is_empty(),
+                _ => false,
+            })
+            .count()
+    }
+
+    /// How far the hover fade has run, from 0.0 to 1.0.
+    ///
+    /// Returns 1.0 when nothing is hovered, so a caller that asks anyway gets
+    /// the settled colour rather than a half-faded one.
+    #[must_use]
+    pub fn hover_progress(&self) -> f32 {
+        let Some(since) = self.hover_since else {
+            return 1.0;
+        };
+        let elapsed = since.elapsed().as_secs_f32();
+        (elapsed / Self::HOVER_FADE.as_secs_f32()).clamp(0.0, 1.0)
+    }
+
+    /// Whether a fade is still running and the UI owes another frame.
+    #[must_use]
+    pub fn animating(&self) -> bool {
+        self.hover_since.is_some() && self.hover_progress() < 1.0
+    }
+
+    /// Whether anything is being waited on, and so whether a spinner is turning.
+    ///
+    /// Includes a selection with no entry yet, not only one already in flight:
+    /// the pane says it is fetching during the settling delay before the request
+    /// is sent, and a spinner that is drawn but not stepped looks like a freeze.
+    ///
+    /// The store only ever holds packages the user has looked at, so scanning it
+    /// costs nothing worth avoiding.
+    #[must_use]
+    pub fn busy(&self) -> bool {
+        self.scanning
+            || self
+                .packages
+                .values()
+                .any(|data| matches!(data, PackageData::Loading))
+            || self
+                .selected_key()
+                .is_some_and(|key| !self.packages.contains_key(&key))
+    }
+
+    /// Advance the animation clock, once per frame.
+    ///
+    /// The renderer calls this before drawing anything; everything drawn after
+    /// it sees one consistent instant.
+    pub fn tick(&mut self) {
+        self.frame = crate::spinner::frame(self.started.elapsed());
+    }
+
+    /// The spinner frame for the frame being drawn.
+    #[must_use]
+    pub fn spinner(&self) -> &'static str {
+        self.frame
+    }
+
+    /// The URL the selected package is best identified by.
+    ///
+    /// Ordered by how likely it is to be what the reader wants: the source
+    /// repository first, then the project's own page, then its documentation,
+    /// and finally the package's page on its own registry. That last one is
+    /// derived rather than fetched, so `o` works the instant a package is
+    /// selected and on one whose registry published no links at all.
+    ///
+    /// Returns `None` only for a row with no registry package behind it — a
+    /// project, a workspace member, or a git or path dependency.
+    #[must_use]
+    pub fn selected_url(&self) -> Option<String> {
+        let row = self.selected()?;
+        let key = self.selected_key()?;
+        let published = match self.packages.get(&key) {
+            Some(PackageData::Ready(facts)) => facts.metadata.as_ref().and_then(|meta| {
+                // Each is taken only if it was actually published: a field a
+                // registry recorded as an empty string would otherwise win over
+                // the populated one behind it, and open as a bare `https://`.
+                crate::url::published(meta.repository.as_deref())
+                    .or_else(|| crate::url::published(meta.homepage.as_deref()))
+                    .or_else(|| crate::url::published(meta.documentation.as_deref()))
+                    // Registries store URLs in their own ecosystem's shape; npm's
+                    // `git+https://…` is not a scheme a browser knows.
+                    .map(crate::url::target_url)
+            }),
+            _ => None,
+        };
+        Some(published.unwrap_or_else(|| self.ecosystem_of(row).package_url(&row.name)))
+    }
+
+    /// Take the URL the user asked to open, if any.
+    pub fn take_open_request(&mut self) -> Option<String> {
+        self.open_request.take()
     }
 
     /// Keep the selection within a viewport `height` rows tall.

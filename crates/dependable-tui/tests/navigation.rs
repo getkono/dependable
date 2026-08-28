@@ -340,3 +340,110 @@ fn an_empty_project_list_is_navigable_without_panicking() {
     assert!(app.rows().is_empty());
     assert!(app.selected().is_none());
 }
+
+// --- hover ---
+
+#[test]
+fn hovering_a_row_records_it_and_starts_the_fade() {
+    let mut app = sample();
+    assert_eq!(app.hover, None);
+    assert!(!app.animating(), "nothing is hovered, nothing is animating");
+
+    app.apply(Action::Hover(Some(0)));
+    assert_eq!(app.hover, Some(0));
+    assert!(app.animating(), "the marker fades in on arrival");
+    assert!(app.hover_progress() < 1.0);
+}
+
+#[test]
+fn an_idle_ui_is_not_animating() {
+    // The fade shortens the poll interval while it runs; if it never finished,
+    // an idle UI would wake sixty times a second forever.
+    let mut app = sample();
+    app.apply(Action::Hover(Some(0)));
+    std::thread::sleep(App::HOVER_FADE + std::time::Duration::from_millis(20));
+
+    assert!(!app.animating(), "the fade finishes");
+    assert_eq!(app.hover_progress(), 1.0, "and settles on its target");
+}
+
+#[test]
+fn moving_within_one_row_does_not_restart_the_fade() {
+    // Motion reporting fires per cell crossed. Restarting the clock on each
+    // would hold the marker at the start of its fade while the pointer slid
+    // along a single row.
+    let mut app = sample();
+    app.apply(Action::Hover(Some(0)));
+    std::thread::sleep(std::time::Duration::from_millis(120));
+    let progressed = app.hover_progress();
+
+    app.apply(Action::Hover(Some(0)));
+    assert!(
+        app.hover_progress() >= progressed,
+        "the fade kept running: {} then {}",
+        progressed,
+        app.hover_progress()
+    );
+}
+
+#[test]
+fn leaving_the_tree_clears_the_hover() {
+    let mut app = sample();
+    app.apply(Action::Hover(Some(0)));
+    app.apply(Action::Hover(None));
+
+    assert_eq!(app.hover, None);
+    assert!(
+        !app.animating(),
+        "nothing is fading once nothing is hovered"
+    );
+}
+
+#[test]
+fn hovering_a_row_that_does_not_exist_is_ignored() {
+    let mut app = sample();
+    app.apply(Action::Hover(Some(9_999)));
+    assert_eq!(app.hover, None);
+}
+
+// --- pointer selection and the divider ---
+
+#[test]
+fn clicking_selects_without_expanding() {
+    let mut app = sample();
+    app.apply(Action::Expand);
+    let before = app.rows().len();
+
+    app.apply(Action::Select(1));
+    assert_eq!(app.selected_index(), 1);
+    assert_eq!(app.rows().len(), before, "selecting does not open anything");
+}
+
+#[test]
+fn clicking_a_marker_selects_and_opens_in_one_go() {
+    let mut app = sample();
+    app.apply(Action::Expand);
+    let before = app.rows().len();
+
+    app.apply(Action::ToggleAt(1));
+    assert_eq!(app.selected_index(), 1);
+    assert!(
+        app.rows().len() > before,
+        "the row under the pointer was opened"
+    );
+}
+
+#[test]
+fn the_divider_cannot_be_dragged_off_either_edge() {
+    // A pane dragged to nothing cannot be dragged back.
+    let mut app = sample();
+
+    app.apply(Action::SetSplit(0));
+    assert_eq!(app.split, *App::SPLIT_RANGE.start());
+
+    app.apply(Action::SetSplit(100));
+    assert_eq!(app.split, *App::SPLIT_RANGE.end());
+
+    app.apply(Action::SetSplit(50));
+    assert_eq!(app.split, 50, "a sensible width is kept as asked");
+}

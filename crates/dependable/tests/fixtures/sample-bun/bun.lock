@@ -1,0 +1,22 @@
+{
+  "lockfileVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "sample-bun",
+      "version": "1.0.0",
+      "dependencies": {
+        "@acme/ui": "^2.1.0",
+        "react": "^19.0.0",
+      },
+      "devDependencies": {
+        "typescript": "^5.4.0",
+      },
+    },
+  },
+  "packages": {
+    "@acme/ui": ["@acme/ui@2.1.0", "", { "dependencies": { "react": "^19.0.0" } }, "sha512-acmeui"],
+    "react": ["react@19.0.0", "", { "dependencies": { "scheduler": "^0.25.0" } }, "sha512-react"],
+    "scheduler": ["scheduler@0.25.0", "", {}, "sha512-scheduler"],
+    "typescript": ["typescript@5.4.5", "", {}, "sha512-typescript"],
+  },
+}

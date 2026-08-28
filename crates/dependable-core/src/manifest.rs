@@ -65,23 +65,47 @@ impl ManifestKind {
         }
     }
 
-    /// The sibling lockfile name, if this manifest kind has one we read.
+    /// The sibling lockfiles this manifest kind may have, in precedence order.
+    ///
+    /// A manifest is not tied to one lockfile: a `package.json` is governed by
+    /// whichever of several a package manager wrote, and the first one actually
+    /// present wins. Ecosystems where only one exists simply list one.
     #[must_use]
-    pub fn lockfile_name(self) -> Option<&'static str> {
+    pub fn lockfiles(self) -> &'static [LockfileKind] {
         match self {
-            ManifestKind::CargoToml => Some("Cargo.lock"),
-            ManifestKind::PackageJson => Some("package-lock.json"),
-            ManifestKind::ComposerJson => Some("composer.lock"),
-            ManifestKind::PubspecYaml => Some("pubspec.lock"),
-            ManifestKind::MixExs => Some("mix.lock"),
-            _ => None,
+            ManifestKind::CargoToml => &[LockfileKind::CargoLock],
+            // `package-lock.json` first: a repository carrying both has been
+            // through a migration, and npm's is what every existing caller
+            // already resolved to. A bun-only project has only `bun.lock`, so
+            // the order costs it nothing.
+            ManifestKind::PackageJson => &[LockfileKind::PackageLockJson, LockfileKind::BunLock],
+            ManifestKind::ComposerJson => &[LockfileKind::ComposerLock],
+            ManifestKind::PubspecYaml => &[LockfileKind::PubspecLock],
+            ManifestKind::MixExs => &[LockfileKind::MixLock],
+            _ => &[],
+        }
+    }
+
+    /// Lockfiles this ecosystem produces that we recognise but cannot read.
+    ///
+    /// Listed so their presence can be reported rather than mistaken for a
+    /// missing lockfile.
+    #[must_use]
+    pub fn unreadable_lockfiles(self) -> &'static [UnreadableLockfile] {
+        match self {
+            ManifestKind::PackageJson => &[UnreadableLockfile {
+                file_name: "bun.lockb",
+                reason: "Bun's legacy binary lockfile, which cannot be read as text. \
+                         Run `bun install --save-text-lockfile` to migrate it to bun.lock.",
+            }],
+            _ => &[],
         }
     }
 
     /// Whether a sibling lockfile is read for this manifest kind.
     #[must_use]
     pub fn has_lockfile_support(self) -> bool {
-        self.lockfile_name().is_some()
+        !self.lockfiles().is_empty()
     }
 
     /// Detect a manifest kind from a file path.
@@ -108,6 +132,78 @@ impl ManifestKind {
             _ => return None,
         };
         Some(kind)
+    }
+}
+
+/// A lockfile format we recognise but cannot read, and what to do about it.
+///
+/// Recognising these is what separates "no lockfile here" from "a lockfile we
+/// cannot use". The second is the more common state for a user to be in and the
+/// one they can act on, and reporting it as the first is actively misleading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct UnreadableLockfile {
+    /// The file name to look for.
+    pub file_name: &'static str,
+    /// Why it cannot be read, phrased for the person who has to fix it.
+    pub reason: &'static str,
+}
+
+/// A lockfile format we can read.
+///
+/// Separate from [`ManifestKind`] because the mapping is not one to one in
+/// either direction: one manifest may be governed by any of several lockfiles,
+/// and dispatching a parser on the manifest rather than on the file in front of
+/// it is what made a second lockfile per ecosystem inexpressible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum LockfileKind {
+    /// Cargo's `Cargo.lock`.
+    CargoLock,
+    /// npm's `package-lock.json`.
+    PackageLockJson,
+    /// Bun's text lockfile, `bun.lock`.
+    ///
+    /// Bun's older binary format, `bun.lockb`, is deliberately absent: it is not
+    /// a text format and cannot be read. It is detected during discovery and
+    /// reported, rather than being silently treated as a missing lockfile.
+    BunLock,
+    /// Composer's `composer.lock`.
+    ComposerLock,
+    /// Dart's `pubspec.lock`.
+    PubspecLock,
+    /// Mix's `mix.lock`.
+    MixLock,
+}
+
+impl LockfileKind {
+    /// The file name this kind is written to.
+    #[must_use]
+    pub fn file_name(self) -> &'static str {
+        match self {
+            LockfileKind::CargoLock => "Cargo.lock",
+            LockfileKind::PackageLockJson => "package-lock.json",
+            LockfileKind::BunLock => "bun.lock",
+            LockfileKind::ComposerLock => "composer.lock",
+            LockfileKind::PubspecLock => "pubspec.lock",
+            LockfileKind::MixLock => "mix.lock",
+        }
+    }
+
+    /// Recognise a lockfile by its file name.
+    #[must_use]
+    pub fn detect(path: &Path) -> Option<Self> {
+        let name = path.file_name()?.to_str()?;
+        [
+            LockfileKind::CargoLock,
+            LockfileKind::PackageLockJson,
+            LockfileKind::BunLock,
+            LockfileKind::ComposerLock,
+            LockfileKind::PubspecLock,
+            LockfileKind::MixLock,
+        ]
+        .into_iter()
+        .find(|kind| kind.file_name() == name)
     }
 }
 
@@ -157,22 +253,60 @@ mod tests {
         assert_eq!(ManifestKind::detect(Path::new("setup.py")), None);
     }
 
+    /// The file names a manifest kind's lockfiles are written to.
+    fn names(kind: ManifestKind) -> Vec<&'static str> {
+        kind.lockfiles()
+            .iter()
+            .map(|lockfile| lockfile.file_name())
+            .collect()
+    }
+
     #[test]
     fn lockfile_names() {
-        assert_eq!(ManifestKind::CargoToml.lockfile_name(), Some("Cargo.lock"));
+        assert_eq!(names(ManifestKind::CargoToml), ["Cargo.lock"]);
         assert_eq!(
-            ManifestKind::PackageJson.lockfile_name(),
-            Some("package-lock.json")
+            names(ManifestKind::PackageJson),
+            ["package-lock.json", "bun.lock"]
+        );
+        assert_eq!(names(ManifestKind::ComposerJson), ["composer.lock"]);
+        assert_eq!(names(ManifestKind::PubspecYaml), ["pubspec.lock"]);
+        assert_eq!(names(ManifestKind::MixExs), ["mix.lock"]);
+        assert!(names(ManifestKind::GoMod).is_empty());
+        assert!(!ManifestKind::GoMod.has_lockfile_support());
+    }
+
+    #[test]
+    fn a_lockfile_is_recognised_by_its_name() {
+        assert_eq!(
+            LockfileKind::detect(Path::new("/a/b/Cargo.lock")),
+            Some(LockfileKind::CargoLock)
         );
         assert_eq!(
-            ManifestKind::ComposerJson.lockfile_name(),
-            Some("composer.lock")
+            LockfileKind::detect(Path::new("package-lock.json")),
+            Some(LockfileKind::PackageLockJson)
         );
-        assert_eq!(
-            ManifestKind::PubspecYaml.lockfile_name(),
-            Some("pubspec.lock")
-        );
-        assert_eq!(ManifestKind::MixExs.lockfile_name(), Some("mix.lock"));
-        assert_eq!(ManifestKind::GoMod.lockfile_name(), None);
+        assert_eq!(LockfileKind::detect(Path::new("Cargo.toml")), None);
+        assert_eq!(LockfileKind::detect(Path::new("")), None);
+    }
+
+    #[test]
+    fn every_lockfile_a_manifest_names_round_trips_through_detection() {
+        // A kind whose file name is not recognised back would be located on disk
+        // and then not parsed, which is the silent-drop failure this replaces.
+        for kind in [
+            ManifestKind::CargoToml,
+            ManifestKind::PackageJson,
+            ManifestKind::ComposerJson,
+            ManifestKind::PubspecYaml,
+            ManifestKind::MixExs,
+        ] {
+            for lockfile in kind.lockfiles() {
+                assert_eq!(
+                    LockfileKind::detect(Path::new(lockfile.file_name())),
+                    Some(*lockfile),
+                    "{lockfile:?} is not recognised by its own name"
+                );
+            }
+        }
     }
 }

@@ -20,10 +20,14 @@ pub mod data;
 pub mod event;
 pub mod filter;
 pub mod model;
+pub mod open;
 pub mod rows;
 pub mod run;
+pub mod spinner;
 pub mod terminal;
+pub mod theme;
 pub mod ui;
+pub mod url;
 
 pub use run::{TuiOptions, run};
 

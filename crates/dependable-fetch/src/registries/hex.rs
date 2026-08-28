@@ -5,7 +5,7 @@ use futures::FutureExt;
 use futures::future::BoxFuture;
 use serde::Deserialize;
 
-use super::{FetchedVersions, PackageMetadata, RegistryFetcher};
+use super::{FetchedVersions, Owner, PackageMetadata, RegistryFetcher};
 use crate::error::FetchError;
 
 const DEFAULT_REGISTRY: &str = "https://hex.pm";
@@ -82,6 +82,8 @@ struct HexDownloads {
 #[derive(Deserialize)]
 struct DatedRelease {
     #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
     inserted_at: Option<String>,
 }
 
@@ -155,10 +157,22 @@ impl RegistryFetcher for HexFetcher {
                 homepage: body.meta.links.get("Homepage").cloned(),
                 documentation: body.docs_html_url,
                 license: (!body.meta.licenses.is_empty()).then(|| body.meta.licenses.join(" OR ")),
-                authors: body.meta.maintainers,
+                // Hex publishes maintainers as bare strings and nothing more.
+                owners: body
+                    .meta
+                    .maintainers
+                    .into_iter()
+                    .filter(|m| !m.trim().is_empty())
+                    .map(Owner::named)
+                    .collect(),
                 downloads: body.downloads.all,
                 // Hex lists releases newest-first.
-                last_published: body.releases.into_iter().find_map(|r| r.inserted_at),
+                latest_published: body.releases.iter().find_map(|r| r.inserted_at.clone()),
+                published: body
+                    .releases
+                    .into_iter()
+                    .filter_map(|r| Some((r.version?, r.inserted_at?)))
+                    .collect(),
                 yanked: false,
                 msrv: None,
             }))

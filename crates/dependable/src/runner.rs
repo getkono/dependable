@@ -212,6 +212,7 @@ impl Engine {
     /// has no registered checker or no parser yet — so a polyglot repo with a
     /// not-yet-supported manifest does not abort the whole run.
     async fn check_manifest(&self, path: &Path) -> anyhow::Result<Option<ManifestReport>> {
+        report_lockfile_notices(path);
         match self.checker.check_path(path).await {
             Ok(check) => {
                 for warning in &check.warnings {
@@ -241,6 +242,20 @@ impl Engine {
             }
             Err(e) => Err(anyhow::Error::new(e).context(format!("checking {}", path.display()))),
         }
+    }
+}
+
+/// Warn about lockfiles that are present beside `manifest` but cannot be used.
+///
+/// Without this a `bun.lockb` is silently skipped and every dependency is
+/// reported unlocked, with nothing to tell the user that a lockfile they can
+/// migrate is the reason.
+fn report_lockfile_notices(manifest: &Path) {
+    let Some(kind) = ManifestKind::detect(manifest) else {
+        return;
+    };
+    for notice in dependable_fetch::lockfile_notices(manifest, kind) {
+        eprintln!("warning: {notice}");
     }
 }
 
@@ -330,6 +345,7 @@ pub async fn run_list(args: ListArgs) -> anyhow::Result<ExitCode> {
         let Some(kind) = ManifestKind::detect(manifest) else {
             continue;
         };
+        report_lockfile_notices(manifest);
         let content = std::fs::read_to_string(manifest)
             .with_context(|| format!("reading {}", manifest.display()))?;
         let mut parsed = match parse(kind, &content) {

@@ -14,10 +14,10 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use dependable_core::{
-    CargoTomlParser, DependencyGraph, LockedPackage, ManifestKind, PackageSource, ParseError,
-    Parser, ResolvedLockfile, parse, parse_cargo_lock_graph, parse_composer_lock_graph,
-    parse_mix_lock_graph, parse_package_lock_graph, parse_package_name, parse_project,
-    parse_workspace,
+    CargoTomlParser, DependencyGraph, LockedPackage, LockfileKind, ManifestKind, PackageSource,
+    ParseError, Parser, ResolvedLockfile, parse, parse_bun_lock_graph, parse_cargo_lock_graph,
+    parse_composer_lock_graph, parse_mix_lock_graph, parse_package_lock_graph, parse_package_name,
+    parse_project, parse_workspace,
 };
 use thiserror::Error;
 
@@ -40,6 +40,13 @@ pub enum GraphSource {
     /// distinct from [`Self::Manifests`], where a lockfile would have helped and
     /// simply was not there.
     Unsupported,
+    /// A shallow graph because the lockfile that *is* there could not be used.
+    ///
+    /// Bun's binary `bun.lockb`, or a file that would not parse. Distinct from
+    /// [`Self::Manifests`] because the user has something to act on: telling
+    /// them no lockfile was found, when one is sitting beside the manifest, is
+    /// worse than telling them nothing.
+    UnreadableLockfile,
 }
 
 /// The result of [`build_workspace_graph`]: the graph plus how it was built.
@@ -113,8 +120,9 @@ pub fn build_workspace_graph(
 
     // Prefer the resolved lockfile; fall back to a shallow manifest-only graph.
     let lock_name = ManifestKind::CargoToml
-        .lockfile_name()
-        .unwrap_or("Cargo.lock");
+        .lockfiles()
+        .first()
+        .map_or("Cargo.lock", |lockfile| lockfile.file_name());
     if let Ok(lock_content) = std::fs::read_to_string(root_dir.join(lock_name)) {
         let resolved = parse_cargo_lock_graph(&lock_content)?;
         let graph = DependencyGraph::from_resolved(&resolved, &workspace_names, &roots);
@@ -296,19 +304,32 @@ pub fn build_project_graph(
         None => vec![root_name.clone()],
     };
 
-    let Some(parser) = graph_parser(kind) else {
+    if !has_graph_parser(kind) {
         let graph = direct_graph(&root_name, &root_version, &direct, &workspace_names, &roots);
         return Ok(WorkspaceGraph {
             graph,
             source: GraphSource::Unsupported,
         });
+    }
+
+    let Some((lock_path, lock_kind)) = crate::discover::locate_lockfile(manifest, kind) else {
+        let graph = direct_graph(&root_name, &root_version, &direct, &workspace_names, &roots);
+        // Distinguish "there is none" from "there is one we cannot use".
+        let source = if crate::discover::lockfile_notices(manifest, kind).is_empty() {
+            GraphSource::Manifests
+        } else {
+            GraphSource::UnreadableLockfile
+        };
+        return Ok(WorkspaceGraph { graph, source });
     };
 
-    let Some(lock_path) = crate::discover::locate_lockfile(manifest, kind) else {
+    // The manifest has *a* format we can read edges from, but the one actually
+    // on disk may not be it.
+    let Some(parser) = graph_parser(lock_kind) else {
         let graph = direct_graph(&root_name, &root_version, &direct, &workspace_names, &roots);
         return Ok(WorkspaceGraph {
             graph,
-            source: GraphSource::Manifests,
+            source: GraphSource::Unsupported,
         });
     };
 
@@ -323,15 +344,29 @@ pub fn build_project_graph(
 /// A lockfile parser that preserves dependency edges.
 type GraphParser = fn(&str) -> Result<ResolvedLockfile, ParseError>;
 
-/// The graph-preserving lockfile parser for `kind`, or `None` when the ecosystem's
-/// lockfile cannot express edges (Dart, Go) or has no parser yet.
-fn graph_parser(kind: ManifestKind) -> Option<GraphParser> {
+/// The graph-preserving parser for a lockfile, or `None` when that format
+/// cannot express edges (Dart's `pubspec.lock`) or has no parser yet.
+///
+/// Keyed on the lockfile rather than the manifest: two lockfiles for the same
+/// ecosystem are different formats and need different parsers.
+fn graph_parser(kind: LockfileKind) -> Option<GraphParser> {
     match kind {
-        ManifestKind::PackageJson => Some(parse_package_lock_graph),
-        ManifestKind::ComposerJson => Some(parse_composer_lock_graph),
-        ManifestKind::MixExs => Some(parse_mix_lock_graph),
+        LockfileKind::PackageLockJson => Some(parse_package_lock_graph),
+        LockfileKind::BunLock => Some(parse_bun_lock_graph),
+        LockfileKind::ComposerLock => Some(parse_composer_lock_graph),
+        LockfileKind::MixLock => Some(parse_mix_lock_graph),
         _ => None,
     }
+}
+
+/// Whether any lockfile this manifest kind may have can express edges.
+///
+/// Asked before looking on disk so that an ecosystem which could never produce
+/// a resolved graph says so, rather than reporting the lockfile as missing.
+fn has_graph_parser(kind: ManifestKind) -> bool {
+    kind.lockfiles()
+        .iter()
+        .any(|lockfile| graph_parser(*lockfile).is_some())
 }
 
 /// Ensure the project itself is a node, so the graph has a root to render from.

@@ -4,7 +4,7 @@
 //! real markers); they are sorted newest-first by their semver interpretation. The
 //! evaluation layer converts them to semver for comparison.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use ::semver::Version;
 use dependable_core::semver::python::pep440_to_semver;
@@ -12,7 +12,7 @@ use futures::FutureExt;
 use futures::future::BoxFuture;
 use serde::Deserialize;
 
-use super::{FetchedVersions, PackageMetadata, RegistryFetcher};
+use super::{FetchedVersions, Owner, OwnerKind, PackageMetadata, RegistryFetcher};
 use crate::error::FetchError;
 
 const DEFAULT_REGISTRY: &str = "https://pypi.org/pypi";
@@ -63,6 +63,11 @@ struct InfoResponse {
     info: Info,
     #[serde(default)]
     urls: Vec<UploadedFile>,
+    /// Every release and its files. PyPI has long signalled that this block may
+    /// go away, so it is read opportunistically and never depended on — when it
+    /// is absent only the newest release can be dated, from `urls`.
+    #[serde(default)]
+    releases: HashMap<String, Vec<UploadedFile>>,
 }
 
 #[derive(Deserialize, Default)]
@@ -74,7 +79,15 @@ struct Info {
     #[serde(default)]
     license: Option<String>,
     #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
     author: Option<String>,
+    #[serde(default)]
+    author_email: Option<String>,
+    #[serde(default)]
+    maintainer: Option<String>,
+    #[serde(default)]
+    maintainer_email: Option<String>,
     #[serde(default)]
     yanked: bool,
     #[serde(default)]
@@ -85,6 +98,67 @@ struct Info {
 struct UploadedFile {
     #[serde(default)]
     upload_time_iso_8601: Option<String>,
+}
+
+/// Publish dates per version, from whichever of the two shapes PyPI served.
+///
+/// A release is dated by its earliest uploaded file: a version's files can be
+/// uploaded minutes or years apart (a later wheel for a new Python), and the
+/// first upload is what "published" means.
+fn pypi_published(body: &InfoResponse) -> BTreeMap<String, String> {
+    if !body.releases.is_empty() {
+        return body
+            .releases
+            .iter()
+            .filter_map(|(version, files)| {
+                let earliest = files
+                    .iter()
+                    .filter_map(|f| f.upload_time_iso_8601.as_deref())
+                    .min()?;
+                Some((version.clone(), earliest.to_owned()))
+            })
+            .collect();
+    }
+
+    // Only the newest release is described, so that is all we can date.
+    match (
+        body.info.version.as_deref(),
+        body.urls
+            .iter()
+            .filter_map(|f| f.upload_time_iso_8601.as_deref())
+            .min(),
+    ) {
+        (Some(version), Some(uploaded)) => {
+            BTreeMap::from([(version.to_owned(), uploaded.to_owned())])
+        }
+        _ => BTreeMap::new(),
+    }
+}
+
+/// PyPI records an author and a maintainer as two independent name/email pairs,
+/// either of which may be blank or absent.
+///
+/// The two are frequently the same person, and a package that names the same
+/// party twice should not read as having two owners.
+fn pypi_owners(info: &Info) -> Vec<Owner> {
+    let pair = |name: &Option<String>, email: &Option<String>| Owner {
+        name: name.clone().filter(|v| !v.trim().is_empty()),
+        login: None,
+        email: email.clone().filter(|v| !v.trim().is_empty()),
+        url: None,
+        kind: OwnerKind::User,
+    };
+
+    let mut owners = Vec::new();
+    for owner in [
+        pair(&info.author, &info.author_email),
+        pair(&info.maintainer, &info.maintainer_email),
+    ] {
+        if !owner.is_anonymous() && !owners.contains(&owner) {
+            owners.push(owner);
+        }
+    }
+    owners
 }
 
 /// The `project_urls` key naming a source repository, by PyPI convention.
@@ -153,15 +227,24 @@ impl RegistryFetcher for PyPiFetcher {
                 detail: e.to_string(),
             })?;
 
+            // Computed before the struct literal moves the fields they read.
+            let owners = pypi_owners(&body.info);
+            let published = pypi_published(&body);
+
             Ok(Some(PackageMetadata {
                 description: body.info.summary,
                 repository: repository_url(&body.info.project_urls),
                 homepage: body.info.home_page,
                 documentation: body.info.project_urls.get("Documentation").cloned(),
                 license: body.info.license.filter(|l| !l.is_empty()),
-                authors: body.info.author.into_iter().collect(),
+                owners,
                 downloads: None,
-                last_published: body.urls.into_iter().find_map(|f| f.upload_time_iso_8601),
+                latest_published: body
+                    .urls
+                    .into_iter()
+                    .filter_map(|f| f.upload_time_iso_8601)
+                    .min(),
+                published,
                 yanked: body.info.yanked,
                 msrv: None,
             }))

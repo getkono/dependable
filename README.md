@@ -14,8 +14,11 @@ brew install getkono/tap/dependable
 # aqua
 aqua g -i getkono/dependable
 
-# Cargo (from source)
+# Cargo (from source; needs Rust 1.88 or newer)
 cargo install --locked --git https://github.com/getkono/dependable dependable
+
+# From a clone
+mise run install
 ```
 
 Or download a prebuilt binary for your platform from the
@@ -26,7 +29,7 @@ Or download a prebuilt binary for your platform from the
 | Language | Manifest(s) | Registry | Lockfile | Status |
 | --- | --- | --- | --- | --- |
 | Rust | `Cargo.toml` | crates.io | `Cargo.lock` | ✅ Stable |
-| JavaScript / TypeScript | `package.json` | npm | `package-lock.json` | ✅ Stable |
+| JavaScript / TypeScript | `package.json` | npm | `package-lock.json`, `bun.lock` | ✅ Stable |
 | Python | `requirements*.txt`, `pyproject.toml`, `pixi.toml` | PyPI | — | ✅ Stable |
 | Go | `go.mod` | Go proxy | — | 🧪 Experimental |
 | Deno / JSR | `deno.json(c)` | JSR | — | 🧪 Experimental |
@@ -35,6 +38,32 @@ Or download a prebuilt binary for your platform from the
 | Dart / Flutter | `pubspec.yaml` | pub.dev | `pubspec.lock` | 🧪 Experimental |
 | C# / .NET | `*.csproj`, `Directory.Packages.props` | NuGet | — | 🧪 Experimental |
 | Elixir | `mix.exs` | Hex | `mix.lock` | 🧪 Experimental |
+
+### Lockfiles
+
+A lockfile is what turns "the manifest allows `^19.0.0`" into "you are actually
+running 19.0.0", so it is what the resolved dependency tree and the age column
+are built from. Where the Lockfile column above reads `—`, versions come from the
+manifest's constraints instead and the tree shows only directly declared
+dependencies.
+
+| Lockfile | Locked versions | Resolved tree |
+| --- | --- | --- |
+| `Cargo.lock` | ✅ | ✅ |
+| `package-lock.json` | ✅ | ✅ |
+| `bun.lock` | ✅ | ✅ |
+| `composer.lock` | ✅ | ✅ |
+| `mix.lock` | ✅ | ✅ |
+| `pubspec.lock` | ✅ | ✕ — records versions but not which package required which |
+
+Not read: `yarn.lock`, `pnpm-lock.yaml`, `deno.lock`, `go.sum`, `uv.lock`,
+`poetry.lock`, `Pipfile.lock`, `packages.lock.json`.
+
+**Bun.** Only the text format, `bun.lock`, is supported. The older binary
+`bun.lockb` cannot be read; when one is found, `dependable` says so and tells you
+to run `bun install --save-text-lockfile` to migrate, rather than silently
+reporting your dependencies as unlocked. A project with both is read from
+`package-lock.json`.
 
 **Status legend:**
 
@@ -71,6 +100,7 @@ both V1 and V2 (decision D9 in [`docs/SCOPE.md`](docs/SCOPE.md)).
 ```bash
 mise install        # install hk + cargo-llvm-cov from mise.toml
 mise run build
+mise run install    # install the dependable binary into ~/.cargo/bin
 ```
 
 ## Usage
@@ -92,21 +122,40 @@ every project in the repository, expanded to whatever depth you care to descend,
 with each package's public metadata beside it.
 
 ```
-┌ dependencies — 4 of 11 ──────────────────┐┌ details ─────────────────────────┐
-│v Cargo.toml                              ││regex                             │
-│  v dependable-core 0.1.2 (workspace)     ││   resolved  1.12.4               │
-│    v regex 1.12.4 update                 ││     latest  1.13.1               │
-│      v aho-corasick 1.1.4 patch          ││     status  update available     │
-│          memchr 2.8.2                    ││ advisories  none known           │
-│      > regex-automata 0.4.18             ││ repository  github.com/rust-lang │
-│    > serde 1.0.228                       ││    license  MIT OR Apache-2.0    │
-│    > toml_edit 0.22.27                   ││  downloads  1.1B                 │
-└──────────────────────────────────────────┘└──────────────────────────────────┘
+dependable  ~/src/dependable   7 packages
+┌ dependencies — 3 of 8 ────────────────────────────┐┌ details ────────────────────────────────┐
+│  NAME                VERSION      AGE    STATUS   ││regex                                    │
+│v Cargo.toml                                       ││   resolved  1.12.4                      │
+│  v dependable-core   0.1.2               workspace││                                         │
+│    v regex           1.12.4       1y     update   ││   registry  crates.io/crates/regex      │
+│      v aho-corasick  1.1.4                        ││                                         │
+│          memchr      2.8.2                        ││     latest  1.13.1                      │
+│        regex-automat 0.4.18                       ││     status  update available            │
+│      serde           1.0.228                      ││ advisories  none known                  │
+│      toml_edit       0.22.27                      ││                                         │
+│                                                   ││ repository  github.com/rust-lang/regex  │
+│                                                   ││   homepage  not published               │
+│                                                   ││       docs  docs.rs/regex/1.12.4        │
+└───────────────────────────────────────────────────┘└─────────────────────────────────────────┘
+press / to search, ? for help
 ```
 
 Press `?` for the keys. `/` searches by glob — `serde*`, `@types/*`,
 `{tokio,hyper}*` — and opens the tree along every path that matches, so a package
 buried six levels down is one query away.
+
+Every URL in the detail pane is a link: the package's page on its registry, that
+exact version, the repository, the homepage, the documentation, each owner's
+profile, and every advisory's OSV entry. Terminals that understand OSC 8 make
+them clickable; `o` opens the selected package's link anywhere else.
+
+The registry and version pages are derived from the package's name rather than
+fetched, so they are on screen before anything has been looked up. Where an
+ecosystem builds documentation for everything it hosts — docs.rs, HexDocs,
+pub.dev — that page is offered too, whether or not the package declared one.
+
+The mouse works too: click a row to select it, click its marker to open it, drag
+the divider between the panes, and scroll with the wheel.
 
 The tree is built offline from your lockfiles, so it appears instantly; the
 network is touched only for the package you actually select. Resolved transitive

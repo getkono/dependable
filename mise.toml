@@ -17,6 +17,13 @@ run = "hk install --mise"
 description = "Build the workspace"
 run = "cargo build --workspace"
 
+# Installs the `dependable` binary, which is both the CLI and the TUI — a bare
+# `dependable` in a terminal opens the interactive UI. `--locked` so the install
+# uses the versions in Cargo.lock rather than resolving fresh ones.
+[tasks.install]
+description = "Install the dependable CLI/TUI into ~/.cargo/bin"
+run = "cargo install --path crates/dependable --locked --force"
+
 [tasks.test]
 description = "Run all tests (live network tests are #[ignore]d and skipped)"
 run = "cargo test --workspace"

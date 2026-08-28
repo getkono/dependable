@@ -1,13 +1,13 @@
 //! The Packagist fetcher for PHP/Composer (`repo.packagist.org` metadata v2).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use ::semver::Version;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use serde::Deserialize;
 
-use super::{FetchedVersions, PackageMetadata, RegistryFetcher};
+use super::{FetchedVersions, Owner, OwnerKind, PackageMetadata, RegistryFetcher};
 use crate::error::FetchError;
 
 const DEFAULT_REGISTRY: &str = "https://repo.packagist.org";
@@ -60,6 +60,8 @@ struct MetadataDoc {
 #[derive(Deserialize)]
 struct DetailedRelease {
     #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
     description: Option<String>,
     #[serde(default)]
     homepage: Option<String>,
@@ -73,10 +75,27 @@ struct DetailedRelease {
     time: Option<String>,
 }
 
+/// Composer authors carry contact details we can attribute a package with.
 #[derive(Deserialize)]
 struct Author {
     #[serde(default)]
     name: Option<String>,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    homepage: Option<String>,
+}
+
+impl From<Author> for Owner {
+    fn from(a: Author) -> Self {
+        Owner {
+            name: a.name,
+            login: None,
+            email: a.email,
+            url: a.homepage,
+            kind: OwnerKind::User,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -145,12 +164,14 @@ impl RegistryFetcher for PackagistFetcher {
             })?;
 
             // Packagist lists a package's releases newest-first.
-            let Some(newest) = body
-                .packages
-                .into_values()
-                .next()
-                .and_then(|releases| releases.into_iter().next())
-            else {
+            let Some(releases) = body.packages.into_values().next() else {
+                return Ok(None);
+            };
+            let published: BTreeMap<String, String> = releases
+                .iter()
+                .filter_map(|r| Some((strip_v(r.version.as_deref()?), r.time.clone()?)))
+                .collect();
+            let Some(newest) = releases.into_iter().next() else {
                 return Ok(None);
             };
 
@@ -160,9 +181,15 @@ impl RegistryFetcher for PackagistFetcher {
                 homepage: newest.homepage,
                 documentation: None,
                 license: (!newest.license.is_empty()).then(|| newest.license.join(" OR ")),
-                authors: newest.authors.into_iter().filter_map(|a| a.name).collect(),
+                owners: newest
+                    .authors
+                    .into_iter()
+                    .map(Owner::from)
+                    .filter(|o| !o.is_anonymous())
+                    .collect(),
                 downloads: None,
-                last_published: newest.time,
+                latest_published: newest.time,
+                published,
                 yanked: false,
                 msrv: None,
             }))

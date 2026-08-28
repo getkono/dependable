@@ -23,6 +23,19 @@ const SETTLE: Duration = Duration::from_millis(180);
 /// terminal resizes appear promptly.
 const TICK: Duration = Duration::from_millis(100);
 
+/// The poll interval while an animation is running.
+///
+/// At [`TICK`] a 150 ms fade would render a single intermediate frame, which
+/// reads as a jump rather than a transition. This is used *only* while a fade
+/// is in flight, so an idle UI still wakes ten times a second and no more.
+const FRAME: Duration = Duration::from_millis(16);
+
+/// The poll interval while a spinner is turning.
+///
+/// A spinner steps far more slowly than a fade, and waking at [`FRAME`] for one
+/// would draw the same glyph five times over.
+const SPIN: Duration = crate::spinner::PERIOD;
+
 /// How the UI was asked to start.
 #[derive(Debug, Clone)]
 pub struct TuiOptions {
@@ -49,7 +62,7 @@ pub async fn run(options: TuiOptions, checker: Arc<Checker>) -> Result<(), TuiEr
 
     let mut terminal = terminal::enter()?;
     // Restore the terminal on every exit path, not just the happy one.
-    let outcome = event_loop(&mut terminal, checker, tx, rx).await;
+    let outcome = event_loop(&mut terminal, checker, tx, rx, options.path).await;
     let restored = terminal::restore();
     outcome.and(restored.map_err(TuiError::from))
 }
@@ -79,20 +92,21 @@ async fn event_loop(
     checker: Arc<Checker>,
     tx: UnboundedSender<Message>,
     mut rx: UnboundedReceiver<Message>,
+    root: PathBuf,
 ) -> Result<(), TuiError> {
     let mut app = App::new(Vec::new());
-    let mut loading = true;
+    app.root = Some(root);
+    app.scanning = true;
     let mut pending: Option<(PackageKey, std::time::Instant)> = None;
     // Only redraw when something actually changed: an idle UI should cost nothing.
     let mut dirty = true;
+    // Where the last frame put the panes and rows, for resolving pointer events.
+    let mut geometry = ui::Geometry::default();
 
     loop {
         if dirty {
             terminal.draw(|frame| {
-                if loading && app.projects.is_empty() {
-                    app.message = Some("scanning for projects…".to_owned());
-                }
-                ui::draw(frame, &mut app);
+                geometry = ui::draw(frame, &mut app);
             })?;
             dirty = false;
         }
@@ -106,12 +120,29 @@ async fn event_loop(
             dirty = true;
             match message {
                 Message::Projects(projects) => {
+                    // A fresh `App`, so what discovery does not decide has to be
+                    // carried across by hand. The notices arrive immediately
+                    // before this and are drained in the same pass, so a message
+                    // left behind here is one no frame ever showed.
+                    let root = app.root.take();
+                    let notice = app.message.take();
                     app = App::new(projects);
-                    loading = false;
+                    app.root = root;
+                    app.message = notice;
                 }
                 Message::Package(key, data) => app.set_data(key, data),
                 Message::Notice(text) => app.message = Some(text),
             }
+        }
+
+        // A link the user asked for. Failing to launch is worth saying: the key
+        // otherwise looks broken on a machine with no launcher installed.
+        if let Some(url) = app.take_open_request() {
+            app.message = Some(match crate::open::browser(&url) {
+                Ok(()) => format!("opening {url}"),
+                Err(error) => format!("could not open {url}: {error}"),
+            });
+            dirty = true;
         }
 
         // Start the lookup for a selection that has settled.
@@ -127,8 +158,22 @@ async fn event_loop(
         }
 
         // Blocking reads happen on this thread, but only for a tick at a time, so
-        // results and resizes still surface promptly.
-        if event::poll(TICK)? {
+        // results and resizes still surface promptly. A running fade or a turning
+        // spinner owes the screen frames, so either shortens the wait for as long
+        // as it lasts — the fade by more, since it is the finer of the two.
+        let animating = app.animating();
+        let busy = app.busy();
+        if animating || busy {
+            dirty = true;
+        }
+        let wait = if animating {
+            FRAME
+        } else if busy {
+            SPIN
+        } else {
+            TICK
+        };
+        if event::poll(wait)? {
             match event::read()? {
                 Event::Key(key) => {
                     if let Some(action) = crate::event::action_for(key, app.mode) {
@@ -138,6 +183,26 @@ async fn event_loop(
                             return Ok(());
                         }
                         dirty = true;
+                    }
+                }
+                Event::Mouse(mouse) => {
+                    if let Some(action) = crate::event::action_for_mouse(
+                        mouse,
+                        app.mode,
+                        &geometry,
+                        app.rows(),
+                        app.dragging,
+                    ) {
+                        // Motion reporting delivers an event per cell the
+                        // pointer crosses. Redrawing for a hover that landed on
+                        // the row it was already on would burn a frame per
+                        // pixel of movement across a single row.
+                        let redraw = match action {
+                            Action::Hover(row) => app.hover != row,
+                            _ => true,
+                        };
+                        app.apply(action);
+                        dirty |= redraw;
                     }
                 }
                 Event::Resize(_, _) => dirty = true,
