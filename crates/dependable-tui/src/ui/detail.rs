@@ -214,7 +214,15 @@ fn facts_lines(
 
     content.push(Line::raw(""));
     match &facts.metadata {
-        None => content.push(dim("this registry publishes no package metadata")),
+        None => {
+            content.push(dim("this registry publishes no package metadata"));
+            // Derived from the name, so it survives a registry that publishes
+            // nothing at all — which is the case pub.dev and NuGet are in.
+            if let Some(url) = ecosystem.docs_url(&row.name, &row.version) {
+                content.push(Line::raw(""));
+                link_field(content, "docs", &url);
+            }
+        }
         Some(meta) => metadata_lines(content, meta, row, ecosystem, width),
     }
 

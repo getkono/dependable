@@ -147,10 +147,12 @@ buried six levels down is one query away.
 Every URL in the detail pane is a link: the package's page on its registry, that
 exact version, the repository, the homepage, the documentation, each owner's
 profile, and every advisory's OSV entry. Terminals that understand OSC 8 make
-them clickable; `o` opens the selected package's link anywhere else. The registry
-and documentation pages are derived from the package's name, so they are there
-before anything has been fetched and for packages whose registry published no
-links at all.
+them clickable; `o` opens the selected package's link anywhere else.
+
+The registry and version pages are derived from the package's name rather than
+fetched, so they are on screen before anything has been looked up. Where an
+ecosystem builds documentation for everything it hosts — docs.rs, HexDocs,
+pub.dev — that page is offered too, whether or not the package declared one.
 
 The mouse works too: click a row to select it, click its marker to open it, drag
 the divider between the panes, and scroll with the wheel.

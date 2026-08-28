@@ -53,8 +53,10 @@ project discovered in the repository, expands each one's **resolved** dependency
 any depth, and shows what is known about whichever package is selected: repository,
 homepage, documentation, license, owners, description, current-vs-latest version, OSV
 advisories, downloads, publish recency, and yanked status. Every URL among them is a
-link, alongside two derived from the package's name rather than fetched — its page on
-its registry, and its page on the ecosystem's documentation host.
+link, alongside two derived from the package's name rather than fetched: its page on the
+registry, which is on screen before anything has been looked up, and — for the
+ecosystems that build documentation for everything they host — its documentation, which
+is offered whether or not the package declared one.
 
 - **Offline first, lazy after.** The forest is built from lockfiles with no network at
   all, so it appears immediately. Registry data is fetched only for the package actually

@@ -927,3 +927,27 @@ fn a_url_a_registry_recorded_as_blank_is_not_shown_or_opened() {
         "and the populated field behind it is what `o` opens"
     );
 }
+
+#[test]
+fn a_registry_that_publishes_no_metadata_still_offers_the_docs_it_builds() {
+    // pub.dev and NuGet publish no metadata this tool reads, so the docs link
+    // for those ecosystems is only ever the derived one.
+    let mut app = App::new(vec![project(GraphSource::Lockfile)]);
+    app.apply(Action::Move(1));
+    app.apply(Action::Expand);
+    app.apply(Action::Move(1));
+    app.set_data(
+        key(Ecosystem::Rust, "serde", "1.0.0"),
+        PackageData::Ready(Box::default()),
+    );
+
+    let screen = render(&mut app);
+    assert!(
+        screen.contains("publishes no package metadata"),
+        "it still says so: {screen}"
+    );
+    assert!(
+        link_targets(&mut app).contains(&"https://docs.rs/serde/1.0.0".to_owned()),
+        "and the page the ecosystem builds is offered anyway"
+    );
+}
