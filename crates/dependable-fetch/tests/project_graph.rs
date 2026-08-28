@@ -74,6 +74,37 @@ fn npm_graph_is_transitive() {
 }
 
 #[test]
+fn a_lockfile_root_without_edges_falls_back_to_the_manifest() {
+    // npm names the project in its `""` entry but does not always record what it
+    // depends on there; the manifest still does, and a root with no edges would
+    // render as a project with no dependencies at all.
+    let dir = TempDir::new().expect("tempdir");
+    write(
+        &dir.path().join("package.json"),
+        r#"{ "name": "app", "version": "1.0.0",
+             "dependencies": { "react": "^18.0.0" },
+             "devDependencies": { "typescript": "^5.0.0" } }"#,
+    );
+    write(
+        &dir.path().join("package-lock.json"),
+        r#"{ "lockfileVersion": 3, "packages": {
+    "": { "name": "app", "version": "1.0.0" },
+    "node_modules/react": { "version": "18.2.0" },
+    "node_modules/typescript": { "version": "5.4.2" } } }"#,
+    );
+
+    let built = build_project_graph(
+        &dir.path().join("package.json"),
+        &WorkspaceGraphOptions::default(),
+    )
+    .expect("graph");
+
+    let mut names = flatten(&built.graph);
+    names.sort();
+    assert_eq!(names, vec!["app", "react", "typescript"]);
+}
+
+#[test]
 fn npm_root_is_local_and_installed_packages_are_external() {
     let dir = TempDir::new().expect("tempdir");
     write(

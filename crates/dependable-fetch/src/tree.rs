@@ -340,16 +340,22 @@ fn graph_parser(kind: ManifestKind) -> Option<GraphParser> {
 /// Mix lockfiles describe only dependencies, so the root is synthesized from what
 /// the manifest declares.
 fn with_root(
-    resolved: ResolvedLockfile,
+    mut resolved: ResolvedLockfile,
     root_name: &str,
     root_version: &str,
     direct: Vec<String>,
 ) -> ResolvedLockfile {
-    if resolved
+    if let Some(existing) = resolved
         .packages
-        .iter()
-        .any(|p| p.name == root_name && p.source.is_none())
+        .iter_mut()
+        .find(|p| p.name == root_name && p.source.is_none())
     {
+        // A lockfile may name the project without recording what it depends on
+        // (npm writes the `""` entry either way). Its manifest still says, and a
+        // root with no edges would render as a project with no dependencies.
+        if existing.dependencies.is_empty() && !direct.is_empty() {
+            existing.dependencies = direct;
+        }
         return resolved;
     }
     let mut packages = vec![LockedPackage::new(
