@@ -119,6 +119,72 @@ pub fn find_lockfile(manifest: &Path, kind: ManifestKind) -> Option<(PathBuf, Lo
     }
 }
 
+/// A lockfile beside a manifest that exists but yields nothing.
+///
+/// Every such case used to be a silent drop — an unreadable candidate was
+/// discarded by `if let Ok(...)` and the walk carried on, so a project with a
+/// lockfile it could not use was indistinguishable from one with none. That is
+/// the state a user is most able to act on, and the one they were never told
+/// about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct LockfileNotice {
+    /// The file this is about.
+    pub path: PathBuf,
+    /// What is wrong with it, phrased for the person who has to fix it.
+    pub reason: String,
+}
+
+impl std::fmt::Display for LockfileNotice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.path.display(), self.reason)
+    }
+}
+
+/// Report lockfiles beside `manifest` that exist but cannot be used.
+///
+/// Covers two cases: a format we recognise and deliberately do not read (Bun's
+/// binary `bun.lockb`), and one we do read that will not parse. Only the
+/// manifest's own directory is searched — a file further up governs a different
+/// project, and blaming this one for it would be noise.
+#[must_use]
+pub fn lockfile_notices(manifest: &Path, kind: ManifestKind) -> Vec<LockfileNotice> {
+    let Some(dir) = manifest.parent() else {
+        return Vec::new();
+    };
+    let mut notices = Vec::new();
+
+    for unreadable in kind.unreadable_lockfiles() {
+        let path = dir.join(unreadable.file_name);
+        if path.is_file() {
+            notices.push(LockfileNotice {
+                path,
+                reason: unreadable.reason.to_owned(),
+            });
+        }
+    }
+
+    for lockfile in kind.lockfiles() {
+        let path = dir.join(lockfile.file_name());
+        if !path.is_file() {
+            continue;
+        }
+        let reason = match std::fs::read_to_string(&path) {
+            Err(error) => format!("could not be read: {error}"),
+            Ok(content) => match parse_lockfile_kind(*lockfile, &content) {
+                Err(error) => format!("could not be parsed: {error}"),
+                Ok(data) if data.versions.is_empty() => {
+                    "was read but records no versions".to_owned()
+                }
+                Ok(_) => continue,
+            },
+        };
+        notices.push(LockfileNotice { path, reason });
+    }
+
+    notices
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,6 +314,63 @@ mod tests {
         let (path, _) =
             locate_lockfile(&nested.join("package.json"), ManifestKind::PackageJson).unwrap();
         assert_eq!(path, nested.join("package-lock.json"));
+    }
+
+    #[test]
+    fn a_binary_bun_lockfile_is_reported_rather_than_ignored() {
+        // The state this exists for: a lockfile is right there, and the project
+        // was being told none was found.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("bun.lockb"), [0u8, 1, 2, 3]).unwrap();
+
+        let notices = lockfile_notices(&dir.path().join("package.json"), ManifestKind::PackageJson);
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert_eq!(notices[0].path, dir.path().join("bun.lockb"));
+        assert!(
+            notices[0].reason.contains("--save-text-lockfile"),
+            "the notice says how to fix it: {}",
+            notices[0].reason
+        );
+    }
+
+    #[test]
+    fn a_readable_lockfile_produces_no_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        std::fs::write(
+            dir.path().join("bun.lock"),
+            r#"{"packages":{"react":["react@19.0.0","",{},"h"]}}"#,
+        )
+        .unwrap();
+
+        let notices = lockfile_notices(&dir.path().join("package.json"), ManifestKind::PackageJson);
+        assert!(notices.is_empty(), "{notices:?}");
+    }
+
+    #[test]
+    fn a_lockfile_that_yields_nothing_is_reported() {
+        // Silently reading a file and finding no versions in it is the failure
+        // mode hardest to notice, so it is called out too.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("bun.lock"), "{}").unwrap();
+
+        let notices = lockfile_notices(&dir.path().join("package.json"), ManifestKind::PackageJson);
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].reason.contains("no versions"), "{notices:?}");
+    }
+
+    #[test]
+    fn a_lockfile_further_up_is_not_this_projects_problem() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("bun.lockb"), [0u8]).unwrap();
+        let nested = root.path().join("app");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("package.json"), "{}").unwrap();
+
+        let notices = lockfile_notices(&nested.join("package.json"), ManifestKind::PackageJson);
+        assert!(notices.is_empty(), "{notices:?}");
     }
 
     #[test]

@@ -25,7 +25,9 @@ pub use lockfiles::{
     parse_composer_lock_graph, parse_dart_pubspec_lock, parse_lockfile, parse_lockfile_kind,
     parse_mix_lock, parse_mix_lock_graph, parse_package_lock, parse_package_lock_graph,
 };
-pub use manifest::{AlternateRegistryDecl, LockfileKind, ManifestKind, ParsedManifest};
+pub use manifest::{
+    AlternateRegistryDecl, LockfileKind, ManifestKind, ParsedManifest, UnreadableLockfile,
+};
 pub use npmrc::{NpmrcConfig, parse_npmrc};
 pub use parsers::{
     AutoTargets, CargoPackageManifest, CargoTarget, CargoTargetKind, CargoTomlParser,

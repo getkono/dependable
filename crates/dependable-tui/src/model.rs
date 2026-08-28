@@ -38,6 +38,10 @@ impl Project {
                 "this ecosystem's lockfile records no dependency edges — \
                  showing directly declared dependencies only",
             ),
+            GraphSource::UnreadableLockfile => Some(
+                "a lockfile is present but could not be read — \
+                 showing directly declared dependencies only",
+            ),
             // `GraphSource` is `#[non_exhaustive]`; a future source is unknown to us.
             _ => Some("the dependency graph may be incomplete"),
         }

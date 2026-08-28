@@ -40,6 +40,13 @@ pub enum GraphSource {
     /// distinct from [`Self::Manifests`], where a lockfile would have helped and
     /// simply was not there.
     Unsupported,
+    /// A shallow graph because the lockfile that *is* there could not be used.
+    ///
+    /// Bun's binary `bun.lockb`, or a file that would not parse. Distinct from
+    /// [`Self::Manifests`] because the user has something to act on: telling
+    /// them no lockfile was found, when one is sitting beside the manifest, is
+    /// worse than telling them nothing.
+    UnreadableLockfile,
 }
 
 /// The result of [`build_workspace_graph`]: the graph plus how it was built.
@@ -307,10 +314,13 @@ pub fn build_project_graph(
 
     let Some((lock_path, lock_kind)) = crate::discover::locate_lockfile(manifest, kind) else {
         let graph = direct_graph(&root_name, &root_version, &direct, &workspace_names, &roots);
-        return Ok(WorkspaceGraph {
-            graph,
-            source: GraphSource::Manifests,
-        });
+        // Distinguish "there is none" from "there is one we cannot use".
+        let source = if crate::discover::lockfile_notices(manifest, kind).is_empty() {
+            GraphSource::Manifests
+        } else {
+            GraphSource::UnreadableLockfile
+        };
+        return Ok(WorkspaceGraph { graph, source });
     };
 
     // The manifest has *a* format we can read edges from, but the one actually

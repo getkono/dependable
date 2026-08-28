@@ -86,6 +86,22 @@ impl ManifestKind {
         }
     }
 
+    /// Lockfiles this ecosystem produces that we recognise but cannot read.
+    ///
+    /// Listed so their presence can be reported rather than mistaken for a
+    /// missing lockfile.
+    #[must_use]
+    pub fn unreadable_lockfiles(self) -> &'static [UnreadableLockfile] {
+        match self {
+            ManifestKind::PackageJson => &[UnreadableLockfile {
+                file_name: "bun.lockb",
+                reason: "Bun's legacy binary lockfile, which cannot be read as text. \
+                         Run `bun install --save-text-lockfile` to migrate it to bun.lock.",
+            }],
+            _ => &[],
+        }
+    }
+
     /// Whether a sibling lockfile is read for this manifest kind.
     #[must_use]
     pub fn has_lockfile_support(self) -> bool {
@@ -117,6 +133,20 @@ impl ManifestKind {
         };
         Some(kind)
     }
+}
+
+/// A lockfile format we recognise but cannot read, and what to do about it.
+///
+/// Recognising these is what separates "no lockfile here" from "a lockfile we
+/// cannot use". The second is the more common state for a user to be in and the
+/// one they can act on, and reporting it as the first is actively misleading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct UnreadableLockfile {
+    /// The file name to look for.
+    pub file_name: &'static str,
+    /// Why it cannot be read, phrased for the person who has to fix it.
+    pub reason: &'static str,
 }
 
 /// A lockfile format we can read.

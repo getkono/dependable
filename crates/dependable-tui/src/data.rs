@@ -36,6 +36,12 @@ pub fn discover_projects(root: &Path, depth: usize) -> (Vec<Project>, Vec<String
         let Some(kind) = ManifestKind::detect(&manifest) else {
             continue;
         };
+        // A lockfile that is present but unusable is the state a user can act
+        // on, and it used to be indistinguishable from having none.
+        for notice in dependable_fetch::lockfile_notices(&manifest, kind) {
+            notices.push(notice.to_string());
+        }
+
         // A Cargo workspace is reached through any of its members, which would
         // otherwise produce one identical graph per member.
         match build_project_graph(&manifest, &WorkspaceGraphOptions::default()) {
