@@ -120,11 +120,15 @@ async fn event_loop(
             dirty = true;
             match message {
                 Message::Projects(projects) => {
-                    // A fresh `App`, so only what discovery does not decide is
-                    // carried across.
+                    // A fresh `App`, so what discovery does not decide has to be
+                    // carried across by hand. The notices arrive immediately
+                    // before this and are drained in the same pass, so a message
+                    // left behind here is one no frame ever showed.
                     let root = app.root.take();
+                    let notice = app.message.take();
                     app = App::new(projects);
                     app.root = root;
+                    app.message = notice;
                 }
                 Message::Package(key, data) => app.set_data(key, data),
                 Message::Notice(text) => app.message = Some(text),
