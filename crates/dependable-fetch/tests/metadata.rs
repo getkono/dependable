@@ -335,3 +335,61 @@ async fn the_checker_caches_metadata_across_calls() {
     assert_eq!(first, second);
     assert!(first.is_some());
 }
+
+// --- live smoke tests (`mise run test:live`) ------------------------------
+
+#[tokio::test]
+#[ignore = "hits the network; run with `mise run test:live`"]
+async fn live_crates_io_metadata() {
+    let fetcher = CratesIoFetcher::new(build_client().unwrap());
+    let meta = fetcher
+        .fetch_metadata("serde")
+        .await
+        .expect("request")
+        .expect("crates.io publishes metadata for serde");
+
+    assert!(
+        meta.repository.is_some_and(|r| r.contains("serde")),
+        "a repository URL is the headline field"
+    );
+    assert!(meta.license.is_some(), "license");
+    assert!(meta.downloads.is_some_and(|d| d > 0), "downloads");
+    assert!(!meta.authors.is_empty(), "owners");
+}
+
+#[tokio::test]
+#[ignore = "hits the network; run with `mise run test:live`"]
+async fn live_npm_metadata() {
+    let fetcher = NpmFetcher::new(build_client().unwrap());
+    let meta = fetcher.fetch_metadata("react").await.unwrap().unwrap();
+    assert!(meta.repository.is_some_and(|r| r.contains("react")));
+    assert!(meta.license.is_some());
+}
+
+#[tokio::test]
+#[ignore = "hits the network; run with `mise run test:live`"]
+async fn live_pypi_metadata() {
+    let fetcher = PyPiFetcher::new(build_client().unwrap());
+    let meta = fetcher.fetch_metadata("requests").await.unwrap().unwrap();
+    assert!(meta.description.is_some());
+}
+
+#[tokio::test]
+#[ignore = "hits the network; run with `mise run test:live`"]
+async fn live_hex_metadata() {
+    let fetcher = HexFetcher::new(build_client().unwrap());
+    let meta = fetcher.fetch_metadata("phoenix").await.unwrap().unwrap();
+    assert!(meta.repository.is_some(), "hex links carry the repository");
+}
+
+#[tokio::test]
+#[ignore = "hits the network; run with `mise run test:live`"]
+async fn live_packagist_metadata() {
+    let fetcher = PackagistFetcher::new(build_client().unwrap());
+    let meta = fetcher
+        .fetch_metadata("monolog/monolog")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(meta.license.is_some());
+}
