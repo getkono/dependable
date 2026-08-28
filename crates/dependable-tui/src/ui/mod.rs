@@ -104,6 +104,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) -> Geometry {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(1), // header
             Constraint::Min(3),    // tree + detail
             Constraint::Length(1), // search line
             Constraint::Length(1), // status bar
@@ -116,16 +117,17 @@ pub fn draw(frame: &mut Frame, app: &mut App) -> Geometry {
             Constraint::Percentage(app.split),
             Constraint::Percentage(100 - app.split),
         ])
-        .split(chunks[0]);
+        .split(chunks[1]);
 
     // The border and title take two rows off the usable height.
     let viewport = panes[0].height.saturating_sub(2) as usize;
     app.scroll_into_view(viewport);
 
+    draw_header(frame, chunks[0], app);
     tree::draw(frame, panes[0], app);
     detail::draw(frame, panes[1], app);
-    draw_search(frame, chunks[1], app);
-    draw_status(frame, chunks[2], app);
+    draw_search(frame, chunks[2], app);
+    draw_status(frame, chunks[3], app);
 
     if app.mode == Mode::Help {
         draw_help(frame, frame.area());
@@ -138,6 +140,42 @@ pub fn draw(frame: &mut Frame, app: &mut App) -> Geometry {
         tree_height: panes[0].height.saturating_sub(2),
         row_count: app.rows().len(),
     }
+}
+
+/// The header: the wordmark, what was scanned, and the totals.
+///
+/// The wordmark is hard left and is the only thing painted in the brand colour,
+/// so it stays recognisable as the product rather than as one more coloured
+/// label among many.
+fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
+    let mut spans = vec![Span::styled("dependable", theme::bold(Token::Brand))];
+
+    if let Some(root) = &app.root {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            root.display().to_string(),
+            theme::fg(Token::Muted),
+        ));
+    }
+
+    if !app.projects.is_empty() {
+        spans.push(Span::styled(
+            format!("   {} packages", app.package_count()),
+            theme::fg(Token::Muted),
+        ));
+    }
+
+    // Only packages already looked up can be counted, so this is a floor rather
+    // than a total, and it appears only once there is something to report.
+    let vulnerable = app.vulnerable_count();
+    if vulnerable > 0 {
+        spans.push(Span::styled(
+            format!("   {vulnerable} vulnerable"),
+            theme::bold(Token::Critical),
+        ));
+    }
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// The search line, showing a cursor while it is being typed into.

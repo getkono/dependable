@@ -56,7 +56,7 @@ pub async fn run(options: TuiOptions, checker: Arc<Checker>) -> Result<(), TuiEr
 
     let mut terminal = terminal::enter()?;
     // Restore the terminal on every exit path, not just the happy one.
-    let outcome = event_loop(&mut terminal, checker, tx, rx).await;
+    let outcome = event_loop(&mut terminal, checker, tx, rx, options.path).await;
     let restored = terminal::restore();
     outcome.and(restored.map_err(TuiError::from))
 }
@@ -86,8 +86,10 @@ async fn event_loop(
     checker: Arc<Checker>,
     tx: UnboundedSender<Message>,
     mut rx: UnboundedReceiver<Message>,
+    root: PathBuf,
 ) -> Result<(), TuiError> {
     let mut app = App::new(Vec::new());
+    app.root = Some(root);
     let mut loading = true;
     let mut pending: Option<(PackageKey, std::time::Instant)> = None;
     // Only redraw when something actually changed: an idle UI should cost nothing.
@@ -115,7 +117,9 @@ async fn event_loop(
             dirty = true;
             match message {
                 Message::Projects(projects) => {
+                    let root = app.root.take();
                     app = App::new(projects);
+                    app.root = root;
                     loading = false;
                 }
                 Message::Package(key, data) => app.set_data(key, data),

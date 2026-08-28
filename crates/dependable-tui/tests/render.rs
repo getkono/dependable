@@ -91,16 +91,15 @@ fn render(app: &mut App) -> String {
         .join("\n")
 }
 
-/// Render `app` and return the styled cells of the row at `y`.
-fn styled_row(app: &mut App, y: u16) -> Vec<ratatui::buffer::Cell> {
+/// Render `app` and return every styled cell on screen.
+fn styled_cells(app: &mut App) -> Vec<ratatui::buffer::Cell> {
     let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("terminal");
     terminal
         .draw(|frame| {
             ui::draw(frame, app);
         })
         .expect("draw succeeds");
-    let buffer = terminal.backend().buffer();
-    (0..100).map(|x| buffer[(x, y)].clone()).collect()
+    terminal.backend().buffer().content().to_vec()
 }
 
 #[test]
@@ -113,8 +112,9 @@ fn the_selected_row_is_never_marked_by_a_background_alone() {
 
     let mut app = App::new(vec![project(GraphSource::Lockfile)]);
 
-    // Row 0 of the tree pane sits just inside the block's top border.
-    let cells = styled_row(&mut app, 1);
+    // Found rather than indexed by position, so adding chrome above the panes
+    // does not silently turn this into an assertion about a different row.
+    let cells = styled_cells(&mut app);
     let marked = cells
         .iter()
         .find(|c| c.bg != Color::Reset || c.modifier.contains(Modifier::REVERSED))
@@ -492,4 +492,49 @@ fn pressing_o_on_a_package_with_no_link_says_so() {
     app.apply(Action::OpenLink);
     assert_eq!(app.take_open_request(), None);
     assert!(app.message.is_some(), "the user is told why nothing opened");
+}
+
+#[test]
+fn the_header_names_the_product_and_what_was_scanned() {
+    let mut app = App::new(vec![project(GraphSource::Lockfile)]);
+    app.root = Some(PathBuf::from("/home/dev/acme"));
+
+    let screen = render(&mut app);
+    let header = screen.lines().next().expect("a header row");
+
+    assert!(
+        header.starts_with("dependable"),
+        "the wordmark is hard left: {header:?}"
+    );
+    assert!(header.contains("/home/dev/acme"), "{header:?}");
+    assert!(header.contains("packages"), "{header:?}");
+}
+
+#[test]
+fn the_wordmark_is_the_only_thing_in_the_brand_colour() {
+    // The brand colour identifies the product; spending it on ordinary labels
+    // would stop it doing that.
+    use dependable_tui::theme::{self, Token};
+
+    let mut app = App::new(vec![project(GraphSource::Lockfile)]);
+    app.root = Some(PathBuf::from("/home/dev/acme"));
+    let cells = styled_cells(&mut app);
+
+    let brand = theme::fg(Token::Brand).fg.expect("the brand has a colour");
+    let painted: String = cells
+        .iter()
+        .filter(|cell| cell.fg == brand)
+        .map(ratatui::buffer::Cell::symbol)
+        .collect();
+    assert_eq!(painted, "dependable", "brand-coloured cells: {painted:?}");
+}
+
+#[test]
+fn the_header_omits_a_path_it_was_never_given() {
+    // Before discovery reports back there is nothing to name, and inventing a
+    // path would be worse than leaving the space empty.
+    let mut app = App::new(Vec::new());
+    let screen = render(&mut app);
+    let header = screen.lines().next().expect("a header row");
+    assert_eq!(header.trim(), "dependable", "{header:?}");
 }

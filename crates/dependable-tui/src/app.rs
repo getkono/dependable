@@ -122,6 +122,11 @@ pub struct App {
     pub quit: bool,
     /// A transient message shown in the status bar.
     pub message: Option<String>,
+    /// The directory that was scanned, shown in the header.
+    ///
+    /// `None` in tests and before discovery reports back; the header simply
+    /// omits it rather than inventing a path.
+    pub root: Option<std::path::PathBuf>,
     /// The row the pointer is resting on.
     ///
     /// Distinct from the selection, and styled more weakly: it follows the
@@ -176,6 +181,7 @@ impl App {
             packages: PackageStore::new(),
             quit: false,
             message: None,
+            root: None,
             hover: None,
             hover_since: None,
             dragging: false,
@@ -448,6 +454,30 @@ impl App {
         {
             self.selected = index;
         }
+    }
+
+    /// How many packages are known across every discovered project.
+    ///
+    /// Counts graph nodes, so a package pulled in by two projects counts once
+    /// per project — which is what "how much is in front of me" means here.
+    #[must_use]
+    pub fn package_count(&self) -> usize {
+        self.projects.iter().map(|p| p.graph.nodes().len()).sum()
+    }
+
+    /// How many looked-up packages carry at least one advisory.
+    ///
+    /// Only packages actually fetched can be counted, so this grows as the user
+    /// browses. It is a floor, never a total, and the header says so.
+    #[must_use]
+    pub fn vulnerable_count(&self) -> usize {
+        self.packages
+            .values()
+            .filter(|data| match data {
+                PackageData::Ready(facts) => !facts.vulnerabilities.is_empty(),
+                _ => false,
+            })
+            .count()
     }
 
     /// How far the hover fade has run, from 0.0 to 1.0.
