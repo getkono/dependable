@@ -56,6 +56,16 @@ pub enum Action {
     ToggleHelp,
     /// Open the selected package's primary URL in a browser.
     OpenLink,
+    /// Select the row at this index, as a click does.
+    Select(usize),
+    /// Select the row at this index and expand or collapse it.
+    ToggleAt(usize),
+    /// Start dragging the divider between the panes.
+    BeginDrag,
+    /// Stop dragging.
+    EndDrag,
+    /// Set the tree pane's share of the width, as a percentage.
+    SetSplit(u16),
     /// Leave the application.
     Quit,
 }
@@ -110,6 +120,12 @@ pub struct App {
     pub quit: bool,
     /// A transient message shown in the status bar.
     pub message: Option<String>,
+    /// Whether the divider is being dragged.
+    ///
+    /// A drag has to be attributed to where it began: the pointer wanders well
+    /// off the divider mid-drag, and a drag that started in the tree must not
+    /// resize anything.
+    pub dragging: bool,
     /// A URL the user asked to open, for the event loop to hand to the browser.
     ///
     /// Parked here rather than opened directly because this type is free of IO;
@@ -144,6 +160,7 @@ impl App {
             packages: PackageStore::new(),
             quit: false,
             message: None,
+            dragging: false,
             open_request: None,
         };
         app.rebuild();
@@ -247,6 +264,16 @@ impl App {
                     self.message = Some("no link published for this package".to_owned());
                 }
             },
+            Action::Select(index) => self.select(index),
+            Action::ToggleAt(index) => {
+                self.select(index);
+                self.apply(Action::Toggle);
+            }
+            Action::BeginDrag => self.dragging = true,
+            Action::EndDrag => self.dragging = false,
+            Action::SetSplit(percent) => {
+                self.split = percent.clamp(*Self::SPLIT_RANGE.start(), *Self::SPLIT_RANGE.end());
+            }
             Action::Quit => self.quit = true,
         }
     }

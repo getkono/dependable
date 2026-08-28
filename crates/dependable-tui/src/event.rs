@@ -3,9 +3,19 @@
 //! Kept apart from the event loop so the whole keymap is testable without a
 //! terminal, and so the bindings are readable in one place.
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 
 use crate::app::{Action, Direction, End, Mode};
+use crate::rows::Row;
+use crate::ui::Geometry;
+
+/// How many rows one notch of the wheel moves.
+///
+/// Three is what most terminals and editors use; one notch moving one row makes
+/// a long tree feel unscrollable.
+const WHEEL_ROWS: isize = 3;
 
 /// The action a key press means in the current mode, if any.
 ///
@@ -73,6 +83,59 @@ fn browse_key(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('?') => Action::ToggleHelp,
         _ => return None,
     })
+}
+
+/// The action a mouse event means, if any.
+///
+/// Pure over the pointer position, the last frame's [`Geometry`], and the rows
+/// it described, so every mapping below is testable without a terminal — the
+/// same property that makes the keymap testable.
+///
+/// `rows` supplies each row's depth, which is what decides whether a click
+/// landed on a disclosure marker or on the name beside it. `dragging` says
+/// whether a divider drag is already under way: the pointer wanders well off
+/// the divider mid-drag, and a drag that began in the tree must not resize.
+#[must_use]
+pub fn action_for_mouse(
+    event: MouseEvent,
+    mode: Mode,
+    geometry: &Geometry,
+    rows: &[Row],
+    dragging: bool,
+) -> Option<Action> {
+    // The help overlay covers the panes, so a click behind it would act on
+    // something the user cannot see.
+    if mode == Mode::Help {
+        return match event.kind {
+            MouseEventKind::Down(MouseButton::Left) => Some(Action::ToggleHelp),
+            _ => None,
+        };
+    }
+
+    let (x, y) = (event.column, event.row);
+    match event.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if geometry.on_divider(x, y) {
+                return Some(Action::BeginDrag);
+            }
+            let index = geometry.row_at(x, y)?;
+            // The marker is the affordance for opening a row; the name beside
+            // it only selects, so a click never expands something unintended.
+            let depth = rows.get(index)?.depth;
+            if geometry.on_marker(x, depth) {
+                Some(Action::ToggleAt(index))
+            } else {
+                Some(Action::Select(index))
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) if dragging => {
+            Some(Action::SetSplit(geometry.split_at(x)))
+        }
+        MouseEventKind::Up(MouseButton::Left) if dragging => Some(Action::EndDrag),
+        MouseEventKind::ScrollDown => Some(Action::Move(WHEEL_ROWS)),
+        MouseEventKind::ScrollUp => Some(Action::Move(-WHEEL_ROWS)),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -163,5 +226,207 @@ mod tests {
     #[test]
     fn an_unbound_key_does_nothing() {
         assert_eq!(action_for(press(KeyCode::F(5)), Mode::Browse), None);
+    }
+
+    // --- pointer ---
+
+    use ratatui::layout::Rect;
+
+    fn geometry() -> Geometry {
+        Geometry {
+            tree: Rect {
+                x: 0,
+                y: 0,
+                width: 40,
+                height: 12,
+            },
+            detail: Rect {
+                x: 40,
+                y: 0,
+                width: 60,
+                height: 12,
+            },
+            tree_offset: 0,
+            tree_height: 10,
+            row_count: 20,
+        }
+    }
+
+    /// Rows at increasing depth, so marker positions differ between them.
+    fn rows() -> Vec<Row> {
+        (0..20)
+            .map(|i| Row {
+                path: vec![i],
+                depth: i % 3,
+                kind: crate::rows::RowKind::Package,
+                project: 0,
+                node: None,
+                name: format!("pkg-{i}"),
+                version: String::new(),
+                node_kind: None,
+                has_children: true,
+                expanded: false,
+                cyclic: false,
+                matched: false,
+            })
+            .collect()
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn click(column: u16, row: u16) -> MouseEvent {
+        mouse(MouseEventKind::Down(MouseButton::Left), column, row)
+    }
+
+    #[test]
+    fn clicking_a_row_selects_it() {
+        // Row 1 is at depth 1, so its marker is indented past column 10.
+        assert_eq!(
+            action_for_mouse(click(10, 2), Mode::Browse, &geometry(), &rows(), false),
+            Some(Action::Select(1))
+        );
+    }
+
+    #[test]
+    fn clicking_the_marker_expands_rather_than_only_selecting() {
+        // Row 0 is at depth 0, so its marker is the first two body columns.
+        assert_eq!(
+            action_for_mouse(click(1, 1), Mode::Browse, &geometry(), &rows(), false),
+            Some(Action::ToggleAt(0))
+        );
+        // The name beside it only selects.
+        assert_eq!(
+            action_for_mouse(click(6, 1), Mode::Browse, &geometry(), &rows(), false),
+            Some(Action::Select(0))
+        );
+    }
+
+    #[test]
+    fn the_marker_moves_with_the_rows_indent() {
+        // Row 2 is at depth 2, so its marker sits four columns further right.
+        assert_eq!(
+            action_for_mouse(click(1, 3), Mode::Browse, &geometry(), &rows(), false),
+            Some(Action::Select(2)),
+            "the indent before a deep row is not its marker"
+        );
+        assert_eq!(
+            action_for_mouse(click(5, 3), Mode::Browse, &geometry(), &rows(), false),
+            Some(Action::ToggleAt(2))
+        );
+    }
+
+    #[test]
+    fn the_wheel_scrolls_several_rows_at_a_time() {
+        let g = geometry();
+        assert_eq!(
+            action_for_mouse(
+                mouse(MouseEventKind::ScrollDown, 5, 5),
+                Mode::Browse,
+                &g,
+                &rows(),
+                false
+            ),
+            Some(Action::Move(3))
+        );
+        assert_eq!(
+            action_for_mouse(
+                mouse(MouseEventKind::ScrollUp, 5, 5),
+                Mode::Browse,
+                &g,
+                &rows(),
+                false
+            ),
+            Some(Action::Move(-3))
+        );
+    }
+
+    #[test]
+    fn dragging_the_divider_resizes_only_once_the_drag_has_begun() {
+        let g = geometry();
+        // The divider is the tree's right border column.
+        assert_eq!(
+            action_for_mouse(click(39, 5), Mode::Browse, &g, &rows(), false),
+            Some(Action::BeginDrag)
+        );
+
+        let drag = mouse(MouseEventKind::Drag(MouseButton::Left), 60, 5);
+        assert_eq!(
+            action_for_mouse(drag, Mode::Browse, &g, &rows(), false),
+            None,
+            "a drag that began in the tree must not resize"
+        );
+        assert_eq!(
+            action_for_mouse(drag, Mode::Browse, &g, &rows(), true),
+            Some(Action::SetSplit(60))
+        );
+        assert_eq!(
+            action_for_mouse(
+                mouse(MouseEventKind::Up(MouseButton::Left), 60, 5),
+                Mode::Browse,
+                &g,
+                &rows(),
+                true
+            ),
+            Some(Action::EndDrag)
+        );
+    }
+
+    #[test]
+    fn a_click_behind_the_help_overlay_closes_it_instead() {
+        // The overlay covers the panes, so acting on what is behind it would
+        // hit something the user cannot see.
+        assert_eq!(
+            action_for_mouse(click(10, 2), Mode::Help, &geometry(), &rows(), false),
+            Some(Action::ToggleHelp)
+        );
+    }
+
+    #[test]
+    fn clicking_outside_the_tree_does_nothing() {
+        let g = geometry();
+        assert_eq!(
+            action_for_mouse(click(70, 5), Mode::Browse, &g, &rows(), false),
+            None,
+            "over the detail pane"
+        );
+        assert_eq!(
+            action_for_mouse(click(10, 0), Mode::Browse, &g, &rows(), false),
+            None,
+            "on the border"
+        );
+    }
+
+    #[test]
+    fn a_click_past_the_last_row_does_nothing() {
+        let short = Geometry {
+            row_count: 2,
+            ..geometry()
+        };
+        assert_eq!(
+            action_for_mouse(click(10, 5), Mode::Browse, &short, &rows(), false),
+            None
+        );
+    }
+
+    #[test]
+    fn scrolling_still_works_while_searching() {
+        // The search box takes the keyboard, not the pointer.
+        assert_eq!(
+            action_for_mouse(
+                mouse(MouseEventKind::ScrollDown, 5, 5),
+                Mode::Search,
+                &geometry(),
+                &rows(),
+                false
+            ),
+            Some(Action::Move(3))
+        );
     }
 }

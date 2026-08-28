@@ -73,6 +73,21 @@ impl Geometry {
             && y < self.tree.bottom()
     }
 
+    /// The tree pane's share of the width if the divider were dropped at `x`,
+    /// as a percentage.
+    ///
+    /// Clamping to a sensible range is [`crate::app::App`]'s job, since it owns
+    /// the split; this only converts a column to a proportion.
+    #[must_use]
+    pub fn split_at(&self, x: u16) -> u16 {
+        let total = self.tree.width.saturating_add(self.detail.width);
+        if total == 0 {
+            return 0;
+        }
+        let offset = x.saturating_sub(self.tree.x);
+        u16::try_from(u32::from(offset) * 100 / u32::from(total)).unwrap_or(100)
+    }
+
     /// The tree pane's interior, excluding its border.
     fn tree_body(&self) -> Rect {
         Rect {
