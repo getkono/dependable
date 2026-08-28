@@ -27,6 +27,7 @@ pub mod spinner;
 pub mod terminal;
 pub mod theme;
 pub mod ui;
+pub mod url;
 
 pub use run::{TuiOptions, run};
 

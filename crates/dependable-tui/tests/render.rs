@@ -894,3 +894,36 @@ fn discovery_spins_in_the_status_bar() {
     let screen = render(&mut app);
     spinner_before(&screen, " scanning for projects…");
 }
+
+#[test]
+fn a_url_a_registry_recorded_as_blank_is_not_shown_or_opened() {
+    // crates.io and npm alike store an unset field as "". Taken at face value
+    // it wins over the populated field behind it, renders as a label with
+    // nothing after it, and opens as a bare `https://`.
+    let mut app = App::new(vec![project(GraphSource::Lockfile)]);
+    app.apply(Action::Move(1));
+    app.apply(Action::Expand);
+    app.apply(Action::Move(1));
+
+    let mut meta = PackageMetadata::default();
+    meta.repository = Some(String::new());
+    meta.homepage = Some("https://serde.rs".to_owned());
+    app.set_data(
+        key(Ecosystem::Rust, "serde", "1.0.0"),
+        PackageData::Ready(Box::new(PackageFacts {
+            metadata: Some(meta),
+            ..PackageFacts::default()
+        })),
+    );
+
+    let screen = render(&mut app);
+    assert!(
+        screen.contains("repository  not published"),
+        "a blank field is one the registry did not publish: {screen}"
+    );
+    assert_eq!(
+        app.selected_url().as_deref(),
+        Some("https://serde.rs"),
+        "and the populated field behind it is what `o` opens"
+    );
+}

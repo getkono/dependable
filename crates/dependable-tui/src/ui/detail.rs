@@ -16,6 +16,7 @@ use crate::model::{PackageData, PackageFacts, compact_count, dated_age};
 use crate::rows::RowKind;
 use crate::theme::{self, Token};
 use crate::ui::link;
+use crate::url;
 
 /// The width of a field label, including the two spaces after it.
 const LABEL_WIDTH: u16 = 13;
@@ -49,7 +50,7 @@ impl Content {
         self.links.push(Spot {
             line: self.lines.len(),
             col,
-            url: link::target_url(url),
+            url: url::target_url(url),
             text: text.to_owned(),
         });
     }
@@ -318,12 +319,16 @@ fn linked_field(content: &mut Content, name: &str, text: &str, url: &str) {
 
 /// A URL field: shown by its readable form, and clickable.
 fn link_field(content: &mut Content, name: &str, url: &str) {
-    linked_field(content, name, &link::display_url(url), url);
+    linked_field(content, name, &url::display_url(url), url);
 }
 
 /// A URL field the registry may not have published.
+///
+/// A field recorded as an empty string is one it did not publish: rendering it
+/// would put a label on screen with nothing after it, which is the blank line
+/// this pane exists to avoid.
 fn url_field(content: &mut Content, name: &str, url: Option<&str>) {
-    match url {
+    match url::published(url) {
         Some(url) => link_field(content, name, url),
         None => content.push(optional(name, None)),
     }

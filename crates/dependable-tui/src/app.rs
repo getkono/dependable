@@ -555,13 +555,15 @@ impl App {
         let key = self.selected_key()?;
         let published = match self.packages.get(&key) {
             Some(PackageData::Ready(facts)) => facts.metadata.as_ref().and_then(|meta| {
-                meta.repository
-                    .as_deref()
-                    .or(meta.homepage.as_deref())
-                    .or(meta.documentation.as_deref())
+                // Each is taken only if it was actually published: a field a
+                // registry recorded as an empty string would otherwise win over
+                // the populated one behind it, and open as a bare `https://`.
+                crate::url::published(meta.repository.as_deref())
+                    .or_else(|| crate::url::published(meta.homepage.as_deref()))
+                    .or_else(|| crate::url::published(meta.documentation.as_deref()))
                     // Registries store URLs in their own ecosystem's shape; npm's
                     // `git+https://…` is not a scheme a browser knows.
-                    .map(crate::ui::link::target_url)
+                    .map(crate::url::target_url)
             }),
             _ => None,
         };
