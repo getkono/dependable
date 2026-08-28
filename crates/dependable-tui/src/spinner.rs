@@ -27,7 +27,17 @@ pub const PERIOD: Duration = Duration::from_millis(80);
 /// The frame to show for a spinner that has been turning for `elapsed`.
 #[must_use]
 pub fn frame(elapsed: Duration) -> &'static str {
-    let step = (elapsed.as_millis() / PERIOD.as_millis()) as usize;
+    frame_every(elapsed, PERIOD)
+}
+
+/// [`frame`], for any `period`.
+///
+/// `period` is a divisor, and the arithmetic is in nanoseconds so that any
+/// period a caller could pick is a working spinner rather than a division by
+/// zero — which would panic inside the draw and leave the terminal in raw mode.
+#[must_use]
+fn frame_every(elapsed: Duration, period: Duration) -> &'static str {
+    let step = (elapsed.as_nanos() / period.as_nanos().max(1)) as usize;
     FRAMES[step % FRAMES.len()]
 }
 
@@ -54,6 +64,21 @@ mod tests {
             FRAMES[(3_600_000 / 80) % 10]
         );
     }
+
+    #[test]
+    fn any_period_is_a_working_spinner_rather_than_a_panic() {
+        // The divisor used to be truncated to whole milliseconds, so a period
+        // under 1 ms divided by zero — a panic inside the draw, which leaves
+        // the terminal in raw mode.
+        assert_eq!(frame_every(Duration::from_micros(300), MICRO), FRAMES[3]);
+        assert_eq!(
+            frame_every(Duration::from_secs(1), Duration::ZERO),
+            FRAMES[0]
+        );
+    }
+
+    /// A period far below the millisecond the arithmetic used to round to.
+    const MICRO: Duration = Duration::from_micros(100);
 
     #[test]
     fn every_frame_is_one_column_wide() {

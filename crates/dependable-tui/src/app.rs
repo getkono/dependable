@@ -157,10 +157,14 @@ pub struct App {
     /// is what it took, since applying any action clears that message.
     pub scanning: bool,
     /// When this UI started, which is the phase every spinner is drawn from.
-    ///
-    /// One clock for all of them, so the badge in the tree and the line in the
-    /// detail pane turn together instead of drifting apart.
     started: std::time::Instant,
+    /// The spinner frame for the frame currently being drawn.
+    ///
+    /// Snapshotted by [`Self::tick`] rather than read from the clock at each
+    /// call, so the badge in the tree and the line in the detail pane always
+    /// show the same frame — even when the draw between them happens to
+    /// straddle a period boundary.
+    frame: &'static str,
 }
 
 impl App {
@@ -199,6 +203,7 @@ impl App {
             open_request: None,
             scanning: false,
             started: std::time::Instant::now(),
+            frame: crate::spinner::frame(std::time::Duration::ZERO),
         };
         app.rebuild();
         app
@@ -533,10 +538,18 @@ impl App {
                 .is_some_and(|key| !self.packages.contains_key(&key))
     }
 
-    /// The spinner frame for this instant.
+    /// Advance the animation clock, once per frame.
+    ///
+    /// The renderer calls this before drawing anything; everything drawn after
+    /// it sees one consistent instant.
+    pub fn tick(&mut self) {
+        self.frame = crate::spinner::frame(self.started.elapsed());
+    }
+
+    /// The spinner frame for the frame being drawn.
     #[must_use]
     pub fn spinner(&self) -> &'static str {
-        crate::spinner::frame(self.started.elapsed())
+        self.frame
     }
 
     /// The URL the selected package is best identified by.

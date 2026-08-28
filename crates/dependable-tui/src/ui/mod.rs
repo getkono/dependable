@@ -119,6 +119,9 @@ impl Geometry {
 
 /// Draw the whole UI for one frame, reporting where everything landed.
 pub fn draw(frame: &mut Frame, app: &mut App) -> Geometry {
+    // One clock reading for the whole frame, so every spinner on it agrees.
+    app.tick();
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
