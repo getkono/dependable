@@ -426,8 +426,13 @@ impl Walker<'_> {
         });
         if placement == Placement::Full {
             // Only a full appearance counts as seen: a depth-truncated one must
-            // stay expandable from a shallower path elsewhere.
-            if self.opts.dedupe {
+            // stay expandable from a shallower path elsewhere. A crate with a
+            // tree of its own does not count either, or the leaf drawn here
+            // would collapse its own entry to `(*)` — the very bug the pointer
+            // exists to fix.
+            let has_own_entry =
+                self.opts.collapse_roots && depth > 0 && self.graph.root_slot(node).is_some();
+            if self.opts.dedupe && !has_own_entry {
                 self.expanded.insert(node);
             }
             if degree > 0 {
@@ -449,15 +454,20 @@ impl Walker<'_> {
     /// a crate the reader is already standing inside is reported as the cycle it
     /// is rather than sent somewhere else. A root is recognised before a repeat,
     /// so a crate reached after its own entry still points at that entry instead
-    /// of degrading to `(*)`. The depth limit comes after both and, as ever,
+    /// of degrading to `(*)` — but only when it has dependencies to show, since
+    /// a pointer at an empty tree helps nobody. The depth limit comes next and, as ever,
     /// does not mark the node seen — a shallower path elsewhere may still
     /// expand it.
     fn placement(&self, node: usize, depth: usize, degree: usize) -> Placement {
         if self.on_path.contains(&node) {
             return Placement::Cycle;
         }
+        // Only worth pointing at a tree that has something in it: a member with
+        // no dependencies of its own reads as the leaf it is, and sending the
+        // reader to an empty entry would be worse than drawing it twice.
         if self.opts.collapse_roots
             && depth > 0
+            && degree > 0
             && let Some(root) = self.graph.root_slot(node)
         {
             return Placement::Root { root };
@@ -830,6 +840,38 @@ source = "registry+https://x"
             ),
             vec![("b", "0.1.0", false), ("serde", "1.0.0", false)],
         );
+    }
+
+    #[test]
+    fn a_member_with_no_dependencies_is_a_leaf_not_a_pointer() {
+        // `b` has nothing under it, so pointing at its entry would send the
+        // reader somewhere empty. It reads as the leaf it is.
+        let lock = r#"
+[[package]]
+name = "a"
+version = "0.1.0"
+dependencies = ["b"]
+
+[[package]]
+name = "b"
+version = "0.1.0"
+"#;
+        let resolved = parse_cargo_lock_graph(lock).unwrap();
+        let g = DependencyGraph::from_resolved(
+            &resolved,
+            &names(&["a", "b"]),
+            &["a".into(), "b".into()],
+        );
+        let tree = g.tree(&TreeOptions::default());
+
+        assert_eq!(under_root(&g, &tree, "a", "b").placement, Placement::Full);
+        // And drawing it there must not collapse its own entry to `(*)`.
+        assert_eq!(
+            tree.roots[1].placement,
+            Placement::Full,
+            "`b`'s own entry stays the place it is shown"
+        );
+        assert!(!tree.roots[1].deduped());
     }
 
     #[test]

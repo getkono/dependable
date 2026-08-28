@@ -607,3 +607,28 @@ fn a_search_reaches_a_match_that_sits_below_a_pointer() {
         "the match is flagged"
     );
 }
+
+#[test]
+fn a_member_with_no_dependencies_is_a_leaf_not_a_pointer() {
+    let mut app = App::new(vec![workspace(
+        "Cargo.toml",
+        2,
+        &[("a", "0.1.0", &["b"]), ("b", "0.1.0", &[])],
+    )]);
+    app.apply(Action::Move(1));
+    app.apply(Action::Expand); // a -> b
+
+    let under_a = &app.rows()[2];
+    assert_eq!(under_a.name, "b");
+    assert!(
+        under_a.redirect.is_none(),
+        "there is nothing at `b`'s own entry to send the reader to"
+    );
+    assert!(!under_a.has_children);
+
+    // Pressing expand on it does nothing rather than scrolling somewhere empty.
+    let before = app.selected_index();
+    app.apply(Action::Move(1));
+    app.apply(Action::Expand);
+    assert_eq!(app.selected_index(), before + 1, "the selection stays put");
+}

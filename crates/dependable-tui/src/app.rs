@@ -393,8 +393,9 @@ impl App {
                 self.selected = index;
                 self.message = Some(format!("{name} is shown here, at the top of its project"));
             }
-            // A search can hide the target while still showing the pointer to
-            // it, since the pointer may be an ancestor of a match.
+            // A search normally keeps the two together, since both are the
+            // same crate under the same name. They can still come apart when
+            // the search runs out of budget between them.
             None => {
                 self.message = Some(format!(
                     "{name} has its own entry in this project — clear the search to reach it"
