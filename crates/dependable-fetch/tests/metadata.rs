@@ -109,6 +109,30 @@ async fn an_alternate_registry_has_no_crates_io_api() {
 }
 
 #[tokio::test]
+async fn the_public_index_url_still_reaches_the_crates_io_api() {
+    // The CLI always constructs the fetcher with an explicit index URL, which is
+    // the public one by default. That is still crates.io, so metadata must work.
+    let fetcher =
+        CratesIoFetcher::with_registry(build_client().unwrap(), "https://index.crates.io", None);
+    // Not a live call: only the decision about whether an API exists is checked,
+    // by confirming it does not short-circuit to `Ok(None)` the way an alternate
+    // registry does. A real request is covered by the mocked tests above.
+    let alternate = CratesIoFetcher::with_registry(
+        build_client().unwrap(),
+        "sparse+https://internal.example.com/index/",
+        None,
+    );
+    assert!(
+        fetcher.has_metadata_api(),
+        "the public index must expose the crates.io API"
+    );
+    assert!(
+        !alternate.has_metadata_api(),
+        "an alternate index must not be asked about crates.io"
+    );
+}
+
+#[tokio::test]
 async fn crates_io_reports_a_missing_crate_as_not_found() {
     let server = MockServer::start().await;
     let fetcher = CratesIoFetcher::new(build_client().unwrap()).with_api_url(server.uri());

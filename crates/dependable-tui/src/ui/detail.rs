@@ -121,7 +121,11 @@ fn facts_lines(facts: &PackageFacts) -> Vec<Line<'static>> {
 fn metadata_lines(meta: &PackageMetadata) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if let Some(description) = &meta.description {
-        lines.push(Line::raw(description.clone()));
+        // Registry descriptions are often hard-wrapped; the pane does its own
+        // wrapping, and the embedded newlines would otherwise run words together.
+        lines.push(Line::raw(
+            description.split_whitespace().collect::<Vec<_>>().join(" "),
+        ));
         lines.push(Line::raw(""));
     }
     lines.push(optional("repository", meta.repository.as_deref()));

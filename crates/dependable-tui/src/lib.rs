@@ -34,4 +34,10 @@ pub enum TuiError {
     /// The terminal could not be configured or drawn to.
     #[error("terminal error: {0}")]
     Io(#[from] std::io::Error),
+    /// There is no terminal to draw on.
+    #[error(
+        "not a terminal: the interactive UI needs stdin and stdout attached to \
+         one. Use `dependable check`, `list`, or `tree` for piped or CI output."
+    )]
+    NotATerminal,
 }

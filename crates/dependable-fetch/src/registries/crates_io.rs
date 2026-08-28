@@ -86,14 +86,24 @@ impl CratesIoFetcher {
             .unwrap_or(&raw)
             .trim_end_matches('/')
             .to_string();
+        // The crates.io API describes crates.io. Pointing at the public index —
+        // which is what the default config does — still means crates.io, so the
+        // API applies; any other index is a different registry, and asking
+        // crates.io about its crates would return the wrong package entirely.
+        let api_url = (base_url == DEFAULT_INDEX).then(|| DEFAULT_API.to_string());
         Self {
             client,
             base_url,
             auth,
-            // An alternate sparse index is not crates.io and serves no such API;
-            // querying crates.io about its crates would be wrong, not merely empty.
-            api_url: None,
+            api_url,
         }
+    }
+
+    /// Whether this fetcher can serve package metadata, i.e. whether its index is
+    /// crates.io itself rather than an alternate registry.
+    #[must_use]
+    pub fn has_metadata_api(&self) -> bool {
+        self.api_url.is_some()
     }
 
     /// Point the metadata client at a different crates.io API base (for testing).

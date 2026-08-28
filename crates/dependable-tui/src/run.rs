@@ -37,6 +37,13 @@ pub struct TuiOptions {
 /// # Errors
 /// Returns [`TuiError`] if the terminal cannot be configured or drawn to.
 pub async fn run(options: TuiOptions, checker: Arc<Checker>) -> Result<(), TuiError> {
+    // Refuse before touching raw mode. On Unix crossterm can put `/dev/tty` into
+    // raw mode even when our own stdout is a pipe, which would swallow the
+    // caller's keystrokes and write escape codes into whatever is reading us.
+    if !is_terminal() {
+        return Err(TuiError::NotATerminal);
+    }
+
     let (tx, rx) = mpsc::unbounded_channel();
     spawn_discovery(&options, tx.clone());
 
@@ -45,6 +52,12 @@ pub async fn run(options: TuiOptions, checker: Arc<Checker>) -> Result<(), TuiEr
     let outcome = event_loop(&mut terminal, checker, tx, rx).await;
     let restored = terminal::restore();
     outcome.and(restored.map_err(TuiError::from))
+}
+
+/// Whether both ends are attached to a terminal.
+fn is_terminal() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }
 
 /// Discover projects off the render thread: it reads the filesystem, which on a
@@ -70,14 +83,19 @@ async fn event_loop(
     let mut app = App::new(Vec::new());
     let mut loading = true;
     let mut pending: Option<(PackageKey, std::time::Instant)> = None;
+    // Only redraw when something actually changed: an idle UI should cost nothing.
+    let mut dirty = true;
 
     loop {
-        terminal.draw(|frame| {
-            if loading && app.projects.is_empty() {
-                app.message = Some("scanning for projects…".to_owned());
-            }
-            ui::draw(frame, &mut app);
-        })?;
+        if dirty {
+            terminal.draw(|frame| {
+                if loading && app.projects.is_empty() {
+                    app.message = Some("scanning for projects…".to_owned());
+                }
+                ui::draw(frame, &mut app);
+            })?;
+            dirty = false;
+        }
 
         if app.quit {
             return Ok(());
@@ -85,6 +103,7 @@ async fn event_loop(
 
         // Drain everything the background tasks have finished.
         while let Ok(message) = rx.try_recv() {
+            dirty = true;
             match message {
                 Message::Projects(projects) => {
                     app = App::new(projects);
@@ -103,6 +122,7 @@ async fn event_loop(
             if !app.packages.contains_key(&key) {
                 app.set_data(key.clone(), PackageData::Loading);
                 data::spawn_lookup(Arc::clone(&checker), key, tx.clone());
+                dirty = true;
             }
         }
 
@@ -117,10 +137,10 @@ async fn event_loop(
                         if quitting {
                             return Ok(());
                         }
+                        dirty = true;
                     }
                 }
-                // Redrawing on the next pass is all a resize needs.
-                Event::Resize(_, _) => {}
+                Event::Resize(_, _) => dirty = true,
                 _ => {}
             }
         }

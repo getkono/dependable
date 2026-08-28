@@ -21,9 +21,10 @@ use dependable_fetch::{
     PyPiFetcher, RegistryFetcher, ScopedRegistry, TreeOptions, UnstableFilter,
     WorkspaceGraphOptions, build_client, build_workspace_graph,
 };
+use dependable_tui::TuiOptions;
 use indicatif::{ProgressBar, ProgressStyle};
 
-use crate::cli::{CheckArgs, FailOn, FixArgs, ListArgs, TreeArgs};
+use crate::cli::{CheckArgs, FailOn, FixArgs, ListArgs, TreeArgs, TuiArgs};
 use crate::config::{Config, load_config};
 use crate::fix;
 use crate::output::list::ProjectReport;
@@ -541,6 +542,48 @@ fn relative_to(root: &Path, manifest: &Path) -> PathBuf {
     manifest
         .strip_prefix(root)
         .map_or_else(|_| manifest.to_path_buf(), Path::to_path_buf)
+}
+
+/// `dependable tui` (and a bare `dependable` in a terminal)
+///
+/// Builds the same fully-wired [`Checker`] the other commands use — every enabled
+/// ecosystem, alternate registries, `.npmrc` auth — and hands it to the UI, which
+/// only ever asks it about the one package on screen.
+///
+/// # Errors
+/// Returns an error if the checker cannot be built or the terminal cannot be
+/// configured.
+pub async fn run_tui(args: TuiArgs) -> anyhow::Result<ExitCode> {
+    let cfg = load_config(&args.config);
+    let settings = tui_settings(&cfg);
+    // No progress bar: the UI draws its own screen.
+    let engine = Engine::new(&settings, &cfg, false)?;
+
+    let options = TuiOptions {
+        path: args.path.unwrap_or_else(|| PathBuf::from(".")),
+        depth: args.depth,
+    };
+    dependable_tui::run(options, Arc::new(engine.checker))
+        .await
+        .context("running the interactive UI")?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Settings for the UI: the config file's choices, with none of the check-only
+/// flags (there is no `--fail-on` or output format to honor here).
+fn tui_settings(cfg: &Config) -> Settings {
+    Settings {
+        concurrency: cfg.global.concurrency.max(1),
+        depth: 3,
+        check_lockfile: cfg.global.lock_file,
+        check_vuln: cfg.vulnerability.enabled,
+        cache: true,
+        include_ghsa: cfg.global.include_ghsa,
+        fail_on: FailOn::None,
+        unstable: cfg.global.unstable.into(),
+        registry: cfg.rust.registry.clone(),
+        osv_url: cfg.vulnerability.osv_batch_url.clone(),
+    }
 }
 
 /// `dependable tree`

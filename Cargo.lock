@@ -548,6 +548,7 @@ dependencies = [
  "anyhow",
  "clap",
  "dependable-fetch",
+ "dependable-tui",
  "figment",
  "indicatif",
  "owo-colors",
