@@ -135,17 +135,15 @@ fn package_lines(app: &App, row: &crate::rows::Row, width: u16) -> Content {
 
     // A package that did not come from the registry is not the registry's package
     // of the same name, so nothing is fetched and nothing is claimed.
-    if let Some(origin) = local_origin(row) {
-        content.push(dim(origin));
+    if !published {
+        content.push(dim(local_origin(row)));
         return content;
     }
 
-    if published {
-        // Derived from the name rather than fetched, so it is on screen while
-        // everything below it is still being looked up.
-        link_field(&mut content, "registry", &ecosystem.package_url(&row.name));
-        content.push(Line::raw(""));
-    }
+    // Derived from the name rather than fetched, so it is on screen while
+    // everything below it is still being looked up.
+    link_field(&mut content, "registry", &ecosystem.package_url(&row.name));
+    content.push(Line::raw(""));
 
     // `Unloaded` and `None` are a request that has not been sent yet rather than
     // one in flight, but the distinction is a fraction of a second the reader
@@ -384,12 +382,16 @@ fn owner_span(owner: &Owner) -> Span<'static> {
 }
 
 /// Why a package is not looked up, when it did not come from a registry.
-fn local_origin(row: &crate::rows::Row) -> Option<&'static str> {
-    match row.node_kind? {
-        NodeKind::Workspace => Some("a member of this workspace — not fetched from a registry"),
-        NodeKind::Path => Some("a local path dependency — not fetched from a registry"),
-        NodeKind::Git => Some("a git dependency — not fetched from a registry"),
-        _ => None,
+///
+/// `NodeKind` is `#[non_exhaustive]`, so a kind this build has never heard of
+/// still has to say something. Saying only that it was not fetched is honest
+/// about both facts: nothing was looked up, and we cannot explain why.
+fn local_origin(row: &crate::rows::Row) -> &'static str {
+    match row.node_kind {
+        Some(NodeKind::Workspace) => "a member of this workspace — not fetched from a registry",
+        Some(NodeKind::Path) => "a local path dependency — not fetched from a registry",
+        Some(NodeKind::Git) => "a git dependency — not fetched from a registry",
+        _ => "not fetched from a registry",
     }
 }
 
