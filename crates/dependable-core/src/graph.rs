@@ -72,7 +72,7 @@ impl Default for TreeOptions {
         Self {
             max_depth: None,
             dedupe: true,
-            collapse_roots: false,
+            collapse_roots: true,
         }
     }
 }
@@ -758,6 +758,154 @@ source = "registry+https://x"
         assert_eq!(
             flat2.iter().filter(|(n, _, ded)| *n == "d" && !ded).count(),
             2
+        );
+    }
+
+    /// Find the first appearance of `name` at a non-root position.
+    fn under_root<'a>(g: &DependencyGraph, t: &'a Tree, root: &str, name: &str) -> &'a TreeNode {
+        let entry = t
+            .roots
+            .iter()
+            .find(|r| g.nodes()[r.node].name == root)
+            .expect("root entry");
+        entry
+            .children
+            .iter()
+            .find(|c| g.nodes()[c.node].name == name)
+            .expect("child")
+    }
+
+    #[test]
+    fn a_member_reached_under_another_member_points_at_its_own_root() {
+        let lock = r#"
+[[package]]
+name = "a"
+version = "0.1.0"
+dependencies = ["b"]
+
+[[package]]
+name = "b"
+version = "0.1.0"
+dependencies = ["serde"]
+
+[[package]]
+name = "serde"
+version = "1.0.0"
+source = "registry+https://x"
+"#;
+        let resolved = parse_cargo_lock_graph(lock).unwrap();
+        let g = DependencyGraph::from_resolved(
+            &resolved,
+            &names(&["a", "b"]),
+            &["a".into(), "b".into()],
+        );
+        let tree = g.tree(&TreeOptions::default());
+
+        let b_under_a = under_root(&g, &tree, "a", "b");
+        assert_eq!(
+            b_under_a.placement,
+            Placement::Root { root: 1 },
+            "`b` has a tree of its own, so here it is a pointer at it"
+        );
+        assert!(b_under_a.children.is_empty(), "and carries no copy of it");
+        assert!(
+            !b_under_a.deduped(),
+            "a pointer is not the `(*)` repeat marker"
+        );
+
+        // The entry it points at is the one that expands — which is what the
+        // first-seen-wins walk used to get backwards.
+        let b_root = &tree.roots[1];
+        assert_eq!(g.nodes()[b_root.node].name, "b");
+        assert_eq!(b_root.placement, Placement::Full);
+        assert_eq!(
+            flatten(
+                &g,
+                &Tree {
+                    roots: vec![b_root.clone()]
+                }
+            ),
+            vec![("b", "0.1.0", false), ("serde", "1.0.0", false)],
+        );
+    }
+
+    #[test]
+    fn a_registry_namesake_of_a_member_still_expands_in_place() {
+        // `a` depends on a crates.io crate that happens to share member `b`'s
+        // name. It is a different package, so it is not a pointer anywhere.
+        let lock = r#"
+[[package]]
+name = "a"
+version = "0.1.0"
+dependencies = ["b 9.0.0"]
+
+[[package]]
+name = "b"
+version = "0.1.0"
+
+[[package]]
+name = "b"
+version = "9.0.0"
+source = "registry+https://x"
+dependencies = ["serde"]
+
+[[package]]
+name = "serde"
+version = "1.0.0"
+source = "registry+https://x"
+"#;
+        let resolved = parse_cargo_lock_graph(lock).unwrap();
+        let g = DependencyGraph::from_resolved(
+            &resolved,
+            &names(&["a", "b"]),
+            &["a".into(), "b".into()],
+        );
+        let tree = g.tree(&TreeOptions::default());
+
+        let namesake = under_root(&g, &tree, "a", "b");
+        assert_eq!(g.nodes()[namesake.node].version, "9.0.0");
+        assert_eq!(
+            namesake.placement,
+            Placement::Full,
+            "the registry crate is not the member, so it expands where it is used"
+        );
+        assert_eq!(g.nodes()[namesake.children[0].node].name, "serde");
+    }
+
+    #[test]
+    fn disabling_root_collapse_restores_expansion_in_place() {
+        let lock = r#"
+[[package]]
+name = "a"
+version = "0.1.0"
+dependencies = ["b"]
+
+[[package]]
+name = "b"
+version = "0.1.0"
+dependencies = ["serde"]
+
+[[package]]
+name = "serde"
+version = "1.0.0"
+source = "registry+https://x"
+"#;
+        let resolved = parse_cargo_lock_graph(lock).unwrap();
+        let g = DependencyGraph::from_resolved(
+            &resolved,
+            &names(&["a", "b"]),
+            &["a".into(), "b".into()],
+        );
+        let opts = TreeOptions {
+            dedupe: false,
+            collapse_roots: false,
+            ..TreeOptions::default()
+        };
+        let flat = flatten(&g, &g.tree(&opts));
+        assert_eq!(
+            flat.iter().filter(|(n, _, _)| *n == "serde").count(),
+            2,
+            "with both collapses off, `b`'s subtree is drawn under `a` and again at its own root"
         );
     }
 
