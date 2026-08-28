@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::Context;
 use dependable_fetch::core::{
     AlternateRegistryDecl, NpmrcConfig, PackageField, ProjectMeta, WorkspaceDecl, apply_lockfile,
-    parse, parse_cargo_config, parse_lockfile, parse_npmrc, parse_project, parse_workspace,
+    parse, parse_cargo_config, parse_npmrc, parse_project, parse_workspace,
 };
 use dependable_fetch::{
     CheckError, Checker, CratesIoFetcher, DependencyKind, DependencyStatus, Ecosystem,
@@ -25,9 +25,9 @@ use indicatif::{ProgressBar, ProgressStyle};
 
 use crate::cli::{CheckArgs, FailOn, FixArgs, ListArgs, TreeArgs};
 use crate::config::{Config, load_config};
+use crate::fix;
 use crate::output::list::ProjectReport;
 use crate::output::{self, ManifestReport};
-use crate::{discover, fix};
 
 /// Effective settings after layering CLI flags over env vars over config.
 struct Settings {
@@ -402,21 +402,9 @@ fn apply_nearest_lockfile(
     root: &Path,
     items: &mut [Item],
 ) -> Option<PathBuf> {
-    let name = kind.lockfile_name()?;
-    let mut dir = manifest.parent()?;
-    loop {
-        let candidate = dir.join(name);
-        if let Ok(content) = std::fs::read_to_string(&candidate)
-            && let Ok(resolved) = parse_lockfile(kind, &content)
-        {
-            apply_lockfile(items, &resolved);
-            return Some(relative_to(root, &candidate));
-        }
-        if dir.join(".git").exists() {
-            return None;
-        }
-        dir = dir.parent()?;
-    }
+    let (path, resolved) = dependable_fetch::find_lockfile(manifest, kind)?;
+    apply_lockfile(items, &resolved);
+    Some(relative_to(root, &path))
 }
 
 /// Fill in the constraints a member inherits from `[workspace.dependencies]`, returning
@@ -647,7 +635,7 @@ fn collect_manifests(manifest: Option<&Path>, path: Option<&Path>, depth: usize)
         return vec![manifest.to_path_buf()];
     }
     let root = path.map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-    discover::find_manifests(&root, depth)
+    dependable_fetch::find_manifests(&root, depth)
 }
 
 /// Cargo's home directory: `$CARGO_HOME`, else `~/.cargo`. Returns `None` when

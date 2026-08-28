@@ -40,6 +40,7 @@ use std::time::Duration;
 
 pub mod cache;
 pub mod check;
+pub mod discover;
 pub mod error;
 pub mod osv;
 pub mod registries;
@@ -47,6 +48,9 @@ pub mod tree;
 
 // High-level entry point (recommended for embedding).
 pub use check::{CheckError, Checker, CheckerBuilder, ManifestCheck, ProgressEvent};
+
+// Manifest discovery (filesystem; shared by every frontend).
+pub use discover::{find_lockfile, find_manifests};
 
 // Workspace dependency graph (offline; reads Cargo.lock / manifests).
 pub use tree::{

@@ -6,7 +6,6 @@ use clap::Parser;
 
 mod cli;
 mod config;
-mod discover;
 mod fix;
 mod output;
 mod runner;
