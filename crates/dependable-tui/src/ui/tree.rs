@@ -130,7 +130,7 @@ fn name_cell<'a>(app: &App, row: &'a Row, hovered: bool) -> Line<'a> {
     // The marker is the thing a click acts on, so it is the thing that responds
     // to the pointer arriving: it fades from muted to the brand colour. Both
     // ends are ours, so nothing here assumes anything about the terminal.
-    let marker_style = if hovered && row.has_children {
+    let marker_style = if hovered && (row.has_children || row.redirect.is_some()) {
         Style::default().fg(theme::blend(
             Token::Muted,
             Token::Brand,
@@ -146,13 +146,21 @@ fn name_cell<'a>(app: &App, row: &'a Row, hovered: bool) -> Line<'a> {
     if row.cyclic {
         spans.push(Span::styled(" (cycle)", theme::fg(Token::Muted)));
     }
+    if row.redirect.is_some() {
+        spans.push(Span::styled(" (see root)", theme::fg(Token::Muted)));
+    }
 
     Line::from(spans)
 }
 
-/// The disclosure marker: open, closed, or a leaf.
+/// The disclosure marker: open, closed, a pointer elsewhere, or a leaf.
+///
+/// Always two columns wide, so the indent arithmetic the click hit-test relies
+/// on holds whatever a row turns out to be.
 fn marker(row: &Row) -> &'static str {
-    if !row.has_children {
+    if row.redirect.is_some() {
+        "\u{2197} "
+    } else if !row.has_children {
         "  "
     } else if row.expanded {
         "v "

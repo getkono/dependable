@@ -37,6 +37,51 @@ fn project(label: &str, packages: &[(&str, &str, &[&str])]) -> Project {
     }
 }
 
+/// Build a project shaped like a Cargo workspace: the first `members` packages
+/// are workspace members and every one of them is a root of the forest, as
+/// `build_workspace_graph` makes them.
+fn workspace(label: &str, members: usize, packages: &[(&str, &str, &[&str])]) -> Project {
+    let locked: Vec<LockedPackage> = packages
+        .iter()
+        .enumerate()
+        .map(|(i, (name, version, deps))| {
+            LockedPackage::new(
+                (*name).to_owned(),
+                (*version).to_owned(),
+                // A member has no `source`; everything else came from a registry.
+                (i >= members).then(|| "registry+https://example.com".to_owned()),
+                deps.iter().map(|d| (*d).to_owned()).collect(),
+            )
+        })
+        .collect();
+    let roots: Vec<String> = packages[..members]
+        .iter()
+        .map(|(name, _, _)| (*name).to_owned())
+        .collect();
+    let resolved = ResolvedLockfile::from_packages(locked);
+    let names = roots.iter().cloned().collect();
+    Project {
+        manifest: PathBuf::from(label),
+        label: label.to_owned(),
+        ecosystem: Ecosystem::Rust,
+        graph: DependencyGraph::from_resolved(&resolved, &names, &roots),
+        source: GraphSource::Lockfile,
+    }
+}
+
+/// Two members, `a` -> `b`, with `b` pulling in `serde`.
+fn two_members() -> App {
+    App::new(vec![workspace(
+        "Cargo.toml",
+        2,
+        &[
+            ("a", "0.1.0", &["b"]),
+            ("b", "0.1.0", &["serde"]),
+            ("serde", "1.0.0", &[]),
+        ],
+    )])
+}
+
 /// A three-level project: app -> tokio -> mio, plus app -> serde.
 fn sample() -> App {
     App::new(vec![project(
@@ -446,4 +491,119 @@ fn the_divider_cannot_be_dragged_off_either_edge() {
 
     app.apply(Action::SetSplit(50));
     assert_eq!(app.split, 50, "a sensible width is kept as asked");
+}
+
+#[test]
+fn a_member_under_another_member_points_at_its_own_row() {
+    let mut app = two_members();
+    assert_eq!(names(&app), vec!["Cargo.toml", "a", "b"]);
+
+    app.apply(Action::Move(1));
+    app.apply(Action::Expand); // a -> b
+
+    assert_eq!(
+        names(&app),
+        vec!["Cargo.toml", "a", "b", "b"],
+        "`b` appears under `a` and at its own top-level entry"
+    );
+    let pointer = &app.rows()[2];
+    assert_eq!(pointer.depth, 2);
+    assert_eq!(
+        pointer.redirect.as_deref(),
+        Some([0, 1].as_slice()),
+        "it points at `b`'s own row"
+    );
+    assert!(
+        !pointer.has_children,
+        "a pointer offers no subtree of its own"
+    );
+    assert!(!pointer.cyclic, "and it is not a cycle");
+
+    // `serde` is reachable only through `b`'s own entry, never under `a`.
+    let own = &app.rows()[3];
+    assert_eq!(own.depth, 1);
+    assert!(own.redirect.is_none());
+    assert!(own.has_children);
+}
+
+#[test]
+fn expanding_a_pointer_jumps_to_that_crates_own_row() {
+    let mut app = two_members();
+    app.apply(Action::Move(1));
+    app.apply(Action::Expand); // a -> b
+    app.apply(Action::Move(1)); // select the pointer
+    assert_eq!(app.selected_index(), 2);
+
+    app.apply(Action::Expand);
+
+    assert_eq!(
+        app.selected_index(),
+        3,
+        "the selection travels to `b`'s own entry"
+    );
+    let landed = app.selected().expect("a row is selected");
+    assert_eq!(landed.name, "b");
+    assert_eq!(landed.depth, 1);
+    assert!(
+        !landed.expanded,
+        "the jump does not also open a subtree the user did not ask for"
+    );
+    assert!(app.message.is_some(), "and it says where it went");
+}
+
+#[test]
+fn a_pointer_offers_nothing_to_collapse() {
+    let mut app = two_members();
+    app.apply(Action::Move(1));
+    app.apply(Action::Expand);
+    app.apply(Action::Move(1)); // the pointer
+    app.apply(Action::Collapse);
+
+    let selected = app.selected().expect("a row is selected");
+    assert_eq!(selected.name, "a", "collapsing steps out to its parent");
+}
+
+#[test]
+fn a_registry_namesake_of_a_member_still_expands_in_the_tree() {
+    // `a` depends on a crates.io crate that happens to share member `b`'s name.
+    // It is a different package, so it is not a pointer at `b`.
+    let mut app = App::new(vec![workspace(
+        "Cargo.toml",
+        2,
+        &[
+            ("a", "0.1.0", &["b 9.0.0"]),
+            ("b", "0.1.0", &[]),
+            ("b", "9.0.0", &["serde"]),
+            ("serde", "1.0.0", &[]),
+        ],
+    )]);
+    app.apply(Action::Move(1));
+    app.apply(Action::Expand); // a -> the registry `b`
+
+    let namesake = &app.rows()[2];
+    assert_eq!(namesake.version, "9.0.0");
+    assert!(
+        namesake.redirect.is_none(),
+        "the registry crate has no top-level entry of its own"
+    );
+    assert!(namesake.has_children, "so it expands where it is used");
+}
+
+#[test]
+fn a_search_reaches_a_match_that_sits_below_a_pointer() {
+    let mut app = two_members();
+    for c in "serde".chars() {
+        app.apply(Action::SearchInput(c));
+    }
+    // `serde` is only under `b`. The copy of `b` beneath `a` is a pointer, so
+    // the match must be opened at `b`'s own entry rather than stranded there.
+    assert_eq!(names(&app), vec!["Cargo.toml", "b", "serde"]);
+    assert!(
+        app.rows()
+            .iter()
+            .find(|r| r.name == "serde")
+            .unwrap()
+            .matched,
+        "the match is flagged"
+    );
 }

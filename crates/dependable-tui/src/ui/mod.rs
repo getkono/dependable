@@ -259,7 +259,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
 
     const KEYS: &[(&str, &str)] = &[
         ("j / k, arrows", "move"),
-        ("l / right / enter", "expand, or step in"),
+        ("l / right / enter", "expand, step in, or follow a pointer"),
         ("h / left", "collapse, or step out"),
         ("g / G", "first / last row"),
         ("/", "search by glob: serde*, @types/*"),

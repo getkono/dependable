@@ -267,6 +267,7 @@ mod tests {
                 version: String::new(),
                 node_kind: None,
                 has_children: true,
+                redirect: None,
                 expanded: false,
                 cyclic: false,
                 matched: false,

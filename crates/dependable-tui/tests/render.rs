@@ -951,3 +951,73 @@ fn a_registry_that_publishes_no_metadata_still_offers_the_docs_it_builds() {
         "and the page the ecosystem builds is offered anyway"
     );
 }
+
+/// Two workspace members, `a` -> `b`, so `b` has a tree of its own.
+fn two_members() -> App {
+    let packages = vec![
+        LockedPackage::new("a".into(), "0.1.0".into(), None, vec!["b".into()]),
+        LockedPackage::new("b".into(), "0.1.0".into(), None, vec!["serde".into()]),
+        LockedPackage::new(
+            "serde".into(),
+            "1.0.0".into(),
+            Some("registry+https://example.com".into()),
+            Vec::new(),
+        ),
+    ];
+    let resolved = ResolvedLockfile::from_packages(packages);
+    let names = ["a".to_owned(), "b".to_owned()].into_iter().collect();
+    App::new(vec![Project {
+        manifest: PathBuf::from("Cargo.toml"),
+        label: "Cargo.toml".to_owned(),
+        ecosystem: Ecosystem::Rust,
+        graph: DependencyGraph::from_resolved(&resolved, &names, &["a".to_owned(), "b".to_owned()]),
+        source: GraphSource::Lockfile,
+    }])
+}
+
+#[test]
+fn a_pointer_row_says_where_the_crate_is_shown() {
+    let mut app = two_members();
+    app.apply(Action::Move(1));
+    app.apply(Action::Expand); // a -> b
+    let screen = render(&mut app);
+
+    let pointer = screen
+        .lines()
+        .find(|line| line.contains("(see root)"))
+        .unwrap_or_else(|| panic!("a pointer row is drawn; {screen}"));
+    assert!(pointer.contains('b'), "{pointer}");
+    assert!(
+        pointer.contains('\u{2197}'),
+        "the marker distinguishes it from an expandable row; {pointer}"
+    );
+    // `serde` lives under `b`'s own entry, which is still closed.
+    assert!(!screen.contains("serde"), "{screen}");
+}
+
+#[test]
+fn a_pointer_keeps_the_columns_aligned() {
+    let mut app = two_members();
+    app.apply(Action::Move(1));
+    app.apply(Action::Expand);
+    let screen = render(&mut app);
+
+    let heading = screen
+        .lines()
+        .find(|line| line.contains("NAME"))
+        .expect("a column heading row");
+    let version = column_of(heading, "VERSION").expect("VERSION");
+    let tree_width = column_of(heading, "STATUS").expect("STATUS") + "STATUS".len();
+
+    // The pointer's marker and its ` (see root)` tag both live in the name
+    // column, so the columns beside it must not shift.
+    let versions: Vec<usize> = screen
+        .lines()
+        .map(|line| tree_part(line, tree_width))
+        .filter_map(|line| column_of(&line, "0.1.0"))
+        .collect();
+    assert_eq!(versions.len(), 3, "`a`, the pointer, and `b`: {screen}");
+    for column in versions {
+        assert_eq!(column, version, "a version is out of its column: {screen}");
+    }
+}

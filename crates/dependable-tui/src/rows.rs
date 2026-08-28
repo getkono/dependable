@@ -6,6 +6,11 @@
 //! A package may legitimately appear in many places in a dependency graph, so a
 //! row is identified by its **path** from the root rather than by its node index —
 //! opening `serde` under `tokio` must not also open it under `clap`.
+//!
+//! The exception is a crate with a tree of its own in the project: a workspace
+//! member reached under another member is drawn as a pointer at that tree
+//! ([`Row::redirect`]), because a workspace's members all sit at the top level
+//! and copying their subtrees under each other buries the tree in repeats.
 
 use std::collections::HashSet;
 
@@ -61,6 +66,10 @@ pub struct Row {
     pub expanded: bool,
     /// Whether expanding would revisit a package already on this path.
     pub cyclic: bool,
+    /// The row that shows this crate's dependencies, when they are not shown
+    /// here: a crate with a tree of its own in this project is a pointer at
+    /// that tree rather than a second copy of it. `None` on every other row.
+    pub redirect: Option<RowPath>,
     /// Whether the row matched the active search.
     pub matched: bool,
 }
@@ -96,6 +105,7 @@ pub fn visible(
             has_children: !project.graph.roots().is_empty(),
             expanded: is_open,
             cyclic: false,
+            redirect: None,
             matched: false,
             path: path.clone(),
         });
@@ -108,7 +118,7 @@ pub fn visible(
                 // A package opened under `tokio` is not the one under `clap`, so
                 // a second appearance is expanded on its own terms.
                 dedupe: false,
-                collapse_roots: false,
+                collapse_roots: true,
                 prefix: &path,
                 expand: Some(&is_expanded),
                 include: Some(&is_kept),
@@ -152,6 +162,10 @@ impl Visitor for RowBuilder<'_> {
             has_children: expandable,
             expanded: visit.placement == Placement::Full && visit.degree > 0,
             cyclic: visit.placement == Placement::Cycle,
+            redirect: match visit.placement {
+                Placement::Root { root } => Some(vec![self.project_index, root]),
+                _ => None,
+            },
             matched: self.found.is_some_and(|f| f.matched.contains(visit.path)),
             path: visit.path.to_vec(),
         });
@@ -222,7 +236,11 @@ fn descend(
             found.matched.insert(path.clone());
             record(&path, found);
         }
-        if ancestors.contains(&node) {
+        // A crate with a tree of its own is drawn as a pointer here, so the
+        // rows below this copy are never drawn and opening a path into them
+        // would strand the match. The same subtree is searched at that crate's
+        // own entry, which is where the match is shown.
+        if ancestors.contains(&node) || (depth > 0 && project.graph.root_slot(node).is_some()) {
             continue;
         }
         let deps: Vec<usize> = project.graph.deps_of(node).to_vec();
