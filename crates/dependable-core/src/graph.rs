@@ -7,7 +7,7 @@
 //! Rendering (color, box-drawing) is deliberately left to the caller — this
 //! module only produces plain data.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::lockfiles::ResolvedLockfile;
 
@@ -47,6 +47,12 @@ pub struct DependencyGraph {
     edges: Vec<Vec<usize>>,
     /// Indices of the root nodes a tree is rendered from.
     roots: Vec<usize>,
+    /// Reverse of [`Self::roots`]: node index to its position within it.
+    ///
+    /// Held rather than searched because a traversal asks "is this node one of
+    /// the roots?" once per node it reaches, and a workspace may have hundreds
+    /// of members.
+    root_slots: HashMap<usize, usize>,
 }
 
 /// Options controlling how a [`Tree`] is expanded from a [`DependencyGraph`].
@@ -125,11 +131,27 @@ impl DependencyGraph {
         let mut root_indices: Vec<usize> = roots
             .iter()
             .flat_map(|name| {
-                nodes
+                let matching: Vec<usize> = nodes
                     .iter()
                     .enumerate()
-                    .filter(move |(_, n)| &n.name == name)
+                    .filter(|(_, n)| &n.name == name)
                     .map(|(i, _)| i)
+                    .collect();
+                // A name can match both a member and a registry crate that happens
+                // to share it. The member is the one meant by "render this crate";
+                // a name that matches no member (a `-p` on a dependency) keeps
+                // every match, so asking for a crate resolved at two versions
+                // still renders both.
+                let members: Vec<usize> = matching
+                    .iter()
+                    .copied()
+                    .filter(|&i| nodes[i].kind == NodeKind::Workspace)
+                    .collect();
+                if members.is_empty() {
+                    matching
+                } else {
+                    members
+                }
             })
             .collect();
         if root_indices.is_empty() {
@@ -142,6 +164,7 @@ impl DependencyGraph {
         }
 
         Self {
+            root_slots: index_roots(&root_indices),
             nodes,
             edges,
             roots: root_indices,
@@ -166,6 +189,15 @@ impl DependencyGraph {
         &self.roots
     }
 
+    /// The position of `node` within [`Self::roots`], if it is one of them.
+    ///
+    /// Answers "does this crate have a tree of its own in this forest?" — which
+    /// is what lets a traversal point at that tree instead of copying it.
+    #[must_use]
+    pub fn root_slot(&self, node: usize) -> Option<usize> {
+        self.root_slots.get(&node).copied()
+    }
+
     /// Reverse every edge, keeping the same nodes and roots. Rooting the result
     /// at a crate and walking it answers "what depends on this crate" — the
     /// downstream-impact (`--invert`) view.
@@ -181,6 +213,7 @@ impl DependencyGraph {
             nodes: self.nodes.clone(),
             edges,
             roots: self.roots.clone(),
+            root_slots: self.root_slots.clone(),
         }
     }
 
@@ -247,12 +280,27 @@ impl DependencyGraph {
     }
 }
 
-/// Classify a package by workspace membership then lockfile source.
-fn classify(name: &str, source: Option<&str>, workspace_names: &HashSet<String>) -> NodeKind {
-    if workspace_names.contains(name) {
-        return NodeKind::Workspace;
+/// Index root node indices by their position, for [`DependencyGraph::root_slot`].
+///
+/// A node listed twice keeps its first position, so the slot always names the
+/// entry a reader would actually find.
+fn index_roots(roots: &[usize]) -> HashMap<usize, usize> {
+    let mut out = HashMap::with_capacity(roots.len());
+    for (slot, &node) in roots.iter().enumerate() {
+        out.entry(node).or_insert(slot);
     }
+    out
+}
+
+/// Classify a package by its lockfile source, then workspace membership.
+///
+/// Source is tested first because a member's name is not exclusive to it: a
+/// crate published to a registry may share the name of a crate in this
+/// workspace, and Cargo records both as separate packages. Only the one with no
+/// `source` is the member — which is the rule `docs/SCOPE.md` already states.
+fn classify(name: &str, source: Option<&str>, workspace_names: &HashSet<String>) -> NodeKind {
     match source {
+        None if workspace_names.contains(name) => NodeKind::Workspace,
         None => NodeKind::Path,
         Some(s) if s.starts_with("git+") => NodeKind::Git,
         Some(_) => NodeKind::Registry,
@@ -318,6 +366,98 @@ version = "0.1.0"
         assert_eq!(kind("serde"), NodeKind::Registry);
         assert_eq!(kind("gitdep"), NodeKind::Git);
         assert_eq!(kind("localdep"), NodeKind::Path); // no source, not a member
+    }
+
+    #[test]
+    fn a_registry_crate_sharing_a_member_name_is_not_a_member() {
+        // `b` is a workspace member, and a *different* crate published to
+        // crates.io also happens to be called `b`. Cargo locks both.
+        let lock = r#"
+[[package]]
+name = "a"
+version = "0.1.0"
+dependencies = ["b 9.0.0"]
+
+[[package]]
+name = "b"
+version = "0.1.0"
+
+[[package]]
+name = "b"
+version = "9.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+"#;
+        let resolved = parse_cargo_lock_graph(lock).unwrap();
+        let g = DependencyGraph::from_resolved(&resolved, &names(&["a", "b"]), &["a".into()]);
+        let kind_at = |version: &str| {
+            g.nodes()
+                .iter()
+                .find(|n| n.name == "b" && n.version == version)
+                .unwrap()
+                .kind
+        };
+        assert_eq!(kind_at("0.1.0"), NodeKind::Workspace, "the member");
+        assert_eq!(kind_at("9.0.0"), NodeKind::Registry, "the namesake");
+    }
+
+    #[test]
+    fn a_member_namesake_from_the_registry_is_not_a_root() {
+        let lock = r#"
+[[package]]
+name = "a"
+version = "0.1.0"
+dependencies = ["b 9.0.0"]
+
+[[package]]
+name = "b"
+version = "0.1.0"
+
+[[package]]
+name = "b"
+version = "9.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+"#;
+        let resolved = parse_cargo_lock_graph(lock).unwrap();
+        let g = DependencyGraph::from_resolved(
+            &resolved,
+            &names(&["a", "b"]),
+            &["a".into(), "b".into()],
+        );
+        let roots: Vec<(&str, &str)> = g
+            .roots()
+            .iter()
+            .map(|&i| (g.nodes()[i].name.as_str(), g.nodes()[i].version.as_str()))
+            .collect();
+        assert_eq!(
+            roots,
+            vec![("a", "0.1.0"), ("b", "0.1.0")],
+            "asking for member `b` must not also root its registry namesake"
+        );
+        assert_eq!(g.root_slot(g.roots()[1]), Some(1));
+    }
+
+    #[test]
+    fn a_root_name_matching_no_member_keeps_every_version() {
+        // `-p dep` on a crate resolved at two versions still shows both.
+        let lock = r#"
+[[package]]
+name = "app"
+version = "0.1.0"
+dependencies = ["dep 1.0.0", "dep 2.0.0"]
+
+[[package]]
+name = "dep"
+version = "1.0.0"
+source = "registry+https://x"
+
+[[package]]
+name = "dep"
+version = "2.0.0"
+source = "registry+https://x"
+"#;
+        let resolved = parse_cargo_lock_graph(lock).unwrap();
+        let g = DependencyGraph::from_resolved(&resolved, &names(&["app"]), &["dep".into()]);
+        assert_eq!(g.roots().len(), 2);
     }
 
     #[test]
