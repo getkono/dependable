@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use dependable_fetch::core::{LockedPackage, ResolvedLockfile};
 use dependable_fetch::{
-    DependencyGraph, DependencyStatus, Ecosystem, GraphSource, Owner, PackageMetadata,
+    DependencyGraph, DependencyStatus, Ecosystem, GraphSource, Owner, OwnerKind, PackageMetadata,
 };
 use dependable_tui::app::{Action, App};
 use dependable_tui::model::{PackageData, PackageFacts, Project, key};
@@ -21,7 +21,29 @@ fn metadata() -> PackageMetadata {
     meta.description = Some("Serialization framework".to_owned());
     meta.repository = Some("https://github.com/serde-rs/serde".to_owned());
     meta.license = Some("MIT OR Apache-2.0".to_owned());
-    meta.owners = vec![Owner::named("David Tolnay")];
+    meta.owners = vec![
+        {
+            let mut owner = Owner::named("David Tolnay");
+            owner.login = Some("dtolnay".to_owned());
+            owner.url = Some("https://github.com/dtolnay".to_owned());
+            owner
+        },
+        {
+            let mut owner = Owner::default();
+            owner.login = Some("oli-obk".to_owned());
+            owner
+        },
+        {
+            let mut owner = Owner::named("libs");
+            owner.kind = OwnerKind::Team;
+            owner
+        },
+    ];
+    meta.published = std::collections::BTreeMap::from([
+        ("1.0.0".to_owned(), "2021-03-04T00:00:00Z".to_owned()),
+        ("2.0.0".to_owned(), "2025-11-12T00:00:00Z".to_owned()),
+    ]);
+    meta.latest_published = Some("2025-11-12T00:00:00Z".to_owned());
     meta.downloads = Some(5_000_000);
     meta
 }
@@ -177,6 +199,97 @@ fn metadata_is_rendered_when_it_arrives() {
     assert!(screen.contains("5.0M"), "downloads: {screen}");
     assert!(screen.contains("RUSTSEC-2020-0001"), "advisory: {screen}");
     assert!(screen.contains("update available"), "status: {screen}");
+}
+
+/// Select `serde` and hand it a completed lookup, as the metadata test does.
+fn app_with_serde_metadata() -> App {
+    let mut app = App::new(vec![project(GraphSource::Lockfile)]);
+    app.apply(Action::Move(1));
+    app.apply(Action::Expand);
+    app.apply(Action::Move(1));
+    app.set_data(
+        key(Ecosystem::Rust, "serde", "1.0.0"),
+        PackageData::Ready(Box::new(PackageFacts {
+            metadata: Some(metadata()),
+            latest: Some("2.0.0".to_owned()),
+            status: Some(DependencyStatus::UpdateAvailable),
+            vulnerabilities: Vec::new(),
+            warnings: Vec::new(),
+        })),
+    );
+    app
+}
+
+#[test]
+fn each_owner_is_shown_with_the_identifiers_the_registry_published() {
+    let mut app = app_with_serde_metadata();
+    let screen = render(&mut app);
+
+    assert!(
+        screen.contains("David Tolnay (@dtolnay)"),
+        "a name and a login are both shown: {screen}"
+    );
+    assert!(
+        screen.contains("@oli-obk"),
+        "an owner known only by login is shown by it: {screen}"
+    );
+    assert!(
+        screen.contains("[team]"),
+        "a team owner is marked as one: {screen}"
+    );
+}
+
+#[test]
+fn the_publish_date_describes_the_resolved_version_not_the_newest() {
+    // The bug this guards: `published` printed the newest release's date
+    // directly beneath `resolved`, so a project pinned to 1.0.0 was shown
+    // 2.0.0's release date as its own.
+    let mut app = app_with_serde_metadata();
+    let screen = render(&mut app);
+
+    assert!(
+        screen.contains("2021-03-04"),
+        "1.0.0's own publish date: {screen}"
+    );
+    assert!(
+        screen.contains("2025-11-12"),
+        "2.0.0's release date, labelled separately: {screen}"
+    );
+    assert!(
+        screen.contains("ago)"),
+        "each date carries its age in parentheses: {screen}"
+    );
+}
+
+#[test]
+fn the_latest_release_is_not_repeated_when_it_is_the_resolved_one() {
+    // Nothing is learned from the same date twice under two labels.
+    let mut app = App::new(vec![project(GraphSource::Lockfile)]);
+    app.apply(Action::Move(1));
+    app.apply(Action::Expand);
+    app.apply(Action::Move(1));
+
+    let mut meta = metadata();
+    meta.published =
+        std::collections::BTreeMap::from([("1.0.0".to_owned(), "2021-03-04T00:00:00Z".to_owned())]);
+    meta.latest_published = Some("2021-03-04T00:00:00Z".to_owned());
+    app.set_data(
+        key(Ecosystem::Rust, "serde", "1.0.0"),
+        PackageData::Ready(Box::new(PackageFacts {
+            metadata: Some(meta),
+            latest: Some("1.0.0".to_owned()),
+            status: Some(DependencyStatus::UpToDate),
+            vulnerabilities: Vec::new(),
+            warnings: Vec::new(),
+        })),
+    );
+
+    let screen = render(&mut app);
+    assert!(screen.contains("published"), "{screen}");
+    assert!(
+        !screen.contains("released"),
+        "the latest release is the resolved one, so it is not repeated: {screen}"
+    );
 }
 
 #[test]

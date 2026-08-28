@@ -4,7 +4,7 @@
 //! "not published", never as a blank line that looks like missing data, and a
 //! lookup that failed says so rather than looking like an empty package.
 
-use dependable_fetch::{DependencyStatus, NodeKind, Owner, PackageMetadata};
+use dependable_fetch::{DependencyStatus, NodeKind, Owner, OwnerKind, PackageMetadata};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
@@ -12,7 +12,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::app::App;
-use crate::model::{PackageData, PackageFacts, compact_count, relative_age};
+use crate::model::{PackageData, PackageFacts, compact_count, dated_age};
 use crate::rows::RowKind;
 use crate::theme::{self, Token};
 
@@ -80,13 +80,16 @@ fn package_lines(app: &App, row: &crate::rows::Row) -> Vec<Line<'static>> {
             ));
             lines.push(dim("press r to try again"));
         }
-        Some(PackageData::Ready(facts)) => lines.extend(facts_lines(facts)),
+        Some(PackageData::Ready(facts)) => lines.extend(facts_lines(facts, &row.version)),
     }
     lines
 }
 
 /// Render a completed lookup.
-fn facts_lines(facts: &PackageFacts) -> Vec<Line<'static>> {
+///
+/// `resolved` is the version the project actually uses, which is what the
+/// publish date must describe.
+fn facts_lines(facts: &PackageFacts, resolved: &str) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
     // Freshness first: it is the question most often being asked.
@@ -115,7 +118,7 @@ fn facts_lines(facts: &PackageFacts) -> Vec<Line<'static>> {
     lines.push(Line::raw(""));
     match &facts.metadata {
         None => lines.push(dim("this registry publishes no package metadata")),
-        Some(meta) => lines.extend(metadata_lines(meta)),
+        Some(meta) => lines.extend(metadata_lines(meta, resolved)),
     }
 
     for warning in &facts.warnings {
@@ -125,7 +128,7 @@ fn facts_lines(facts: &PackageFacts) -> Vec<Line<'static>> {
 }
 
 /// The public metadata block.
-fn metadata_lines(meta: &PackageMetadata) -> Vec<Line<'static>> {
+fn metadata_lines(meta: &PackageMetadata, resolved: &str) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if let Some(description) = &meta.description {
         // Registry descriptions are often hard-wrapped; the pane does its own
@@ -141,13 +144,19 @@ fn metadata_lines(meta: &PackageMetadata) -> Vec<Line<'static>> {
     lines.push(optional("license", meta.license.as_deref()));
     lines.push(optional("msrv", meta.msrv.as_deref()));
 
-    // Still one joined line here; the structured per-owner rendering lands with
-    // the rest of the detail-pane rework.
-    let owners: Vec<&str> = meta.owners.iter().filter_map(Owner::display_name).collect();
-    if owners.is_empty() {
+    if meta.owners.is_empty() {
         lines.push(optional("owners", None));
     } else {
-        lines.push(field("owners", &owners.join(", ")));
+        // One per line: a comma-joined run of names, logins, and emails is
+        // unreadable, and there is no room to align them on one row.
+        for (i, owner) in meta.owners.iter().enumerate() {
+            let name = if i == 0 {
+                label("owners")
+            } else {
+                Span::raw(" ".repeat(13))
+            };
+            lines.push(Line::from(vec![name, owner_span(owner)]));
+        }
     }
 
     lines.push(Line::raw(""));
@@ -155,13 +164,19 @@ fn metadata_lines(meta: &PackageMetadata) -> Vec<Line<'static>> {
         "downloads",
         meta.downloads.map(compact_count).as_deref(),
     ));
+    // The resolved version's own date, not the newest release's: printed under
+    // `resolved`, the latter reads as a claim about a version the project does
+    // not use.
     lines.push(optional(
         "published",
-        meta.latest_published
-            .as_deref()
-            .map(relative_age)
-            .as_deref(),
+        meta.published_at(resolved).map(dated_age).as_deref(),
     ));
+    // The newest release, shown only when it is a different one to compare to.
+    if meta.published_at(resolved) != meta.latest_published.as_deref()
+        && let Some(latest) = &meta.latest_published
+    {
+        lines.push(field("released", &dated_age(latest)));
+    }
     if meta.yanked {
         lines.push(Line::styled(
             "this version has been yanked",
@@ -169,6 +184,32 @@ fn metadata_lines(meta: &PackageMetadata) -> Vec<Line<'static>> {
         ));
     }
     lines
+}
+
+/// One owner, showing every identifier the registry published for them.
+///
+/// Registries differ in what they know, so this renders what is there rather
+/// than a fixed shape: a name and a login become `David Tolnay (@dtolnay)`, a
+/// login alone becomes `@dtolnay`, and an owner known only by email is shown by
+/// it. A team is marked, because "owned by a group" is a different fact from
+/// "owned by a person who happens to be called that".
+fn owner_span(owner: &Owner) -> Span<'static> {
+    let mut text = match (owner.name.as_deref(), owner.login.as_deref()) {
+        (Some(name), Some(login)) if name != login => format!("{name} (@{login})"),
+        (Some(name), _) => name.to_owned(),
+        (None, Some(login)) => format!("@{login}"),
+        (None, None) => owner.email.clone().unwrap_or_default(),
+    };
+    // Only worth repeating when it is not already the whole label.
+    if let Some(email) = &owner.email
+        && !text.contains(email.as_str())
+    {
+        text.push_str(&format!(" <{email}>"));
+    }
+    if owner.kind == OwnerKind::Team {
+        text.push_str("  [team]");
+    }
+    Span::styled(text, theme::fg(Token::Text))
 }
 
 /// Why a package is not looked up, when it did not come from a registry.

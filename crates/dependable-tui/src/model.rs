@@ -110,6 +110,33 @@ pub fn relative_age(timestamp: &str) -> String {
     }
 }
 
+/// Format an RFC 3339 timestamp as a date and its age: `2023-04-11 (2 years ago)`.
+///
+/// The datestamp is what makes two packages comparable and is the thing to cite
+/// in an issue; the age is what makes it meaningful at a glance. Showing only
+/// the relative form, as this pane used to, throws away the precise answer for
+/// a rounded one.
+///
+/// Falls back to the age alone when the timestamp carries no readable date, and
+/// to the raw input when it cannot be parsed at all.
+#[must_use]
+pub fn dated_age(timestamp: &str) -> String {
+    let age = relative_age(timestamp);
+    match calendar_date(timestamp) {
+        // `relative_age` returns its input verbatim when parsing failed, and a
+        // date beside itself reads as a mistake.
+        Some(date) if age != timestamp => format!("{date} ({age})"),
+        Some(date) => date,
+        None => age,
+    }
+}
+
+/// The `YYYY-MM-DD` portion of an RFC 3339 timestamp.
+fn calendar_date(timestamp: &str) -> Option<String> {
+    let then = timestamp.parse::<jiff::Timestamp>().ok()?;
+    Some(then.to_zoned(jiff::tz::TimeZone::UTC).date().to_string())
+}
+
 /// `1 month ago` / `4 months ago`.
 fn plural(n: i64, unit: &str) -> String {
     if n == 1 {
@@ -151,6 +178,27 @@ mod tests {
     fn a_recent_timestamp_reads_as_days() {
         let two_days_ago = jiff::Timestamp::now() - jiff::SignedDuration::from_hours(48);
         assert_eq!(relative_age(&two_days_ago.to_string()), "2 days ago");
+    }
+
+    #[test]
+    fn a_date_is_shown_with_its_age_beside_it() {
+        assert_eq!(
+            dated_age("2023-04-11T09:30:00Z"),
+            format!("2023-04-11 ({})", relative_age("2023-04-11T09:30:00Z")),
+        );
+    }
+
+    #[test]
+    fn a_date_is_read_in_utc_not_the_local_zone() {
+        // Rendering in the viewer's zone would make the same package show
+        // different publish dates to two people reading the same registry.
+        assert!(dated_age("2023-04-11T23:30:00Z").starts_with("2023-04-11"));
+        assert!(dated_age("2023-04-11T00:30:00Z").starts_with("2023-04-11"));
+    }
+
+    #[test]
+    fn an_unparseable_timestamp_keeps_its_raw_form_without_a_date() {
+        assert_eq!(dated_age("not a date"), "not a date");
     }
 
     #[test]
