@@ -72,15 +72,15 @@ pub fn check_version(constraint: &str, versions: &[String], locked_at: Option<&s
     let locked = locked_at.and_then(|s| Version::parse(s).ok());
 
     // A locked version that no longer satisfies the declared constraint.
-    if let (Some(req), Some(locked)) = (req.as_ref(), locked.as_ref()) {
-        if !req.matches(locked) {
-            return Evaluation {
-                status: DependencyStatus::Outdated,
-                latest_compatible: latest_compatible.map(|v| v.to_string()),
-                latest_available: Some(latest_available.to_string()),
-                patch_available: false,
-            };
-        }
+    if let (Some(req), Some(locked)) = (req.as_ref(), locked.as_ref())
+        && !req.matches(locked)
+    {
+        return Evaluation {
+            status: DependencyStatus::Outdated,
+            latest_compatible: latest_compatible.map(|v| v.to_string()),
+            latest_available: Some(latest_available.to_string()),
+            patch_available: false,
+        };
     }
 
     let current = locked.clone().or_else(|| latest_compatible.clone());

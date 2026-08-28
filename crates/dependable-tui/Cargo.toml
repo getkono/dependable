@@ -1,0 +1,17 @@
+[package]
+name = "dependable-tui"
+description = "Interactive terminal UI for exploring a project's dependencies."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+dependable-fetch.workspace = true
+ratatui.workspace = true
+globset.workspace = true
+jiff.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

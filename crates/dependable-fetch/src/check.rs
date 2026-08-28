@@ -213,6 +213,58 @@ impl Checker {
     /// [`CheckError::UnknownManifest`] if the file name is unrecognized,
     /// [`CheckError::Io`] if the manifest cannot be read, plus the errors of
     /// [`Checker::check_manifest`].
+    /// Fetch the available versions for one package, newest-first.
+    ///
+    /// Shares the checker's version cache with `check_*`, so a package already
+    /// seen in a check costs nothing here.
+    ///
+    /// # Errors
+    /// Returns [`CheckError::UnsupportedEcosystem`] if no fetcher is registered for
+    /// `ecosystem`, or [`CheckError::Fetch`] if the request fails.
+    pub async fn fetch_versions(
+        &self,
+        ecosystem: Ecosystem,
+        name: &str,
+    ) -> Result<Vec<String>, CheckError> {
+        let key = (ecosystem.osv_name().to_owned(), name.to_owned());
+        if let Some(hit) = self.versions_cache.get(&key).await {
+            return Ok(hit);
+        }
+        let fetcher = self
+            .registries
+            .get(&ecosystem)
+            .ok_or(CheckError::UnsupportedEcosystem(ecosystem))?;
+        let versions = fetcher.fetch_versions(name).await?.versions;
+        self.versions_cache.insert(key, versions.clone()).await;
+        Ok(versions)
+    }
+
+    /// Query OSV for advisories affecting one exact package version.
+    ///
+    /// `check_*` scans a whole manifest in one batch; this exists for a UI asking
+    /// about the single package it is displaying. Results share the OSV cache.
+    ///
+    /// # Errors
+    /// Returns [`CheckError::Fetch`] if the query fails. Returns an empty list —
+    /// not an error — when vulnerability scanning is disabled.
+    pub async fn scan_package(
+        &self,
+        ecosystem: Ecosystem,
+        name: &str,
+        version: &str,
+    ) -> Result<Vec<String>, CheckError> {
+        let Some(osv) = &self.osv else {
+            return Ok(Vec::new());
+        };
+        let query = OsvQuery {
+            ecosystem: ecosystem.osv_name().to_owned(),
+            name: name.to_owned(),
+            version: version.to_owned(),
+        };
+        let mut results = osv.query_batch(std::slice::from_ref(&query)).await?;
+        Ok(results.pop().unwrap_or_default())
+    }
+
     /// Fetch the registry's public metadata for one package.
     ///
     /// This is deliberately **not** part of `check_*`: version checking never needs
