@@ -7,7 +7,7 @@ use futures::FutureExt;
 use futures::future::BoxFuture;
 use serde::Deserialize;
 
-use super::{FetchedVersions, PackageMetadata, RegistryFetcher};
+use super::{FetchedVersions, Owner, OwnerKind, PackageMetadata, RegistryFetcher};
 use crate::error::FetchError;
 
 const DEFAULT_REGISTRY: &str = "https://registry.npmjs.org";
@@ -143,10 +143,25 @@ impl Repository {
     }
 }
 
+/// npm publishes maintainers as `{"name": "...", "email": "..."}`.
 #[derive(Deserialize)]
 struct Maintainer {
     #[serde(default)]
     name: Option<String>,
+    #[serde(default)]
+    email: Option<String>,
+}
+
+impl From<Maintainer> for Owner {
+    fn from(m: Maintainer) -> Self {
+        Owner {
+            name: m.name,
+            login: None,
+            email: m.email,
+            url: None,
+            kind: OwnerKind::User,
+        }
+    }
 }
 
 impl RegistryFetcher for NpmFetcher {
@@ -234,10 +249,11 @@ impl RegistryFetcher for NpmFetcher {
                 homepage: body.homepage,
                 documentation: None,
                 license: body.license,
-                authors: body
+                owners: body
                     .maintainers
                     .into_iter()
-                    .filter_map(|m| m.name)
+                    .map(Owner::from)
+                    .filter(|o| !o.is_anonymous())
                     .collect(),
                 downloads: None,
                 last_published,

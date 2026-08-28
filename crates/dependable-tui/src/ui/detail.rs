@@ -4,7 +4,7 @@
 //! "not published", never as a blank line that looks like missing data, and a
 //! lookup that failed says so rather than looking like an empty package.
 
-use dependable_fetch::{DependencyStatus, NodeKind, PackageMetadata};
+use dependable_fetch::{DependencyStatus, NodeKind, Owner, PackageMetadata};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -141,10 +141,13 @@ fn metadata_lines(meta: &PackageMetadata) -> Vec<Line<'static>> {
     lines.push(optional("license", meta.license.as_deref()));
     lines.push(optional("msrv", meta.msrv.as_deref()));
 
-    if meta.authors.is_empty() {
+    // Still one joined line here; the structured per-owner rendering lands with
+    // the rest of the detail-pane rework.
+    let owners: Vec<&str> = meta.owners.iter().filter_map(Owner::display_name).collect();
+    if owners.is_empty() {
         lines.push(optional("owners", None));
     } else {
-        lines.push(field("owners", &meta.authors.join(", ")));
+        lines.push(field("owners", &owners.join(", ")));
     }
 
     lines.push(Line::raw(""));

@@ -1,8 +1,8 @@
 //! Hermetic tests for the package-metadata layer (wiremock; no real network).
 
 use dependable_fetch::{
-    CratesIoFetcher, HexFetcher, NpmFetcher, PackagistFetcher, PyPiFetcher, RegistryFetcher,
-    build_client,
+    CratesIoFetcher, HexFetcher, NpmFetcher, OwnerKind, PackagistFetcher, PyPiFetcher,
+    RegistryFetcher, build_client,
 };
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -34,8 +34,10 @@ async fn crates_io_reads_metadata_and_owners() {
     mount(
         &server,
         "/crates/serde/owners",
-        r#"{ "users": [ { "login": "dtolnay", "name": "David Tolnay" },
-                       { "login": "oli-obk", "name": null } ] }"#,
+        r#"{ "users": [ { "login": "dtolnay", "name": "David Tolnay",
+                         "url": "https://github.com/dtolnay" },
+                       { "login": "oli-obk", "name": null } ],
+             "teams": [ { "login": "github:rust-lang:libs", "name": "libs" } ] }"#,
     )
     .await;
 
@@ -58,11 +60,65 @@ async fn crates_io_reads_metadata_and_owners() {
     assert_eq!(meta.msrv.as_deref(), Some("1.61"));
     assert_eq!(meta.last_published.as_deref(), Some("2025-01-02T03:04:05Z"));
     assert!(!meta.yanked);
+    assert_eq!(meta.owners.len(), 3, "two users and one team");
+
+    assert_eq!(meta.owners[0].name.as_deref(), Some("David Tolnay"));
     assert_eq!(
-        meta.authors,
-        vec!["David Tolnay".to_owned(), "oli-obk".to_owned()],
+        meta.owners[0].login.as_deref(),
+        Some("dtolnay"),
+        "the login survives alongside the display name, not instead of it"
+    );
+    assert_eq!(
+        meta.owners[0].url.as_deref(),
+        Some("https://github.com/dtolnay")
+    );
+    assert_eq!(meta.owners[0].kind, OwnerKind::User);
+    assert_eq!(
+        meta.owners[0].email, None,
+        "crates.io does not publish owner emails"
+    );
+
+    assert_eq!(meta.owners[1].name, None);
+    assert_eq!(
+        meta.owners[1].display_name(),
+        Some("oli-obk"),
         "an owner without a display name falls back to its login"
     );
+
+    assert_eq!(
+        meta.owners[2].kind,
+        OwnerKind::Team,
+        "a team owner is reported, not dropped"
+    );
+    assert_eq!(meta.owners[2].name.as_deref(), Some("libs"));
+}
+
+#[tokio::test]
+async fn crates_io_reports_a_team_only_crate_as_owned() {
+    let server = MockServer::start().await;
+    mount(
+        &server,
+        "/crates/tokio",
+        r#"{ "crate": {}, "versions": [] }"#,
+    )
+    .await;
+    // Some crates are owned solely by a team; `users` is then empty.
+    mount(
+        &server,
+        "/crates/tokio/owners",
+        r#"{ "users": [], "teams": [ { "login": "github:tokio-rs:core", "name": "core" } ] }"#,
+    )
+    .await;
+
+    let fetcher = CratesIoFetcher::new(build_client().unwrap()).with_api_url(server.uri());
+    let meta = fetcher
+        .fetch_metadata("tokio")
+        .await
+        .expect("request")
+        .expect("metadata");
+
+    assert_eq!(meta.owners.len(), 1);
+    assert_eq!(meta.owners[0].kind, OwnerKind::Team);
 }
 
 #[tokio::test]
@@ -88,7 +144,7 @@ async fn crates_io_still_returns_metadata_when_owners_fail() {
         Some("https://github.com/serde-rs/serde")
     );
     assert!(
-        meta.authors.is_empty(),
+        meta.owners.is_empty(),
         "owners are enrichment, not the point"
     );
 }
@@ -150,7 +206,7 @@ async fn npm_reads_the_full_packument() {
   "homepage": "https://react.dev/",
   "license": "MIT",
   "repository": { "type": "git", "url": "git+https://github.com/facebook/react.git" },
-  "maintainers": [ { "name": "fb" } ],
+  "maintainers": [ { "name": "fb", "email": "opensource@fb.com" } ],
   "dist-tags": { "latest": "18.2.0" },
   "time": { "modified": "2024-01-01T00:00:00Z", "18.2.0": "2022-06-14T19:46:38Z" }
 }"#,
@@ -169,7 +225,13 @@ async fn npm_reads_the_full_packument() {
         Some("git+https://github.com/facebook/react.git")
     );
     assert_eq!(meta.license.as_deref(), Some("MIT"));
-    assert_eq!(meta.authors, vec!["fb".to_owned()]);
+    assert_eq!(meta.owners.len(), 1);
+    assert_eq!(meta.owners[0].name.as_deref(), Some("fb"));
+    assert_eq!(
+        meta.owners[0].email.as_deref(),
+        Some("opensource@fb.com"),
+        "npm publishes maintainer emails and we keep them"
+    );
     assert_eq!(
         meta.last_published.as_deref(),
         Some("2022-06-14T19:46:38Z"),
@@ -200,7 +262,8 @@ async fn pypi_prefers_a_source_project_url() {
         "/requests/json",
         r#"{
   "info": { "summary": "HTTP for Humans", "home_page": "https://requests.readthedocs.io",
-            "license": "Apache 2.0", "author": "Kenneth Reitz", "yanked": false,
+            "license": "Apache 2.0", "author": "Kenneth Reitz",
+    "author_email": "me@kennethreitz.org", "maintainer": "Nate Prewitt", "yanked": false,
             "project_urls": { "Source": "https://github.com/psf/requests",
                               "Documentation": "https://requests.readthedocs.io" } },
   "urls": [ { "upload_time_iso_8601": "2023-05-22T15:12:42.123456Z" } ]
@@ -216,7 +279,10 @@ async fn pypi_prefers_a_source_project_url() {
         Some("https://github.com/psf/requests")
     );
     assert_eq!(meta.description.as_deref(), Some("HTTP for Humans"));
-    assert_eq!(meta.authors, vec!["Kenneth Reitz".to_owned()]);
+    assert_eq!(meta.owners.len(), 2, "author and a distinct maintainer");
+    assert_eq!(meta.owners[0].name.as_deref(), Some("Kenneth Reitz"));
+    assert_eq!(meta.owners[0].email.as_deref(), Some("me@kennethreitz.org"));
+    assert_eq!(meta.owners[1].name.as_deref(), Some("Nate Prewitt"));
     assert_eq!(
         meta.documentation.as_deref(),
         Some("https://requests.readthedocs.io")
@@ -232,7 +298,8 @@ async fn packagist_joins_multiple_licenses() {
         r#"{ "packages": { "monolog/monolog": [
             { "version": "2.1.0", "description": "Logging for PHP",
               "license": ["MIT", "Apache-2.0"],
-              "authors": [ { "name": "Jordi Boggiano" } ],
+              "authors": [ { "name": "Jordi Boggiano", "email": "j.boggiano@seld.be",
+                             "homepage": "https://seld.be" } ],
               "source": { "url": "https://github.com/Seldaek/monolog.git" },
               "time": "2020-05-22T08:12:19+00:00" } ] } }"#,
     )
@@ -250,7 +317,10 @@ async fn packagist_joins_multiple_licenses() {
         meta.repository.as_deref(),
         Some("https://github.com/Seldaek/monolog.git")
     );
-    assert_eq!(meta.authors, vec!["Jordi Boggiano".to_owned()]);
+    assert_eq!(meta.owners.len(), 1);
+    assert_eq!(meta.owners[0].name.as_deref(), Some("Jordi Boggiano"));
+    assert_eq!(meta.owners[0].email.as_deref(), Some("j.boggiano@seld.be"));
+    assert_eq!(meta.owners[0].url.as_deref(), Some("https://seld.be"));
 }
 
 #[tokio::test]
@@ -354,7 +424,7 @@ async fn live_crates_io_metadata() {
     );
     assert!(meta.license.is_some(), "license");
     assert!(meta.downloads.is_some_and(|d| d > 0), "downloads");
-    assert!(!meta.authors.is_empty(), "owners");
+    assert!(!meta.owners.is_empty(), "owners");
 }
 
 #[tokio::test]

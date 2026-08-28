@@ -12,7 +12,7 @@ use futures::FutureExt;
 use futures::future::BoxFuture;
 use serde::Deserialize;
 
-use super::{FetchedVersions, PackageMetadata, RegistryFetcher};
+use super::{FetchedVersions, Owner, OwnerKind, PackageMetadata, RegistryFetcher};
 use crate::error::FetchError;
 
 const DEFAULT_REGISTRY: &str = "https://pypi.org/pypi";
@@ -76,6 +76,12 @@ struct Info {
     #[serde(default)]
     author: Option<String>,
     #[serde(default)]
+    author_email: Option<String>,
+    #[serde(default)]
+    maintainer: Option<String>,
+    #[serde(default)]
+    maintainer_email: Option<String>,
+    #[serde(default)]
     yanked: bool,
     #[serde(default)]
     project_urls: HashMap<String, String>,
@@ -85,6 +91,32 @@ struct Info {
 struct UploadedFile {
     #[serde(default)]
     upload_time_iso_8601: Option<String>,
+}
+
+/// PyPI records an author and a maintainer as two independent name/email pairs,
+/// either of which may be blank or absent.
+///
+/// The two are frequently the same person, and a package that names the same
+/// party twice should not read as having two owners.
+fn pypi_owners(info: &Info) -> Vec<Owner> {
+    let pair = |name: &Option<String>, email: &Option<String>| Owner {
+        name: name.clone().filter(|v| !v.trim().is_empty()),
+        login: None,
+        email: email.clone().filter(|v| !v.trim().is_empty()),
+        url: None,
+        kind: OwnerKind::User,
+    };
+
+    let mut owners = Vec::new();
+    for owner in [
+        pair(&info.author, &info.author_email),
+        pair(&info.maintainer, &info.maintainer_email),
+    ] {
+        if !owner.is_anonymous() && !owners.contains(&owner) {
+            owners.push(owner);
+        }
+    }
+    owners
 }
 
 /// The `project_urls` key naming a source repository, by PyPI convention.
@@ -153,13 +185,16 @@ impl RegistryFetcher for PyPiFetcher {
                 detail: e.to_string(),
             })?;
 
+            // Computed before the struct literal moves the fields it reads.
+            let owners = pypi_owners(&body.info);
+
             Ok(Some(PackageMetadata {
                 description: body.info.summary,
                 repository: repository_url(&body.info.project_urls),
                 homepage: body.info.home_page,
                 documentation: body.info.project_urls.get("Documentation").cloned(),
                 license: body.info.license.filter(|l| !l.is_empty()),
-                authors: body.info.author.into_iter().collect(),
+                owners,
                 downloads: None,
                 last_published: body.urls.into_iter().find_map(|f| f.upload_time_iso_8601),
                 yanked: body.info.yanked,

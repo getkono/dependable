@@ -7,7 +7,7 @@ use futures::FutureExt;
 use futures::future::BoxFuture;
 use serde::Deserialize;
 
-use super::{FetchedVersions, PackageMetadata, RegistryFetcher};
+use super::{FetchedVersions, Owner, OwnerKind, PackageMetadata, RegistryFetcher};
 use crate::error::FetchError;
 
 const DEFAULT_REGISTRY: &str = "https://repo.packagist.org";
@@ -73,10 +73,27 @@ struct DetailedRelease {
     time: Option<String>,
 }
 
+/// Composer authors carry contact details we can attribute a package with.
 #[derive(Deserialize)]
 struct Author {
     #[serde(default)]
     name: Option<String>,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    homepage: Option<String>,
+}
+
+impl From<Author> for Owner {
+    fn from(a: Author) -> Self {
+        Owner {
+            name: a.name,
+            login: None,
+            email: a.email,
+            url: a.homepage,
+            kind: OwnerKind::User,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -160,7 +177,12 @@ impl RegistryFetcher for PackagistFetcher {
                 homepage: newest.homepage,
                 documentation: None,
                 license: (!newest.license.is_empty()).then(|| newest.license.join(" OR ")),
-                authors: newest.authors.into_iter().filter_map(|a| a.name).collect(),
+                owners: newest
+                    .authors
+                    .into_iter()
+                    .map(Owner::from)
+                    .filter(|o| !o.is_anonymous())
+                    .collect(),
                 downloads: None,
                 last_published: newest.time,
                 yanked: false,

@@ -25,6 +25,72 @@ pub use packagist::PackagistFetcher;
 pub use pub_dev::PubDevFetcher;
 pub use pypi::PyPiFetcher;
 
+/// How a registry classifies an owner.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OwnerKind {
+    /// An individual account.
+    #[default]
+    User,
+    /// A group account — a crates.io team, a GitHub organization.
+    Team,
+}
+
+/// One owner, maintainer, or author of a package, as a registry describes them.
+///
+/// Registries disagree about what they publish: crates.io has a login and a
+/// profile URL but never an email, npm has a name and an email but no profile,
+/// PyPI has a single free-text author. Every field is therefore optional, and a
+/// consumer should render whichever identifiers are present rather than assume
+/// any particular one is.
+///
+/// At least one of `name`, `login`, or `email` is set on every owner a fetcher
+/// produces — see [`Owner::is_anonymous`], which the fetchers filter on.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Owner {
+    /// Display name, as the registry spells it ("David Tolnay").
+    pub name: Option<String>,
+    /// Registry username, without any sigil ("dtolnay").
+    pub login: Option<String>,
+    /// Contact email, where the registry publishes one.
+    pub email: Option<String>,
+    /// Profile or homepage URL for this owner.
+    pub url: Option<String>,
+    /// Whether this is an individual or a group.
+    pub kind: OwnerKind,
+}
+
+impl Owner {
+    /// An owner known only by a display name — what a registry that publishes a
+    /// bare string, such as Hex or PyPI, gives us.
+    #[must_use]
+    pub fn named(name: impl Into<String>) -> Self {
+        Self {
+            name: Some(name.into()),
+            ..Self::default()
+        }
+    }
+
+    /// Whether this owner carries no identifier at all.
+    ///
+    /// A registry can return an owner record whose every name field is null; it
+    /// tells a reader nothing, so fetchers drop it rather than render a blank.
+    #[must_use]
+    pub fn is_anonymous(&self) -> bool {
+        self.name.is_none() && self.login.is_none() && self.email.is_none()
+    }
+
+    /// The best human-readable label available, preferring a real name over a
+    /// login over a bare email.
+    #[must_use]
+    pub fn display_name(&self) -> Option<&str> {
+        self.name
+            .as_deref()
+            .or(self.login.as_deref())
+            .or(self.email.as_deref())
+    }
+}
+
 /// The public metadata a registry publishes about a package.
 ///
 /// Every field is optional because coverage varies by registry: crates.io exposes
@@ -47,8 +113,8 @@ pub struct PackageMetadata {
     pub documentation: Option<String>,
     /// SPDX license expression, as the registry reports it.
     pub license: Option<String>,
-    /// Authors, owners, or maintainers, as the registry names them.
-    pub authors: Vec<String>,
+    /// Owners, maintainers, or authors, as the registry names them.
+    pub owners: Vec<Owner>,
     /// All-time download count, where the registry publishes one.
     pub downloads: Option<u64>,
     /// When the newest version was published (RFC 3339).

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use dependable_fetch::core::{LockedPackage, ResolvedLockfile};
 use dependable_fetch::{
-    DependencyGraph, DependencyStatus, Ecosystem, GraphSource, PackageMetadata,
+    DependencyGraph, DependencyStatus, Ecosystem, GraphSource, Owner, PackageMetadata,
 };
 use dependable_tui::app::{Action, App};
 use dependable_tui::model::{PackageData, PackageFacts, Project, key};
@@ -21,7 +21,7 @@ fn metadata() -> PackageMetadata {
     meta.description = Some("Serialization framework".to_owned());
     meta.repository = Some("https://github.com/serde-rs/serde".to_owned());
     meta.license = Some("MIT OR Apache-2.0".to_owned());
-    meta.authors = vec!["David Tolnay".to_owned()];
+    meta.owners = vec![Owner::named("David Tolnay")];
     meta.downloads = Some(5_000_000);
     meta
 }

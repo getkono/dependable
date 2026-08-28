@@ -7,7 +7,7 @@ use futures::FutureExt;
 use futures::future::BoxFuture;
 use serde::Deserialize;
 
-use super::{FetchedVersions, PackageMetadata, RegistryFetcher};
+use super::{FetchedVersions, Owner, OwnerKind, PackageMetadata, RegistryFetcher};
 use crate::error::FetchError;
 
 const DEFAULT_INDEX: &str = "https://index.crates.io";
@@ -150,18 +150,39 @@ struct VersionInfo {
 }
 
 /// The `GET /api/v1/crates/{name}/owners` response.
+///
+/// crates.io splits ownership across two arrays. A crate owned only by a team
+/// has an empty `users`, so reading just that array reports a well-owned crate
+/// as having no owners at all.
 #[derive(Deserialize)]
 struct OwnersResponse {
     #[serde(default)]
-    users: Vec<Owner>,
+    users: Vec<ApiOwner>,
+    #[serde(default)]
+    teams: Vec<ApiOwner>,
 }
 
 #[derive(Deserialize)]
-struct Owner {
+struct ApiOwner {
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
     login: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
+}
+
+impl ApiOwner {
+    fn into_owner(self, kind: OwnerKind) -> Owner {
+        Owner {
+            name: self.name,
+            login: self.login,
+            // crates.io does not publish owner emails on this endpoint.
+            email: None,
+            url: self.url,
+            kind,
+        }
+    }
 }
 
 impl RegistryFetcher for CratesIoFetcher {
@@ -230,7 +251,7 @@ impl RegistryFetcher for CratesIoFetcher {
                 homepage: body.krate.homepage,
                 documentation: body.krate.documentation,
                 license: newest.and_then(|v| v.license.clone()),
-                authors: Vec::new(),
+                owners: Vec::new(),
                 downloads: body.krate.downloads,
                 last_published: newest.and_then(|v| v.created_at.clone()),
                 yanked: newest.is_some_and(|v| v.yanked),
@@ -247,10 +268,17 @@ impl RegistryFetcher for CratesIoFetcher {
                 && resp.status().is_success()
                 && let Ok(owners) = resp.json::<OwnersResponse>().await
             {
-                meta.authors = owners
+                meta.owners = owners
                     .users
                     .into_iter()
-                    .filter_map(|o| o.name.or(o.login))
+                    .map(|o| o.into_owner(OwnerKind::User))
+                    .chain(
+                        owners
+                            .teams
+                            .into_iter()
+                            .map(|o| o.into_owner(OwnerKind::Team)),
+                    )
+                    .filter(|o| !o.is_anonymous())
                     .collect();
             }
 
