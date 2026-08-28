@@ -6,15 +6,21 @@ use crate::manifest::ManifestKind;
 pub mod cargo_lock;
 pub mod cargo_lock_graph;
 pub mod composer_lock;
+pub mod composer_lock_graph;
 pub mod dart_pubspec_lock;
 pub mod mix_lock;
+pub mod mix_lock_graph;
+pub mod package_lock_graph;
 pub mod package_lock_json;
 
 pub use cargo_lock::{LockfileData, apply_lockfile, parse_cargo_lock};
 pub use cargo_lock_graph::{LockedPackage, ResolvedLockfile, parse_cargo_lock_graph};
 pub use composer_lock::parse_composer_lock;
+pub use composer_lock_graph::parse_composer_lock_graph;
 pub use dart_pubspec_lock::parse_dart_pubspec_lock;
 pub use mix_lock::parse_mix_lock;
+pub use mix_lock_graph::parse_mix_lock_graph;
+pub use package_lock_graph::parse_package_lock_graph;
 pub use package_lock_json::parse_package_lock;
 
 /// Parse lockfile `content` for a given manifest `kind`, dispatching to the right
