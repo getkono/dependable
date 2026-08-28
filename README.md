@@ -14,8 +14,11 @@ brew install getkono/tap/dependable
 # aqua
 aqua g -i getkono/dependable
 
-# Cargo (from source)
+# Cargo (from source; needs Rust 1.88 or newer)
 cargo install --locked --git https://github.com/getkono/dependable dependable
+
+# From a clone
+mise run install
 ```
 
 Or download a prebuilt binary for your platform from the
@@ -71,6 +74,7 @@ both V1 and V2 (decision D9 in [`docs/SCOPE.md`](docs/SCOPE.md)).
 ```bash
 mise install        # install hk + cargo-llvm-cov from mise.toml
 mise run build
+mise run install    # install the dependable binary into ~/.cargo/bin
 ```
 
 ## Usage
