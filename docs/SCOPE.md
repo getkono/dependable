@@ -41,6 +41,10 @@ is understanding crate relationships and the blast radius of a change.
   (normal/dev/build), per-feature, or per-target information, so — unlike
   `cargo tree --edges` — those distinctions are not rendered. For the relationship /
   downstream-impact use case the union is the right view.
+- **One tree per member.** Every workspace member is a root of the forest, so a
+  member reached beneath another member is a pointer to its own tree
+  (`(see root)`), not a second copy of its subtree. The same rule drives the CLI
+  and the interactive UI, which share one traversal (`DependencyGraph::walk`).
 - **Language-agnostic core.** The graph model, traversals, and renderers
   (`dependable_core::graph`) are ecosystem-independent; only the `Cargo.lock`/workspace
   *builder* (`dependable_fetch::tree`) is Rust-specific, so other ecosystems can plug in

@@ -1,11 +1,15 @@
-//! A language-agnostic dependency graph plus cycle-safe tree traversals.
+//! A language-agnostic dependency graph plus one cycle-safe traversal of it.
 //!
 //! The graph itself knows nothing about Cargo — it is nodes (a package at a
 //! version) and directed edges (`a` depends on `b`). Building one from a
-//! `Cargo.lock` lives in [`Self::from_resolved`]; other ecosystems can grow
-//! their own constructor without touching the traversal/rendering logic here.
-//! Rendering (color, box-drawing) is deliberately left to the caller — this
-//! module only produces plain data.
+//! `Cargo.lock` lives in [`DependencyGraph::from_resolved`]; other ecosystems
+//! can grow their own constructor without touching the traversal here.
+//!
+//! [`DependencyGraph::walk`] is that traversal, and it is deliberately the only
+//! one: the rendered `tree` and the interactive UI both drive it, so what counts
+//! as a cycle, a repeat, or a crate already shown elsewhere cannot mean two
+//! different things in the two places a user meets it. Rendering (color,
+//! box-drawing, rows) is left to the caller — this module produces plain data.
 
 use std::collections::{HashMap, HashSet};
 

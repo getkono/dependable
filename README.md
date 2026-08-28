@@ -140,7 +140,10 @@ dependable  ~/src/dependable   7 packages
 press / to search, ? for help
 ```
 
-Press `?` for the keys. `/` searches by glob — `serde*`, `@types/*`,
+A workspace member that another member depends on is shown as a pointer, `↗ …
+(see root)`, at its own row near the top rather than copied into every tree that
+reaches it; pressing the expand key on one jumps to that row. Press `?` for the
+keys. `/` searches by glob — `serde*`, `@types/*`,
 `{tokio,hyper}*` — and opens the tree along every path that matches, so a package
 buried six levels down is one query away.
 
@@ -260,18 +263,25 @@ dependable tree --format dot | dot -Tsvg > deps.svg   # visual graph
 
 ```
 my-app v0.1.0 (workspace)
-├── my-lib v0.1.0 (workspace)
-│   └── serde v1.0.228
-│       └── serde_derive v1.0.228
-├── serde v1.0.228 (*)
-└── gitdep v0.3.0 (git)
+├── gitdep v0.3.0 (git)
+├── my-lib v0.1.0 (workspace) (see root)
+└── serde v1.0.228
+    └── serde_derive v1.0.228
+
+my-lib v0.1.0 (workspace)
+└── serde v1.0.228 (*)
 ```
 
-Repeated crates are collapsed to `(*)` (pass `--no-dedupe` to expand them). The
-tree is the **resolved union graph** from `Cargo.lock`: unlike `cargo tree --edges`
-it does not distinguish normal/dev/build edges or feature activation. When no
-`Cargo.lock` is present, `tree` prints a warning and falls back to a shallow graph
-of each member plus its direct declared dependencies.
+Every workspace member is a root of the forest, so each one's dependencies are
+shown **once**, at its own tree. Reached under another member it is a pointer,
+`(see root)`, rather than a second copy — otherwise a workspace of any size
+buries itself in repeats. Crates repeated elsewhere collapse to `(*)`.
+`--no-dedupe` turns both off and expands every occurrence in place.
+
+The tree is the **resolved union graph** from `Cargo.lock`: unlike
+`cargo tree --edges` it does not distinguish normal/dev/build edges or feature
+activation. When no `Cargo.lock` is present, `tree` prints a warning and falls
+back to a shallow graph of each member plus its direct declared dependencies.
 
 ## Use as a library
 
