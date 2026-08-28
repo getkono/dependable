@@ -18,10 +18,12 @@ use dependable_core::{
 use futures::stream::{self, StreamExt};
 
 use crate::build_client;
-use crate::cache::{DISK_CACHE_TTL, DiskCache, VersionsCache, versions_cache};
+use crate::cache::{
+    DISK_CACHE_TTL, DiskCache, MetadataCache, VersionsCache, metadata_cache, versions_cache,
+};
 use crate::error::FetchError;
 use crate::osv::{OsvClient, OsvQuery};
-use crate::registries::{CratesIoFetcher, RegistryFetcher};
+use crate::registries::{CratesIoFetcher, PackageMetadata, RegistryFetcher};
 
 /// Default OSV `querybatch` endpoint.
 const DEFAULT_OSV_BATCH_URL: &str = "https://api.osv.dev/v1/querybatch";
@@ -144,6 +146,7 @@ pub struct Checker {
     read_lockfiles: bool,
     unstable: UnstableFilter,
     versions_cache: VersionsCache,
+    metadata_cache: MetadataCache,
     /// Persistent on-disk cache, consulted below the in-process cache. `None`
     /// disables it (`--no-cache`, or no resolvable cache directory).
     disk_cache: Option<Arc<DiskCache>>,
@@ -210,6 +213,37 @@ impl Checker {
     /// [`CheckError::UnknownManifest`] if the file name is unrecognized,
     /// [`CheckError::Io`] if the manifest cannot be read, plus the errors of
     /// [`Checker::check_manifest`].
+    /// Fetch the registry's public metadata for one package.
+    ///
+    /// This is deliberately **not** part of `check_*`: version checking never needs
+    /// repository, license, or owner information, and fetching it for every
+    /// dependency would multiply the request count for data nothing is displaying.
+    /// A UI calls this for the one package it is about to show.
+    ///
+    /// Results — including "this registry publishes none" — are cached, so
+    /// revisiting a package costs nothing.
+    ///
+    /// # Errors
+    /// Returns [`CheckError::UnsupportedEcosystem`] if no fetcher is registered for
+    /// `ecosystem`, or [`CheckError::Fetch`] if the request fails.
+    pub async fn fetch_metadata(
+        &self,
+        ecosystem: Ecosystem,
+        name: &str,
+    ) -> Result<Option<PackageMetadata>, CheckError> {
+        let key = (ecosystem.osv_name().to_owned(), name.to_owned());
+        if let Some(hit) = self.metadata_cache.get(&key).await {
+            return Ok(hit);
+        }
+        let fetcher = self
+            .registries
+            .get(&ecosystem)
+            .ok_or(CheckError::UnsupportedEcosystem(ecosystem))?;
+        let metadata = fetcher.fetch_metadata(name).await?;
+        self.metadata_cache.insert(key, metadata.clone()).await;
+        Ok(metadata)
+    }
+
     pub async fn check_path(&self, path: impl AsRef<Path>) -> Result<ManifestCheck, CheckError> {
         let path = path.as_ref();
         let kind = ManifestKind::detect(path)
@@ -707,6 +741,7 @@ impl CheckerBuilder {
             read_lockfiles: self.read_lockfiles,
             unstable: self.unstable,
             versions_cache: versions_cache(),
+            metadata_cache: metadata_cache(),
             disk_cache,
             progress: self.progress,
         })

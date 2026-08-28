@@ -5,7 +5,7 @@ use futures::FutureExt;
 use futures::future::BoxFuture;
 use serde::Deserialize;
 
-use super::{FetchedVersions, RegistryFetcher};
+use super::{FetchedVersions, PackageMetadata, RegistryFetcher};
 use crate::error::FetchError;
 
 const DEFAULT_REGISTRY: &str = "https://hex.pm";
@@ -48,6 +48,50 @@ impl HexFetcher {
     }
 }
 
+/// The Hex package response, narrowed to what we render.
+#[derive(Deserialize)]
+struct PackageMeta {
+    #[serde(default)]
+    meta: HexMeta,
+    #[serde(default)]
+    downloads: HexDownloads,
+    #[serde(default)]
+    releases: Vec<DatedRelease>,
+    #[serde(default)]
+    docs_html_url: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct HexMeta {
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    licenses: Vec<String>,
+    #[serde(default)]
+    links: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    maintainers: Vec<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct HexDownloads {
+    #[serde(default)]
+    all: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct DatedRelease {
+    #[serde(default)]
+    inserted_at: Option<String>,
+}
+
+/// The `links` key naming a source repository, by Hex convention.
+fn hex_repository(links: &std::collections::HashMap<String, String>) -> Option<String> {
+    ["GitHub", "Github", "github", "Source", "Repository"]
+        .iter()
+        .find_map(|key| links.get(*key).cloned())
+}
+
 impl RegistryFetcher for HexFetcher {
     fn fetch_versions<'a>(
         &'a self,
@@ -79,6 +123,45 @@ impl RegistryFetcher for HexFetcher {
                 .collect();
             sort_desc(&mut versions);
             Ok(FetchedVersions::new(versions))
+        }
+        .boxed()
+    }
+
+    fn fetch_metadata<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> BoxFuture<'a, Result<Option<PackageMetadata>, FetchError>> {
+        async move {
+            let url = format!("{}/api/packages/{name}", self.base_url);
+            let resp = self.client.get(&url).send().await?;
+            let status = resp.status();
+            if status == reqwest::StatusCode::NOT_FOUND {
+                return Err(FetchError::NotFound(name.to_string()));
+            }
+            if !status.is_success() {
+                return Err(FetchError::Status {
+                    code: status.as_u16(),
+                    package: name.to_string(),
+                });
+            }
+            let body: PackageMeta = resp.json().await.map_err(|e| FetchError::Decode {
+                package: name.to_string(),
+                detail: e.to_string(),
+            })?;
+
+            Ok(Some(PackageMetadata {
+                description: body.meta.description,
+                repository: hex_repository(&body.meta.links),
+                homepage: body.meta.links.get("Homepage").cloned(),
+                documentation: body.docs_html_url,
+                license: (!body.meta.licenses.is_empty()).then(|| body.meta.licenses.join(" OR ")),
+                authors: body.meta.maintainers,
+                downloads: body.downloads.all,
+                // Hex lists releases newest-first.
+                last_published: body.releases.into_iter().find_map(|r| r.inserted_at),
+                yanked: false,
+                msrv: None,
+            }))
         }
         .boxed()
     }

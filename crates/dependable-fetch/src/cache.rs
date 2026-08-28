@@ -8,6 +8,8 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use moka::future::Cache;
+
+use crate::registries::PackageMetadata;
 use serde::{Deserialize, Serialize};
 
 /// Caches OSV results, keyed by `(ecosystem, name, version)` → vulnerability IDs.
@@ -30,6 +32,24 @@ pub type VersionsCache = Cache<(String, String), Vec<String>>;
 pub fn versions_cache() -> VersionsCache {
     Cache::builder()
         .time_to_live(Duration::from_secs(300))
+        .max_capacity(10_000)
+        .build()
+}
+
+/// Caches package metadata, keyed by `(ecosystem, name)` → metadata.
+///
+/// The value is `Option` so a registry that publishes no metadata for a package is
+/// cached as such, rather than re-requested on every selection.
+pub type MetadataCache = Cache<(String, String), Option<PackageMetadata>>;
+
+/// A fresh metadata cache with a 10-minute TTL.
+///
+/// Metadata changes far more slowly than a version list — a repository URL or
+/// license is effectively static — so it is held longer than available versions.
+#[must_use]
+pub fn metadata_cache() -> MetadataCache {
+    Cache::builder()
+        .time_to_live(Duration::from_secs(600))
         .max_capacity(10_000)
         .build()
 }

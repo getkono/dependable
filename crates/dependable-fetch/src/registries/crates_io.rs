@@ -7,10 +7,14 @@ use futures::FutureExt;
 use futures::future::BoxFuture;
 use serde::Deserialize;
 
-use super::{FetchedVersions, RegistryFetcher};
+use super::{FetchedVersions, PackageMetadata, RegistryFetcher};
 use crate::error::FetchError;
 
 const DEFAULT_INDEX: &str = "https://index.crates.io";
+
+/// The crates.io web API, which serves the metadata the sparse index does not
+/// carry (repository, license, homepage, owners, downloads).
+const DEFAULT_API: &str = "https://crates.io/api/v1";
 
 /// Fetches crate versions from a crates.io-compatible sparse index.
 #[derive(Clone)]
@@ -18,6 +22,9 @@ pub struct CratesIoFetcher {
     client: reqwest::Client,
     base_url: String,
     auth: Option<String>,
+    /// The crates.io web API base, or `None` for an alternate registry, which
+    /// serves a sparse index but no such API.
+    api_url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -57,6 +64,7 @@ impl CratesIoFetcher {
             client,
             base_url: DEFAULT_INDEX.to_string(),
             auth: None,
+            api_url: Some(DEFAULT_API.to_string()),
         }
     }
 
@@ -82,8 +90,68 @@ impl CratesIoFetcher {
             client,
             base_url,
             auth,
+            // An alternate sparse index is not crates.io and serves no such API;
+            // querying crates.io about its crates would be wrong, not merely empty.
+            api_url: None,
         }
     }
+
+    /// Point the metadata client at a different crates.io API base (for testing).
+    #[must_use]
+    pub fn with_api_url(mut self, api_url: impl Into<String>) -> Self {
+        self.api_url = Some(api_url.into().trim_end_matches('/').to_string());
+        self
+    }
+}
+
+/// The `GET /api/v1/crates/{name}` response, narrowed to what we render.
+#[derive(Deserialize)]
+struct CrateResponse {
+    #[serde(rename = "crate")]
+    krate: CrateInfo,
+    #[serde(default)]
+    versions: Vec<VersionInfo>,
+}
+
+#[derive(Deserialize)]
+struct CrateInfo {
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    homepage: Option<String>,
+    #[serde(default)]
+    documentation: Option<String>,
+    #[serde(default)]
+    repository: Option<String>,
+    #[serde(default)]
+    downloads: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct VersionInfo {
+    #[serde(default)]
+    license: Option<String>,
+    #[serde(default)]
+    yanked: bool,
+    #[serde(default)]
+    rust_version: Option<String>,
+    #[serde(default)]
+    created_at: Option<String>,
+}
+
+/// The `GET /api/v1/crates/{name}/owners` response.
+#[derive(Deserialize)]
+struct OwnersResponse {
+    #[serde(default)]
+    users: Vec<Owner>,
+}
+
+#[derive(Deserialize)]
+struct Owner {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    login: Option<String>,
 }
 
 impl RegistryFetcher for CratesIoFetcher {
@@ -110,6 +178,73 @@ impl RegistryFetcher for CratesIoFetcher {
             }
             let body = resp.text().await?;
             Ok(parse_index(&body))
+        }
+        .boxed()
+    }
+
+    fn fetch_metadata<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> BoxFuture<'a, Result<Option<PackageMetadata>, FetchError>> {
+        async move {
+            // An alternate registry serves an index but no crates.io API.
+            let Some(api) = self.api_url.as_deref() else {
+                return Ok(None);
+            };
+
+            let resp = self
+                .client
+                .get(format!("{api}/crates/{name}"))
+                .send()
+                .await?;
+            let status = resp.status();
+            if status == reqwest::StatusCode::NOT_FOUND {
+                return Err(FetchError::NotFound(name.to_string()));
+            }
+            if !status.is_success() {
+                return Err(FetchError::Status {
+                    code: status.as_u16(),
+                    package: name.to_string(),
+                });
+            }
+            let body: CrateResponse = resp.json().await.map_err(|e| FetchError::Decode {
+                package: name.to_string(),
+                detail: e.to_string(),
+            })?;
+
+            // Per-version fields come from the newest release the API lists first.
+            let newest = body.versions.first();
+            let mut meta = PackageMetadata {
+                description: body.krate.description,
+                repository: body.krate.repository,
+                homepage: body.krate.homepage,
+                documentation: body.krate.documentation,
+                license: newest.and_then(|v| v.license.clone()),
+                authors: Vec::new(),
+                downloads: body.krate.downloads,
+                last_published: newest.and_then(|v| v.created_at.clone()),
+                yanked: newest.is_some_and(|v| v.yanked),
+                msrv: newest.and_then(|v| v.rust_version.clone()),
+            };
+
+            // Owners are a second endpoint. They are enrichment, not the point:
+            // a failure here must not cost the caller everything else.
+            if let Ok(resp) = self
+                .client
+                .get(format!("{api}/crates/{name}/owners"))
+                .send()
+                .await
+                && resp.status().is_success()
+                && let Ok(owners) = resp.json::<OwnersResponse>().await
+            {
+                meta.authors = owners
+                    .users
+                    .into_iter()
+                    .filter_map(|o| o.name.or(o.login))
+                    .collect();
+            }
+
+            Ok(Some(meta))
         }
         .boxed()
     }

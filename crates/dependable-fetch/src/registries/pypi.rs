@@ -12,7 +12,7 @@ use futures::FutureExt;
 use futures::future::BoxFuture;
 use serde::Deserialize;
 
-use super::{FetchedVersions, RegistryFetcher};
+use super::{FetchedVersions, PackageMetadata, RegistryFetcher};
 use crate::error::FetchError;
 
 const DEFAULT_REGISTRY: &str = "https://pypi.org/pypi";
@@ -56,6 +56,44 @@ impl PyPiFetcher {
     }
 }
 
+/// The `info` block of a PyPI project response, narrowed to what we render.
+#[derive(Deserialize)]
+struct InfoResponse {
+    #[serde(default)]
+    info: Info,
+    #[serde(default)]
+    urls: Vec<UploadedFile>,
+}
+
+#[derive(Deserialize, Default)]
+struct Info {
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    home_page: Option<String>,
+    #[serde(default)]
+    license: Option<String>,
+    #[serde(default)]
+    author: Option<String>,
+    #[serde(default)]
+    yanked: bool,
+    #[serde(default)]
+    project_urls: HashMap<String, String>,
+}
+
+#[derive(Deserialize)]
+struct UploadedFile {
+    #[serde(default)]
+    upload_time_iso_8601: Option<String>,
+}
+
+/// The `project_urls` key naming a source repository, by PyPI convention.
+fn repository_url(urls: &HashMap<String, String>) -> Option<String> {
+    ["Source", "Source Code", "Repository", "Code", "Homepage"]
+        .iter()
+        .find_map(|key| urls.get(*key).cloned())
+}
+
 impl RegistryFetcher for PyPiFetcher {
     fn fetch_versions<'a>(
         &'a self,
@@ -89,6 +127,44 @@ impl RegistryFetcher for PyPiFetcher {
                 .collect();
             sort_desc(&mut versions);
             Ok(FetchedVersions::new(versions))
+        }
+        .boxed()
+    }
+
+    fn fetch_metadata<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> BoxFuture<'a, Result<Option<PackageMetadata>, FetchError>> {
+        async move {
+            let url = format!("{}/{name}/json", self.base_url);
+            let resp = self.client.get(&url).send().await?;
+            let status = resp.status();
+            if status == reqwest::StatusCode::NOT_FOUND {
+                return Err(FetchError::NotFound(name.to_string()));
+            }
+            if !status.is_success() {
+                return Err(FetchError::Status {
+                    code: status.as_u16(),
+                    package: name.to_string(),
+                });
+            }
+            let body: InfoResponse = resp.json().await.map_err(|e| FetchError::Decode {
+                package: name.to_string(),
+                detail: e.to_string(),
+            })?;
+
+            Ok(Some(PackageMetadata {
+                description: body.info.summary,
+                repository: repository_url(&body.info.project_urls),
+                homepage: body.info.home_page,
+                documentation: body.info.project_urls.get("Documentation").cloned(),
+                license: body.info.license.filter(|l| !l.is_empty()),
+                authors: body.info.author.into_iter().collect(),
+                downloads: None,
+                last_published: body.urls.into_iter().find_map(|f| f.upload_time_iso_8601),
+                yanked: body.info.yanked,
+                msrv: None,
+            }))
         }
         .boxed()
     }

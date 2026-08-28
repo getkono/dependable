@@ -64,7 +64,7 @@ pub use osv::{OsvClient, OsvQuery};
 pub use registries::npm::ScopedRegistry;
 pub use registries::{
     CratesIoFetcher, FetchedVersions, GoProxyFetcher, HexFetcher, JsrFetcher, NpmFetcher,
-    NuGetFetcher, PackagistFetcher, PubDevFetcher, PyPiFetcher, RegistryFetcher,
+    NuGetFetcher, PackageMetadata, PackagistFetcher, PubDevFetcher, PyPiFetcher, RegistryFetcher,
 };
 
 // Re-export the core types a consumer needs, so depending on `dependable-fetch`

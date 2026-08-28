@@ -7,7 +7,7 @@ use futures::FutureExt;
 use futures::future::BoxFuture;
 use serde::Deserialize;
 
-use super::{FetchedVersions, RegistryFetcher};
+use super::{FetchedVersions, PackageMetadata, RegistryFetcher};
 use crate::error::FetchError;
 
 const DEFAULT_REGISTRY: &str = "https://repo.packagist.org";
@@ -50,6 +50,41 @@ impl PackagistFetcher {
     }
 }
 
+/// The Packagist p2 response, narrowed to what we render.
+#[derive(Deserialize)]
+struct MetadataDoc {
+    #[serde(default)]
+    packages: HashMap<String, Vec<DetailedRelease>>,
+}
+
+#[derive(Deserialize)]
+struct DetailedRelease {
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    homepage: Option<String>,
+    #[serde(default)]
+    license: Vec<String>,
+    #[serde(default)]
+    authors: Vec<Author>,
+    #[serde(default)]
+    source: Option<Source>,
+    #[serde(default)]
+    time: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct Author {
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct Source {
+    #[serde(default)]
+    url: Option<String>,
+}
+
 impl RegistryFetcher for PackagistFetcher {
     fn fetch_versions<'a>(
         &'a self,
@@ -83,6 +118,54 @@ impl RegistryFetcher for PackagistFetcher {
                 .collect();
             sort_desc(&mut versions);
             Ok(FetchedVersions::new(versions))
+        }
+        .boxed()
+    }
+
+    fn fetch_metadata<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> BoxFuture<'a, Result<Option<PackageMetadata>, FetchError>> {
+        async move {
+            let url = format!("{}/p2/{name}.json", self.base_url);
+            let resp = self.client.get(&url).send().await?;
+            let status = resp.status();
+            if status == reqwest::StatusCode::NOT_FOUND {
+                return Err(FetchError::NotFound(name.to_string()));
+            }
+            if !status.is_success() {
+                return Err(FetchError::Status {
+                    code: status.as_u16(),
+                    package: name.to_string(),
+                });
+            }
+            let body: MetadataDoc = resp.json().await.map_err(|e| FetchError::Decode {
+                package: name.to_string(),
+                detail: e.to_string(),
+            })?;
+
+            // Packagist lists a package's releases newest-first.
+            let Some(newest) = body
+                .packages
+                .into_values()
+                .next()
+                .and_then(|releases| releases.into_iter().next())
+            else {
+                return Ok(None);
+            };
+
+            Ok(Some(PackageMetadata {
+                description: newest.description,
+                repository: newest.source.and_then(|s| s.url),
+                homepage: newest.homepage,
+                documentation: None,
+                license: (!newest.license.is_empty()).then(|| newest.license.join(" OR ")),
+                authors: newest.authors.into_iter().filter_map(|a| a.name).collect(),
+                downloads: None,
+                last_published: newest.time,
+                yanked: false,
+                msrv: None,
+            }))
         }
         .boxed()
     }
