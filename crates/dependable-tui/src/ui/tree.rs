@@ -2,24 +2,26 @@
 
 use dependable_fetch::NodeKind;
 use ratatui::Frame;
-use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::layout::{Constraint, Rect};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Row as TableRow, Table, TableState};
 
 use crate::app::App;
 use crate::model::PackageData;
 use crate::rows::{Row, RowKind};
 use crate::theme::{self, Token};
 
-/// Draw the visible slice of the tree.
-pub fn draw(frame: &mut Frame, area: Rect, app: &App, viewport: usize) {
+/// Draw the tree.
+///
+/// Rendered as a [`Table`] rather than a `Paragraph` of pre-sliced lines: the
+/// widget owns the scroll offset and the highlight, which is what gives the
+/// pointer a row to land on and the selection a style ratatui applies for us.
+pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
     let rows = app.rows();
-    let end = (app.offset + viewport).min(rows.len());
-    let lines: Vec<Line> = rows[app.offset.min(rows.len())..end]
+    let table_rows: Vec<TableRow> = rows
         .iter()
-        .enumerate()
-        .map(|(i, row)| line(app, row, app.offset + i == app.selected_index()))
+        .map(|row| TableRow::new(vec![line(app, row)]))
         .collect();
 
     let title = if rows.is_empty() {
@@ -32,24 +34,36 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, viewport: usize) {
         )
     };
 
-    frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(theme::fg(Token::Border))
-                .title(Span::styled(title, theme::fg(Token::Muted))),
-        ),
+    // The offset stays owned by `App`, which is free of ratatui so navigation is
+    // testable without a terminal; the widget state is rebuilt from it per frame.
+    let mut state = TableState::new()
+        .with_offset(app.offset)
+        .with_selected((!rows.is_empty()).then(|| app.selected_index()));
+
+    frame.render_stateful_widget(
+        Table::new(table_rows, [Constraint::Percentage(100)])
+            .row_highlight_style(theme::selection())
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(theme::fg(Token::Border))
+                    .title(Span::styled(title, theme::fg(Token::Muted))),
+            ),
         area,
+        &mut state,
     );
 }
 
 /// Render one row: indent, disclosure marker, name, version, and annotations.
-fn line<'a>(app: &App, row: &'a Row, selected: bool) -> Line<'a> {
+///
+/// The selected row's background is applied by the table's highlight style, so
+/// nothing here needs to know whether it is selected.
+fn line<'a>(app: &App, row: &'a Row) -> Line<'a> {
     let mut spans = vec![Span::raw("  ".repeat(row.depth))];
 
     spans.push(Span::styled(marker(row), theme::fg(Token::Muted)));
 
-    spans.push(Span::styled(row.name.clone(), name_style(row, selected)));
+    spans.push(Span::styled(row.name.clone(), name_style(row)));
 
     if !row.version.is_empty() {
         spans.push(Span::styled(
@@ -70,11 +84,7 @@ fn line<'a>(app: &App, row: &'a Row, selected: bool) -> Line<'a> {
         spans.push(badge);
     }
 
-    let mut line = Line::from(spans);
-    if selected {
-        line = line.style(theme::selection());
-    }
-    line
+    Line::from(spans)
 }
 
 /// The disclosure marker: open, closed, or a leaf.
@@ -88,7 +98,7 @@ fn marker(row: &Row) -> &'static str {
     }
 }
 
-fn name_style(row: &Row, selected: bool) -> Style {
+fn name_style(row: &Row) -> Style {
     let mut style = match row.kind {
         RowKind::Project => theme::bold(Token::Heading),
         RowKind::Package => match row.node_kind {
@@ -100,9 +110,6 @@ fn name_style(row: &Row, selected: bool) -> Style {
     };
     if row.matched {
         style = style.patch(theme::search_match());
-    }
-    if selected {
-        style = style.add_modifier(Modifier::BOLD);
     }
     style
 }

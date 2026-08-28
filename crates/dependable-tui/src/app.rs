@@ -90,6 +90,12 @@ pub struct App {
     selected: usize,
     /// First visible row, tracked so the selection stays on screen.
     pub offset: usize,
+    /// The tree pane's share of the width, as a percentage.
+    ///
+    /// Held here rather than fixed in the layout so the divider between the
+    /// panes can be dragged; clamped to [`App::SPLIT_RANGE`] so neither pane can
+    /// be dragged away entirely.
+    pub split: u16,
     /// The current search text.
     pub query: String,
     /// The compiled search, when the query is not blank.
@@ -105,6 +111,11 @@ pub struct App {
 }
 
 impl App {
+    /// The tree pane's default share of the width.
+    pub const DEFAULT_SPLIT: u16 = 55;
+    /// How far the divider may be dragged, either way.
+    pub const SPLIT_RANGE: std::ops::RangeInclusive<u16> = 20..=80;
+
     /// Build the state for a set of discovered projects.
     ///
     /// Every project starts expanded: a tree whose first interaction must be
@@ -119,6 +130,7 @@ impl App {
             rows: Vec::new(),
             selected: 0,
             offset: 0,
+            split: Self::DEFAULT_SPLIT,
             query: String::new(),
             filter: None,
             mode: Mode::Browse,

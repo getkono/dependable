@@ -51,7 +51,9 @@ fn project(source: GraphSource) -> Project {
 fn render(app: &mut App) -> String {
     let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("terminal");
     terminal
-        .draw(|frame| ui::draw(frame, app))
+        .draw(|frame| {
+            ui::draw(frame, app);
+        })
         .expect("draw succeeds");
     terminal
         .backend()
@@ -71,7 +73,9 @@ fn render(app: &mut App) -> String {
 fn styled_row(app: &mut App, y: u16) -> Vec<ratatui::buffer::Cell> {
     let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("terminal");
     terminal
-        .draw(|frame| ui::draw(frame, app))
+        .draw(|frame| {
+            ui::draw(frame, app);
+        })
         .expect("draw succeeds");
     let buffer = terminal.backend().buffer();
     (0..100).map(|x| buffer[(x, y)].clone()).collect()
@@ -243,7 +247,9 @@ fn a_tiny_terminal_does_not_panic() {
     for (w, h) in [(1, 1), (4, 3), (20, 5), (200, 60)] {
         let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
         terminal
-            .draw(|frame| ui::draw(frame, &mut app))
+            .draw(|frame| {
+                ui::draw(frame, &mut app);
+            })
             .unwrap_or_else(|e| panic!("{w}x{h} failed: {e}"));
     }
 }

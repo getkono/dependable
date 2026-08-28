@@ -85,6 +85,8 @@ async fn event_loop(
     let mut pending: Option<(PackageKey, std::time::Instant)> = None;
     // Only redraw when something actually changed: an idle UI should cost nothing.
     let mut dirty = true;
+    // Where the last frame put the panes and rows, for resolving pointer events.
+    let mut geometry = ui::Geometry::default();
 
     loop {
         if dirty {
@@ -92,7 +94,7 @@ async fn event_loop(
                 if loading && app.projects.is_empty() {
                     app.message = Some("scanning for projects…".to_owned());
                 }
-                ui::draw(frame, &mut app);
+                geometry = ui::draw(frame, &mut app);
             })?;
             dirty = false;
         }
