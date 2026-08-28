@@ -75,6 +75,11 @@ pub enum Token {
     /// The product wordmark. Reserved for it, so it stays recognisable.
     Brand,
     /// Ordinary readable text.
+    ///
+    /// Deliberately unpainted at every tier: the terminal's own foreground is
+    /// the one colour guaranteed to be legible against the terminal's own
+    /// background, whatever the user has themed it to. Choosing a light grey
+    /// here would read beautifully on a dark profile and vanish on a light one.
     Text,
     /// Present but secondary: versions, labels, annotations.
     Muted,
@@ -135,7 +140,7 @@ impl Token {
         use Color::{Blue, Cyan, Green, Indexed, Magenta, Red, Reset, Rgb, White, Yellow};
         match self {
             Token::Brand => (Rgb(232, 163, 61), Indexed(215), Yellow),
-            Token::Text => (Rgb(220, 223, 228), Indexed(253), Reset),
+            Token::Text => (Reset, Reset, Reset),
             Token::Muted => (Rgb(122, 130, 144), Indexed(245), Color::DarkGray),
             Token::Heading => (Rgb(240, 242, 245), Indexed(255), White),
             Token::SelectionBg => (Rgb(45, 51, 67), Indexed(237), Reset),
@@ -218,10 +223,12 @@ pub fn search_match() -> Style {
 mod tests {
     use super::*;
 
-    /// Every token that is drawn as text, paired with the surface it sits on.
+    /// Every token that is drawn as a chosen colour.
+    ///
+    /// [`Token::Text`] is absent on purpose: it resolves to `Reset` at every
+    /// tier so that ordinary text inherits the terminal's foreground.
     const FOREGROUNDS: &[Token] = &[
         Token::Brand,
-        Token::Text,
         Token::Muted,
         Token::Heading,
         Token::Ok,
@@ -328,6 +335,20 @@ mod tests {
             Style::default().add_modifier(Modifier::REVERSED)
         };
         assert!(style.add_modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn ordinary_text_is_never_given_a_colour_of_its_own() {
+        // Painting body text light grey reads well on a dark profile and
+        // disappears on a light one. The terminal's own foreground is the only
+        // choice that is legible on both.
+        for tier in TIERS {
+            assert_eq!(
+                Token::Text.color(tier),
+                Color::Reset,
+                "body text is painted at {tier:?}"
+            );
+        }
     }
 
     #[test]
