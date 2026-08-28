@@ -30,6 +30,12 @@ const TICK: Duration = Duration::from_millis(100);
 /// is in flight, so an idle UI still wakes ten times a second and no more.
 const FRAME: Duration = Duration::from_millis(16);
 
+/// The poll interval while a spinner is turning.
+///
+/// A spinner steps far more slowly than a fade, and waking at [`FRAME`] for one
+/// would draw the same glyph five times over.
+const SPIN: Duration = crate::spinner::PERIOD;
+
 /// How the UI was asked to start.
 #[derive(Debug, Clone)]
 pub struct TuiOptions {
@@ -90,7 +96,7 @@ async fn event_loop(
 ) -> Result<(), TuiError> {
     let mut app = App::new(Vec::new());
     app.root = Some(root);
-    let mut loading = true;
+    app.scanning = true;
     let mut pending: Option<(PackageKey, std::time::Instant)> = None;
     // Only redraw when something actually changed: an idle UI should cost nothing.
     let mut dirty = true;
@@ -100,9 +106,6 @@ async fn event_loop(
     loop {
         if dirty {
             terminal.draw(|frame| {
-                if loading && app.projects.is_empty() {
-                    app.message = Some("scanning for projects…".to_owned());
-                }
                 geometry = ui::draw(frame, &mut app);
             })?;
             dirty = false;
@@ -117,10 +120,11 @@ async fn event_loop(
             dirty = true;
             match message {
                 Message::Projects(projects) => {
+                    // A fresh `App`, so only what discovery does not decide is
+                    // carried across.
                     let root = app.root.take();
                     app = App::new(projects);
                     app.root = root;
-                    loading = false;
                 }
                 Message::Package(key, data) => app.set_data(key, data),
                 Message::Notice(text) => app.message = Some(text),
@@ -150,13 +154,22 @@ async fn event_loop(
         }
 
         // Blocking reads happen on this thread, but only for a tick at a time, so
-        // results and resizes still surface promptly. A running fade owes the
-        // screen frames, so it shortens the wait for as long as it lasts.
+        // results and resizes still surface promptly. A running fade or a turning
+        // spinner owes the screen frames, so either shortens the wait for as long
+        // as it lasts — the fade by more, since it is the finer of the two.
         let animating = app.animating();
-        if animating {
+        let busy = app.busy();
+        if animating || busy {
             dirty = true;
         }
-        if event::poll(if animating { FRAME } else { TICK })? {
+        let wait = if animating {
+            FRAME
+        } else if busy {
+            SPIN
+        } else {
+            TICK
+        };
+        if event::poll(wait)? {
             match event::read()? {
                 Event::Key(key) => {
                     if let Some(action) = crate::event::action_for(key, app.mode) {

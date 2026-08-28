@@ -147,9 +147,17 @@ fn package_lines(app: &App, row: &crate::rows::Row, width: u16) -> Content {
         content.push(Line::raw(""));
     }
 
+    // `Unloaded` and `None` are a request that has not been sent yet rather than
+    // one in flight, but the distinction is a fraction of a second the reader
+    // cannot act on, and both are genuinely being waited for.
+    let fetching = format!(
+        "{} fetching from {}…",
+        app.spinner(),
+        ecosystem.display_name()
+    );
     match app.selected_data() {
-        None | Some(PackageData::Unloaded) => content.push(dim("loading…")),
-        Some(PackageData::Loading) => content.push(dim("loading…")),
+        None | Some(PackageData::Unloaded) => content.push(dim(&fetching)),
+        Some(PackageData::Loading) => content.push(dim(&fetching)),
         Some(PackageData::Failed(error)) => {
             content.push(Line::styled(
                 format!("could not load: {error}"),

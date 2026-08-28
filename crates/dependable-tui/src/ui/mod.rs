@@ -222,6 +222,17 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
+    if app.scanning {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                format!("{} scanning for projects…", app.spinner()),
+                theme::fg(Token::Muted),
+            )),
+            area,
+        );
+        return;
+    }
+
     let mut spans = vec![Span::styled(
         format!("{} rows", app.rows().len()),
         theme::fg(Token::Muted),

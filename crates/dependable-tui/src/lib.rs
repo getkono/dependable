@@ -23,6 +23,7 @@ pub mod model;
 pub mod open;
 pub mod rows;
 pub mod run;
+pub mod spinner;
 pub mod terminal;
 pub mod theme;
 pub mod ui;

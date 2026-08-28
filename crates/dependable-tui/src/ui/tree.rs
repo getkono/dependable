@@ -215,7 +215,7 @@ fn status_badge<'a>(app: &App, row: &Row) -> Option<Line<'a>> {
     }
     let key = crate::model::key(app.ecosystem_of(row), &row.name, &row.version);
     Some(match app.packages.get(&key)? {
-        PackageData::Loading => Line::styled("…", theme::fg(Token::Muted)),
+        PackageData::Loading => Line::styled(app.spinner(), theme::fg(Token::Muted)),
         PackageData::Failed(_) => Line::styled("failed", theme::fg(Token::Critical)),
         PackageData::Unloaded => return None,
         PackageData::Ready(facts) => {

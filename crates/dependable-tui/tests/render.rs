@@ -405,7 +405,7 @@ fn a_workspace_member_is_never_shown_registry_data() {
         "it must say why nothing is shown: {screen}"
     );
     assert!(
-        !screen.contains("loading"),
+        !screen.contains("fetching"),
         "and must not sit there pretending to fetch: {screen}"
     );
 }
@@ -825,4 +825,72 @@ fn pressing_o_falls_back_to_the_registry_page() {
         app.take_open_request().as_deref(),
         Some("https://crates.io/crates/serde")
     );
+}
+
+#[test]
+fn a_lookup_in_flight_spins_in_both_panes() {
+    // A static `loading…` cannot be told apart from a hung one.
+    let mut app = App::new(vec![project(GraphSource::Lockfile)]);
+    app.apply(Action::Move(1));
+    app.apply(Action::Expand);
+    app.apply(Action::Move(1));
+    app.set_data(key(Ecosystem::Rust, "serde", "1.0.0"), PackageData::Loading);
+    assert!(app.busy(), "a request is in flight, so the UI owes frames");
+
+    // Asserted on whichever frame the render happened to land on rather than on
+    // one read from the clock beforehand, which would flake whenever the two
+    // straddled a period boundary.
+    let screen = render(&mut app);
+    let glyph = spinner_before(&screen, " fetching from Rust…");
+    assert_eq!(
+        screen.matches(glyph).count(),
+        2,
+        "the tree's status column shows the same frame: {screen}"
+    );
+}
+
+/// The glyph drawn immediately before `text` on screen.
+fn spinner_before(screen: &str, text: &str) -> char {
+    let line = screen
+        .lines()
+        .find(|line| line.contains(text))
+        .unwrap_or_else(|| panic!("{text} is on screen:\n{screen}"));
+    let head = &line[..line.find(text).expect("just matched")];
+    let glyph = head.chars().last().expect("something precedes it");
+    assert!(
+        !glyph.is_ascii(),
+        "a spinner frame, not text: {glyph:?} in {line:?}"
+    );
+    glyph
+}
+
+#[test]
+fn a_settled_ui_owes_no_frames() {
+    // The spinner shortens the event loop's poll; leaving it turning over a
+    // finished lookup would wake the process forever.
+    let app = app_with_serde_metadata();
+    assert!(!app.busy());
+    assert!(!app.animating());
+}
+
+#[test]
+fn a_selection_waiting_on_its_first_request_is_busy() {
+    // Nothing is in flight yet during the settling delay, but the pane already
+    // says it is fetching, and a spinner drawn without being stepped looks like
+    // a freeze.
+    let mut app = App::new(vec![project(GraphSource::Lockfile)]);
+    app.apply(Action::Move(1));
+    app.apply(Action::Expand);
+    app.apply(Action::Move(1));
+    assert!(app.busy());
+}
+
+#[test]
+fn discovery_spins_in_the_status_bar() {
+    let mut app = App::new(Vec::new());
+    app.scanning = true;
+    assert!(app.busy());
+
+    let screen = render(&mut app);
+    spinner_before(&screen, " scanning for projects…");
 }

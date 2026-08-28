@@ -150,6 +150,17 @@ pub struct App {
     /// Parked here rather than opened directly because this type is free of IO;
     /// the loop takes it with [`App::take_open_request`].
     open_request: Option<String>,
+    /// Whether projects are still being discovered.
+    ///
+    /// The event loop sets this, because only it knows discovery is running.
+    /// Held here rather than written into [`Self::message`] every frame — which
+    /// is what it took, since applying any action clears that message.
+    pub scanning: bool,
+    /// When this UI started, which is the phase every spinner is drawn from.
+    ///
+    /// One clock for all of them, so the badge in the tree and the line in the
+    /// detail pane turn together instead of drifting apart.
+    started: std::time::Instant,
 }
 
 impl App {
@@ -186,6 +197,8 @@ impl App {
             hover_since: None,
             dragging: false,
             open_request: None,
+            scanning: false,
+            started: std::time::Instant::now(),
         };
         app.rebuild();
         app
@@ -498,6 +511,32 @@ impl App {
     #[must_use]
     pub fn animating(&self) -> bool {
         self.hover_since.is_some() && self.hover_progress() < 1.0
+    }
+
+    /// Whether anything is being waited on, and so whether a spinner is turning.
+    ///
+    /// Includes a selection with no entry yet, not only one already in flight:
+    /// the pane says it is fetching during the settling delay before the request
+    /// is sent, and a spinner that is drawn but not stepped looks like a freeze.
+    ///
+    /// The store only ever holds packages the user has looked at, so scanning it
+    /// costs nothing worth avoiding.
+    #[must_use]
+    pub fn busy(&self) -> bool {
+        self.scanning
+            || self
+                .packages
+                .values()
+                .any(|data| matches!(data, PackageData::Loading))
+            || self
+                .selected_key()
+                .is_some_and(|key| !self.packages.contains_key(&key))
+    }
+
+    /// The spinner frame for this instant.
+    #[must_use]
+    pub fn spinner(&self) -> &'static str {
+        crate::spinner::frame(self.started.elapsed())
     }
 
     /// The URL the selected package is best identified by.
