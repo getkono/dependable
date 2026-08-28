@@ -29,7 +29,7 @@ Or download a prebuilt binary for your platform from the
 | Language | Manifest(s) | Registry | Lockfile | Status |
 | --- | --- | --- | --- | --- |
 | Rust | `Cargo.toml` | crates.io | `Cargo.lock` | ✅ Stable |
-| JavaScript / TypeScript | `package.json` | npm | `package-lock.json` | ✅ Stable |
+| JavaScript / TypeScript | `package.json` | npm | `package-lock.json`, `bun.lock` | ✅ Stable |
 | Python | `requirements*.txt`, `pyproject.toml`, `pixi.toml` | PyPI | — | ✅ Stable |
 | Go | `go.mod` | Go proxy | — | 🧪 Experimental |
 | Deno / JSR | `deno.json(c)` | JSR | — | 🧪 Experimental |
@@ -38,6 +38,32 @@ Or download a prebuilt binary for your platform from the
 | Dart / Flutter | `pubspec.yaml` | pub.dev | `pubspec.lock` | 🧪 Experimental |
 | C# / .NET | `*.csproj`, `Directory.Packages.props` | NuGet | — | 🧪 Experimental |
 | Elixir | `mix.exs` | Hex | `mix.lock` | 🧪 Experimental |
+
+### Lockfiles
+
+A lockfile is what turns "the manifest allows `^19.0.0`" into "you are actually
+running 19.0.0", so it is what the resolved dependency tree and the age column
+are built from. Where the Lockfile column above reads `—`, versions come from the
+manifest's constraints instead and the tree shows only directly declared
+dependencies.
+
+| Lockfile | Locked versions | Resolved tree |
+| --- | --- | --- |
+| `Cargo.lock` | ✅ | ✅ |
+| `package-lock.json` | ✅ | ✅ |
+| `bun.lock` | ✅ | ✅ |
+| `composer.lock` | ✅ | ✅ |
+| `mix.lock` | ✅ | ✅ |
+| `pubspec.lock` | ✅ | ✕ — records versions but not which package required which |
+
+Not read: `yarn.lock`, `pnpm-lock.yaml`, `deno.lock`, `go.sum`, `uv.lock`,
+`poetry.lock`, `Pipfile.lock`, `packages.lock.json`.
+
+**Bun.** Only the text format, `bun.lock`, is supported. The older binary
+`bun.lockb` cannot be read; when one is found, `dependable` says so and tells you
+to run `bun install --save-text-lockfile` to migrate, rather than silently
+reporting your dependencies as unlocked. A project with both is read from
+`package-lock.json`.
 
 **Status legend:**
 

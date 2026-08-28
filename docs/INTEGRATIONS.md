@@ -57,7 +57,7 @@ emit/consume their format) · **Supersede-broader** (we do their job and more) �
 | **npm audit / npm outdated / pip list --outdated / composer outdated / go list -m -u** | Per-ecosystem built-ins | **Unify** | One command and one JSON schema for a polyglot repo instead of a different tool per language. |
 | **npm-check-updates (ncu)** | npm manifest version bumping | **Supersede-broader** | `dependable fix` rewrites version constraints in place, format-agnostic and multi-ecosystem — preserving the operator (`^1.0` → `^1.5.0`) so a constraint's meaning isn't silently changed. |
 | **Dependi (VSCode extension)** | Inline in-editor version/vuln hints | **Reimplement engine + first-party editor integration (roadmap)** | `dependable` is the clean-slate, open-source engine (no code ported). The in-editor experience is now a committed roadmap item — a **first-party LSP and/or VSCode extension built on `dependable-fetch`** (see §3 and [`SCOPE.md`](SCOPE.md)). |
-| **Trivy / Grype** | Container image / SBOM / supply-chain scanners | **Not overlap** | Images, SBOMs, and full transitive graphs are a different niche. We check the **direct** dependencies declared in your manifest. |
+| **Trivy / Grype** | Container image / SBOM / supply-chain scanners | **Not overlap** | Images and SBOMs are a different niche. We read the lockfile you already have, so the transitive graph we show is the one you actually installed — not one reconstructed from a scan. |
 | **OWASP dependency-check** | Heavy, Java-centric CVE scanner | **Not overlap** | Different footprint and ecosystem focus; we stay a fast single binary. |
 
 ---

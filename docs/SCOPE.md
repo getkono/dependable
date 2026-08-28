@@ -74,12 +74,24 @@ advisories, downloads, publish recency, and yanked status.
 
 `tree` remains Rust-only, but the **graph builders** are no longer Cargo-only:
 `dependable_fetch::build_project_graph` assembles a resolved transitive graph for **Rust,
-npm, PHP, and Elixir**, whose lockfiles record per-package edges.
+npm (including Bun), PHP, and Elixir**, whose lockfiles record per-package edges.
+
+A manifest may name several candidate lockfiles (`ManifestKind::lockfiles`), and the
+parser is chosen from the file actually found rather than from the manifest beside it —
+a `package.json` says nothing about which package manager wrote the lockfile next to it.
+Candidates are tried in precedence order within a directory before the walk moves up, so
+proximity decides.
 
 Dart and Go are *not* deferred work — `pubspec.lock` and `go.sum` record resolved
 versions but never which package required which, so no transitive graph exists to read
 offline. Python, C#, pnpm, and Deno need a lockfile parser first. All of these report
 `GraphSource::Unsupported` and fall back to directly declared dependencies.
+
+**Lockfiles we recognise but cannot read.** Bun's binary `bun.lockb` is listed in
+`ManifestKind::unreadable_lockfiles` and reported by `dependable_fetch::lockfile_notices`
+rather than passed over. A project whose only lockfile is one of these reports
+`GraphSource::UnreadableLockfile`, which is distinct from having none: the user has
+something they can act on.
 
 ---
 
