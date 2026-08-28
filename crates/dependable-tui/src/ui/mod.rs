@@ -194,6 +194,9 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ("i", "invert: what depends on this"),
         ("r", "re-fetch the selected package"),
         ("o", "open this package's link in a browser"),
+        ("click / scroll", "select a row, or open it by its marker"),
+        ("drag the divider", "resize the panes"),
+        ("shift-drag", "select text (bypasses mouse reporting)"),
         ("?", "close this help"),
         ("q / ctrl-c", "quit"),
     ];

@@ -152,6 +152,18 @@ async fn event_loop(
                         dirty = true;
                     }
                 }
+                Event::Mouse(mouse) => {
+                    if let Some(action) = crate::event::action_for_mouse(
+                        mouse,
+                        app.mode,
+                        &geometry,
+                        app.rows(),
+                        app.dragging,
+                    ) {
+                        app.apply(action);
+                        dirty = true;
+                    }
+                }
                 Event::Resize(_, _) => dirty = true,
                 _ => {}
             }
