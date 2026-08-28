@@ -3,13 +3,14 @@
 use dependable_fetch::NodeKind;
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::app::App;
 use crate::model::PackageData;
 use crate::rows::{Row, RowKind};
+use crate::theme::{self, Token};
 
 /// Draw the visible slice of the tree.
 pub fn draw(frame: &mut Frame, area: Rect, app: &App, viewport: usize) {
@@ -32,7 +33,12 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, viewport: usize) {
     };
 
     frame.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title)),
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(theme::fg(Token::Border))
+                .title(Span::styled(title, theme::fg(Token::Muted))),
+        ),
         area,
     );
 }
@@ -41,32 +47,23 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, viewport: usize) {
 fn line<'a>(app: &App, row: &'a Row, selected: bool) -> Line<'a> {
     let mut spans = vec![Span::raw("  ".repeat(row.depth))];
 
-    spans.push(Span::styled(
-        marker(row),
-        Style::default().fg(Color::DarkGray),
-    ));
+    spans.push(Span::styled(marker(row), theme::fg(Token::Muted)));
 
     spans.push(Span::styled(row.name.clone(), name_style(row, selected)));
 
     if !row.version.is_empty() {
         spans.push(Span::styled(
             format!(" {}", row.version),
-            Style::default().fg(Color::DarkGray),
+            theme::fg(Token::Muted),
         ));
     }
 
     if let Some(tag) = kind_tag(row) {
-        spans.push(Span::styled(
-            format!(" ({tag})"),
-            Style::default().fg(Color::Blue),
-        ));
+        spans.push(Span::styled(format!(" ({tag})"), theme::fg(Token::Link)));
     }
 
     if row.cyclic {
-        spans.push(Span::styled(
-            " (cycle)",
-            Style::default().fg(Color::DarkGray),
-        ));
+        spans.push(Span::styled(" (cycle)", theme::fg(Token::Muted)));
     }
 
     if let Some(badge) = status_badge(app, row) {
@@ -75,7 +72,7 @@ fn line<'a>(app: &App, row: &'a Row, selected: bool) -> Line<'a> {
 
     let mut line = Line::from(spans);
     if selected {
-        line = line.style(Style::default().bg(Color::Rgb(40, 44, 52)));
+        line = line.style(theme::selection());
     }
     line
 }
@@ -93,20 +90,16 @@ fn marker(row: &Row) -> &'static str {
 
 fn name_style(row: &Row, selected: bool) -> Style {
     let mut style = match row.kind {
-        RowKind::Project => Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD),
+        RowKind::Project => theme::bold(Token::Heading),
         RowKind::Package => match row.node_kind {
-            Some(NodeKind::Workspace) => Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-            Some(NodeKind::Git) => Style::default().fg(Color::Magenta),
-            Some(NodeKind::Path) => Style::default().fg(Color::Yellow),
-            _ => Style::default(),
+            Some(NodeKind::Workspace) => theme::bold(Token::KindWorkspace),
+            Some(NodeKind::Git) => theme::fg(Token::KindGit),
+            Some(NodeKind::Path) => theme::fg(Token::KindPath),
+            _ => theme::fg(Token::Text),
         },
     };
     if row.matched {
-        style = style.bg(Color::Rgb(70, 60, 0));
+        style = style.patch(theme::search_match());
     }
     if selected {
         style = style.add_modifier(Modifier::BOLD);
@@ -138,25 +131,25 @@ fn status_badge<'a>(app: &App, row: &Row) -> Option<Span<'a>> {
     }
     let key = crate::model::key(app.ecosystem_of(row), &row.name, &row.version);
     Some(match app.packages.get(&key)? {
-        PackageData::Loading => Span::styled(" …", Style::default().fg(Color::DarkGray)),
-        PackageData::Failed(_) => Span::styled(" !", Style::default().fg(Color::Red)),
+        PackageData::Loading => Span::styled(" …", theme::fg(Token::Muted)),
+        PackageData::Failed(_) => Span::styled(" !", theme::fg(Token::Critical)),
         PackageData::Unloaded => return None,
         PackageData::Ready(facts) => {
             if !facts.vulnerabilities.is_empty() {
                 Span::styled(
                     format!(" VULN({})", facts.vulnerabilities.len()),
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    theme::bold(Token::Critical),
                 )
             } else {
                 match facts.status {
                     Some(DependencyStatus::Outdated) => {
-                        Span::styled(" outdated", Style::default().fg(Color::Red))
+                        Span::styled(" outdated", theme::fg(Token::Critical))
                     }
                     Some(DependencyStatus::UpdateAvailable) => {
-                        Span::styled(" update", Style::default().fg(Color::Yellow))
+                        Span::styled(" update", theme::fg(Token::Warn))
                     }
                     Some(DependencyStatus::PatchAvailable) => {
-                        Span::styled(" patch", Style::default().fg(Color::Yellow))
+                        Span::styled(" patch", theme::fg(Token::Warn))
                     }
                     _ => return None,
                 }

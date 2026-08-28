@@ -5,11 +5,11 @@ mod tree;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::app::{App, Mode};
+use crate::theme::{self, Token};
 
 /// Draw the whole UI for one frame.
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -44,9 +44,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 /// The search line, showing a cursor while it is being typed into.
 fn draw_search(frame: &mut Frame, area: Rect, app: &App) {
     let (prefix, style) = match app.mode {
-        Mode::Search => ("/", Style::default().fg(Color::Yellow)),
-        _ if app.query.is_empty() => ("", Style::default().fg(Color::DarkGray)),
-        _ => ("/", Style::default().fg(Color::DarkGray)),
+        Mode::Search => ("/", theme::fg(Token::Warn)),
+        _ if app.query.is_empty() => ("", theme::fg(Token::Muted)),
+        _ => ("/", theme::fg(Token::Muted)),
     };
     let text = if app.mode == Mode::Search {
         format!("{prefix}{}\u{2588}", app.query)
@@ -61,26 +61,23 @@ fn draw_search(frame: &mut Frame, area: Rect, app: &App) {
 /// The status bar: counts, the active caveat, and any transient message.
 fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     if let Some(message) = &app.message {
-        let style = Style::default().fg(Color::Yellow);
+        let style = theme::fg(Token::Warn);
         frame.render_widget(Paragraph::new(Line::styled(message.clone(), style)), area);
         return;
     }
 
     let mut spans = vec![Span::styled(
         format!("{} rows", app.rows().len()),
-        Style::default().fg(Color::DarkGray),
+        theme::fg(Token::Muted),
     )];
     if let Some(row) = app.selected()
         && let Some(caveat) = app.projects[row.project].caveat()
     {
         spans.push(Span::raw("  "));
-        spans.push(Span::styled(caveat, Style::default().fg(Color::Yellow)));
+        spans.push(Span::styled(caveat, theme::fg(Token::Warn)));
     }
     if app.inverted {
-        spans.push(Span::styled(
-            "  inverted",
-            Style::default().fg(Color::Magenta),
-        ));
+        spans.push(Span::styled("  inverted", theme::fg(Token::KindGit)));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -115,20 +112,20 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         .iter()
         .map(|(key, what)| {
             Line::from(vec![
-                Span::styled(
-                    format!("{key:>18}  "),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(*what),
+                Span::styled(format!("{key:>18}  "), theme::bold(Token::KindWorkspace)),
+                Span::styled(*what, theme::fg(Token::Text)),
             ])
         })
         .collect();
 
     frame.render_widget(Clear, popup);
     frame.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" keys ")),
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(theme::fg(Token::Border))
+                .title(Span::styled(" keys ", theme::fg(Token::Muted))),
+        ),
         popup,
     );
 }

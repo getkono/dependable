@@ -7,13 +7,14 @@
 use dependable_fetch::{DependencyStatus, NodeKind, Owner, PackageMetadata};
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::app::App;
 use crate::model::{PackageData, PackageFacts, compact_count, relative_age};
 use crate::rows::RowKind;
+use crate::theme::{self, Token};
 
 /// Draw the pane for the current selection.
 pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
@@ -24,7 +25,12 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
     };
     frame.render_widget(
         Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL).title(" details "))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(theme::fg(Token::Border))
+                    .title(Span::styled(" details ", theme::fg(Token::Muted))),
+            )
             .wrap(Wrap { trim: false }),
         area,
     );
@@ -41,10 +47,7 @@ fn project_lines(app: &App, index: usize) -> Vec<Line<'static>> {
     ];
     if let Some(caveat) = project.caveat() {
         lines.push(Line::raw(""));
-        lines.push(Line::styled(
-            caveat.to_owned(),
-            Style::default().fg(Color::Yellow),
-        ));
+        lines.push(Line::styled(caveat.to_owned(), theme::fg(Token::Warn)));
     }
     lines
 }
@@ -73,7 +76,7 @@ fn package_lines(app: &App, row: &crate::rows::Row) -> Vec<Line<'static>> {
         Some(PackageData::Failed(error)) => {
             lines.push(Line::styled(
                 format!("could not load: {error}"),
-                Style::default().fg(Color::Red),
+                theme::fg(Token::Critical),
             ));
             lines.push(dim("press r to try again"));
         }
@@ -104,7 +107,7 @@ fn facts_lines(facts: &PackageFacts) -> Vec<Line<'static>> {
             label("advisories"),
             Span::styled(
                 facts.vulnerabilities.join(", "),
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                theme::bold(Token::Critical),
             ),
         ]));
     }
@@ -116,10 +119,7 @@ fn facts_lines(facts: &PackageFacts) -> Vec<Line<'static>> {
     }
 
     for warning in &facts.warnings {
-        lines.push(Line::styled(
-            warning.clone(),
-            Style::default().fg(Color::Yellow),
-        ));
+        lines.push(Line::styled(warning.clone(), theme::fg(Token::Warn)));
     }
     lines
 }
@@ -165,7 +165,7 @@ fn metadata_lines(meta: &PackageMetadata) -> Vec<Line<'static>> {
     if meta.yanked {
         lines.push(Line::styled(
             "this version has been yanked",
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            theme::bold(Token::Critical),
         ));
     }
     lines
@@ -183,36 +183,29 @@ fn local_origin(row: &crate::rows::Row) -> Option<&'static str> {
 
 fn status_style(status: &DependencyStatus) -> Style {
     match status {
-        DependencyStatus::UpToDate => Style::default().fg(Color::Green),
+        DependencyStatus::UpToDate => theme::fg(Token::Ok),
         DependencyStatus::PatchAvailable | DependencyStatus::UpdateAvailable => {
-            Style::default().fg(Color::Yellow)
+            theme::fg(Token::Warn)
         }
-        DependencyStatus::Outdated => Style::default().fg(Color::Red),
-        DependencyStatus::Vulnerable => {
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
-        }
-        _ => Style::default().fg(Color::DarkGray),
+        DependencyStatus::Outdated => theme::fg(Token::Critical),
+        DependencyStatus::Vulnerable => theme::bold(Token::Critical),
+        _ => theme::fg(Token::Muted),
     }
 }
 
 fn heading(text: &str) -> Line<'static> {
-    Line::styled(
-        text.to_owned(),
-        Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD),
-    )
+    Line::styled(text.to_owned(), theme::bold(Token::Heading))
 }
 
 fn label(name: &str) -> Span<'static> {
-    Span::styled(
-        format!("{name:>11}  "),
-        Style::default().fg(Color::DarkGray),
-    )
+    Span::styled(format!("{name:>11}  "), theme::fg(Token::Muted))
 }
 
 fn field(name: &str, value: &str) -> Line<'static> {
-    Line::from(vec![label(name), Span::raw(value.to_owned())])
+    Line::from(vec![
+        label(name),
+        Span::styled(value.to_owned(), theme::fg(Token::Text)),
+    ])
 }
 
 /// A field the registry may not have published — said plainly either way.
@@ -221,11 +214,11 @@ fn optional(name: &str, value: Option<&str>) -> Line<'static> {
         Some(value) => field(name, value),
         None => Line::from(vec![
             label(name),
-            Span::styled("not published", Style::default().fg(Color::DarkGray)),
+            Span::styled("not published", theme::fg(Token::Muted)),
         ]),
     }
 }
 
 fn dim(text: &str) -> Line<'static> {
-    Line::styled(text.to_owned(), Style::default().fg(Color::DarkGray))
+    Line::styled(text.to_owned(), theme::fg(Token::Muted))
 }

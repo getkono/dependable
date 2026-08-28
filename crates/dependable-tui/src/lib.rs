@@ -23,6 +23,7 @@ pub mod model;
 pub mod rows;
 pub mod run;
 pub mod terminal;
+pub mod theme;
 pub mod ui;
 
 pub use run::{TuiOptions, run};

@@ -67,6 +67,49 @@ fn render(app: &mut App) -> String {
         .join("\n")
 }
 
+/// Render `app` and return the styled cells of the row at `y`.
+fn styled_row(app: &mut App, y: u16) -> Vec<ratatui::buffer::Cell> {
+    let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("terminal");
+    terminal
+        .draw(|frame| ui::draw(frame, app))
+        .expect("draw succeeds");
+    let buffer = terminal.backend().buffer();
+    (0..100).map(|x| buffer[(x, y)].clone()).collect()
+}
+
+#[test]
+fn the_selected_row_is_never_marked_by_a_background_alone() {
+    // The regression this guards: selection set only a background and left the
+    // row's own foreground on top of it, so on a light terminal the selected
+    // row was dark text on a dark bar. Whichever tier is in force, the row must
+    // be distinguished, and never by a background with no foreground to match.
+    use ratatui::style::{Color, Modifier};
+
+    let mut app = App::new(vec![project(GraphSource::Lockfile)]);
+
+    // Row 0 of the tree pane sits just inside the block's top border.
+    let cells = styled_row(&mut app, 1);
+    let marked = cells
+        .iter()
+        .find(|c| c.bg != Color::Reset || c.modifier.contains(Modifier::REVERSED))
+        .expect("the selected row is distinguished somehow");
+
+    if marked.bg == Color::Reset {
+        // The 16-colour tier reverses, which is legible by construction.
+        assert!(marked.modifier.contains(Modifier::REVERSED));
+        return;
+    }
+    assert_ne!(
+        marked.fg,
+        Color::Reset,
+        "a selection background with no foreground is the illegible case"
+    );
+    assert_ne!(
+        marked.fg, marked.bg,
+        "selected text must not match the bar it sits on"
+    );
+}
+
 #[test]
 fn the_tree_and_detail_panes_both_render() {
     let mut app = App::new(vec![project(GraphSource::Lockfile)]);
