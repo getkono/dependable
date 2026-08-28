@@ -417,14 +417,15 @@ fn a_url_is_written_as_a_clickable_link_showing_its_readable_form() {
         link.symbol()
     );
     assert!(
-        link.symbol().ends_with("\u{1b}]8;;\u{1b}\\"),
+        link.symbol().contains("\u{1b}]8;;\u{1b}\\"),
         "the link is terminated: {:?}",
         link.symbol()
     );
-    assert_eq!(
-        link.cell_width(),
-        "github.com/serde-rs/serde".len() as u16,
-        "the cell occupies the columns of the visible text, not of the escapes"
+    // The cell claims the rest of its row so a shorter link cannot leave the
+    // tail of a longer one behind; the label itself is what is visible.
+    assert!(
+        link.cell_width() >= "github.com/serde-rs/serde".len() as u16,
+        "the cell reports screen columns, not the length of its escapes"
     );
 }
 
@@ -615,4 +616,43 @@ fn a_local_package_reports_its_origin_in_the_status_column() {
         Some(status),
         "the origin sits in the status column: {row:?}"
     );
+}
+
+#[test]
+fn switching_to_a_package_with_less_to_say_leaves_nothing_behind() {
+    // Redrawing is a diff against the previous frame, and a forced-width cell
+    // makes the diff step over columns it never compares. A package with long
+    // values must not leave fragments of them behind the next one's short ones.
+    let mut app = app_with_serde_metadata();
+    let _ = render(&mut app);
+
+    let mut sparse = PackageMetadata::default();
+    sparse.description = Some("tiny".to_owned());
+    sparse.repository = Some("https://ex.io/a".to_owned());
+    app.set_data(
+        key(Ecosystem::Rust, "serde", "1.0.0"),
+        PackageData::Ready(Box::new(PackageFacts {
+            metadata: Some(sparse),
+            latest: Some("1.0.0".to_owned()),
+            status: Some(DependencyStatus::UpToDate),
+            vulnerabilities: Vec::new(),
+            warnings: Vec::new(),
+        })),
+    );
+
+    let screen = render(&mut app);
+    for fragment in [
+        "serde-rs",
+        "dtolnay",
+        "oli-obk",
+        "team",
+        "5.0M",
+        "2021-03-04",
+        "Serialization",
+    ] {
+        assert!(
+            !screen.contains(fragment),
+            "{fragment:?} survived from the previous package:\n{screen}"
+        );
+    }
 }
