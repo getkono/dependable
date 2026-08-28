@@ -1,7 +1,7 @@
 //! Lockfile parsers and per-kind dispatch.
 
 use crate::error::ParseError;
-use crate::manifest::ManifestKind;
+use crate::manifest::{LockfileKind, ManifestKind};
 
 pub mod cargo_lock;
 pub mod cargo_lock_graph;
@@ -23,16 +23,36 @@ pub use mix_lock_graph::parse_mix_lock_graph;
 pub use package_lock_graph::parse_package_lock_graph;
 pub use package_lock_json::parse_package_lock;
 
-/// Parse lockfile `content` for a given manifest `kind`, dispatching to the right
-/// parser. Returns [`ParseError::Unsupported`] for kinds whose lockfile parser
-/// has not landed yet (callers treat that as "no locked versions").
-pub fn parse_lockfile(kind: ManifestKind, content: &str) -> Result<LockfileData, ParseError> {
+/// Parse lockfile `content` with the parser for the file that was found.
+///
+/// Dispatching on the lockfile rather than on the manifest beside it is what
+/// lets one ecosystem have several: a `package.json` says nothing about which
+/// package manager wrote the lockfile next to it.
+///
+/// # Errors
+/// Never fails on the kind itself — every [`LockfileKind`] has a parser. Returns
+/// the parser's own error when the content does not read.
+pub fn parse_lockfile_kind(kind: LockfileKind, content: &str) -> Result<LockfileData, ParseError> {
     match kind {
-        ManifestKind::CargoToml => parse_cargo_lock(content),
-        ManifestKind::PackageJson => parse_package_lock(content),
-        ManifestKind::ComposerJson => parse_composer_lock(content),
-        ManifestKind::PubspecYaml => parse_dart_pubspec_lock(content),
-        ManifestKind::MixExs => parse_mix_lock(content),
-        other => Err(ParseError::Unsupported(other)),
+        LockfileKind::CargoLock => parse_cargo_lock(content),
+        LockfileKind::PackageLockJson => parse_package_lock(content),
+        LockfileKind::ComposerLock => parse_composer_lock(content),
+        LockfileKind::PubspecLock => parse_dart_pubspec_lock(content),
+        LockfileKind::MixLock => parse_mix_lock(content),
     }
+}
+
+/// Parse lockfile `content` for a manifest `kind`, using its first lockfile.
+///
+/// Retained for callers that have a manifest and no particular lockfile in
+/// hand. Prefer [`parse_lockfile_kind`] where the file is actually known.
+///
+/// # Errors
+/// Returns [`ParseError::Unsupported`] for manifest kinds with no lockfile we
+/// read (callers treat that as "no locked versions").
+pub fn parse_lockfile(kind: ManifestKind, content: &str) -> Result<LockfileData, ParseError> {
+    let Some(lockfile) = kind.lockfiles().first() else {
+        return Err(ParseError::Unsupported(kind));
+    };
+    parse_lockfile_kind(*lockfile, content)
 }

@@ -12,8 +12,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use dependable_core::{
-    CheckResult, DependencyStatus, Ecosystem, Item, ManifestKind, PackageSource, UnstableFilter,
-    apply_lockfile, check_version, parse, parse_lockfile, to_semver_constraint,
+    CheckResult, DependencyStatus, Ecosystem, Item, LockfileKind, ManifestKind, PackageSource,
+    UnstableFilter, apply_lockfile, check_version, parse, parse_lockfile_kind,
+    to_semver_constraint,
 };
 use futures::stream::{self, StreamExt};
 
@@ -202,6 +203,9 @@ impl Checker {
         manifest: &str,
         lockfile: Option<&str>,
     ) -> Result<ManifestCheck, CheckError> {
+        // Content with no file behind it: the manifest's first lockfile is the
+        // only thing it can be attributed to.
+        let lockfile = lockfile.and_then(|lock| Some((*kind.lockfiles().first()?, lock)));
         self.check_inner(kind, manifest, lockfile).await
     }
 
@@ -301,24 +305,35 @@ impl Checker {
         let kind = ManifestKind::detect(path)
             .ok_or_else(|| CheckError::UnknownManifest(path.to_path_buf()))?;
         let manifest = tokio::fs::read_to_string(path).await?;
-        let lockfile = self.read_sibling_lockfile(path, kind).await;
-        self.check_inner(kind, &manifest, lockfile.as_deref()).await
+        let lockfile = self.read_lockfile(path, kind).await;
+        let lockfile = lockfile.as_ref().map(|(kind, lock)| (*kind, lock.as_str()));
+        self.check_inner(kind, &manifest, lockfile).await
     }
 
-    async fn read_sibling_lockfile(&self, path: &Path, kind: ManifestKind) -> Option<String> {
+    /// Read the lockfile governing `path`, whichever of its candidates exists.
+    ///
+    /// Uses the same search every other frontend does — the manifest's own
+    /// directory first, then each ancestor, stopping at a repository boundary —
+    /// so a workspace member picks up the lockfile at the workspace root rather
+    /// than reporting no locked versions.
+    async fn read_lockfile(
+        &self,
+        path: &Path,
+        kind: ManifestKind,
+    ) -> Option<(LockfileKind, String)> {
         if !self.read_lockfiles {
             return None;
         }
-        let name = kind.lockfile_name()?;
-        let lock_path = path.parent().unwrap_or_else(|| Path::new(".")).join(name);
-        tokio::fs::read_to_string(&lock_path).await.ok()
+        let (lock_path, lock_kind) = crate::discover::locate_lockfile(path, kind)?;
+        let content = tokio::fs::read_to_string(&lock_path).await.ok()?;
+        Some((lock_kind, content))
     }
 
     async fn check_inner(
         &self,
         kind: ManifestKind,
         manifest: &str,
-        lockfile: Option<&str>,
+        lockfile: Option<(LockfileKind, &str)>,
     ) -> Result<ManifestCheck, CheckError> {
         let ecosystem = kind.ecosystem();
         let fetcher = self
@@ -329,13 +344,13 @@ impl Checker {
 
         let mut parsed = parse(kind, manifest)?;
 
-        // Apply the lockfile to annotate locked versions, dispatching by manifest
-        // kind. A kind without a lockfile parser (or an unparseable lockfile) is
-        // ignored — the dependency is simply checked without a locked version.
-        // `apply_lockfile` only annotates existing items, never inserts, so
-        // transitive deps are never introduced.
-        if let Some(lock) = lockfile
-            && let Ok(data) = parse_lockfile(kind, lock)
+        // Apply the lockfile to annotate locked versions, dispatching on the file
+        // that was found rather than on the manifest beside it. An unparseable
+        // lockfile is ignored — the dependency is simply checked without a locked
+        // version. `apply_lockfile` only annotates existing items, never inserts,
+        // so transitive deps are never introduced.
+        if let Some((lock_kind, lock)) = lockfile
+            && let Ok(data) = parse_lockfile_kind(lock_kind, lock)
         {
             apply_lockfile(&mut parsed.items, &data);
         }

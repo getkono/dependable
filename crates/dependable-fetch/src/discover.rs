@@ -11,7 +11,7 @@
 
 use std::path::{Path, PathBuf};
 
-use dependable_core::{LockfileData, ManifestKind, parse_lockfile};
+use dependable_core::{LockfileData, LockfileKind, ManifestKind, parse_lockfile_kind};
 
 /// Directories never descended into during discovery: build output, vendored
 /// dependencies, and VCS metadata. Dotted directories are skipped as well.
@@ -63,13 +63,21 @@ fn walk(dir: &Path, depth_left: usize, out: &mut Vec<PathBuf>) {
 /// each ancestor, stopping at a `.git` boundary — but it answers only "where is it",
 /// which is what callers that need a different parse of the same file want.
 #[must_use]
-pub fn locate_lockfile(manifest: &Path, kind: ManifestKind) -> Option<PathBuf> {
-    let name = kind.lockfile_name()?;
+pub fn locate_lockfile(manifest: &Path, kind: ManifestKind) -> Option<(PathBuf, LockfileKind)> {
+    let candidates = kind.lockfiles();
+    if candidates.is_empty() {
+        return None;
+    }
     let mut dir = manifest.parent()?;
     loop {
-        let candidate = dir.join(name);
-        if candidate.is_file() {
-            return Some(candidate);
+        // A directory is searched for every candidate before moving up, so a
+        // lockfile beside the manifest always beats one further away whichever
+        // package manager wrote it.
+        for lockfile in candidates {
+            let candidate = dir.join(lockfile.file_name());
+            if candidate.is_file() {
+                return Some((candidate, *lockfile));
+            }
         }
         if dir.join(".git").exists() {
             return None;
@@ -87,17 +95,22 @@ pub fn locate_lockfile(manifest: &Path, kind: ManifestKind) -> Option<PathBuf> {
 /// continues upward, because an unreadable file governs nothing.
 ///
 /// Returns the path and the parsed data, or `None` for manifest kinds that have no
-/// lockfile ([`ManifestKind::lockfile_name`]) and when none is found.
+/// lockfile ([`ManifestKind::lockfiles`]) and when none is found.
 #[must_use]
 pub fn find_lockfile(manifest: &Path, kind: ManifestKind) -> Option<(PathBuf, LockfileData)> {
-    let name = kind.lockfile_name()?;
+    let candidates = kind.lockfiles();
+    if candidates.is_empty() {
+        return None;
+    }
     let mut dir = manifest.parent()?;
     loop {
-        let candidate = dir.join(name);
-        if let Ok(content) = std::fs::read_to_string(&candidate)
-            && let Ok(parsed) = parse_lockfile(kind, &content)
-        {
-            return Some((candidate, parsed));
+        for lockfile in candidates {
+            let candidate = dir.join(lockfile.file_name());
+            if let Ok(content) = std::fs::read_to_string(&candidate)
+                && let Ok(parsed) = parse_lockfile_kind(*lockfile, &content)
+            {
+                return Some((candidate, parsed));
+            }
         }
         if dir.join(".git").exists() {
             return None;
@@ -203,6 +216,38 @@ mod tests {
             root.join("Cargo.lock"),
             "the broken one governs nothing"
         );
+    }
+
+    #[test]
+    fn a_located_lockfile_reports_which_format_it_is() {
+        // The parser is chosen from this, so locating a file without saying what
+        // it is would put us back to guessing from the manifest.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "").unwrap();
+        std::fs::write(dir.path().join("Cargo.lock"), "").unwrap();
+
+        let (path, kind) =
+            locate_lockfile(&dir.path().join("Cargo.toml"), ManifestKind::CargoToml).unwrap();
+        assert_eq!(path, dir.path().join("Cargo.lock"));
+        assert_eq!(kind, LockfileKind::CargoLock);
+    }
+
+    #[test]
+    fn a_nearer_lockfile_wins_over_one_further_up() {
+        // Every candidate is tried in a directory before moving up, so proximity
+        // decides, not the order the formats are listed in.
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join(".git"), "").unwrap();
+        std::fs::write(root.path().join("package-lock.json"), "{}").unwrap();
+
+        let nested = root.path().join("packages").join("app");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("package.json"), "{}").unwrap();
+        std::fs::write(nested.join("package-lock.json"), "{}").unwrap();
+
+        let (path, _) =
+            locate_lockfile(&nested.join("package.json"), ManifestKind::PackageJson).unwrap();
+        assert_eq!(path, nested.join("package-lock.json"));
     }
 
     #[test]
