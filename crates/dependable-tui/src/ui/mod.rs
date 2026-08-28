@@ -221,6 +221,9 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
 
 /// The key reference, shown over the tree.
 fn draw_help(frame: &mut Frame, area: Rect) {
+    /// Width the key names are right-aligned within.
+    const KEY_COLUMN: usize = 18;
+
     const KEYS: &[(&str, &str)] = &[
         ("j / k, arrows", "move"),
         ("l / right / enter", "expand, or step in"),
@@ -239,8 +242,17 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ("q / ctrl-c", "quit"),
     ];
 
+    // Sized to its longest entry rather than to a guess, so adding a binding
+    // cannot silently truncate the one that explains it.
+    let widest = KEYS
+        .iter()
+        .map(|(_, what)| what.chars().count())
+        .max()
+        .unwrap_or(0);
+    let content = u16::try_from(KEY_COLUMN + 2 + widest + 2).unwrap_or(u16::MAX);
+
     // One row per entry: the paragraph does not wrap, so this height is exact.
-    let width = 58.min(area.width.saturating_sub(4));
+    let width = content.min(area.width.saturating_sub(4));
     let height = (KEYS.len() as u16 + 2).min(area.height.saturating_sub(2));
     let popup = Rect {
         x: area.x + (area.width.saturating_sub(width)) / 2,
@@ -253,7 +265,10 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         .iter()
         .map(|(key, what)| {
             Line::from(vec![
-                Span::styled(format!("{key:>18}  "), theme::bold(Token::KindWorkspace)),
+                Span::styled(
+                    format!("{key:>KEY_COLUMN$}  "),
+                    theme::bold(Token::KindWorkspace),
+                ),
                 Span::styled(*what, theme::fg(Token::Text)),
             ])
         })
