@@ -157,7 +157,10 @@ fn metadata_lines(meta: &PackageMetadata) -> Vec<Line<'static>> {
     ));
     lines.push(optional(
         "published",
-        meta.last_published.as_deref().map(relative_age).as_deref(),
+        meta.latest_published
+            .as_deref()
+            .map(relative_age)
+            .as_deref(),
     ));
     if meta.yanked {
         lines.push(Line::styled(

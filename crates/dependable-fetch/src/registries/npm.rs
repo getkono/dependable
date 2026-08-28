@@ -236,7 +236,7 @@ impl RegistryFetcher for NpmFetcher {
 
             // `time` is keyed by version, plus `created`/`modified` entries; the
             // publish date we want is the one for the version tagged `latest`.
-            let last_published = body
+            let latest_published = body
                 .dist_tags
                 .latest
                 .as_deref()
@@ -256,7 +256,14 @@ impl RegistryFetcher for NpmFetcher {
                     .filter(|o| !o.is_anonymous())
                     .collect(),
                 downloads: None,
-                last_published,
+                latest_published,
+                // `time` also carries `created`/`modified` housekeeping keys,
+                // which are not versions and must not be offered as one.
+                published: body
+                    .time
+                    .into_iter()
+                    .filter(|(k, _)| k != "created" && k != "modified")
+                    .collect(),
                 yanked: false,
                 msrv: None,
             }))

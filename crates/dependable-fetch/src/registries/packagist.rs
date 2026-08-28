@@ -1,6 +1,6 @@
 //! The Packagist fetcher for PHP/Composer (`repo.packagist.org` metadata v2).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use ::semver::Version;
 use futures::FutureExt;
@@ -59,6 +59,8 @@ struct MetadataDoc {
 
 #[derive(Deserialize)]
 struct DetailedRelease {
+    #[serde(default)]
+    version: Option<String>,
     #[serde(default)]
     description: Option<String>,
     #[serde(default)]
@@ -162,12 +164,14 @@ impl RegistryFetcher for PackagistFetcher {
             })?;
 
             // Packagist lists a package's releases newest-first.
-            let Some(newest) = body
-                .packages
-                .into_values()
-                .next()
-                .and_then(|releases| releases.into_iter().next())
-            else {
+            let Some(releases) = body.packages.into_values().next() else {
+                return Ok(None);
+            };
+            let published: BTreeMap<String, String> = releases
+                .iter()
+                .filter_map(|r| Some((strip_v(r.version.as_deref()?), r.time.clone()?)))
+                .collect();
+            let Some(newest) = releases.into_iter().next() else {
                 return Ok(None);
             };
 
@@ -184,7 +188,8 @@ impl RegistryFetcher for PackagistFetcher {
                     .filter(|o| !o.is_anonymous())
                     .collect(),
                 downloads: None,
-                last_published: newest.time,
+                latest_published: newest.time,
+                published,
                 yanked: false,
                 msrv: None,
             }))

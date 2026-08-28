@@ -27,7 +27,8 @@ async fn crates_io_reads_metadata_and_owners() {
              "repository": "https://github.com/serde-rs/serde",
              "downloads": 5000000 },
   "versions": [ { "num": "1.0.228", "license": "MIT OR Apache-2.0", "yanked": false,
-                  "rust_version": "1.61", "created_at": "2025-01-02T03:04:05Z" } ]
+                  "rust_version": "1.61", "created_at": "2025-01-02T03:04:05Z" },
+                { "num": "1.0.100", "created_at": "2022-06-07T08:09:10Z" } ]
 }"#,
     )
     .await;
@@ -58,7 +59,17 @@ async fn crates_io_reads_metadata_and_owners() {
     assert_eq!(meta.documentation.as_deref(), Some("https://docs.rs/serde"));
     assert_eq!(meta.downloads, Some(5_000_000));
     assert_eq!(meta.msrv.as_deref(), Some("1.61"));
-    assert_eq!(meta.last_published.as_deref(), Some("2025-01-02T03:04:05Z"));
+    assert_eq!(
+        meta.latest_published.as_deref(),
+        Some("2025-01-02T03:04:05Z")
+    );
+    assert_eq!(
+        meta.published_at("1.0.100"),
+        Some("2022-06-07T08:09:10Z"),
+        "an older release is dated by its own publish date, not the newest one"
+    );
+    assert_eq!(meta.published_at("1.0.228"), Some("2025-01-02T03:04:05Z"));
+    assert_eq!(meta.published_at("0.9.0"), None, "a version not listed");
     assert!(!meta.yanked);
     assert_eq!(meta.owners.len(), 3, "two users and one team");
 
@@ -208,7 +219,8 @@ async fn npm_reads_the_full_packument() {
   "repository": { "type": "git", "url": "git+https://github.com/facebook/react.git" },
   "maintainers": [ { "name": "fb", "email": "opensource@fb.com" } ],
   "dist-tags": { "latest": "18.2.0" },
-  "time": { "modified": "2024-01-01T00:00:00Z", "18.2.0": "2022-06-14T19:46:38Z" }
+  "time": { "created": "2013-05-29T00:00:00Z", "modified": "2024-01-01T00:00:00Z",
+            "18.2.0": "2022-06-14T19:46:38Z", "16.8.0": "2019-02-06T00:00:00Z" }
 }"#,
     )
     .await;
@@ -233,9 +245,16 @@ async fn npm_reads_the_full_packument() {
         "npm publishes maintainer emails and we keep them"
     );
     assert_eq!(
-        meta.last_published.as_deref(),
+        meta.latest_published.as_deref(),
         Some("2022-06-14T19:46:38Z"),
         "the publish date is the one for the `latest` version, not `modified`"
+    );
+    assert_eq!(meta.published_at("16.8.0"), Some("2019-02-06T00:00:00Z"));
+    assert_eq!(meta.published_at("18.2.0"), Some("2022-06-14T19:46:38Z"));
+    assert_eq!(
+        meta.published.len(),
+        2,
+        "`created` and `modified` are housekeeping keys, not versions"
     );
 }
 
@@ -287,6 +306,58 @@ async fn pypi_prefers_a_source_project_url() {
         meta.documentation.as_deref(),
         Some("https://requests.readthedocs.io")
     );
+}
+
+#[tokio::test]
+async fn pypi_dates_every_release_from_the_releases_block() {
+    let server = MockServer::start().await;
+    mount(
+        &server,
+        "/requests/json",
+        r#"{
+  "info": { "version": "2.31.0" },
+  "urls": [ { "upload_time_iso_8601": "2023-05-22T15:12:42Z" } ],
+  "releases": {
+    "2.31.0": [ { "upload_time_iso_8601": "2023-05-22T15:12:42Z" },
+                { "upload_time_iso_8601": "2023-05-23T09:00:00Z" } ],
+    "2.28.0": [ { "upload_time_iso_8601": "2022-06-29T11:00:00Z" } ]
+  }
+}"#,
+    )
+    .await;
+
+    let fetcher = PyPiFetcher::with_registry(build_client().unwrap(), server.uri());
+    let meta = fetcher.fetch_metadata("requests").await.unwrap().unwrap();
+
+    assert_eq!(meta.published_at("2.28.0"), Some("2022-06-29T11:00:00Z"));
+    assert_eq!(
+        meta.published_at("2.31.0"),
+        Some("2023-05-22T15:12:42Z"),
+        "a release is dated by its earliest file, not its latest"
+    );
+}
+
+#[tokio::test]
+async fn pypi_falls_back_to_the_newest_release_without_a_releases_block() {
+    let server = MockServer::start().await;
+    // PyPI has signalled it may stop serving `releases`; only the version in
+    // `info` can be dated then, and nothing may be invented for the others.
+    mount(
+        &server,
+        "/requests/json",
+        r#"{
+  "info": { "version": "2.31.0" },
+  "urls": [ { "upload_time_iso_8601": "2023-05-22T15:12:42Z" } ]
+}"#,
+    )
+    .await;
+
+    let fetcher = PyPiFetcher::with_registry(build_client().unwrap(), server.uri());
+    let meta = fetcher.fetch_metadata("requests").await.unwrap().unwrap();
+
+    assert_eq!(meta.published_at("2.31.0"), Some("2023-05-22T15:12:42Z"));
+    assert_eq!(meta.published.len(), 1);
+    assert_eq!(meta.published_at("2.28.0"), None);
 }
 
 #[tokio::test]
@@ -356,7 +427,10 @@ async fn hex_reads_links_and_downloads() {
         Some("https://hexdocs.pm/phoenix/")
     );
     assert_eq!(meta.downloads, Some(12345));
-    assert_eq!(meta.last_published.as_deref(), Some("2023-11-01T10:00:00Z"));
+    assert_eq!(
+        meta.latest_published.as_deref(),
+        Some("2023-11-01T10:00:00Z")
+    );
 }
 
 #[tokio::test]

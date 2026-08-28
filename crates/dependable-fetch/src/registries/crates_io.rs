@@ -140,6 +140,8 @@ struct CrateInfo {
 #[derive(Deserialize)]
 struct VersionInfo {
     #[serde(default)]
+    num: Option<String>,
+    #[serde(default)]
     license: Option<String>,
     #[serde(default)]
     yanked: bool,
@@ -243,6 +245,14 @@ impl RegistryFetcher for CratesIoFetcher {
                 detail: e.to_string(),
             })?;
 
+            // Every listed release is dated in this same response, so the whole
+            // version -> date map costs nothing beyond what we already fetched.
+            let published: BTreeMap<String, String> = body
+                .versions
+                .iter()
+                .filter_map(|v| Some((v.num.clone()?, v.created_at.clone()?)))
+                .collect();
+
             // Per-version fields come from the newest release the API lists first.
             let newest = body.versions.first();
             let mut meta = PackageMetadata {
@@ -253,7 +263,8 @@ impl RegistryFetcher for CratesIoFetcher {
                 license: newest.and_then(|v| v.license.clone()),
                 owners: Vec::new(),
                 downloads: body.krate.downloads,
-                last_published: newest.and_then(|v| v.created_at.clone()),
+                latest_published: newest.and_then(|v| v.created_at.clone()),
+                published,
                 yanked: newest.is_some_and(|v| v.yanked),
                 msrv: newest.and_then(|v| v.rust_version.clone()),
             };

@@ -1,5 +1,7 @@
 //! Registry fetchers. V1 ships the crates.io sparse-index fetcher.
 
+use std::collections::BTreeMap;
+
 use futures::FutureExt;
 use futures::future::BoxFuture;
 
@@ -117,8 +119,18 @@ pub struct PackageMetadata {
     pub owners: Vec<Owner>,
     /// All-time download count, where the registry publishes one.
     pub downloads: Option<u64>,
-    /// When the newest version was published (RFC 3339).
-    pub last_published: Option<String>,
+    /// When the *newest* version was published (RFC 3339).
+    ///
+    /// This describes the latest release, not whichever version a project has
+    /// resolved. Use [`PackageMetadata::published_at`] for that.
+    pub latest_published: Option<String>,
+    /// Publish dates keyed by version (RFC 3339), for whichever versions the
+    /// registry listed in the same response.
+    ///
+    /// Coverage varies and is never guaranteed to be complete: PyPI may list
+    /// only the newest release, and no registry is obliged to date every one.
+    /// A missing key means "not published to us", never "never published".
+    pub published: BTreeMap<String, String>,
     /// Whether the newest version has been yanked / withdrawn.
     pub yanked: bool,
     /// The minimum supported Rust version, for registries that record one.
@@ -126,6 +138,16 @@ pub struct PackageMetadata {
 }
 
 impl PackageMetadata {
+    /// When a specific version was published, if the registry dated it.
+    ///
+    /// This is the honest answer for a resolved dependency;
+    /// [`PackageMetadata::latest_published`] describes a different version and
+    /// reads as wrong when shown beside one a project actually depends on.
+    #[must_use]
+    pub fn published_at(&self, version: &str) -> Option<&str> {
+        self.published.get(version).map(String::as_str)
+    }
+
     /// Whether the registry supplied nothing at all, so a caller can report
     /// "no metadata published" rather than rendering an empty panel.
     #[must_use]
