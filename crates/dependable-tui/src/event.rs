@@ -69,6 +69,7 @@ fn browse_key(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('n') => Action::CycleMatch(Direction::Forward),
         KeyCode::Char('i') => Action::ToggleInvert,
         KeyCode::Char('r') => Action::Refresh,
+        KeyCode::Char('o') => Action::OpenLink,
         KeyCode::Char('?') => Action::ToggleHelp,
         _ => return None,
     })

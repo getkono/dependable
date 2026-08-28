@@ -20,6 +20,7 @@ pub mod data;
 pub mod event;
 pub mod filter;
 pub mod model;
+pub mod open;
 pub mod rows;
 pub mod run;
 pub mod terminal;

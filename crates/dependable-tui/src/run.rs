@@ -116,6 +116,16 @@ async fn event_loop(
             }
         }
 
+        // A link the user asked for. Failing to launch is worth saying: the key
+        // otherwise looks broken on a machine with no launcher installed.
+        if let Some(url) = app.take_open_request() {
+            app.message = Some(match crate::open::browser(&url) {
+                Ok(()) => format!("opening {url}"),
+                Err(error) => format!("could not open {url}: {error}"),
+            });
+            dirty = true;
+        }
+
         // Start the lookup for a selection that has settled.
         if let Some((key, since)) = pending.clone()
             && since.elapsed() >= SETTLE

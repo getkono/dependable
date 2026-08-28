@@ -1,6 +1,7 @@
 //! Rendering. Reads [`App`]; never mutates it beyond scrolling to the selection.
 
 mod detail;
+pub mod link;
 mod tree;
 
 use ratatui::Frame;
@@ -177,6 +178,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ("esc", "clear the search"),
         ("i", "invert: what depends on this"),
         ("r", "re-fetch the selected package"),
+        ("o", "open this package's link in a browser"),
         ("?", "close this help"),
         ("q / ctrl-c", "quit"),
     ];

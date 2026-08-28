@@ -385,3 +385,111 @@ fn a_workspace_member_is_never_shown_registry_data() {
         "and must not sit there pretending to fetch: {screen}"
     );
 }
+
+#[test]
+fn a_url_is_written_as_a_clickable_link_showing_its_readable_form() {
+    use ratatui::buffer::CellWidth;
+
+    let mut app = app_with_serde_metadata();
+    let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("terminal");
+    terminal
+        .draw(|frame| {
+            ui::draw(frame, &mut app);
+        })
+        .expect("draw succeeds");
+    let buffer = terminal.backend().buffer();
+
+    let link = buffer
+        .content()
+        .iter()
+        .find(|cell| cell.symbol().contains("\u{1b}]8;;"))
+        .expect("a hyperlink was written");
+
+    assert!(
+        link.symbol()
+            .contains("\u{1b}]8;;https://github.com/serde-rs/serde\u{1b}\\"),
+        "the full URL is the target: {:?}",
+        link.symbol()
+    );
+    assert!(
+        link.symbol().contains("github.com/serde-rs/serde"),
+        "the readable form is the visible text: {:?}",
+        link.symbol()
+    );
+    assert!(
+        link.symbol().ends_with("\u{1b}]8;;\u{1b}\\"),
+        "the link is terminated: {:?}",
+        link.symbol()
+    );
+    assert_eq!(
+        link.cell_width(),
+        "github.com/serde-rs/serde".len() as u16,
+        "the cell occupies the columns of the visible text, not of the escapes"
+    );
+}
+
+#[test]
+fn a_link_does_not_change_how_many_columns_the_pane_uses() {
+    // The escapes live inside one cell's symbol, which declares the width of
+    // its visible text. Walking a row the way the diff does -- stepping over
+    // the columns a forced-width cell covers -- must still total the terminal
+    // width. If the accounting were wrong, everything after a link on that line
+    // would be shifted.
+    use ratatui::buffer::CellWidth;
+
+    let mut app = app_with_serde_metadata();
+    let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("terminal");
+    terminal
+        .draw(|frame| {
+            ui::draw(frame, &mut app);
+        })
+        .expect("draw succeeds");
+    let buffer = terminal.backend().buffer();
+
+    let mut rows_with_links = 0;
+    for y in 0..30u16 {
+        let mut columns = 0u16;
+        let mut x = 0u16;
+        let mut linked = false;
+        while x < 100 {
+            let cell = &buffer[(x, y)];
+            linked |= cell.symbol().contains("\u{1b}]8;;");
+            let width = cell.cell_width().max(1);
+            columns += width;
+            x += width;
+        }
+        assert_eq!(columns, 100, "row {y} does not total the terminal width");
+        rows_with_links += u32::from(linked);
+    }
+    assert!(rows_with_links > 0, "the fixture renders at least one link");
+}
+
+#[test]
+fn pressing_o_asks_for_the_packages_repository() {
+    let mut app = app_with_serde_metadata();
+    assert_eq!(
+        app.selected_url(),
+        Some("https://github.com/serde-rs/serde"),
+        "the repository is the link a reader most likely wants"
+    );
+
+    app.apply(Action::OpenLink);
+    assert_eq!(
+        app.take_open_request().as_deref(),
+        Some("https://github.com/serde-rs/serde")
+    );
+    assert_eq!(
+        app.take_open_request(),
+        None,
+        "the request is taken once, not repeated every frame"
+    );
+}
+
+#[test]
+fn pressing_o_on_a_package_with_no_link_says_so() {
+    // A key that silently does nothing reads as broken.
+    let mut app = App::new(vec![project(GraphSource::Lockfile)]);
+    app.apply(Action::OpenLink);
+    assert_eq!(app.take_open_request(), None);
+    assert!(app.message.is_some(), "the user is told why nothing opened");
+}

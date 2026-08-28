@@ -54,6 +54,8 @@ pub enum Action {
     Refresh,
     /// Show or hide the help overlay.
     ToggleHelp,
+    /// Open the selected package's primary URL in a browser.
+    OpenLink,
     /// Leave the application.
     Quit,
 }
@@ -108,6 +110,11 @@ pub struct App {
     pub quit: bool,
     /// A transient message shown in the status bar.
     pub message: Option<String>,
+    /// A URL the user asked to open, for the event loop to hand to the browser.
+    ///
+    /// Parked here rather than opened directly because this type is free of IO;
+    /// the loop takes it with [`App::take_open_request`].
+    open_request: Option<String>,
 }
 
 impl App {
@@ -137,6 +144,7 @@ impl App {
             packages: PackageStore::new(),
             quit: false,
             message: None,
+            open_request: None,
         };
         app.rebuild();
         app
@@ -232,6 +240,13 @@ impl App {
                     Mode::Help
                 };
             }
+            Action::OpenLink => match self.selected_url() {
+                Some(url) => self.open_request = Some(url.to_owned()),
+                // Saying so beats a key that silently does nothing.
+                None => {
+                    self.message = Some("no link published for this package".to_owned());
+                }
+            },
             Action::Quit => self.quit = true,
         }
     }
@@ -378,6 +393,29 @@ impl App {
         {
             self.selected = index;
         }
+    }
+
+    /// The URL the selected package is best identified by.
+    ///
+    /// Ordered by how likely it is to be what the reader wants: the source
+    /// repository first, then the project's own page, then its documentation.
+    /// Returns `None` for a package with no lookup yet, or one the registry
+    /// published no links for.
+    #[must_use]
+    pub fn selected_url(&self) -> Option<&str> {
+        let PackageData::Ready(facts) = self.packages.get(&self.selected_key()?)? else {
+            return None;
+        };
+        let meta = facts.metadata.as_ref()?;
+        meta.repository
+            .as_deref()
+            .or(meta.homepage.as_deref())
+            .or(meta.documentation.as_deref())
+    }
+
+    /// Take the URL the user asked to open, if any.
+    pub fn take_open_request(&mut self) -> Option<String> {
+        self.open_request.take()
     }
 
     /// Keep the selection within a viewport `height` rows tall.
