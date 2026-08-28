@@ -66,6 +66,8 @@ pub enum Action {
     EndDrag,
     /// Set the tree pane's share of the width, as a percentage.
     SetSplit(u16),
+    /// The row the pointer is over, or `None` when it is over nothing.
+    Hover(Option<usize>),
     /// Leave the application.
     Quit,
 }
@@ -120,6 +122,18 @@ pub struct App {
     pub quit: bool,
     /// A transient message shown in the status bar.
     pub message: Option<String>,
+    /// The row the pointer is resting on.
+    ///
+    /// Distinct from the selection, and styled more weakly: it follows the
+    /// pointer rather than the cursor, and must not be mistaken for what the
+    /// keyboard would act on.
+    pub hover: Option<usize>,
+    /// When the pointer arrived on [`Self::hover`], for the marker's fade in.
+    ///
+    /// The one piece of wall-clock state here. It is a clock reading rather
+    /// than IO, and keeping it beside the hover it describes is what lets the
+    /// renderer stay a pure function of this type.
+    hover_since: Option<std::time::Instant>,
     /// Whether the divider is being dragged.
     ///
     /// A drag has to be attributed to where it began: the pointer wanders well
@@ -138,6 +152,8 @@ impl App {
     pub const DEFAULT_SPLIT: u16 = 55;
     /// How far the divider may be dragged, either way.
     pub const SPLIT_RANGE: std::ops::RangeInclusive<u16> = 20..=80;
+    /// How long the hover marker takes to reach its colour.
+    pub const HOVER_FADE: std::time::Duration = std::time::Duration::from_millis(150);
 
     /// Build the state for a set of discovered projects.
     ///
@@ -160,6 +176,8 @@ impl App {
             packages: PackageStore::new(),
             quit: false,
             message: None,
+            hover: None,
+            hover_since: None,
             dragging: false,
             open_request: None,
         };
@@ -268,6 +286,16 @@ impl App {
             Action::ToggleAt(index) => {
                 self.select(index);
                 self.apply(Action::Toggle);
+            }
+            Action::Hover(row) => {
+                let row = row.filter(|i| *i < self.rows.len());
+                // Restarting the clock on an unchanged hover would hold the
+                // marker at the start of its fade while the pointer moved
+                // along a single row.
+                if row != self.hover {
+                    self.hover_since = row.is_some().then(std::time::Instant::now);
+                    self.hover = row;
+                }
             }
             Action::BeginDrag => self.dragging = true,
             Action::EndDrag => self.dragging = false,
@@ -420,6 +448,25 @@ impl App {
         {
             self.selected = index;
         }
+    }
+
+    /// How far the hover fade has run, from 0.0 to 1.0.
+    ///
+    /// Returns 1.0 when nothing is hovered, so a caller that asks anyway gets
+    /// the settled colour rather than a half-faded one.
+    #[must_use]
+    pub fn hover_progress(&self) -> f32 {
+        let Some(since) = self.hover_since else {
+            return 1.0;
+        };
+        let elapsed = since.elapsed().as_secs_f32();
+        (elapsed / Self::HOVER_FADE.as_secs_f32()).clamp(0.0, 1.0)
+    }
+
+    /// Whether a fade is still running and the UI owes another frame.
+    #[must_use]
+    pub fn animating(&self) -> bool {
+        self.hover_since.is_some() && self.hover_progress() < 1.0
     }
 
     /// The URL the selected package is best identified by.

@@ -23,6 +23,13 @@ const SETTLE: Duration = Duration::from_millis(180);
 /// terminal resizes appear promptly.
 const TICK: Duration = Duration::from_millis(100);
 
+/// The poll interval while an animation is running.
+///
+/// At [`TICK`] a 150 ms fade would render a single intermediate frame, which
+/// reads as a jump rather than a transition. This is used *only* while a fade
+/// is in flight, so an idle UI still wakes ten times a second and no more.
+const FRAME: Duration = Duration::from_millis(16);
+
 /// How the UI was asked to start.
 #[derive(Debug, Clone)]
 pub struct TuiOptions {
@@ -139,8 +146,13 @@ async fn event_loop(
         }
 
         // Blocking reads happen on this thread, but only for a tick at a time, so
-        // results and resizes still surface promptly.
-        if event::poll(TICK)? {
+        // results and resizes still surface promptly. A running fade owes the
+        // screen frames, so it shortens the wait for as long as it lasts.
+        let animating = app.animating();
+        if animating {
+            dirty = true;
+        }
+        if event::poll(if animating { FRAME } else { TICK })? {
             match event::read()? {
                 Event::Key(key) => {
                     if let Some(action) = crate::event::action_for(key, app.mode) {
@@ -160,8 +172,16 @@ async fn event_loop(
                         app.rows(),
                         app.dragging,
                     ) {
+                        // Motion reporting delivers an event per cell the
+                        // pointer crosses. Redrawing for a hover that landed on
+                        // the row it was already on would burn a frame per
+                        // pixel of movement across a single row.
+                        let redraw = match action {
+                            Action::Hover(row) => app.hover != row,
+                            _ => true,
+                        };
                         app.apply(action);
-                        dirty = true;
+                        dirty |= redraw;
                     }
                 }
                 Event::Resize(_, _) => dirty = true,

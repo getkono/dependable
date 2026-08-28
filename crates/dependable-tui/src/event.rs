@@ -132,6 +132,8 @@ pub fn action_for_mouse(
             Some(Action::SetSplit(geometry.split_at(x)))
         }
         MouseEventKind::Up(MouseButton::Left) if dragging => Some(Action::EndDrag),
+        // Tracking the pointer is what tells the user a row is clickable.
+        MouseEventKind::Moved => Some(Action::Hover(geometry.row_at(x, y))),
         MouseEventKind::ScrollDown => Some(Action::Move(WHEEL_ROWS)),
         MouseEventKind::ScrollUp => Some(Action::Move(-WHEEL_ROWS)),
         _ => None,

@@ -21,7 +21,18 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
     let rows = app.rows();
     let table_rows: Vec<TableRow> = rows
         .iter()
-        .map(|row| TableRow::new(vec![line(app, row)]))
+        .enumerate()
+        .map(|(i, row)| {
+            let hovered = app.hover == Some(i);
+            let table_row = TableRow::new(vec![line(app, row, hovered)]);
+            // The selection is painted by the table's highlight style and is the
+            // stronger signal, so hover never competes with it.
+            if hovered && i != app.selected_index() {
+                table_row.style(theme::hover())
+            } else {
+                table_row
+            }
+        })
         .collect();
 
     let title = if rows.is_empty() {
@@ -58,10 +69,22 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
 ///
 /// The selected row's background is applied by the table's highlight style, so
 /// nothing here needs to know whether it is selected.
-fn line<'a>(app: &App, row: &'a Row) -> Line<'a> {
+fn line<'a>(app: &App, row: &'a Row, hovered: bool) -> Line<'a> {
     let mut spans = vec![Span::raw("  ".repeat(row.depth))];
 
-    spans.push(Span::styled(marker(row), theme::fg(Token::Muted)));
+    // The marker is the thing a click acts on, so it is the thing that responds
+    // to the pointer arriving: it fades from muted to the brand colour. Both
+    // ends are ours, so nothing here assumes anything about the terminal.
+    let marker_style = if hovered && row.has_children {
+        Style::default().fg(theme::blend(
+            Token::Muted,
+            Token::Brand,
+            app.hover_progress(),
+        ))
+    } else {
+        theme::fg(Token::Muted)
+    };
+    spans.push(Span::styled(marker(row), marker_style));
 
     spans.push(Span::styled(row.name.clone(), name_style(row)));
 

@@ -206,6 +206,32 @@ pub fn hover() -> Style {
     Style::default().bg(Token::HoverBg.resolve())
 }
 
+/// Blend from one token's colour to another's, `t` running 0.0 to 1.0.
+///
+/// Only the truecolor tier can express the colours in between. The 256-colour
+/// cube and the sixteen names cannot be interpolated without landing on
+/// unrelated hues, so those tiers switch at the halfway point instead — the
+/// transition still happens, it just has no frames in the middle.
+#[must_use]
+pub fn blend(from: Token, to: Token, t: f32) -> Color {
+    let t = t.clamp(0.0, 1.0);
+    let (Color::Rgb(fr, fg_, fb), Color::Rgb(tr, tg, tb)) = (from.resolve(), to.resolve()) else {
+        return if t >= 0.5 {
+            to.resolve()
+        } else {
+            from.resolve()
+        };
+    };
+    let mix = |a: u8, b: u8| {
+        let a = f32::from(a);
+        let b = f32::from(b);
+        // `round` before the cast: truncating makes a ramp that never reaches
+        // its endpoint.
+        (a + (b - a) * t).round().clamp(0.0, 255.0) as u8
+    };
+    Color::Rgb(mix(fr, tr), mix(fg_, tg), mix(fb, tb))
+}
+
 /// The style marking a search hit.
 #[must_use]
 pub fn search_match() -> Style {
@@ -323,6 +349,48 @@ mod tests {
             assert_ne!(warn, critical, "warn and critical collide at {tier:?}");
             assert_ne!(ok, critical, "ok and critical collide at {tier:?}");
         }
+    }
+
+    #[test]
+    fn a_blend_reaches_both_of_its_endpoints() {
+        // A ramp that stops short of its target leaves the marker a slightly
+        // wrong colour for as long as the pointer rests there.
+        assert_eq!(
+            blend(Token::Muted, Token::Brand, 0.0),
+            Token::Muted.resolve()
+        );
+        assert_eq!(
+            blend(Token::Muted, Token::Brand, 1.0),
+            Token::Brand.resolve()
+        );
+    }
+
+    #[test]
+    fn a_blend_is_clamped_to_its_endpoints() {
+        // A late frame can hand this a progress past 1.0.
+        assert_eq!(
+            blend(Token::Muted, Token::Brand, 4.2),
+            Token::Brand.resolve()
+        );
+        assert_eq!(
+            blend(Token::Muted, Token::Brand, -1.0),
+            Token::Muted.resolve()
+        );
+    }
+
+    #[test]
+    fn a_midpoint_blend_lies_between_its_endpoints() {
+        let Color::Rgb(r, _, _) = blend(Token::Muted, Token::Brand, 0.5) else {
+            // Only meaningful where both endpoints are 24-bit.
+            return;
+        };
+        let (Color::Rgb(from, ..), Color::Rgb(to, ..)) = (
+            Token::Muted.color(Tier::Truecolor),
+            Token::Brand.color(Tier::Truecolor),
+        ) else {
+            return;
+        };
+        assert!(r > from.min(to) && r < from.max(to), "midpoint is {r}");
     }
 
     #[test]
