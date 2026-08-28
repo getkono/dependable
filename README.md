@@ -122,21 +122,38 @@ every project in the repository, expanded to whatever depth you care to descend,
 with each package's public metadata beside it.
 
 ```
-┌ dependencies — 4 of 11 ──────────────────┐┌ details ─────────────────────────┐
-│v Cargo.toml                              ││regex                             │
-│  v dependable-core 0.1.2 (workspace)     ││   resolved  1.12.4               │
-│    v regex 1.12.4 update                 ││     latest  1.13.1               │
-│      v aho-corasick 1.1.4 patch          ││     status  update available     │
-│          memchr 2.8.2                    ││ advisories  none known           │
-│      > regex-automata 0.4.18             ││ repository  github.com/rust-lang │
-│    > serde 1.0.228                       ││    license  MIT OR Apache-2.0    │
-│    > toml_edit 0.22.27                   ││  downloads  1.1B                 │
-└──────────────────────────────────────────┘└──────────────────────────────────┘
+dependable  ~/src/dependable   7 packages
+┌ dependencies — 3 of 8 ────────────────────────────┐┌ details ────────────────────────────────┐
+│  NAME                VERSION      AGE    STATUS   ││regex                                    │
+│v Cargo.toml                                       ││   resolved  1.12.4                      │
+│  v dependable-core   0.1.2               workspace││                                         │
+│    v regex           1.12.4       1y     update   ││   registry  crates.io/crates/regex      │
+│      v aho-corasick  1.1.4                        ││                                         │
+│          memchr      2.8.2                        ││     latest  1.13.1                      │
+│        regex-automat 0.4.18                       ││     status  update available            │
+│      serde           1.0.228                      ││ advisories  none known                  │
+│      toml_edit       0.22.27                      ││                                         │
+│                                                   ││ repository  github.com/rust-lang/regex  │
+│                                                   ││   homepage  not published               │
+│                                                   ││       docs  docs.rs/regex/1.12.4        │
+└───────────────────────────────────────────────────┘└─────────────────────────────────────────┘
+press / to search, ? for help
 ```
 
 Press `?` for the keys. `/` searches by glob — `serde*`, `@types/*`,
 `{tokio,hyper}*` — and opens the tree along every path that matches, so a package
 buried six levels down is one query away.
+
+Every URL in the detail pane is a link: the package's page on its registry, that
+exact version, the repository, the homepage, the documentation, each owner's
+profile, and every advisory's OSV entry. Terminals that understand OSC 8 make
+them clickable; `o` opens the selected package's link anywhere else. The registry
+and documentation pages are derived from the package's name, so they are there
+before anything has been fetched and for packages whose registry published no
+links at all.
+
+The mouse works too: click a row to select it, click its marker to open it, drag
+the divider between the panes, and scroll with the wheel.
 
 The tree is built offline from your lockfiles, so it appears instantly; the
 network is touched only for the package you actually select. Resolved transitive
