@@ -1,6 +1,7 @@
 //! Hermetic HTTP tests against a local wiremock server (run in normal CI), plus
 //! `#[ignore]`d live smoke tests (run via `mise run test:live`).
 
+use dependable_fetch::registries::fetch_features;
 use dependable_fetch::{
     CratesIoFetcher, GoProxyFetcher, HexFetcher, JsrFetcher, NpmFetcher, NuGetFetcher, OsvClient,
     OsvQuery, PackagistFetcher, PubDevFetcher, PyPiFetcher, RegistryFetcher, ScopedRegistry,
@@ -29,6 +30,39 @@ async fn crates_io_fetch_parses_and_sorts() {
     assert_eq!(fetched.latest_tag.as_deref(), Some("1.2.0"));
     // Feature names come from the newest version (1.2.0), merging features + features2.
     assert_eq!(fetched.features, vec!["default", "derive", "rc"]);
+}
+
+#[tokio::test]
+async fn fetch_features_asks_once_per_name_and_omits_the_featureless() {
+    let server = MockServer::start().await;
+    // `.expect(1)` is the assertion: one GET per name, verified on drop.
+    Mock::given(method("GET"))
+        .and(path("/se/rd/serde"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "{\"name\":\"serde\",\"vers\":\"1.0.0\",\"yanked\":false,\"features\":{\"derive\":[]}}\n",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/le/ft/leftpad"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "{\"name\":\"leftpad\",\"vers\":\"1.0.0\",\"yanked\":false}\n",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let fetcher = CratesIoFetcher::with_registry(build_client().unwrap(), server.uri(), None);
+    let names = vec!["leftpad".to_string(), "serde".to_string()];
+    let features = fetch_features(&fetcher, &names, 8).await;
+
+    assert_eq!(features["serde"], vec!["derive".to_string()]);
+    assert!(
+        !features.contains_key("leftpad"),
+        "a crate that declares no features is omitted, not recorded as empty"
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
 }
 
 #[tokio::test]

@@ -15,11 +15,10 @@ use dependable_fetch::core::{
     parse, parse_cargo_config, parse_npmrc, parse_project, parse_workspace,
 };
 use dependable_fetch::{
-    CheckError, Checker, CratesIoFetcher, DependencyKind, DependencyStatus, Ecosystem,
-    GoProxyFetcher, GraphSource, HexFetcher, Item, JsrFetcher, ManifestKind, NpmFetcher,
-    NuGetFetcher, PackageSource, PackagistFetcher, ParseError, ProgressEvent, PubDevFetcher,
-    PyPiFetcher, RegistryFetcher, ScopedRegistry, TreeOptions, UnstableFilter,
-    WorkspaceGraphOptions, build_client, build_workspace_graph,
+    CheckError, Checker, DependencyKind, DependencyStatus, Ecosystem, GoProxyFetcher, GraphSource,
+    HexFetcher, Item, JsrFetcher, ManifestKind, NpmFetcher, NuGetFetcher, PackageSource,
+    PackagistFetcher, ParseError, ProgressEvent, PubDevFetcher, PyPiFetcher, ScopedRegistry,
+    TreeOptions, UnstableFilter, WorkspaceGraphOptions, build_client, build_workspace_graph,
 };
 use dependable_tui::TuiOptions;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -573,16 +572,6 @@ pub async fn run_list(args: ListArgs) -> anyhow::Result<ExitCode> {
         eprintln!("No supported manifests found.");
         return Ok(ExitCode::SUCCESS);
     }
-    // `--features` fetches crates.io feature flags, so `list` only touches the
-    // network when it is set. Feature data is crates.io-only (Rust manifests).
-    let feature_fetcher = if args.features {
-        Some(CratesIoFetcher::new(
-            build_client().context("building HTTP client")?,
-        ))
-    } else {
-        None
-    };
-
     let mut reports = Vec::new();
     for manifest in &manifests {
         let Some(kind) = ManifestKind::detect(manifest) else {
@@ -617,19 +606,6 @@ pub async fn run_list(args: ListArgs) -> anyhow::Result<ExitCode> {
         let meta = parse_project(kind, &content);
         let (version, version_inherited) = resolve_version(manifest, kind, &meta);
 
-        let mut features = BTreeMap::new();
-        if let Some(fetcher) = &feature_fetcher {
-            for item in &parsed.items {
-                if kind.ecosystem() == Ecosystem::Rust
-                    && item.is_checkable()
-                    && let Ok(fetched) = fetcher.fetch_versions(&item.name).await
-                    && !fetched.features.is_empty()
-                {
-                    features.insert(item.name.clone(), fetched.features);
-                }
-            }
-        }
-
         reports.push(ProjectReport {
             relative: relative_to(&root, manifest),
             ecosystem: kind.ecosystem(),
@@ -641,12 +617,17 @@ pub async fn run_list(args: ListArgs) -> anyhow::Result<ExitCode> {
             lockfile,
             inherited,
             items: parsed.items,
-            features,
+            features: BTreeMap::new(),
             licenses: BTreeMap::new(),
         });
     }
 
-    // A second pass, so one HTTP client serves every manifest.
+    // Second passes, so one HTTP client — and one request per distinct package —
+    // serves every manifest. Fetching inside the loop above asked the registry the
+    // same question once per member that declared the crate.
+    if args.features {
+        crate::features::fetch_all(&mut reports).await?;
+    }
     if args.licenses {
         crate::licenses::fetch_all(&mut reports).await?;
     }
