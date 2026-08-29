@@ -87,8 +87,8 @@ pub struct CheckArgs {
     #[arg(long)]
     pub include_ghsa: bool,
     /// Output format.
-    #[arg(long, value_enum, default_value_t = Format::Table)]
-    pub format: Format,
+    #[arg(long, value_enum, default_value_t = CheckFormat::Table)]
+    pub format: CheckFormat,
     /// Exit non-zero when results match this level.
     #[arg(long, value_enum, default_value_t = FailOn::None)]
     pub fail_on: FailOn,
@@ -218,12 +218,28 @@ pub struct ReportArgs {
     pub verbose: bool,
 }
 
-/// Output format.
+/// Output format for the `list` command.
 #[derive(Copy, Clone, Debug, ValueEnum)]
 pub enum Format {
     Table,
     Json,
     Text,
+}
+
+/// Output format for the `check` command.
+///
+/// Deliberately separate from [`Format`]: `check` can emit SARIF and `list`
+/// cannot. Sharing one enum would make clap advertise `sarif` in `list --help`,
+/// where it does nothing, and force an "unsupported" arm into the `list`
+/// renderer.
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum CheckFormat {
+    Table,
+    Json,
+    Text,
+    /// SARIF v2.1.0, for the GitHub Security tab and IDE problem panes.
+    #[cfg(feature = "report")]
+    Sarif,
 }
 
 /// Output format for the `tree` command.
