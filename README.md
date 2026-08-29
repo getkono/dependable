@@ -113,6 +113,7 @@ dependable check . --fail-on vulnerable   # exit non-zero for CI
 dependable list .                 # every project and what it declares (offline)
 dependable tree .                 # render the dependency tree (Rust)
 dependable fix . --dry-run        # preview in-place upgrades
+dependable report . > report.html # a self-contained HTML report
 ```
 
 ## Interactive UI
@@ -181,6 +182,17 @@ serde    1.0.100  1.0.228  patch available
 tokio    1.20.0   1.52.3   3 vulnerabilities
 time     0.2.7    0.3.51   1 vulnerability
 ```
+
+### Network cost of the vulnerability scan
+
+With vulnerability scanning on (the default), `check` first asks OSV about every
+dependency in one batch, and then issues **one additional `POST /v1/query` per
+distinct vulnerable package version** to pull each advisory's full record —
+severity vector, fixing versions, published dates, links. A clean run pays nothing
+extra: with no vulnerable versions there is nothing to enrich. Those records are
+what give the CVSS policy gate a score to compare and the HTML report something to
+show. `--no-vuln` (or `[vulnerability] enabled = false`) skips the scan entirely
+and restores the previous behaviour.
 
 ## Project inventory (`list`)
 
