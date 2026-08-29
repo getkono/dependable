@@ -2,7 +2,7 @@
 //! plus the GitHub Actions side channels in [`github`].
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use dependable_fetch::{CheckResult, DependencyStatus, Ecosystem};
 
@@ -99,6 +99,22 @@ pub fn render(format: CheckFormat, reports: &[ManifestReport], quiet: bool) -> a
         #[cfg(feature = "report")]
         CheckFormat::Sarif => sarif::render(reports),
     }
+}
+
+/// A path with `/` separators, whatever the platform uses.
+///
+/// Two callers need it and need it to agree: the machine-readable formats, which
+/// are consumed by tooling that joins these paths with paths from elsewhere (git,
+/// a config file, another tool's output), all of which speak `/`; and
+/// `--manifest-glob`, whose patterns a user writes with `/` on every platform. A
+/// Windows run must not produce a differently-shaped document, nor need a
+/// differently-spelled glob.
+#[must_use]
+pub fn posix(path: &Path) -> String {
+    path.components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// The version to display as "current": the locked version, else the declared

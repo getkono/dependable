@@ -63,6 +63,11 @@ pub struct CheckArgs {
     /// Check a single manifest file instead of discovering them.
     #[arg(long)]
     pub manifest: Option<PathBuf>,
+    /// Only use manifests whose path, relative to the scanned directory, matches
+    /// this glob (e.g. `crates/*/Cargo.toml`). Repeatable; a manifest matching
+    /// any pattern is kept. `*` and `?` do not cross `/`, `**` does.
+    #[arg(long, conflicts_with = "manifest")]
+    pub manifest_glob: Vec<String>,
     /// Config file path.
     #[arg(long, default_value = ".dependable.toml")]
     pub config: PathBuf,
@@ -116,6 +121,11 @@ pub struct ListArgs {
     /// List a single manifest file instead of discovering them.
     #[arg(long)]
     pub manifest: Option<PathBuf>,
+    /// Only use manifests whose path, relative to the scanned directory, matches
+    /// this glob (e.g. `crates/*/Cargo.toml`). Repeatable; a manifest matching
+    /// any pattern is kept. `*` and `?` do not cross `/`, `**` does.
+    #[arg(long, conflicts_with = "manifest")]
+    pub manifest_glob: Vec<String>,
     /// Output format: `table` for reading, `json` for the full inventory, `text` for
     /// one tab-separated line per dependency.
     #[arg(long, value_enum, default_value_t = Format::Table)]
@@ -170,6 +180,11 @@ pub struct FixArgs {
     pub path: Option<PathBuf>,
     #[arg(long)]
     pub manifest: Option<PathBuf>,
+    /// Only use manifests whose path, relative to the scanned directory, matches
+    /// this glob (e.g. `crates/*/Cargo.toml`). Repeatable; a manifest matching
+    /// any pattern is kept. `*` and `?` do not cross `/`, `**` does.
+    #[arg(long, conflicts_with = "manifest")]
+    pub manifest_glob: Vec<String>,
     #[arg(long, default_value = ".dependable.toml")]
     pub config: PathBuf,
     /// Update all, including beyond the declared constraint.
