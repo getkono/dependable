@@ -88,6 +88,10 @@ pub struct CheckArgs {
     /// Exit non-zero when results match this level.
     #[arg(long, value_enum, default_value_t = FailOn::None)]
     pub fail_on: FailOn,
+    /// GitHub Actions annotations and job summary: `auto` (default, on under
+    /// the runner), `always`, or `never`.
+    #[arg(long, value_enum, default_value_t = AnnotationMode::Auto)]
+    pub annotations: AnnotationMode,
     /// How many directories deep to search.
     #[arg(long, default_value_t = 3)]
     pub depth: usize,
@@ -299,6 +303,23 @@ impl FailOn {
             _ => None,
         }
     }
+}
+
+/// When to write GitHub Actions annotations and the job summary.
+///
+/// These are side channels on **stderr** and `GITHUB_STEP_SUMMARY`, not an
+/// output format: they compose with every `--format`, so there is deliberately
+/// no `CheckFormat::Github` variant to choose between them.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum AnnotationMode {
+    /// On exactly when `GITHUB_ACTIONS` is `true` (the default).
+    #[default]
+    Auto,
+    /// Always on — how the behaviour is reproduced and debugged locally.
+    Always,
+    /// Off, including the job summary. The single off-switch for all GitHub
+    /// side-channel output.
+    Never,
 }
 
 /// Pre-release filtering mode, selectable via `--unstable` or `[global] unstable`.
