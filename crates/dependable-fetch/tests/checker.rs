@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use dependable_fetch::osv::Severity;
 use dependable_fetch::{
     Checker, DependencyStatus, Ecosystem, GoProxyFetcher, JsrFetcher, ManifestKind, NpmFetcher,
     PackageSource, PackagistFetcher, PyPiFetcher, build_client,
@@ -483,4 +484,325 @@ async fn ghsa_filtering_respects_include_flag() {
         time.current_vulnerabilities,
         vec!["GHSA-aaaa-bbbb-cccc".to_string()]
     );
+}
+
+/// The OSV batch response that flags `time` (slot 1) and clears `serde` (slot 0).
+const BATCH_FLAGS_TIME: &str = r#"{"results":[{},{"vulns":[{"id":"RUSTSEC-2020-0071"}]}]}"#;
+
+/// A trimmed `/v1/query` response: the full record behind `RUSTSEC-2020-0071`.
+const DETAIL_RUSTSEC: &str = r#"{"vulns":[{
+  "id": "RUSTSEC-2020-0071",
+  "summary": "Potential segfault in the time crate",
+  "severity": [{"type": "CVSS_V3", "score": "CVSS:3.1/AV:L/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H"}],
+  "affected": [{
+    "package": {"name": "time", "ecosystem": "crates.io"},
+    "ranges": [{"type": "SEMVER", "events": [{"introduced": "0"}, {"fixed": "0.2.23"}]}]
+  }],
+  "references": [{"type": "ADVISORY", "url": "https://rustsec.org/advisories/RUSTSEC-2020-0071.html"}]
+}]}"#;
+
+/// The same, plus a GHSA record for the same crate.
+const DETAIL_RUSTSEC_AND_GHSA: &str = r#"{"vulns":[
+  {
+    "id": "RUSTSEC-2020-0071",
+    "summary": "Potential segfault in the time crate",
+    "severity": [{"type": "CVSS_V3", "score": "CVSS:3.1/AV:L/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H"}]
+  },
+  {
+    "id": "GHSA-3gxf-9r58-2ghg",
+    "summary": "Segmentation fault in time",
+    "database_specific": {"severity": "MODERATE"}
+  }
+]}"#;
+
+/// Mount the crates.io index plus the OSV batch response flagging `time`.
+async fn mount_index_and_batch(server: &MockServer) {
+    mount_index(server).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/querybatch"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(BATCH_FLAGS_TIME))
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn advisory_details_are_off_by_default() {
+    let server = MockServer::start().await;
+    mount_index_and_batch(&server).await;
+    // No /v1/query mock is mounted: a detail request would 404 and surface as a
+    // warning, so a clean, empty result proves the default check makes none.
+
+    let checker = Checker::builder()
+        .http_client(build_client().unwrap())
+        .rust_registry(server.uri(), None)
+        .osv_url(format!("{}/v1/querybatch", server.uri()))
+        .build()
+        .unwrap();
+
+    let check = checker
+        .check_manifest(ManifestKind::CargoToml, MANIFEST, Some(LOCK))
+        .await
+        .unwrap();
+    let time = check
+        .results
+        .iter()
+        .find(|r| r.item.name == "time")
+        .unwrap();
+
+    assert!(check.warnings.is_empty());
+    assert_eq!(time.status, DependencyStatus::Vulnerable);
+    assert_eq!(
+        time.current_vulnerabilities,
+        vec!["RUSTSEC-2020-0071".to_string()]
+    );
+    assert!(time.advisories.is_empty());
+}
+
+#[tokio::test]
+async fn advisory_details_enriches_only_vulnerable_results() {
+    let server = MockServer::start().await;
+    mount_index_and_batch(&server).await;
+    // `.expect(1)`: only `time` is vulnerable, so only `time` is looked up.
+    Mock::given(method("POST"))
+        .and(path("/v1/query"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(DETAIL_RUSTSEC))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let checker = Checker::builder()
+        .http_client(build_client().unwrap())
+        .rust_registry(server.uri(), None)
+        .osv_url(format!("{}/v1/querybatch", server.uri()))
+        .advisory_details(true)
+        .build()
+        .unwrap();
+
+    let check = checker
+        .check_manifest(ManifestKind::CargoToml, MANIFEST, Some(LOCK))
+        .await
+        .unwrap();
+    let by_name = |n: &str| check.results.iter().find(|r| r.item.name == n).unwrap();
+    let time = by_name("time");
+
+    assert!(check.warnings.is_empty());
+    assert_eq!(time.advisories.len(), 1);
+    assert_eq!(time.max_cvss(), Some(6.2));
+    assert_eq!(time.max_severity(), Some(Severity::Medium));
+    let advisory = time.advisory("RUSTSEC-2020-0071").expect("the record");
+    assert_eq!(advisory.title(), "Potential segfault in the time crate");
+    assert_eq!(advisory.fixed_versions, vec!["0.2.23"]);
+    assert!(advisory.advisory_url().is_some());
+    // The IDs are untouched, and a clean dependency is never queried.
+    assert_eq!(
+        time.current_vulnerabilities,
+        vec!["RUSTSEC-2020-0071".to_string()]
+    );
+    assert!(by_name("serde").advisories.is_empty());
+}
+
+#[tokio::test]
+async fn advisory_details_respects_include_ghsa() {
+    let server = MockServer::start().await;
+    mount_index(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/querybatch"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"results":[{},{"vulns":[{"id":"RUSTSEC-2020-0071"},{"id":"GHSA-3gxf-9r58-2ghg"}]}]}"#,
+        ))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/query"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(DETAIL_RUSTSEC_AND_GHSA))
+        .mount(&server)
+        .await;
+
+    let osv_url = format!("{}/v1/querybatch", server.uri());
+    let build = |include_ghsa: bool| {
+        Checker::builder()
+            .http_client(build_client().unwrap())
+            .rust_registry(server.uri(), None)
+            .osv_url(osv_url.clone())
+            .advisory_details(true)
+            .include_ghsa(include_ghsa)
+            .build()
+            .unwrap()
+    };
+    let ids = |check: &dependable_fetch::ManifestCheck| {
+        let time = check
+            .results
+            .iter()
+            .find(|r| r.item.name == "time")
+            .unwrap();
+        (
+            time.current_vulnerabilities.clone(),
+            time.advisories
+                .iter()
+                .map(|a| a.id.clone())
+                .collect::<Vec<_>>(),
+        )
+    };
+
+    // Default: the GHSA record is filtered out of the details exactly as it is
+    // out of the IDs, so the two never disagree.
+    let check = build(false)
+        .check_manifest(ManifestKind::CargoToml, MANIFEST, Some(LOCK))
+        .await
+        .unwrap();
+    let (vulnerabilities, advisories) = ids(&check);
+    assert_eq!(vulnerabilities, vec!["RUSTSEC-2020-0071".to_string()]);
+    assert_eq!(advisories, vec!["RUSTSEC-2020-0071".to_string()]);
+
+    let check = build(true)
+        .check_manifest(ManifestKind::CargoToml, MANIFEST, Some(LOCK))
+        .await
+        .unwrap();
+    let (vulnerabilities, advisories) = ids(&check);
+    assert_eq!(
+        vulnerabilities,
+        vec![
+            "RUSTSEC-2020-0071".to_string(),
+            "GHSA-3gxf-9r58-2ghg".to_string()
+        ]
+    );
+    assert_eq!(advisories, vulnerabilities);
+}
+
+#[tokio::test]
+async fn advisory_details_degrade_to_a_warning() {
+    let server = MockServer::start().await;
+    mount_index_and_batch(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/query"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+
+    let checker = Checker::builder()
+        .http_client(build_client().unwrap())
+        .rust_registry(server.uri(), None)
+        .osv_url(format!("{}/v1/querybatch", server.uri()))
+        .advisory_details(true)
+        .build()
+        .unwrap();
+
+    // The check still succeeds: the version and vulnerability data are correct
+    // and useful without the enrichment.
+    let check = checker
+        .check_manifest(ManifestKind::CargoToml, MANIFEST, Some(LOCK))
+        .await
+        .unwrap();
+    let time = check
+        .results
+        .iter()
+        .find(|r| r.item.name == "time")
+        .unwrap();
+
+    assert_eq!(time.status, DependencyStatus::Vulnerable);
+    assert_eq!(
+        time.current_vulnerabilities,
+        vec!["RUSTSEC-2020-0071".to_string()]
+    );
+    assert!(time.advisories.is_empty());
+    assert!(
+        check
+            .warnings
+            .iter()
+            .any(|w| w.contains("advisory enrichment skipped")),
+        "expected an enrichment warning, got {:?}",
+        check.warnings
+    );
+}
+
+#[tokio::test]
+async fn advisory_details_are_a_no_op_without_vulnerability_scanning() {
+    let server = MockServer::start().await;
+    mount_index(&server).await;
+    // No OSV mocks at all: any OSV request would 404.
+
+    let checker = Checker::builder()
+        .http_client(build_client().unwrap())
+        .rust_registry(server.uri(), None)
+        .vulnerabilities(false)
+        .advisory_details(true)
+        .build()
+        .unwrap();
+
+    let check = checker
+        .check_manifest(ManifestKind::CargoToml, MANIFEST, Some(LOCK))
+        .await
+        .unwrap();
+    assert!(check.warnings.is_empty());
+    assert!(check.results.iter().all(|r| r.advisories.is_empty()));
+}
+
+#[tokio::test]
+async fn enrich_advisories_can_be_called_explicitly() {
+    let server = MockServer::start().await;
+    mount_index_and_batch(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/query"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(DETAIL_RUSTSEC))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Built *without* the flag: nothing is enriched until the caller asks.
+    let checker = Checker::builder()
+        .http_client(build_client().unwrap())
+        .rust_registry(server.uri(), None)
+        .osv_url(format!("{}/v1/querybatch", server.uri()))
+        .build()
+        .unwrap();
+
+    let mut check = checker
+        .check_manifest(ManifestKind::CargoToml, MANIFEST, Some(LOCK))
+        .await
+        .unwrap();
+    assert!(check.results.iter().all(|r| r.advisories.is_empty()));
+
+    checker.enrich_advisories(&mut check).await.unwrap();
+    let time = check
+        .results
+        .iter()
+        .find(|r| r.item.name == "time")
+        .unwrap();
+    assert_eq!(time.advisories.len(), 1);
+    assert_eq!(time.max_cvss(), Some(6.2));
+    assert_eq!(time.max_severity(), Some(Severity::Medium));
+    assert!(time.advisory("RUSTSEC-2020-0071").is_some());
+}
+
+#[tokio::test]
+async fn fetch_advisories_returns_records_for_one_package() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/query"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(DETAIL_RUSTSEC))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let checker = Checker::builder()
+        .http_client(build_client().unwrap())
+        .rust_registry(server.uri(), None)
+        .osv_url(format!("{}/v1/querybatch", server.uri()))
+        .build()
+        .unwrap();
+
+    let advisories = checker
+        .fetch_advisories(Ecosystem::Rust, "time", "0.2.7")
+        .await
+        .unwrap();
+    assert_eq!(advisories.len(), 1);
+    assert_eq!(advisories[0].id, "RUSTSEC-2020-0071");
+    assert_eq!(advisories[0].severity.score, Some(6.2));
+
+    // The second call is served from the checker's shared detail cache.
+    let again = checker
+        .fetch_advisories(Ecosystem::Rust, "time", "0.2.7")
+        .await
+        .unwrap();
+    assert_eq!(again, advisories);
 }
