@@ -806,3 +806,80 @@ async fn fetch_advisories_returns_records_for_one_package() {
         .unwrap();
     assert_eq!(again, advisories);
 }
+
+/// PyPI's single JSON endpoint serves both the version list and the metadata, so
+/// the number of requests to it *is* the number of extra lookups a license
+/// collection costs.
+async fn pypi_server() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/flask/json"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"info":{"license_expression":"BSD-3-Clause"},
+                "releases":{"2.0.0":[{"yanked":false}]}}"#,
+        ))
+        .mount(&server)
+        .await;
+    server
+}
+
+#[tokio::test]
+async fn a_check_collects_licenses_when_they_are_asked_for() {
+    let server = pypi_server().await;
+    let client = build_client().unwrap();
+    let checker = Checker::builder()
+        .http_client(client.clone())
+        .registry(
+            Ecosystem::Python,
+            Arc::new(PyPiFetcher::with_registry(client, server.uri())),
+        )
+        .vulnerabilities(false)
+        .disk_cache(false)
+        .licenses(true)
+        .build()
+        .unwrap();
+
+    let check = checker
+        .check_manifest(ManifestKind::RequirementsTxt, "flask==2.0.0\n", None)
+        .await
+        .unwrap();
+
+    assert!(check.warnings.is_empty());
+    assert_eq!(check.results[0].license.as_deref(), Some("BSD-3-Clause"));
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        2,
+        "one version lookup plus one metadata lookup"
+    );
+}
+
+#[tokio::test]
+async fn a_plain_check_makes_no_metadata_request_at_all() {
+    let server = pypi_server().await;
+    let client = build_client().unwrap();
+    let checker = Checker::builder()
+        .http_client(client.clone())
+        .registry(
+            Ecosystem::Python,
+            Arc::new(PyPiFetcher::with_registry(client, server.uri())),
+        )
+        .vulnerabilities(false)
+        .disk_cache(false)
+        .build()
+        .unwrap();
+
+    let check = checker
+        .check_manifest(ManifestKind::RequirementsTxt, "flask==2.0.0\n", None)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        check.results[0].license, None,
+        "collection is opt-in; `None` is not `unlicensed`"
+    );
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        1,
+        "the default check must not pay for data nothing asked for"
+    );
+}

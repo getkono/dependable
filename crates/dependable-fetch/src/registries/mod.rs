@@ -2,8 +2,10 @@
 
 use std::collections::BTreeMap;
 
+use dependable_core::Ecosystem;
 use futures::FutureExt;
 use futures::future::BoxFuture;
+use futures::stream::StreamExt;
 
 use crate::error::FetchError;
 
@@ -239,4 +241,49 @@ pub trait RegistryFetcher: Send + Sync {
         let _ = name;
         futures::future::ready(Ok(None)).boxed()
     }
+}
+
+/// Fetch the declared license of each of `names` from one registry, concurrently.
+///
+/// This lives here rather than in a frontend because the concurrency primitive
+/// does: a caller that fetched these one at a time would pay one HTTP round trip
+/// per package, in series. `concurrency` is clamped to at least 1.
+///
+/// Per-package failures are **swallowed**: license data is decoration for an
+/// inventory listing, and one unreachable package must not fail the listing. The
+/// returned map therefore carries only the packages whose registry both answered
+/// and declared a license — an absent key means "not published to us".
+pub async fn fetch_licenses(
+    fetcher: &dyn RegistryFetcher,
+    names: &[String],
+    concurrency: usize,
+) -> BTreeMap<String, String> {
+    futures::stream::iter(names)
+        .map(|name| async move {
+            let license = fetcher
+                .fetch_metadata(name)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|meta| meta.license);
+            license.map(|license| (name.clone(), license))
+        })
+        .buffer_unordered(concurrency.max(1))
+        .filter_map(|entry| async move { entry })
+        .collect()
+        .await
+}
+
+/// Whether `ecosystem`'s registry publishes package metadata at all.
+///
+/// Four of the nine registries implement no metadata endpoint this crate can
+/// read — the Go module proxy, JSR, NuGet, and pub.dev — so for those the honest
+/// answer to "what license is this?" is "we cannot ask", not "none". A caller
+/// showing license data uses this to say so rather than rendering a blank column.
+#[must_use]
+pub fn publishes_metadata(ecosystem: Ecosystem) -> bool {
+    matches!(
+        ecosystem,
+        Ecosystem::Rust | Ecosystem::Npm | Ecosystem::Python | Ecosystem::Php | Ecosystem::Elixir
+    )
 }
