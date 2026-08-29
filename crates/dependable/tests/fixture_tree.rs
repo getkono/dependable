@@ -43,6 +43,45 @@ fn tree_distinguishes_workspace_and_external() {
 }
 
 #[test]
+fn a_member_used_by_another_member_points_at_its_own_tree() {
+    let out = run(&["tree", fixture().to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success());
+
+    // Under `app`, `util` is a pointer: no second copy of its subtree.
+    assert!(
+        stdout.contains("└── util v0.1.0 (workspace) (see root)"),
+        "{stdout}"
+    );
+    // And `util`'s own entry is the one that expands — it used to be the empty
+    // `(*)` stub, because the first crate to reach it won the expansion.
+    assert!(
+        stdout.contains("util v0.1.0 (workspace)\n└── leftpad v1.2.0 (*)"),
+        "{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("smallvec").count(),
+        1,
+        "leftpad's subtree is drawn once; {stdout}"
+    );
+}
+
+#[test]
+fn no_dedupe_expands_every_occurrence_in_place() {
+    let out = run(&["tree", fixture().to_str().unwrap(), "--no-dedupe"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success());
+
+    assert!(!stdout.contains("(see root)"), "{stdout}");
+    assert!(!stdout.contains("(*)"), "{stdout}");
+    assert_eq!(
+        stdout.matches("smallvec").count(),
+        3,
+        "under app, under app->util, and under util's own entry; {stdout}"
+    );
+}
+
+#[test]
 fn invert_shows_downstream_dependents() {
     // Who depends on leftpad? Both util and app (transitively).
     let out = run(&[

@@ -1,13 +1,17 @@
-//! A language-agnostic dependency graph plus cycle-safe tree traversals.
+//! A language-agnostic dependency graph plus one cycle-safe traversal of it.
 //!
 //! The graph itself knows nothing about Cargo — it is nodes (a package at a
 //! version) and directed edges (`a` depends on `b`). Building one from a
-//! `Cargo.lock` lives in [`Self::from_resolved`]; other ecosystems can grow
-//! their own constructor without touching the traversal/rendering logic here.
-//! Rendering (color, box-drawing) is deliberately left to the caller — this
-//! module only produces plain data.
+//! `Cargo.lock` lives in [`DependencyGraph::from_resolved`]; other ecosystems
+//! can grow their own constructor without touching the traversal here.
+//!
+//! [`DependencyGraph::walk`] is that traversal, and it is deliberately the only
+//! one: the rendered `tree` and the interactive UI both drive it, so what counts
+//! as a cycle, a repeat, or a crate already shown elsewhere cannot mean two
+//! different things in the two places a user meets it. Rendering (color,
+//! box-drawing, rows) is left to the caller — this module produces plain data.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::lockfiles::ResolvedLockfile;
 
@@ -47,6 +51,12 @@ pub struct DependencyGraph {
     edges: Vec<Vec<usize>>,
     /// Indices of the root nodes a tree is rendered from.
     roots: Vec<usize>,
+    /// Reverse of [`Self::roots`]: node index to its position within it.
+    ///
+    /// Held rather than searched because a traversal asks "is this node one of
+    /// the roots?" once per node it reaches, and a workspace may have hundreds
+    /// of members.
+    root_slots: HashMap<usize, usize>,
 }
 
 /// Options controlling how a [`Tree`] is expanded from a [`DependencyGraph`].
@@ -56,6 +66,9 @@ pub struct TreeOptions {
     pub max_depth: Option<usize>,
     /// Collapse a package's second and later appearances to a `(*)` marker.
     pub dedupe: bool,
+    /// Collapse a crate that has a tree of its own in this forest to a pointer
+    /// at that tree, rather than repeating its subtree wherever it is reached.
+    pub collapse_roots: bool,
 }
 
 impl Default for TreeOptions {
@@ -63,6 +76,118 @@ impl Default for TreeOptions {
         Self {
             max_depth: None,
             dedupe: true,
+            collapse_roots: true,
+        }
+    }
+}
+
+/// Why an appearance of a node does or does not show its dependencies below it.
+///
+/// Every reason a walk stops is named, rather than collapsed into one flag,
+/// because they are different things to tell a reader: a repeat is shown in
+/// full elsewhere, a cycle is shown higher on this same path, and a root has a
+/// tree of its own in the forest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Placement {
+    /// Shown in full; its dependencies, if any, follow it.
+    Full,
+    /// Already expanded elsewhere in this walk, collapsed by
+    /// [`WalkOptions::dedupe`]. Its dependencies are at its first appearance.
+    Repeat,
+    /// Already on the path from the root to here. Expanding it would not
+    /// terminate, so the back-edge is cut — always, whatever the options say.
+    Cycle,
+    /// One of the forest's own roots, reached below the top level. Its subtree
+    /// is shown at its own root entry, so this appearance points there.
+    Root {
+        /// Index into [`DependencyGraph::roots`] of the entry it points at.
+        root: usize,
+    },
+    /// [`WalkOptions::max_depth`] stopped the walk here. Whether anything lies
+    /// below is unknown from this appearance alone.
+    Depth,
+    /// [`WalkOptions::expand`] declined to open it — a closed row in an
+    /// interactive tree. Never produced when no predicate is given.
+    Collapsed,
+}
+
+/// One node, as a walk reaches it.
+///
+/// Handed to a [`Visitor`] by reference and valid only for that call: `path`
+/// borrows the walk's own buffer, which is rewritten as the walk moves on.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct Visit<'a> {
+    /// Where this appearance sits: [`WalkOptions::prefix`], then the index of
+    /// each *slot* taken from there — the position within the parent's
+    /// dependency list, which is stable whatever the walk chooses to expand.
+    pub path: &'a [usize],
+    /// Edge depth below the forest's roots; a root is `0`.
+    pub depth: usize,
+    /// Index into [`DependencyGraph::nodes`].
+    pub node: usize,
+    /// Whether this appearance is expanded, and if not, why not.
+    pub placement: Placement,
+    /// How many direct dependencies the node has *in the graph*, whether or not
+    /// this appearance shows them.
+    pub degree: usize,
+}
+
+/// Receives each node a walk reaches.
+///
+/// [`Self::enter`] and [`Self::leave`] are called in matched pairs around every
+/// node the walk emits, so an implementor can build a nested structure without
+/// tracking depth itself. `leave` is called even for a node not descended into.
+pub trait Visitor {
+    /// Called on arriving at a node, before any of its dependencies.
+    fn enter(&mut self, visit: &Visit<'_>);
+
+    /// Called after the node's dependencies, if any were walked.
+    fn leave(&mut self, node: usize) {
+        let _ = node;
+    }
+}
+
+/// A question a walk asks about the node at a given [`Visit::path`].
+pub type PathPredicate<'a> = &'a dyn Fn(&[usize]) -> bool;
+
+/// How a walk decides what to expand.
+///
+/// The defaults are what an offline `tree` render wants, so a caller states
+/// only its differences and leaves the rest to `..WalkOptions::default()`.
+pub struct WalkOptions<'a> {
+    /// Maximum edge depth. `Some(0)` = roots only; `None` = unlimited.
+    pub max_depth: Option<usize>,
+    /// Collapse a node's second and later appearances to [`Placement::Repeat`].
+    pub dedupe: bool,
+    /// Collapse a node that is one of the forest's own roots, reached below the
+    /// top level, to [`Placement::Root`] instead of expanding a second copy.
+    pub collapse_roots: bool,
+    /// Prepended to every [`Visit::path`], for a caller whose paths are rooted
+    /// above this graph.
+    pub prefix: &'a [usize],
+    /// Whether the node at this path should be expanded. `None` = always.
+    ///
+    /// Consulted last, so a repeat, a cycle, or a root is never expanded even
+    /// when this says yes.
+    pub expand: Option<PathPredicate<'a>>,
+    /// Whether the node at this path should be emitted at all. `None` = always.
+    ///
+    /// A node this rejects is skipped along with its whole subtree, but its
+    /// siblings keep their slot indices.
+    pub include: Option<PathPredicate<'a>>,
+}
+
+impl Default for WalkOptions<'_> {
+    fn default() -> Self {
+        Self {
+            max_depth: None,
+            dedupe: true,
+            collapse_roots: true,
+            prefix: &[],
+            expand: None,
+            include: None,
         }
     }
 }
@@ -79,11 +204,23 @@ pub struct Tree {
 pub struct TreeNode {
     /// Index into [`DependencyGraph::nodes`].
     pub node: usize,
-    /// Expanded children (empty when deduped, cut by a cycle, or depth-limited).
+    /// Expanded children. Empty for a leaf and for every collapsed appearance —
+    /// see [`Self::placement`] for which.
     pub children: Vec<TreeNode>,
-    /// Whether this appearance was collapsed (`(*)`): a repeat under dedupe or a
-    /// cycle back-edge. Its children are shown at its first, full appearance.
-    pub deduped: bool,
+    /// Whether this appearance is expanded, and if not, why not.
+    pub placement: Placement,
+}
+
+impl TreeNode {
+    /// Whether this appearance was collapsed to the `(*)` repeat marker: a
+    /// dedupe repeat, or a cycle back-edge.
+    ///
+    /// A crate shown at its own root entry is deliberately *not* one of these:
+    /// it is a pointer to another tree, not a copy suppressed within this one.
+    #[must_use]
+    pub fn deduped(&self) -> bool {
+        matches!(self.placement, Placement::Repeat | Placement::Cycle)
+    }
 }
 
 impl DependencyGraph {
@@ -125,11 +262,27 @@ impl DependencyGraph {
         let mut root_indices: Vec<usize> = roots
             .iter()
             .flat_map(|name| {
-                nodes
+                let matching: Vec<usize> = nodes
                     .iter()
                     .enumerate()
-                    .filter(move |(_, n)| &n.name == name)
+                    .filter(|(_, n)| &n.name == name)
                     .map(|(i, _)| i)
+                    .collect();
+                // A name can match both a member and a registry crate that happens
+                // to share it. The member is the one meant by "render this crate";
+                // a name that matches no member (a `-p` on a dependency) keeps
+                // every match, so asking for a crate resolved at two versions
+                // still renders both.
+                let members: Vec<usize> = matching
+                    .iter()
+                    .copied()
+                    .filter(|&i| nodes[i].kind == NodeKind::Workspace)
+                    .collect();
+                if members.is_empty() {
+                    matching
+                } else {
+                    members
+                }
             })
             .collect();
         if root_indices.is_empty() {
@@ -142,6 +295,7 @@ impl DependencyGraph {
         }
 
         Self {
+            root_slots: index_roots(&root_indices),
             nodes,
             edges,
             roots: root_indices,
@@ -166,6 +320,15 @@ impl DependencyGraph {
         &self.roots
     }
 
+    /// The position of `node` within [`Self::roots`], if it is one of them.
+    ///
+    /// Answers "does this crate have a tree of its own in this forest?" — which
+    /// is what lets a traversal point at that tree instead of copying it.
+    #[must_use]
+    pub fn root_slot(&self, node: usize) -> Option<usize> {
+        self.root_slots.get(&node).copied()
+    }
+
     /// Reverse every edge, keeping the same nodes and roots. Rooting the result
     /// at a crate and walking it answers "what depends on this crate" — the
     /// downstream-impact (`--invert`) view.
@@ -181,78 +344,199 @@ impl DependencyGraph {
             nodes: self.nodes.clone(),
             edges,
             roots: self.roots.clone(),
+            root_slots: self.root_slots.clone(),
         }
     }
 
-    /// Expand the graph into a [`Tree`] from its roots. Cycles (legal in Cargo
-    /// via dev-dependencies) always terminate: a node already on the current
-    /// path is cut as a back-edge, independent of `dedupe`.
+    /// Expand the graph into a [`Tree`] from its roots.
+    ///
+    /// A thin assembly over [`Self::walk`], which owns every rule about what is
+    /// expanded where.
     #[must_use]
     pub fn tree(&self, opts: &TreeOptions) -> Tree {
-        let mut expanded: HashSet<usize> = HashSet::new();
-        let mut on_path: HashSet<usize> = HashSet::new();
-        let roots = self
-            .roots
-            .iter()
-            .map(|&r| self.build(r, 0, opts, &mut expanded, &mut on_path))
-            .collect();
-        Tree { roots }
+        let walk = WalkOptions {
+            max_depth: opts.max_depth,
+            dedupe: opts.dedupe,
+            collapse_roots: opts.collapse_roots,
+            ..WalkOptions::default()
+        };
+        let mut builder = TreeBuilder::default();
+        self.walk(&walk, &mut builder);
+        Tree {
+            roots: builder.roots,
+        }
     }
 
-    fn build(
-        &self,
-        idx: usize,
-        depth: usize,
-        opts: &TreeOptions,
-        expanded: &mut HashSet<usize>,
-        on_path: &mut HashSet<usize>,
-    ) -> TreeNode {
-        // Cut a cycle (already on this path) or a dedupe repeat (seen elsewhere).
-        if on_path.contains(&idx) || (opts.dedupe && expanded.contains(&idx)) {
-            return TreeNode {
-                node: idx,
-                children: Vec::new(),
-                deduped: true,
-            };
-        }
-        // Depth-truncated: render as a leaf but do NOT mark it seen, so a
-        // shallower path elsewhere can still expand its subtree.
-        if opts.max_depth.is_some_and(|m| depth >= m) {
-            return TreeNode {
-                node: idx,
-                children: Vec::new(),
-                deduped: false,
-            };
-        }
-        // Rendered fully (leaf or with children) — count it as seen for dedupe.
-        expanded.insert(idx);
-        if self.edges[idx].is_empty() {
-            return TreeNode {
-                node: idx,
-                children: Vec::new(),
-                deduped: false,
-            };
-        }
-        on_path.insert(idx);
-        let children = self.edges[idx]
-            .iter()
-            .map(|&c| self.build(c, depth + 1, opts, expanded, on_path))
-            .collect();
-        on_path.remove(&idx);
-        TreeNode {
-            node: idx,
-            children,
-            deduped: false,
+    /// Walk the forest depth-first, reporting every node reached to `visitor`.
+    ///
+    /// The single traversal behind both the rendered `tree` and the interactive
+    /// UI: the rules for cycles, repeats, roots and the depth limit live here
+    /// once, so the two cannot drift apart. Cycles (legal in Cargo via
+    /// dev-dependencies) always terminate the walk, whatever the options say.
+    ///
+    /// Only subtrees that [`WalkOptions::expand`] admits are descended into, so
+    /// a caller showing a mostly-closed tree pays for what it shows rather than
+    /// for what the graph holds.
+    pub fn walk(&self, opts: &WalkOptions<'_>, visitor: &mut dyn Visitor) {
+        let mut walker = Walker {
+            graph: self,
+            opts,
+            path: opts.prefix.to_vec(),
+            expanded: HashSet::new(),
+            on_path: HashSet::new(),
+        };
+        for (slot, &root) in self.roots.iter().enumerate() {
+            walker.path.push(slot);
+            walker.visit(root, 0, visitor);
+            walker.path.pop();
         }
     }
 }
 
-/// Classify a package by workspace membership then lockfile source.
-fn classify(name: &str, source: Option<&str>, workspace_names: &HashSet<String>) -> NodeKind {
-    if workspace_names.contains(name) {
-        return NodeKind::Workspace;
+/// The state one [`DependencyGraph::walk`] carries down the forest.
+struct Walker<'a> {
+    graph: &'a DependencyGraph,
+    opts: &'a WalkOptions<'a>,
+    /// The path to the node currently being visited.
+    path: Vec<usize>,
+    /// Nodes already expanded anywhere in this walk, for `dedupe`.
+    expanded: HashSet<usize>,
+    /// Nodes on the path from a root to here, for cutting cycles.
+    on_path: HashSet<usize>,
+}
+
+impl Walker<'_> {
+    fn visit(&mut self, node: usize, depth: usize, visitor: &mut dyn Visitor) {
+        if let Some(include) = self.opts.include
+            && !include(&self.path)
+        {
+            return;
+        }
+        // Copied out of `self` so the child list stays borrowed from the graph
+        // rather than from the walker, which the recursion below borrows anew.
+        let deps: &[usize] = &self.graph.edges[node];
+        let degree = deps.len();
+        let placement = self.placement(node, depth, degree);
+        visitor.enter(&Visit {
+            path: &self.path,
+            depth,
+            node,
+            placement,
+            degree,
+        });
+        if placement == Placement::Full {
+            // Only a full appearance counts as seen: a depth-truncated one must
+            // stay expandable from a shallower path elsewhere. A crate with a
+            // tree of its own does not count either, or the leaf drawn here
+            // would collapse its own entry to `(*)` — the very bug the pointer
+            // exists to fix.
+            let has_own_entry =
+                self.opts.collapse_roots && depth > 0 && self.graph.root_slot(node).is_some();
+            if self.opts.dedupe && !has_own_entry {
+                self.expanded.insert(node);
+            }
+            if degree > 0 {
+                self.on_path.insert(node);
+                for (slot, &child) in deps.iter().enumerate() {
+                    self.path.push(slot);
+                    self.visit(child, depth + 1, visitor);
+                    self.path.pop();
+                }
+                self.on_path.remove(&node);
+            }
+        }
+        visitor.leave(node);
     }
+
+    /// Decide how this appearance of `node` is shown.
+    ///
+    /// The order is the whole contract. A cycle is cut first, so a back-edge to
+    /// a crate the reader is already standing inside is reported as the cycle it
+    /// is rather than sent somewhere else. A root is recognised before a repeat,
+    /// so a crate reached after its own entry still points at that entry instead
+    /// of degrading to `(*)` — but only when it has dependencies to show, since
+    /// a pointer at an empty tree helps nobody. The depth limit comes next and, as ever,
+    /// does not mark the node seen — a shallower path elsewhere may still
+    /// expand it.
+    fn placement(&self, node: usize, depth: usize, degree: usize) -> Placement {
+        if self.on_path.contains(&node) {
+            return Placement::Cycle;
+        }
+        // Only worth pointing at a tree that has something in it: a member with
+        // no dependencies of its own reads as the leaf it is, and sending the
+        // reader to an empty entry would be worse than drawing it twice.
+        if self.opts.collapse_roots
+            && depth > 0
+            && degree > 0
+            && let Some(root) = self.graph.root_slot(node)
+        {
+            return Placement::Root { root };
+        }
+        if self.opts.dedupe && self.expanded.contains(&node) {
+            return Placement::Repeat;
+        }
+        if self.opts.max_depth.is_some_and(|max| depth >= max) {
+            return Placement::Depth;
+        }
+        if degree > 0
+            && let Some(expand) = self.opts.expand
+            && !expand(&self.path)
+        {
+            return Placement::Collapsed;
+        }
+        Placement::Full
+    }
+}
+
+/// Assembles a [`Tree`] from a walk, using the matched `enter`/`leave` pairs to
+/// rebuild the nesting without tracking depth.
+#[derive(Default)]
+struct TreeBuilder {
+    /// One frame per node currently open; the last is the node being filled.
+    stack: Vec<TreeNode>,
+    /// Completed root trees, in walk order.
+    roots: Vec<TreeNode>,
+}
+
+impl Visitor for TreeBuilder {
+    fn enter(&mut self, visit: &Visit<'_>) {
+        self.stack.push(TreeNode {
+            node: visit.node,
+            children: Vec::new(),
+            placement: visit.placement,
+        });
+    }
+
+    fn leave(&mut self, _node: usize) {
+        let done = self.stack.pop().expect("leave is paired with enter");
+        match self.stack.last_mut() {
+            Some(parent) => parent.children.push(done),
+            None => self.roots.push(done),
+        }
+    }
+}
+
+/// Index root node indices by their position, for [`DependencyGraph::root_slot`].
+///
+/// A node listed twice keeps its first position, so the slot always names the
+/// entry a reader would actually find.
+fn index_roots(roots: &[usize]) -> HashMap<usize, usize> {
+    let mut out = HashMap::with_capacity(roots.len());
+    for (slot, &node) in roots.iter().enumerate() {
+        out.entry(node).or_insert(slot);
+    }
+    out
+}
+
+/// Classify a package by its lockfile source, then workspace membership.
+///
+/// Source is tested first because a member's name is not exclusive to it: a
+/// crate published to a registry may share the name of a crate in this
+/// workspace, and Cargo records both as separate packages. Only the one with no
+/// `source` is the member — which is the rule `docs/SCOPE.md` already states.
+fn classify(name: &str, source: Option<&str>, workspace_names: &HashSet<String>) -> NodeKind {
     match source {
+        None if workspace_names.contains(name) => NodeKind::Workspace,
         None => NodeKind::Path,
         Some(s) if s.starts_with("git+") => NodeKind::Git,
         Some(_) => NodeKind::Registry,
@@ -272,7 +556,7 @@ mod tests {
     fn flatten<'a>(g: &'a DependencyGraph, t: &Tree) -> Vec<(&'a str, &'a str, bool)> {
         fn walk<'a>(g: &'a DependencyGraph, n: &TreeNode, out: &mut Vec<(&'a str, &'a str, bool)>) {
             let node = &g.nodes()[n.node];
-            out.push((&node.name, &node.version, n.deduped));
+            out.push((&node.name, &node.version, n.deduped()));
             for c in &n.children {
                 walk(g, c, out);
             }
@@ -318,6 +602,98 @@ version = "0.1.0"
         assert_eq!(kind("serde"), NodeKind::Registry);
         assert_eq!(kind("gitdep"), NodeKind::Git);
         assert_eq!(kind("localdep"), NodeKind::Path); // no source, not a member
+    }
+
+    #[test]
+    fn a_registry_crate_sharing_a_member_name_is_not_a_member() {
+        // `b` is a workspace member, and a *different* crate published to
+        // crates.io also happens to be called `b`. Cargo locks both.
+        let lock = r#"
+[[package]]
+name = "a"
+version = "0.1.0"
+dependencies = ["b 9.0.0"]
+
+[[package]]
+name = "b"
+version = "0.1.0"
+
+[[package]]
+name = "b"
+version = "9.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+"#;
+        let resolved = parse_cargo_lock_graph(lock).unwrap();
+        let g = DependencyGraph::from_resolved(&resolved, &names(&["a", "b"]), &["a".into()]);
+        let kind_at = |version: &str| {
+            g.nodes()
+                .iter()
+                .find(|n| n.name == "b" && n.version == version)
+                .unwrap()
+                .kind
+        };
+        assert_eq!(kind_at("0.1.0"), NodeKind::Workspace, "the member");
+        assert_eq!(kind_at("9.0.0"), NodeKind::Registry, "the namesake");
+    }
+
+    #[test]
+    fn a_member_namesake_from_the_registry_is_not_a_root() {
+        let lock = r#"
+[[package]]
+name = "a"
+version = "0.1.0"
+dependencies = ["b 9.0.0"]
+
+[[package]]
+name = "b"
+version = "0.1.0"
+
+[[package]]
+name = "b"
+version = "9.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+"#;
+        let resolved = parse_cargo_lock_graph(lock).unwrap();
+        let g = DependencyGraph::from_resolved(
+            &resolved,
+            &names(&["a", "b"]),
+            &["a".into(), "b".into()],
+        );
+        let roots: Vec<(&str, &str)> = g
+            .roots()
+            .iter()
+            .map(|&i| (g.nodes()[i].name.as_str(), g.nodes()[i].version.as_str()))
+            .collect();
+        assert_eq!(
+            roots,
+            vec![("a", "0.1.0"), ("b", "0.1.0")],
+            "asking for member `b` must not also root its registry namesake"
+        );
+        assert_eq!(g.root_slot(g.roots()[1]), Some(1));
+    }
+
+    #[test]
+    fn a_root_name_matching_no_member_keeps_every_version() {
+        // `-p dep` on a crate resolved at two versions still shows both.
+        let lock = r#"
+[[package]]
+name = "app"
+version = "0.1.0"
+dependencies = ["dep 1.0.0", "dep 2.0.0"]
+
+[[package]]
+name = "dep"
+version = "1.0.0"
+source = "registry+https://x"
+
+[[package]]
+name = "dep"
+version = "2.0.0"
+source = "registry+https://x"
+"#;
+        let resolved = parse_cargo_lock_graph(lock).unwrap();
+        let g = DependencyGraph::from_resolved(&resolved, &names(&["app"]), &["dep".into()]);
+        assert_eq!(g.roots().len(), 2);
     }
 
     #[test]
@@ -389,11 +765,192 @@ source = "registry+https://x"
         let no_dedupe = TreeOptions {
             max_depth: None,
             dedupe: false,
+            ..TreeOptions::default()
         };
         let flat2 = flatten(&g, &g.tree(&no_dedupe));
         assert_eq!(
             flat2.iter().filter(|(n, _, ded)| *n == "d" && !ded).count(),
             2
+        );
+    }
+
+    /// Find the first appearance of `name` at a non-root position.
+    fn under_root<'a>(g: &DependencyGraph, t: &'a Tree, root: &str, name: &str) -> &'a TreeNode {
+        let entry = t
+            .roots
+            .iter()
+            .find(|r| g.nodes()[r.node].name == root)
+            .expect("root entry");
+        entry
+            .children
+            .iter()
+            .find(|c| g.nodes()[c.node].name == name)
+            .expect("child")
+    }
+
+    #[test]
+    fn a_member_reached_under_another_member_points_at_its_own_root() {
+        let lock = r#"
+[[package]]
+name = "a"
+version = "0.1.0"
+dependencies = ["b"]
+
+[[package]]
+name = "b"
+version = "0.1.0"
+dependencies = ["serde"]
+
+[[package]]
+name = "serde"
+version = "1.0.0"
+source = "registry+https://x"
+"#;
+        let resolved = parse_cargo_lock_graph(lock).unwrap();
+        let g = DependencyGraph::from_resolved(
+            &resolved,
+            &names(&["a", "b"]),
+            &["a".into(), "b".into()],
+        );
+        let tree = g.tree(&TreeOptions::default());
+
+        let b_under_a = under_root(&g, &tree, "a", "b");
+        assert_eq!(
+            b_under_a.placement,
+            Placement::Root { root: 1 },
+            "`b` has a tree of its own, so here it is a pointer at it"
+        );
+        assert!(b_under_a.children.is_empty(), "and carries no copy of it");
+        assert!(
+            !b_under_a.deduped(),
+            "a pointer is not the `(*)` repeat marker"
+        );
+
+        // The entry it points at is the one that expands — which is what the
+        // first-seen-wins walk used to get backwards.
+        let b_root = &tree.roots[1];
+        assert_eq!(g.nodes()[b_root.node].name, "b");
+        assert_eq!(b_root.placement, Placement::Full);
+        assert_eq!(
+            flatten(
+                &g,
+                &Tree {
+                    roots: vec![b_root.clone()]
+                }
+            ),
+            vec![("b", "0.1.0", false), ("serde", "1.0.0", false)],
+        );
+    }
+
+    #[test]
+    fn a_member_with_no_dependencies_is_a_leaf_not_a_pointer() {
+        // `b` has nothing under it, so pointing at its entry would send the
+        // reader somewhere empty. It reads as the leaf it is.
+        let lock = r#"
+[[package]]
+name = "a"
+version = "0.1.0"
+dependencies = ["b"]
+
+[[package]]
+name = "b"
+version = "0.1.0"
+"#;
+        let resolved = parse_cargo_lock_graph(lock).unwrap();
+        let g = DependencyGraph::from_resolved(
+            &resolved,
+            &names(&["a", "b"]),
+            &["a".into(), "b".into()],
+        );
+        let tree = g.tree(&TreeOptions::default());
+
+        assert_eq!(under_root(&g, &tree, "a", "b").placement, Placement::Full);
+        // And drawing it there must not collapse its own entry to `(*)`.
+        assert_eq!(
+            tree.roots[1].placement,
+            Placement::Full,
+            "`b`'s own entry stays the place it is shown"
+        );
+        assert!(!tree.roots[1].deduped());
+    }
+
+    #[test]
+    fn a_registry_namesake_of_a_member_still_expands_in_place() {
+        // `a` depends on a crates.io crate that happens to share member `b`'s
+        // name. It is a different package, so it is not a pointer anywhere.
+        let lock = r#"
+[[package]]
+name = "a"
+version = "0.1.0"
+dependencies = ["b 9.0.0"]
+
+[[package]]
+name = "b"
+version = "0.1.0"
+
+[[package]]
+name = "b"
+version = "9.0.0"
+source = "registry+https://x"
+dependencies = ["serde"]
+
+[[package]]
+name = "serde"
+version = "1.0.0"
+source = "registry+https://x"
+"#;
+        let resolved = parse_cargo_lock_graph(lock).unwrap();
+        let g = DependencyGraph::from_resolved(
+            &resolved,
+            &names(&["a", "b"]),
+            &["a".into(), "b".into()],
+        );
+        let tree = g.tree(&TreeOptions::default());
+
+        let namesake = under_root(&g, &tree, "a", "b");
+        assert_eq!(g.nodes()[namesake.node].version, "9.0.0");
+        assert_eq!(
+            namesake.placement,
+            Placement::Full,
+            "the registry crate is not the member, so it expands where it is used"
+        );
+        assert_eq!(g.nodes()[namesake.children[0].node].name, "serde");
+    }
+
+    #[test]
+    fn disabling_root_collapse_restores_expansion_in_place() {
+        let lock = r#"
+[[package]]
+name = "a"
+version = "0.1.0"
+dependencies = ["b"]
+
+[[package]]
+name = "b"
+version = "0.1.0"
+dependencies = ["serde"]
+
+[[package]]
+name = "serde"
+version = "1.0.0"
+source = "registry+https://x"
+"#;
+        let resolved = parse_cargo_lock_graph(lock).unwrap();
+        let g = DependencyGraph::from_resolved(
+            &resolved,
+            &names(&["a", "b"]),
+            &["a".into(), "b".into()],
+        );
+        let opts = TreeOptions {
+            dedupe: false,
+            collapse_roots: false,
+            ..TreeOptions::default()
+        };
+        let flat = flatten(&g, &g.tree(&opts));
+        assert_eq!(
+            flat.iter().filter(|(n, _, _)| *n == "serde").count(),
+            2,
+            "with both collapses off, `b`'s subtree is drawn under `a` and again at its own root"
         );
     }
 
@@ -419,6 +976,7 @@ dependencies = ["a"]
             &g.tree(&TreeOptions {
                 max_depth: None,
                 dedupe: false,
+                ..TreeOptions::default()
             }),
         );
         assert_eq!(
@@ -479,12 +1037,14 @@ source = "registry+https://x"
         let roots_only = g.tree(&TreeOptions {
             max_depth: Some(0),
             dedupe: true,
+            ..TreeOptions::default()
         });
         assert_eq!(flatten(&g, &roots_only), vec![("app", "0.1.0", false)]);
 
         let one_deep = g.tree(&TreeOptions {
             max_depth: Some(1),
             dedupe: true,
+            ..TreeOptions::default()
         });
         assert_eq!(
             flatten(&g, &one_deep),

@@ -138,7 +138,8 @@ pub struct TreeArgs {
     /// Maximum depth to display (default: unlimited; `0` = roots only).
     #[arg(long)]
     pub depth: Option<usize>,
-    /// Show every occurrence of a crate instead of collapsing repeats to `(*)`.
+    /// Show every occurrence of a crate in full, instead of collapsing repeats
+    /// to `(*)` and workspace members to `(see root)`.
     #[arg(long)]
     pub no_dedupe: bool,
     /// Output format.

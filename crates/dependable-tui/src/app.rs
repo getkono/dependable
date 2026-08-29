@@ -345,7 +345,8 @@ impl App {
         self.selected = index.min(self.rows.len().saturating_sub(1));
     }
 
-    /// Open the selected row, or move into it when it is already open.
+    /// Open the selected row, move into it when it is already open, or follow
+    /// it to the tree that holds its dependencies when it is a pointer.
     fn expand(&mut self) {
         let Some(row) = self.rows.get(self.selected) else {
             return;
@@ -355,6 +356,11 @@ impl App {
                 "{} already appears higher in this path (cycle)",
                 row.name
             ));
+            return;
+        }
+        if let Some(target) = row.redirect.clone() {
+            let name = row.name.clone();
+            self.follow_redirect(&target, &name);
             return;
         }
         if !row.has_children {
@@ -367,6 +373,35 @@ impl App {
         let path = row.path.clone();
         self.expanded.insert(path);
         self.rebuild_keeping_selection();
+    }
+
+    /// Move the selection to the row that shows this crate's dependencies.
+    ///
+    /// The selected row is a pointer, not a copy: a workspace member's subtree
+    /// is drawn once, at its own entry near the top of the project. Opening a
+    /// second copy in place is what the pointer exists to avoid, so the
+    /// selection travels to that entry instead.
+    ///
+    /// The target is left closed — a jump that also exploded a subtree the user
+    /// did not ask for would be harder to undo than to repeat.
+    fn follow_redirect(&mut self, target: &RowPath, name: &str) {
+        // The project row above the target may have been closed.
+        self.expanded.insert(target[..1].to_vec());
+        self.rebuild();
+        match self.rows.iter().position(|r| r.path == *target) {
+            Some(index) => {
+                self.selected = index;
+                self.message = Some(format!("{name} is shown here, at the top of its project"));
+            }
+            // A search normally keeps the two together, since both are the
+            // same crate under the same name. They can still come apart when
+            // the search runs out of budget between them.
+            None => {
+                self.message = Some(format!(
+                    "{name} has its own entry in this project — clear the search to reach it"
+                ));
+            }
+        }
     }
 
     /// Close the selected row, or move to its parent when it is already closed.

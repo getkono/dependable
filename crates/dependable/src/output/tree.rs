@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 use std::fmt::Write as _;
 
-use dependable_fetch::{DependencyGraph, NodeKind, TreeNode, TreeOptions};
+use dependable_fetch::{DependencyGraph, NodeKind, Placement, TreeNode, TreeOptions};
 use owo_colors::{OwoColorize, Stream, Style};
 use serde::Serialize;
 
@@ -83,9 +83,10 @@ fn write_node(
     }
 }
 
-/// A node's display label: `name vX.Y.Z`, a kind tag, and a `(*)` dedupe marker,
-/// colored by kind (workspace bold cyan, git magenta, path yellow, registry
-/// plain) and dimmed when deduped.
+/// A node's display label: `name vX.Y.Z`, a kind tag, and a collapse marker —
+/// `(*)` for a repeat, `(see root)` for a crate with a tree of its own further
+/// down the forest. Colored by kind (workspace bold cyan, git magenta, path
+/// yellow, registry plain) and dimmed wherever it is collapsed.
 fn label(graph: &DependencyGraph, node: &TreeNode) -> String {
     let n = &graph.nodes()[node.node];
     let mut text = if n.version.is_empty() {
@@ -99,8 +100,10 @@ fn label(graph: &DependencyGraph, node: &TreeNode) -> String {
         NodeKind::Path => text.push_str(" (path)"),
         _ => {}
     }
-    if node.deduped {
-        text.push_str(" (*)");
+    match node.placement {
+        Placement::Root { .. } => text.push_str(" (see root)"),
+        _ if node.deduped() => text.push_str(" (*)"),
+        _ => {}
     }
     let mut style = match n.kind {
         NodeKind::Workspace => Style::new().cyan().bold(),
@@ -108,13 +111,18 @@ fn label(graph: &DependencyGraph, node: &TreeNode) -> String {
         NodeKind::Path => Style::new().yellow(),
         _ => Style::new(),
     };
-    if node.deduped {
+    if collapsed(node) {
         style = style.dimmed();
     }
     format!(
         "{}",
         text.if_supports_color(Stream::Stdout, |t| t.style(style))
     )
+}
+
+/// Whether a node's dependencies are shown somewhere other than beneath it.
+fn collapsed(node: &TreeNode) -> bool {
+    node.deduped() || matches!(node.placement, Placement::Root { .. })
 }
 
 /// A flat graph (nodes + edges) derived from the expanded tree, so `--depth` and
@@ -296,11 +304,65 @@ source = "registry+https://x"
         assert!(out.contains("(*)")); // serde_derive (or serde) deduped once
     }
 
+    /// Two workspace members, `app` -> `lib`, so `lib` has a tree of its own.
+    fn workspace() -> DependencyGraph {
+        let lock = r#"
+[[package]]
+name = "app"
+version = "0.1.0"
+dependencies = ["lib"]
+
+[[package]]
+name = "lib"
+version = "0.1.0"
+dependencies = ["serde"]
+
+[[package]]
+name = "serde"
+version = "1.0.0"
+source = "registry+https://x"
+"#;
+        let resolved = parse_cargo_lock_graph(lock).unwrap();
+        let names = ["app".to_owned(), "lib".to_owned()].into_iter().collect();
+        DependencyGraph::from_resolved(&resolved, &names, &["app".to_owned(), "lib".to_owned()])
+    }
+
+    #[test]
+    fn ascii_points_a_member_at_its_own_tree() {
+        let out = ascii(&workspace(), &TreeOptions::default());
+        assert!(
+            out.contains("└── lib v0.1.0 (workspace) (see root)"),
+            "under `app`, `lib` is a pointer rather than a copy; {out}"
+        );
+        assert!(
+            !out.contains("(*)"),
+            "a pointer is not the repeat marker; {out}"
+        );
+        // The tree it points at is the one that carries the subtree.
+        assert!(
+            out.contains("lib v0.1.0 (workspace)\n└── serde v1.0.0"),
+            "`lib`'s own entry expands; {out}"
+        );
+    }
+
+    #[test]
+    fn no_dedupe_expands_a_member_in_place() {
+        let opts = TreeOptions {
+            dedupe: false,
+            collapse_roots: false,
+            ..TreeOptions::default()
+        };
+        let out = ascii(&workspace(), &opts);
+        assert!(!out.contains("(see root)"), "{out}");
+        assert_eq!(out.matches("serde v1.0.0").count(), 2, "{out}");
+    }
+
     #[test]
     fn depth_zero_shows_roots_only() {
         let opts = TreeOptions {
             max_depth: Some(0),
             dedupe: true,
+            ..TreeOptions::default()
         };
         let out = ascii(&sample(), &opts);
         assert!(out.contains("app v0.1.0 (workspace)"));

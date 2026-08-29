@@ -143,7 +143,7 @@ fn flatten(graph: &DependencyGraph) -> Vec<(String, bool)> {
         n: &dependable_fetch::TreeNode,
         out: &mut Vec<(String, bool)>,
     ) {
-        out.push((graph.nodes()[n.node].name.clone(), n.deduped));
+        out.push((graph.nodes()[n.node].name.clone(), n.deduped()));
         for c in &n.children {
             walk(graph, c, out);
         }

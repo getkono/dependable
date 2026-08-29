@@ -6,10 +6,15 @@
 //! A package may legitimately appear in many places in a dependency graph, so a
 //! row is identified by its **path** from the root rather than by its node index —
 //! opening `serde` under `tokio` must not also open it under `clap`.
+//!
+//! The exception is a crate with a tree of its own in the project: a workspace
+//! member reached under another member is drawn as a pointer at that tree
+//! ([`Row::redirect`]), because a workspace's members all sit at the top level
+//! and copying their subtrees under each other buries the tree in repeats.
 
 use std::collections::HashSet;
 
-use dependable_fetch::NodeKind;
+use dependable_fetch::{NodeKind, Placement, Visit, Visitor, WalkOptions};
 
 use crate::filter::Filter;
 use crate::model::Project;
@@ -61,6 +66,10 @@ pub struct Row {
     pub expanded: bool,
     /// Whether expanding would revisit a package already on this path.
     pub cyclic: bool,
+    /// The row that shows this crate's dependencies, when they are not shown
+    /// here: a crate with a tree of its own in this project is a pointer at
+    /// that tree rather than a second copy of it. `None` on every other row.
+    pub redirect: Option<RowPath>,
     /// Whether the row matched the active search.
     pub matched: bool,
 }
@@ -96,85 +105,70 @@ pub fn visible(
             has_children: !project.graph.roots().is_empty(),
             expanded: is_open,
             cyclic: false,
+            redirect: None,
             matched: false,
             path: path.clone(),
         });
         if is_open {
-            let roots: Vec<usize> = project.graph.roots().to_vec();
-            walk(
+            let is_expanded = |path: &[usize]| {
+                expanded.contains(path) || found.as_ref().is_some_and(|f| f.open.contains(path))
+            };
+            let is_kept = |path: &[usize]| found.as_ref().is_none_or(|f| f.keep.contains(path));
+            let opts = WalkOptions {
+                // A package opened under `tokio` is not the one under `clap`, so
+                // a second appearance is expanded on its own terms.
+                dedupe: false,
+                collapse_roots: true,
+                prefix: &path,
+                expand: Some(&is_expanded),
+                include: Some(&is_kept),
+                ..WalkOptions::default()
+            };
+            let mut builder = RowBuilder {
                 project,
-                index,
-                &roots,
-                &path,
-                1,
-                &mut HashSet::new(),
-                expanded,
-                found.as_ref(),
-                &mut out,
-            );
+                project_index: index,
+                found: found.as_ref(),
+                out: &mut out,
+            };
+            project.graph.walk(&opts, &mut builder);
         }
     }
     out
 }
 
-/// Emit `children` and, for each expanded one, its own children.
-#[allow(clippy::too_many_arguments)]
-fn walk(
-    project: &Project,
+/// Turns the shared walk into the flat rows the tree pane draws.
+struct RowBuilder<'a> {
+    project: &'a Project,
     project_index: usize,
-    children: &[usize],
-    parent: &RowPath,
-    depth: usize,
-    ancestors: &mut HashSet<usize>,
-    expanded: &HashSet<RowPath>,
-    found: Option<&Found>,
-    out: &mut Vec<Row>,
-) {
-    for (slot, &node) in children.iter().enumerate() {
-        let mut path = parent.clone();
-        path.push(slot);
-        if found.is_some_and(|f| !f.keep.contains(&path)) {
-            continue;
-        }
-        let info = &project.graph.nodes()[node];
-        // Expanding a node already on this path would recurse forever.
-        let cyclic = ancestors.contains(&node);
-        let deps = project.graph.deps_of(node);
-        let has_children = !deps.is_empty() && !cyclic;
-        let is_open = has_children
-            && (expanded.contains(&path) || found.is_some_and(|f| f.open.contains(&path)));
+    found: Option<&'a Found>,
+    out: &'a mut Vec<Row>,
+}
 
-        out.push(Row {
-            depth,
+impl Visitor for RowBuilder<'_> {
+    fn enter(&mut self, visit: &Visit<'_>) {
+        let info = &self.project.graph.nodes()[visit.node];
+        let expandable =
+            visit.degree > 0 && matches!(visit.placement, Placement::Full | Placement::Collapsed);
+        self.out.push(Row {
+            // The walk counts a graph root as depth 0; the project row above it
+            // is the tree's own 0.
+            depth: visit.depth + 1,
             kind: RowKind::Package,
-            project: project_index,
-            node: Some(node),
+            project: self.project_index,
+            node: Some(visit.node),
             name: info.name.clone(),
             version: info.version.clone(),
             node_kind: Some(info.kind),
-            has_children,
-            expanded: is_open,
-            cyclic,
-            matched: found.is_some_and(|f| f.matched.contains(&path)),
-            path: path.clone(),
+            has_children: expandable,
+            expanded: visit.placement == Placement::Full && visit.degree > 0,
+            cyclic: visit.placement == Placement::Cycle,
+            redirect: match visit.placement {
+                Placement::Root { root } => Some(vec![self.project_index, root]),
+                _ => None,
+            },
+            matched: self.found.is_some_and(|f| f.matched.contains(visit.path)),
+            path: visit.path.to_vec(),
         });
-
-        if is_open {
-            let deps: Vec<usize> = deps.to_vec();
-            ancestors.insert(node);
-            walk(
-                project,
-                project_index,
-                &deps,
-                &path,
-                depth + 1,
-                ancestors,
-                expanded,
-                found,
-                out,
-            );
-            ancestors.remove(&node);
-        }
     }
 }
 
@@ -242,7 +236,11 @@ fn descend(
             found.matched.insert(path.clone());
             record(&path, found);
         }
-        if ancestors.contains(&node) {
+        // A crate with a tree of its own is drawn as a pointer here, so the
+        // rows below this copy are never drawn and opening a path into them
+        // would strand the match. The same subtree is searched at that crate's
+        // own entry, which is where the match is shown.
+        if ancestors.contains(&node) || (depth > 0 && project.graph.root_slot(node).is_some()) {
             continue;
         }
         let deps: Vec<usize> = project.graph.deps_of(node).to_vec();
