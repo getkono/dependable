@@ -357,6 +357,24 @@ mod tests {
     }
 
     #[test]
+    fn the_documented_license_keys_deserialize_rather_than_erroring() {
+        // `Policy` denies unknown fields, so before `allowed_licenses` existed a
+        // user copying the documented `[policy]` block got a hard parse error.
+        // This test pins that case shut.
+        let path = write(
+            "licenses",
+            "[policy]\nallowed_licenses = [\"MIT\", \"Apache-2.0\"]\nunknown_licenses = \"fail\"\n",
+        );
+
+        let Ok(PolicySource::Configured(policy)) = load_policy(&path) else {
+            panic!("expected a configured policy, got {:?}", load_policy(&path));
+        };
+        assert_eq!(policy.allowed_licenses, vec!["MIT", "Apache-2.0"]);
+        assert!(policy.requires_licenses());
+        assert_eq!(load_config(&path).policy, policy);
+    }
+
+    #[test]
     fn a_policy_that_exists_but_is_invalid_is_an_error() {
         // The hole this closes: `load_config` would swallow this into defaults,
         // leaving a gate that looks configured and enforces nothing.

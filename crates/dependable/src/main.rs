@@ -7,6 +7,7 @@ use clap::{CommandFactory, Parser};
 mod cli;
 mod config;
 mod fix;
+mod licenses;
 mod output;
 mod runner;
 

@@ -126,6 +126,12 @@ pub struct ListArgs {
     /// crates.io sparse index, so this makes `list` hit the network).
     #[arg(long)]
     pub features: bool,
+    /// Show each dependency's registry-declared license (fetches package
+    /// metadata, so this makes `list` hit the network). Available for crates.io,
+    /// npm, PyPI, Packagist, and Hex; Go, JSR, NuGet, and pub.dev publish none.
+    /// Uses the default registry URLs — `list` reads no config file.
+    #[arg(long)]
+    pub licenses: bool,
     #[arg(short, long)]
     pub verbose: bool,
 }

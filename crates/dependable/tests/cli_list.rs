@@ -136,7 +136,40 @@ fn text_format_emits_one_line_per_dependency() {
     assert_eq!(fields[5], "normal");
     assert_eq!(fields[6], "registry");
     assert_eq!(fields[7], "18.0.0");
+    // The license field always exists, so the record keeps a fixed arity; it is
+    // an em-dash until `--licenses` fetches one.
+    assert_eq!(fields[8], "—");
+    assert_eq!(fields.len(), 9);
     assert_eq!(out.lines().count(), 4);
+}
+
+/// Licenses live on registry metadata, not in a manifest, so `list` must not go
+/// looking for them unless it is asked to — this file's whole contract.
+#[test]
+fn licenses_are_absent_and_offline_unless_asked_for() {
+    let doc = list_json(&fixture("sample-npm"), &[]);
+    let react = dependency(project(&doc, "sample-app"), "react");
+    assert_eq!(
+        react.get("license"),
+        None,
+        "no `license` key without --licenses"
+    );
+}
+
+/// The opt-in path end to end. Ignored by default: it reaches the real registry.
+#[test]
+#[ignore = "network"]
+fn licenses_are_reported_when_asked_for() {
+    let doc = list_json(&fixture("sample-workspace"), &["--licenses"]);
+    let app = project(&doc, "app");
+    assert!(
+        dependency(app, "serde")
+            .get("license")
+            .and_then(Value::as_str)
+            .is_some_and(|l| l.contains("MIT")),
+        "{:?}",
+        dependency(app, "serde")
+    );
 }
 
 /// The default format stays human-readable, and now names the package it describes.
