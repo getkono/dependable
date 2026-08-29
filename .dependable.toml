@@ -19,3 +19,31 @@ registry = "https://index.crates.io"
 [vulnerability]
 enabled = true
 osv_batch_url = "https://api.osv.dev/v1/querybatch"
+
+# CI gating rules. Uncomment to enforce; the block is opt-in and gates nothing
+# until it exists. A `[policy]` block that is present but invalid fails the run
+# (exit 2) rather than being ignored, so a typo can never look like a passing
+# gate. Policy composes with `[global] fail_on`: either one can fail a build.
+#
+# [policy]
+# # Fail when a dependency carries an advisory scoring at or above this.
+# # Requires vulnerability scanning; combining it with `--no-vuln` exits 2.
+# max_cvss = 7.0
+# # The same gate spelled as a band. Ignored when `max_cvss` is also set.
+# fail_on_severity = "high"
+# # Fail when a dependency is more than this many major versions behind. Under
+# # 0.x the minor is the breaking axis, so 0.1 -> 0.9 counts as eight.
+# max_major_behind = 2
+# # Advisories with no CVSS score at all: "ignore" | "warn" (default) | "fail".
+# unrated_advisories = "warn"
+# # Packages that must not appear. Omit `ecosystem` to match every ecosystem.
+# denied_packages = [
+#   { ecosystem = "npm", name = "left-pad" },
+#   { name = "openssl-src" },
+# ]
+#
+# [[policy.minimum_versions]]
+# ecosystem = "rust"
+# name = "openssl"
+# min_version = "0.10.64"
+# reason = "CVE-2023-xxxx fix"

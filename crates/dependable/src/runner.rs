@@ -26,6 +26,8 @@ use indicatif::{ProgressBar, ProgressStyle};
 
 use crate::cli::{CheckArgs, FailOn, FixArgs, ListArgs, TreeArgs, TuiArgs};
 use crate::config::{Config, load_config};
+#[cfg(feature = "report")]
+use crate::config::{PolicySource, load_policy};
 use crate::fix;
 use crate::output::list::ProjectReport;
 use crate::output::{self, ManifestReport};
@@ -94,6 +96,10 @@ impl Engine {
             .http_client(client.clone())
             .rust_registry(settings.registry.clone(), None)
             .vulnerabilities(settings.check_vuln)
+            // Enrichment rides on the vulnerability scan: it costs one extra OSV
+            // lookup per distinct vulnerable package version (a clean run pays
+            // nothing) and is what gives the CVSS policy gate a score to compare.
+            .advisory_details(settings.check_vuln)
             .include_ghsa(settings.include_ghsa)
             .osv_url(settings.osv_url.clone())
             .concurrency(settings.concurrency)
@@ -296,6 +302,19 @@ fn progress_sink() -> Arc<dyn Fn(ProgressEvent) + Send + Sync> {
 pub async fn run_check(args: CheckArgs) -> anyhow::Result<ExitCode> {
     let cfg = load_config(&args.config);
     let settings = resolve_check_settings(&args, &cfg);
+    // Both policy steps run before discovery, so a misconfigured gate costs a
+    // parse rather than a full network check.
+    #[cfg(feature = "report")]
+    let policy = {
+        let policy = resolve_policy(&args.config)?;
+        if let Some(policy) = &policy {
+            check_policy_is_enforceable(policy, settings.check_vuln)?;
+        }
+        policy
+    };
+    #[cfg(not(feature = "report"))]
+    warn_policy_ignored(&args.config);
+
     let manifests = collect_manifests(
         args.manifest.as_deref(),
         args.path.as_deref(),
@@ -316,7 +335,203 @@ pub async fn run_check(args: CheckArgs) -> anyhow::Result<ExitCode> {
     }
 
     output::render(args.format, &reports, args.quiet)?;
+
+    // `[policy]` composes with `--fail-on` rather than replacing it: they gate
+    // different things (a rules gate over scores, names, and versions, versus a
+    // freshness gate over statuses), both are opt-in, and both already exit 1.
+    // OR-ing them is the only composition that cannot downgrade a failure the
+    // user explicitly asked for.
+    #[cfg(feature = "report")]
+    if let Some(policy) = &policy {
+        let root = args.path.clone().unwrap_or_else(|| PathBuf::from("."));
+        let outcome = dependable_report::policy::evaluate(&build_report(root, &reports), policy);
+        report_policy(&outcome);
+        if outcome.has_violations() {
+            return Ok(ExitCode::from(1));
+        }
+    }
     Ok(exit_code(&reports, fail_on))
+}
+
+/// Assemble the neutral report model the policy engine consumes from the CLI's
+/// per-manifest reports.
+#[cfg(feature = "report")]
+fn build_report(root: PathBuf, reports: &[ManifestReport]) -> dependable_report::Report {
+    let mut report = dependable_report::Report::new(root);
+    for manifest in reports {
+        report.push(dependable_report::ManifestResults::new(
+            manifest.path.clone(),
+            manifest.ecosystem,
+            manifest.results.clone(),
+        ));
+    }
+    report
+}
+
+/// Print the policy's findings to **stderr**, always — `--quiet` included.
+///
+/// They are the reason for the exit code, so suppressing them would leave a
+/// failing build with nothing to explain it; stderr keeps stdout machine-readable
+/// for `--format json`/`text`.
+#[cfg(feature = "report")]
+fn report_policy(outcome: &dependable_report::policy::PolicyOutcome) {
+    use dependable_report::policy::Level;
+
+    for note in &outcome.notes {
+        eprintln!("policy: {note}");
+    }
+    for finding in &outcome.findings {
+        let level = match finding.level {
+            Level::Violation => "policy violation",
+            _ => "policy warning",
+        };
+        eprintln!("{level}: {}", finding.message());
+    }
+    let violations = outcome.violation_count();
+    if violations > 0 {
+        let plural = if violations == 1 { "" } else { "s" };
+        eprintln!(
+            "policy: {violations} violation{plural} across {} dependencies",
+            outcome.evaluated
+        );
+    }
+}
+
+/// A CVSS rule needs vulnerability scanning to mean anything.
+///
+/// With scanning off every advisory list is empty, and an empty list is
+/// indistinguishable from "nothing was found" — so the gate would pass
+/// vacuously. Failing here, before any network access, is the only honest
+/// answer: a gate is either enforceable or it is a configuration error.
+///
+/// # Errors
+///
+/// When the policy sets `max_cvss`/`fail_on_severity` and scanning is disabled.
+#[cfg(feature = "report")]
+fn check_policy_is_enforceable(
+    policy: &dependable_report::policy::Policy,
+    check_vuln: bool,
+) -> anyhow::Result<()> {
+    if policy.requires_cvss() && !check_vuln {
+        let key = if policy.max_cvss.is_some() {
+            "max_cvss"
+        } else {
+            "fail_on_severity"
+        };
+        anyhow::bail!(
+            "`[policy] {key}` requires vulnerability scanning, which is disabled;              drop `--no-vuln` (or re-enable `[vulnerability] enabled`), or remove the CVSS rule"
+        );
+    }
+    Ok(())
+}
+
+/// The effective `[policy]` block: the config file's, with `DEPENDABLE_*`
+/// overrides applied. `None` means nothing is gated.
+///
+/// Unlike the rest of the environment layer, a malformed override is an error
+/// rather than a silently ignored value — the same reasoning as
+/// [`crate::config::load_policy`]: an unenforced gate must never look enforced.
+///
+/// # Errors
+///
+/// When a `[policy]` table exists but is invalid, or an override is unusable.
+#[cfg(feature = "report")]
+fn resolve_policy(config: &Path) -> anyhow::Result<Option<dependable_report::policy::Policy>> {
+    use dependable_fetch::core::result::Severity;
+    use dependable_report::policy::Policy;
+
+    // The kill switch, mirroring `DEPENDABLE_NO_VULN`: presence is enough.
+    if std::env::var_os("DEPENDABLE_NO_POLICY").is_some() {
+        return Ok(None);
+    }
+
+    let mut policy = match load_policy(config) {
+        Ok(PolicySource::Configured(policy)) => policy,
+        Ok(PolicySource::Absent) => Policy::default(),
+        Ok(PolicySource::Unreadable(why)) => {
+            eprintln!(
+                "warning: {} could not be parsed; configuration ignored ({why})",
+                config.display()
+            );
+            Policy::default()
+        }
+        Err(e) => {
+            return Err(anyhow::Error::new(*e).context(format!(
+                "invalid `[policy]` in {} — a policy that is configured is enforced or it is an error",
+                config.display()
+            )));
+        }
+    };
+
+    if let Some(score) = env_override(
+        "DEPENDABLE_MAX_CVSS",
+        |raw| raw.parse::<f64>().ok().filter(is_cvss_score),
+        "a CVSS score between 0.0 and 10.0",
+    )? {
+        policy.max_cvss = Some(score);
+    }
+    if let Some(band) = env_override(
+        "DEPENDABLE_FAIL_ON_SEVERITY",
+        Severity::parse,
+        "a severity band (none, low, medium, high, critical)",
+    )? {
+        policy.fail_on_severity = Some(band);
+    }
+    if let Some(behind) = env_override(
+        "DEPENDABLE_MAX_MAJOR_BEHIND",
+        |raw| raw.parse::<u64>().ok(),
+        "a non-negative whole number",
+    )? {
+        policy.max_major_behind = Some(behind);
+    }
+
+    if let Some(score) = policy.max_cvss.filter(|s| !is_cvss_score(s)) {
+        anyhow::bail!("`[policy] max_cvss = {score}` is outside the CVSS range 0.0 to 10.0");
+    }
+
+    // A policy that gates nothing is the same as no policy at all.
+    Ok(policy.is_active().then_some(policy))
+}
+
+/// Whether `score` is a value CVSS can actually produce.
+#[cfg(feature = "report")]
+fn is_cvss_score(score: &f64) -> bool {
+    (0.0..=10.0).contains(score)
+}
+
+/// Read one `DEPENDABLE_*` policy override, failing loudly on a value that
+/// cannot be understood. An unset or empty variable overrides nothing.
+#[cfg(feature = "report")]
+fn env_override<T>(
+    key: &str,
+    parse: impl Fn(&str) -> Option<T>,
+    expected: &str,
+) -> anyhow::Result<Option<T>> {
+    let Some(raw) = std::env::var_os(key) else {
+        return Ok(None);
+    };
+    let raw = raw.to_string_lossy().trim().to_string();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    parse(&raw)
+        .map(Some)
+        .ok_or_else(|| anyhow::anyhow!("{key}={raw:?} is not {expected}"))
+}
+
+/// Say so when a `[policy]` block is present in a build that cannot enforce it.
+///
+/// Without the `report` feature the policy types do not exist, so the block can
+/// only be detected, not read — but silence would look exactly like a gate that
+/// passed.
+#[cfg(not(feature = "report"))]
+fn warn_policy_ignored(config: &Path) {
+    if crate::config::has_policy_table(config) {
+        eprintln!(
+            "warning: {} declares `[policy]`, but this build has no `report` feature;              the policy is not enforced",
+            config.display()
+        );
+    }
 }
 
 /// `dependable list`
