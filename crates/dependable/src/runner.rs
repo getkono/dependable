@@ -690,6 +690,25 @@ pub async fn run_fix(args: FixArgs) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// `dependable report` — scaffolded; the renderer lands with issue #14.
+///
+/// Bails immediately: no discovery, no filesystem walk, no network. `main`
+/// prints the message to stderr and exits 2, leaving stdout empty.
+///
+/// # Errors
+///
+/// Always — report rendering is not implemented yet.
+#[cfg(feature = "report")]
+pub fn run_report(args: crate::cli::ReportArgs) -> anyhow::Result<ExitCode> {
+    let root = args.path.unwrap_or_else(|| PathBuf::from("."));
+    anyhow::bail!(
+        "`dependable report` is not implemented yet (dependable-report v{} is a scaffold); \
+         would report on {}",
+        dependable_report::VERSION,
+        root.display()
+    )
+}
+
 fn collect_manifests(manifest: Option<&Path>, path: Option<&Path>, depth: usize) -> Vec<PathBuf> {
     if let Some(manifest) = manifest {
         return vec![manifest.to_path_buf()];
