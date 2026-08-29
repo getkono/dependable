@@ -76,7 +76,7 @@ what exists today vs. what is roadmapped (tracked as GitHub issues; see
 | **CI exit codes** (`--fail-on none\|outdated\|vulnerable\|any`) | `0` = clean / threshold not met, `1` = threshold met, `2` = tool/fatal error. Also settable via `.dependable.toml` and `DEPENDABLE_FAIL_ON`. | **Shipping** |
 | **`fix`** (`--dry-run`, `--all`) | In-place, position-preserving version rewrites of the **manifest only** — no lockfile edits, no PRs, no scheduled runs. The local, opt-in alternative to a bot's automated PR. | **Shipping** |
 | **SARIF output** (`--format sarif`) | SARIF v2.1.0 (`DEP001` outdated / `DEP002` vulnerable, with locations + CVSS) so results upload into the GitHub Security tab and VS Code. | **Roadmap — V2** (#16) |
-| **GitHub Actions** | A published action with PR annotations (`::error file=…,line=…::`) and a job summary. | **Roadmap — V2** (#18) |
+| **GitHub Actions** | A composite action (`.github/actions/dependable-check`) plus `--annotations auto\|always\|never`: PR annotations (`::error file=…,line=…::`) written to **stderr**, so they compose with every `--format`, and a job summary appended to `GITHUB_STEP_SUMMARY`. | **Shipping** |
 | **GitLab Code Quality** | Code Quality JSON report format. | **Roadmap — V2** (#19) |
 | **First-party editor integration** | An official **LSP server and/or VSCode extension** built on `dependable-fetch` — inline outdated/vulnerable hints and quick-fixes, powered by the same engine as the CLI. | **Roadmap — target V2** (new) |
 
