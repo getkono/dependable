@@ -23,7 +23,7 @@ use crate::cache::{
     DISK_CACHE_TTL, DiskCache, MetadataCache, VersionsCache, metadata_cache, versions_cache,
 };
 use crate::error::FetchError;
-use crate::osv::{OsvClient, OsvQuery};
+use crate::osv::{Advisory, OsvClient, OsvQuery};
 use crate::registries::{CratesIoFetcher, PackageMetadata, RegistryFetcher};
 
 /// Default OSV `querybatch` endpoint.
@@ -143,6 +143,10 @@ pub struct Checker {
     /// ecosystem), used for Deno `jsr:` dependencies.
     jsr: Option<Arc<dyn RegistryFetcher>>,
     osv: Option<Arc<OsvClient>>,
+    /// Whether `check_*` runs the advisory-enrichment post-pass. Off by default:
+    /// enrichment costs one extra OSV request per vulnerable package version, so
+    /// a plain check must not pay for data nothing asked for.
+    advisory_details: bool,
     concurrency: usize,
     read_lockfiles: bool,
     unstable: UnstableFilter,
@@ -269,6 +273,92 @@ impl Checker {
         Ok(results.pop().unwrap_or_default())
     }
 
+    /// Fetch full advisory records for one exact package version.
+    ///
+    /// Where [`Checker::scan_package`] answers "is this version affected?" with
+    /// bare IDs, this answers "what exactly is wrong with it?" — severity, fixed
+    /// versions, summary, and references. It exists for a UI displaying a single
+    /// package it never ran a check over; a checked manifest gets the same records
+    /// through [`Checker::enrich_advisories`]. Routing through the checker's
+    /// shared OSV client means it inherits both warm caches.
+    ///
+    /// # Errors
+    /// Returns [`CheckError::Fetch`] if the query fails. Returns an empty list —
+    /// not an error — when vulnerability scanning is disabled.
+    pub async fn fetch_advisories(
+        &self,
+        ecosystem: Ecosystem,
+        name: &str,
+        version: &str,
+    ) -> Result<Vec<Advisory>, CheckError> {
+        let Some(osv) = &self.osv else {
+            return Ok(Vec::new());
+        };
+        let query = OsvQuery {
+            ecosystem: ecosystem.osv_name().to_owned(),
+            name: name.to_owned(),
+            version: version.to_owned(),
+        };
+        Ok(osv.query_detail(&query).await?)
+    }
+
+    /// Attach full advisory records to every result that has vulnerability IDs.
+    ///
+    /// Costs one OSV request per distinct vulnerable package version, run at the
+    /// checker's configured concurrency; clean packages are never queried, so a
+    /// typical repository pays for the handful of dependencies that are actually
+    /// affected. Enrichment never adds, removes, or reorders
+    /// `current_vulnerabilities` and never changes a status — it only fills in
+    /// [`CheckResult::advisories`], which stays keyed by those IDs.
+    ///
+    /// A version that fails to fetch is left unenriched rather than discarding the
+    /// ones that succeeded; the first failure is still reported.
+    ///
+    /// [`CheckerBuilder::advisory_details`] runs this automatically at the end of
+    /// each check. Calling it by hand is for a caller who wants the details only
+    /// sometimes, or only for a check it already has.
+    ///
+    /// # Errors
+    /// Returns [`CheckError::Fetch`] if an OSV request fails. Returns `Ok(())`
+    /// with nothing enriched when vulnerability scanning is disabled.
+    pub async fn enrich_advisories(&self, check: &mut ManifestCheck) -> Result<(), CheckError> {
+        let Some(osv) = &self.osv else {
+            return Ok(());
+        };
+        let ecosystem = check.ecosystem;
+        let pending: Vec<(usize, OsvQuery)> = check
+            .results
+            .iter()
+            .enumerate()
+            .filter(|(_, result)| !result.current_vulnerabilities.is_empty())
+            .filter_map(|(i, result)| osv_query_for(result, ecosystem).map(|query| (i, query)))
+            .collect();
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        let fetched: Vec<(usize, Result<Vec<Advisory>, FetchError>)> = stream::iter(pending)
+            .map(|(index, query)| {
+                let osv = osv.clone();
+                async move { (index, osv.query_detail(&query).await) }
+            })
+            .buffer_unordered(self.concurrency)
+            .collect()
+            .await;
+
+        let mut failure: Option<FetchError> = None;
+        for (index, outcome) in fetched {
+            match outcome {
+                Ok(advisories) => check.results[index].advisories = advisories,
+                Err(e) => failure = failure.or(Some(e)),
+            }
+        }
+        match failure {
+            Some(e) => Err(CheckError::Fetch(e)),
+            None => Ok(()),
+        }
+    }
+
     /// Fetch the registry's public metadata for one package.
     ///
     /// This is deliberately **not** part of `check_*`: version checking never needs
@@ -387,12 +477,28 @@ impl Checker {
             warnings.push(format!("vulnerability scan skipped: {e}"));
         }
 
-        Ok(ManifestCheck {
+        let mut check = ManifestCheck {
             kind,
             ecosystem,
             results,
             warnings,
-        })
+        };
+
+        // Enrichment is a post-pass over the finished results, so it can equally
+        // be driven by hand ([`Checker::enrich_advisories`]) on a check the caller
+        // already holds. It degrades exactly as the vulnerability scan does: an
+        // OSV failure leaves a warning rather than failing the check, because the
+        // version data is still correct and useful without it.
+        if self.advisory_details {
+            let enrichment = self.enrich_advisories(&mut check).await;
+            if let Err(e) = enrichment {
+                check
+                    .warnings
+                    .push(format!("advisory enrichment skipped: {e}"));
+            }
+        }
+
+        Ok(check)
     }
 
     /// Choose the fetcher and cache namespace for one checkable item. JSR items go
@@ -551,6 +657,29 @@ fn to_semver_versions(versions: &[String], ecosystem: Ecosystem) -> Vec<String> 
     }
 }
 
+/// The OSV query for one result, or `None` if there is nothing to ask about.
+///
+/// The version is the locked one if the lockfile resolved it, else the best
+/// version satisfying the constraint — which is what an unlocked project would
+/// actually install. Shared by the batch scan and the advisory-enrichment pass so
+/// the two produce identical cache keys, and so the advisories describe the exact
+/// version that was flagged.
+fn osv_query_for(result: &CheckResult, ecosystem: Ecosystem) -> Option<OsvQuery> {
+    if !result.item.is_checkable() || matches!(result.status, DependencyStatus::Error(_)) {
+        return None;
+    }
+    let version = result
+        .item
+        .locked_version
+        .clone()
+        .or_else(|| result.latest_compatible.clone())?;
+    Some(OsvQuery {
+        ecosystem: ecosystem.osv_name().to_string(),
+        name: result.item.name.clone(),
+        version,
+    })
+}
+
 /// Query OSV for the current version of each checkable dependency and flip its
 /// status to `Vulnerable` when advisories are found. OSV chunking (≤500 per
 /// request) is handled inside [`OsvClient::query_batch`].
@@ -562,20 +691,8 @@ async fn scan_vulnerabilities(
     let mut queries = Vec::new();
     let mut index_for = Vec::new();
     for (i, result) in results.iter().enumerate() {
-        if !result.item.is_checkable() || matches!(result.status, DependencyStatus::Error(_)) {
-            continue;
-        }
-        let current = result
-            .item
-            .locked_version
-            .clone()
-            .or_else(|| result.latest_compatible.clone());
-        if let Some(version) = current {
-            queries.push(OsvQuery {
-                ecosystem: ecosystem.osv_name().to_string(),
-                name: result.item.name.clone(),
-                version,
-            });
+        if let Some(query) = osv_query_for(result, ecosystem) {
+            queries.push(query);
             index_for.push(i);
         }
     }
@@ -608,6 +725,7 @@ pub struct CheckerBuilder {
     jsr: Option<Arc<dyn RegistryFetcher>>,
     vulnerabilities: bool,
     include_ghsa: bool,
+    advisory_details: bool,
     osv_url: String,
     concurrency: usize,
     read_lockfiles: bool,
@@ -628,6 +746,7 @@ impl Default for CheckerBuilder {
             jsr: None,
             vulnerabilities: true,
             include_ghsa: false,
+            advisory_details: false,
             osv_url: DEFAULT_OSV_BATCH_URL.to_string(),
             concurrency: DEFAULT_CONCURRENCY,
             read_lockfiles: true,
@@ -695,6 +814,20 @@ impl CheckerBuilder {
     /// Include GHSA-prefixed advisories in vulnerability results (default: false).
     pub fn include_ghsa(mut self, include: bool) -> Self {
         self.include_ghsa = include;
+        self
+    }
+
+    /// Fetch full advisory records for vulnerable dependencies (default: false).
+    ///
+    /// Off by default because it is not free: enrichment costs one extra OSV
+    /// request per distinct vulnerable package version, so a plain check makes no
+    /// additional requests at all. Turn it on when something is going to *show*
+    /// the advisories — a severity gate, a SARIF report, a detail pane.
+    ///
+    /// Harmless and silent when combined with `vulnerabilities(false)`: with no
+    /// OSV client there is nothing to enrich.
+    pub fn advisory_details(mut self, enabled: bool) -> Self {
+        self.advisory_details = enabled;
         self
     }
 
@@ -804,6 +937,7 @@ impl CheckerBuilder {
             rust_registries,
             jsr: self.jsr,
             osv,
+            advisory_details: self.advisory_details,
             concurrency: self.concurrency,
             read_lockfiles: self.read_lockfiles,
             unstable: self.unstable,
@@ -812,5 +946,72 @@ impl CheckerBuilder {
             disk_cache,
             progress: self.progress,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dependable_core::parse;
+
+    /// The single item declared by `manifest`. Built through the parser because
+    /// `Item` is `#[non_exhaustive]` and cannot be written out from this crate.
+    fn item(manifest: &str) -> Item {
+        parse(ManifestKind::CargoToml, manifest)
+            .expect("fixture should parse")
+            .items
+            .into_iter()
+            .next()
+            .expect("fixture should declare a dependency")
+    }
+
+    fn registry_item() -> Item {
+        item("[dependencies]\ntime = \"0.2.7\"\n")
+    }
+
+    #[test]
+    fn a_locked_version_outranks_the_best_compatible_one() {
+        let mut declared = registry_item();
+        declared.locked_version = Some("0.2.7".to_string());
+        let mut result = CheckResult::new(declared, DependencyStatus::UpToDate);
+        result.latest_compatible = Some("0.2.9".to_string());
+
+        let query = osv_query_for(&result, Ecosystem::Rust).expect("a query");
+        assert_eq!(query.ecosystem, "crates.io");
+        assert_eq!(query.name, "time");
+        assert_eq!(query.version, "0.2.7");
+    }
+
+    #[test]
+    fn an_unlocked_dependency_is_queried_at_its_best_compatible_version() {
+        let mut result = CheckResult::new(registry_item(), DependencyStatus::UpToDate);
+        result.latest_compatible = Some("0.2.9".to_string());
+        let query = osv_query_for(&result, Ecosystem::Rust).expect("a query");
+        assert_eq!(query.version, "0.2.9");
+    }
+
+    #[test]
+    fn nothing_is_queried_without_a_version() {
+        let result = CheckResult::new(registry_item(), DependencyStatus::UpToDate);
+        assert!(osv_query_for(&result, Ecosystem::Rust).is_none());
+    }
+
+    #[test]
+    fn a_path_dependency_is_never_queried() {
+        let declared = item("[dependencies]\nlocal = { path = \"../local\" }\n");
+        assert!(!declared.is_checkable());
+        let result = CheckResult::new(declared, DependencyStatus::Local);
+        assert!(osv_query_for(&result, Ecosystem::Rust).is_none());
+    }
+
+    #[test]
+    fn an_errored_result_is_never_queried() {
+        let mut declared = registry_item();
+        declared.locked_version = Some("0.2.7".to_string());
+        let result = CheckResult::new(
+            declared,
+            DependencyStatus::Error("registry unreachable".to_string()),
+        );
+        assert!(osv_query_for(&result, Ecosystem::Rust).is_none());
     }
 }
