@@ -308,6 +308,70 @@ async fn pypi_prefers_a_source_project_url() {
     );
 }
 
+/// A PyPI `info` block with `fields` spliced in, served for `pkg`.
+async fn pypi_meta(fields: &str) -> dependable_fetch::PackageMetadata {
+    let server = MockServer::start().await;
+    let body = format!(r#"{{ "info": {{ {fields} }}, "urls": [] }}"#);
+    Mock::given(method("GET"))
+        .and(path("/pkg/json"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+    let fetcher = PyPiFetcher::with_registry(build_client().unwrap(), server.uri());
+    fetcher.fetch_metadata("pkg").await.unwrap().unwrap()
+}
+
+#[tokio::test]
+async fn pypi_prefers_the_pep_639_license_expression() {
+    let meta = pypi_meta(
+        r#""license_expression": "MIT OR Apache-2.0",
+           "license": "MIT License, see LICENSE",
+           "classifiers": ["License :: OSI Approved :: BSD License"]"#,
+    )
+    .await;
+    assert_eq!(meta.license.as_deref(), Some("MIT OR Apache-2.0"));
+}
+
+#[tokio::test]
+async fn pypi_maps_classifiers_to_spdx_when_there_is_no_expression() {
+    let meta = pypi_meta(
+        r#""classifiers": ["Programming Language :: Python :: 3",
+                          "License :: OSI Approved :: MIT License",
+                          "License :: OSI Approved :: Apache Software License"]"#,
+    )
+    .await;
+    assert_eq!(meta.license.as_deref(), Some("MIT OR Apache-2.0"));
+}
+
+#[tokio::test]
+async fn pypi_leaves_an_ambiguous_classifier_alone() {
+    // BSD-2-Clause and BSD-3-Clause share one classifier; guessing which would
+    // let an allowlist approve a license the package never declared.
+    let meta = pypi_meta(r#""classifiers": ["License :: OSI Approved :: BSD License"]"#).await;
+    assert_eq!(meta.license, None);
+}
+
+#[tokio::test]
+async fn pypi_discards_a_pasted_license_body() {
+    let body = "Apache License Version 2.0, January 2004 ".repeat(80);
+    let meta = pypi_meta(&format!(r#""license": "{body}""#)).await;
+    assert_eq!(
+        meta.license, None,
+        "a license body must never reach a license allowlist"
+    );
+
+    let multiline = pypi_meta(r#""license": "MIT\n\nCopyright (c) 2024""#).await;
+    assert_eq!(multiline.license, None, "a multi-line value is prose");
+}
+
+#[tokio::test]
+async fn pypi_keeps_a_short_free_text_license_verbatim() {
+    // Not valid SPDX — deliberately preserved rather than normalized, so the
+    // allowlist reports it as unrecognized instead of silently reinterpreting it.
+    let meta = pypi_meta(r#""license": "Apache 2.0""#).await;
+    assert_eq!(meta.license.as_deref(), Some("Apache 2.0"));
+}
+
 #[tokio::test]
 async fn pypi_dates_every_release_from_the_releases_block() {
     let server = MockServer::start().await;
