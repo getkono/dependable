@@ -46,9 +46,10 @@ async fn fetch_features_asks_once_per_name_and_omits_the_featureless() {
         .await;
     Mock::given(method("GET"))
         .and(path("/le/ft/leftpad"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(
-            "{\"name\":\"leftpad\",\"vers\":\"1.0.0\",\"yanked\":false}\n",
-        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("{\"name\":\"leftpad\",\"vers\":\"1.0.0\",\"yanked\":false}\n"),
+        )
         .expect(1)
         .mount(&server)
         .await;
