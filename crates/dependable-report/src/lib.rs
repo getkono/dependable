@@ -26,6 +26,7 @@ pub mod html;
 pub mod model;
 pub mod policy;
 pub mod sarif;
+pub(crate) mod spdx;
 pub mod summary;
 
 pub use error::ReportError;
