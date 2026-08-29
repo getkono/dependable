@@ -26,6 +26,7 @@ use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::model::Report;
+use crate::spdx;
 
 /// The severity words [`Policy::fail_on_severity`] accepts, for error messages.
 const SEVERITY_TOKENS: &str = "none, low, medium (moderate), high, critical";
@@ -76,6 +77,18 @@ pub struct Policy {
     /// rule is in force. Defaults to [`UnratedPolicy::Warn`].
     #[serde(skip_serializing_if = "UnratedPolicy::is_default")]
     pub unrated_advisories: UnratedPolicy,
+    /// SPDX license identifiers a dependency's declared license must lie within.
+    ///
+    /// **Empty is inert**: with no entry the license rule does not run at all,
+    /// [`Self::unknown_licenses`] included, so a project that has never asked for
+    /// license policy never sees a license finding.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub allowed_licenses: Vec<String>,
+    /// What to do about a dependency whose license is missing or unreadable while
+    /// [`Self::allowed_licenses`] is in force. Defaults to
+    /// [`UnknownLicensePolicy::Warn`].
+    #[serde(skip_serializing_if = "UnknownLicensePolicy::is_default")]
+    pub unknown_licenses: UnknownLicensePolicy,
     /// Packages that must not appear at all, whatever their version or source.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub denied_packages: Vec<PackageRef>,
@@ -92,8 +105,19 @@ impl Policy {
         self.max_cvss.is_some()
             || self.fail_on_severity.is_some()
             || self.max_major_behind.is_some()
+            || !self.allowed_licenses.is_empty()
             || !self.denied_packages.is_empty()
             || !self.minimum_versions.is_empty()
+    }
+
+    /// Whether a rule here can only be enforced with license collection on.
+    ///
+    /// The caller checks this **before** running: with collection off every
+    /// license is `None`, so the gate would report every dependency under
+    /// [`Self::unknown_licenses`] rather than measuring anything.
+    #[must_use]
+    pub fn requires_licenses(&self) -> bool {
+        !self.allowed_licenses.is_empty()
     }
 
     /// Whether a rule here can only be enforced with vulnerability scanning on.
@@ -212,6 +236,37 @@ impl UnratedPolicy {
     }
 }
 
+/// What to do with a dependency whose license is missing or unreadable while
+/// `allowed_licenses` is in force.
+///
+/// Shaped like [`UnratedPolicy`] and defaulting the same way, but deliberately a
+/// separate type: `UnratedPolicy` is named for advisories, and reusing it would
+/// make one of the two config keys read as a lie.
+///
+/// The default is [`UnknownLicensePolicy::Warn`], not `Fail`: four of the nine
+/// registries publish no metadata at all, and PyPI's license field is free text,
+/// so failing on every unknown would make `allowed_licenses` unusable on day one.
+/// What it must never do is *silently pass*.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UnknownLicensePolicy {
+    /// Say nothing about a license that could not be read.
+    Ignore,
+    /// Report it as a warning; the build still passes on it alone.
+    #[default]
+    Warn,
+    /// Treat an unreadable license as a violation.
+    Fail,
+}
+
+impl UnknownLicensePolicy {
+    /// Whether this is the default, so serialization can omit it.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        matches!(self, UnknownLicensePolicy::Warn)
+    }
+}
+
 /// Everything [`evaluate`] found, in a deterministic order.
 ///
 /// Order is manifest order, then dependency order within a manifest, then rule
@@ -286,6 +341,8 @@ pub enum Rule {
     DeniedPackage,
     /// [`Policy::minimum_versions`].
     MinimumVersion,
+    /// [`Policy::allowed_licenses`].
+    License,
 }
 
 impl Rule {
@@ -301,8 +358,28 @@ impl Rule {
             Rule::MaxMajorBehind => "max_major_behind",
             Rule::DeniedPackage => "denied_packages",
             Rule::MinimumVersion => "minimum_versions",
+            Rule::License => "allowed_licenses",
         }
     }
+}
+
+/// Why a dependency's license tripped [`Policy::allowed_licenses`].
+///
+/// The three states earn distinct messages and distinct levels, which
+/// `declared: Option<String>` alone cannot express: it cannot tell an
+/// unreadable license from a readable one that is simply not allowed.
+///
+/// `#[non_exhaustive]`: match with a wildcard arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LicenseVerdict {
+    /// No license reached the report — not collected, or the registry publishes
+    /// none. Never "unlicensed".
+    Missing,
+    /// A license was declared, but it is not an SPDX expression that can be read.
+    Unparsed,
+    /// The expression was read, and the allowlist does not cover it.
+    Denied,
 }
 
 /// The rule-specific evidence behind a [`Finding`].
@@ -344,6 +421,16 @@ pub enum Detail {
     MinimumVersion {
         /// The configured floor, verbatim.
         required: String,
+    },
+    /// A license outside the allowlist, or one that could not be measured.
+    License {
+        /// The license the registry declared, verbatim; `None` when none reached
+        /// the report.
+        declared: Option<String>,
+        /// Which of the three license states this is.
+        verdict: LicenseVerdict,
+        /// The configured allowlist, echoed so the message names the alternative.
+        allowed: Vec<String>,
     },
     /// Advisories carrying no rating at all, while a CVSS rule is in force.
     Unrated {
@@ -438,6 +525,22 @@ impl Finding {
                 Level::Violation => format!("below required {required}"),
                 _ => format!("`min_version = \"{required}\"` is not a valid version; rule skipped"),
             },
+            Detail::License {
+                declared,
+                verdict,
+                allowed,
+            } => match verdict {
+                LicenseVerdict::Denied => format!(
+                    "license `{}` is not in allowed_licenses ({})",
+                    declared.as_deref().unwrap_or(""),
+                    allowed.join(", ")
+                ),
+                LicenseVerdict::Unparsed => format!(
+                    "license `{}` is not a recognised SPDX expression",
+                    declared.as_deref().unwrap_or("")
+                ),
+                _ => "no license declared by the registry".to_string(),
+            },
             Detail::Unrated {
                 count, advisories, ..
             } => {
@@ -491,10 +594,16 @@ pub fn evaluate(report: &Report, policy: &Policy) -> PolicyOutcome {
         Rule::FailOnSeverity
     };
 
+    // Whether *any* dependency carried license data, for the note below: a
+    // configured allowlist with nothing to measure needs explaining once, not a
+    // wall of unexplained warnings.
+    let mut any_license = false;
+
     for manifest in &report.manifests {
         let ecosystem = manifest.ecosystem;
         for result in &manifest.results {
             outcome.evaluated += 1;
+            any_license |= result.license.is_some();
             let name = result.item.name.as_str();
             let current = current_version(result);
             let mut push = |level: Level, rule: Rule, detail: Detail, reason: Option<String>| {
@@ -577,7 +686,45 @@ pub fn evaluate(report: &Report, policy: &Policy) -> PolicyOutcome {
                 }
             }
 
-            // 4/5. CVSS gate, then the unrated advisories it could not see.
+            // 4. License allowlist. Skipped entirely when no allowlist is
+            //    configured — `unknown_licenses` included — so nobody who has not
+            //    asked for license policy is told about licenses.
+            if !policy.allowed_licenses.is_empty() {
+                let verdict = match result.license.as_deref() {
+                    None => Some(LicenseVerdict::Missing),
+                    Some(declared) => match spdx::evaluate(declared, &policy.allowed_licenses) {
+                        spdx::Verdict::Allowed => None,
+                        spdx::Verdict::Denied => Some(LicenseVerdict::Denied),
+                        spdx::Verdict::Unparsed => Some(LicenseVerdict::Unparsed),
+                    },
+                };
+                // A license that was read and is not allowed always fails; one
+                // that could not be read is governed by the knob, which never
+                // silently passes it.
+                let level = match verdict {
+                    None => None,
+                    Some(LicenseVerdict::Denied) => Some(Level::Violation),
+                    Some(_) => match policy.unknown_licenses {
+                        UnknownLicensePolicy::Ignore => None,
+                        UnknownLicensePolicy::Warn => Some(Level::Warning),
+                        UnknownLicensePolicy::Fail => Some(Level::Violation),
+                    },
+                };
+                if let (Some(verdict), Some(level)) = (verdict, level) {
+                    push(
+                        level,
+                        Rule::License,
+                        Detail::License {
+                            declared: result.license.clone(),
+                            verdict,
+                            allowed: policy.allowed_licenses.clone(),
+                        },
+                        None,
+                    );
+                }
+            }
+
+            // 5/6. CVSS gate, then the unrated advisories it could not see.
             if result.advisories.is_empty() {
                 continue;
             }
@@ -638,6 +785,18 @@ pub fn evaluate(report: &Report, policy: &Policy) -> PolicyOutcome {
                 None,
             );
         }
+    }
+
+    // An allowlist with no license data behind it still emits its findings — a
+    // `fail` setting has to fail — but the reason for all of them is one thing,
+    // said once.
+    if !policy.allowed_licenses.is_empty() && outcome.evaluated > 0 && !any_license {
+        outcome.notes.push(
+            "`allowed_licenses` is set but no dependency carried license data; \
+             license collection was not enabled, so every dependency is reported \
+             under `unknown_licenses`"
+                .to_string(),
+        );
     }
 
     outcome
@@ -817,6 +976,8 @@ max_cvss = 7.0
 fail_on_severity = "high"
 max_major_behind = 2
 unrated_advisories = "warn"
+allowed_licenses = ["MIT", "Apache-2.0"]
+unknown_licenses = "warn"
 denied_packages = [
   { ecosystem = "npm", name = "left-pad" },
   { name = "openssl-src" },
@@ -898,6 +1059,8 @@ reason = "CVE-2023-xxxx fix"
         assert_eq!(parsed.fail_on_severity, Some(Severity::High));
         assert_eq!(parsed.max_major_behind, Some(2));
         assert_eq!(parsed.unrated_advisories, UnratedPolicy::Warn);
+        assert_eq!(parsed.allowed_licenses, vec!["MIT", "Apache-2.0"]);
+        assert_eq!(parsed.unknown_licenses, UnknownLicensePolicy::Warn);
         assert_eq!(
             parsed.denied_packages,
             vec![
@@ -1437,6 +1600,144 @@ reason = "CVE-2023-xxxx fix"
         assert_eq!(outcome.warnings().count(), 0);
     }
 
+    // --- license allowlist ------------------------------------------------
+
+    /// A result carrying a declared license.
+    fn licensed(spec: &str, license: &str) -> CheckResult {
+        let mut result = checked(spec);
+        result.license = Some(license.to_string());
+        result
+    }
+
+    /// A policy allowing MIT and Apache-2.0 and nothing else.
+    fn allowlist() -> Policy {
+        Policy {
+            allowed_licenses: vec!["MIT".to_string(), "Apache-2.0".to_string()],
+            ..Policy::default()
+        }
+    }
+
+    #[test]
+    fn an_allowed_license_produces_nothing() {
+        let report = rust(vec![licensed("serde = \"1\"", "MIT OR Apache-2.0")]);
+        let outcome = evaluate(&report, &allowlist());
+        assert!(outcome.findings.is_empty());
+        assert!(outcome.notes.is_empty());
+    }
+
+    #[test]
+    fn a_denied_license_is_a_violation_naming_the_alternatives() {
+        let report = rust(vec![licensed("copyleft = \"1\"", "GPL-3.0")]);
+        let outcome = evaluate(&report, &allowlist());
+
+        assert_eq!(outcome.violation_count(), 1);
+        assert_eq!(outcome.findings[0].rule, Rule::License);
+        assert_eq!(
+            messages(&outcome),
+            vec![
+                "allowed_licenses  copyleft (Cargo.toml): \
+                 license `GPL-3.0` is not in allowed_licenses (MIT, Apache-2.0)"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_and_expression_cannot_be_escaped_by_one_allowed_branch() {
+        // Taking this package means taking Unicode-DFS-2016 too.
+        let report = rust(vec![licensed(
+            "unicode-ident = \"1\"",
+            "(MIT OR Apache-2.0) AND Unicode-DFS-2016",
+        )]);
+        assert_eq!(evaluate(&report, &allowlist()).violation_count(), 1);
+    }
+
+    #[test]
+    fn free_text_is_reported_as_unreadable_rather_than_reinterpreted() {
+        // PyPI's `info.license` is prose; "Apache 2.0" is not an SPDX identifier
+        // and must not be quietly read as `Apache-2.0`.
+        let report = rust(vec![licensed("requests = \"1\"", "Apache 2.0")]);
+        let outcome = evaluate(&report, &allowlist());
+
+        assert_eq!(outcome.warnings().count(), 1);
+        assert_eq!(outcome.violation_count(), 0);
+        assert!(
+            messages(&outcome)[0].contains("`Apache 2.0` is not a recognised SPDX expression"),
+            "{:?}",
+            messages(&outcome)
+        );
+    }
+
+    #[test]
+    fn a_missing_license_follows_the_unknown_licenses_knob() {
+        let report = rust(vec![checked("serde = \"1\"")]);
+
+        let mut warn = allowlist();
+        warn.unknown_licenses = UnknownLicensePolicy::Warn;
+        let outcome = evaluate(&report, &warn);
+        assert_eq!(outcome.warnings().count(), 1);
+        assert_eq!(outcome.violation_count(), 0);
+        assert!(messages(&outcome)[0].contains("no license declared by the registry"));
+
+        let mut fail = allowlist();
+        fail.unknown_licenses = UnknownLicensePolicy::Fail;
+        assert_eq!(evaluate(&report, &fail).violation_count(), 1);
+
+        let mut ignore = allowlist();
+        ignore.unknown_licenses = UnknownLicensePolicy::Ignore;
+        assert!(evaluate(&report, &ignore).findings.is_empty());
+    }
+
+    #[test]
+    fn the_license_rule_is_inert_without_an_allowlist() {
+        // The safety property: nobody who has not asked for license policy gets
+        // license findings, whatever `unknown_licenses` says.
+        let report = rust(vec![
+            licensed("copyleft = \"1\"", "GPL-3.0"),
+            checked("serde = \"1\""),
+        ]);
+        let policy = Policy {
+            unknown_licenses: UnknownLicensePolicy::Fail,
+            ..Policy::default()
+        };
+        let outcome = evaluate(&report, &policy);
+
+        assert!(outcome.findings.is_empty());
+        assert!(outcome.notes.is_empty());
+        assert!(!policy.is_active(), "and the policy gates nothing at all");
+    }
+
+    #[test]
+    fn an_allowlist_with_no_license_data_explains_itself_once() {
+        let report = rust(vec![checked("serde = \"1\""), checked("time = \"1\"")]);
+        let outcome = evaluate(&report, &allowlist());
+
+        assert_eq!(outcome.warnings().count(), 2, "one finding per dependency");
+        assert_eq!(outcome.notes.len(), 1, "but one explanation");
+        assert!(
+            outcome.notes[0].contains("license collection was not enabled"),
+            "{:?}",
+            outcome.notes
+        );
+    }
+
+    #[test]
+    fn one_license_anywhere_is_enough_to_suppress_the_note() {
+        let report = rust(vec![
+            licensed("serde = \"1\"", "MIT"),
+            checked("time = \"1\""),
+        ]);
+        let outcome = evaluate(&report, &allowlist());
+        assert_eq!(outcome.warnings().count(), 1);
+        assert!(outcome.notes.is_empty());
+    }
+
+    #[test]
+    fn an_allowlist_makes_a_policy_active_and_demands_collection() {
+        assert!(allowlist().is_active());
+        assert!(allowlist().requires_licenses());
+        assert!(!Policy::default().requires_licenses());
+    }
+
     #[test]
     fn every_rule_token_is_the_config_key_that_spells_it() {
         // A new rule cannot ship without a token that names a real config key —
@@ -1447,6 +1748,7 @@ reason = "CVE-2023-xxxx fix"
             (Rule::MaxMajorBehind, "max_major_behind"),
             (Rule::DeniedPackage, "denied_packages"),
             (Rule::MinimumVersion, "minimum_versions"),
+            (Rule::License, "allowed_licenses"),
         ];
         for (rule, key) in keys {
             assert_eq!(rule.token(), key);
