@@ -164,7 +164,7 @@ Cross-cutting enablers (also V1.1): extend `Ecosystem`/`ManifestKind` enums + `d
 | GitLab Code Quality | Code Quality JSON report | `serde_json` | §6.3 |
 | First-party editor integration | Official LSP server and/or VSCode extension over `dependable-fetch`: inline outdated/vulnerable hints + quick-fixes | new crate / extension | §9, [`INTEGRATIONS.md`](INTEGRATIONS.md) §3 |
 | Workspace / monorepo | Cross-manifest dedup, rollup, `--manifest-glob`, `workspace = true` inheritance | runner/cache | §6.5 |
-| License visibility + allowlist | Show declared license in `list`; enforce `allowed_licenses` | registry fields | §6.4, §8 D6 |
+| License visibility + allowlist | `list --licenses`; `[policy] allowed_licenses` over a documented SPDX subset. Go, JSR, NuGet, and pub.dev publish no registry license | registry fields | §6.4, §8 D6 |
 | PDF export | `--pdf` via headless chromium (HTML stays self-contained) — **V3** | system chromium | §6.1, §8 D4 |
 
 ### A3 — V1.1 / future polish (non-goals that are real future work)
