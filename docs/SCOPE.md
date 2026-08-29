@@ -163,7 +163,7 @@ Cross-cutting enablers (also V1.1): extend `Ecosystem`/`ManifestKind` enums + `d
 | GitHub Actions integration | PR annotations + job summary + published action | — | §6.3 |
 | GitLab Code Quality | Code Quality JSON report | `serde_json` | §6.3 |
 | First-party editor integration | Official LSP server and/or VSCode extension over `dependable-fetch`: inline outdated/vulnerable hints + quick-fixes | new crate / extension | §9, [`INTEGRATIONS.md`](INTEGRATIONS.md) §3 |
-| Workspace / monorepo | Cross-manifest dedup, rollup, `--manifest-glob`, `workspace = true` inheritance | runner/cache | §6.5 |
+| Workspace / monorepo | Cross-manifest dedup **(shipped)**, rollup **(shipped)**, `--manifest-glob` **(shipped)**; `workspace = true` inheritance for `check`/`fix` remains — see [#73](https://github.com/getkono/dependable/issues/73) | runner | §6.5 |
 | License visibility + allowlist | `list --licenses`; `[policy] allowed_licenses` over a documented SPDX subset. Go, JSR, NuGet, and pub.dev publish no registry license | registry fields | §6.4, §8 D6 |
 | PDF export | `--pdf` via headless chromium (HTML stays self-contained) — **V3** | system chromium | §6.1, §8 D4 |
 
