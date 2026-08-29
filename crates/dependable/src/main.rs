@@ -28,7 +28,7 @@ async fn main() -> ExitCode {
         Some(Command::Fix(args)) => runner::run_fix(args).await,
         Some(Command::Tui(args)) => runner::run_tui(args).await,
         #[cfg(feature = "report")]
-        Some(Command::Report(args)) => runner::run_report(args),
+        Some(Command::Report(args)) => runner::run_report(args).await,
         // A bare `dependable` opens the UI, but only where there is a user to
         // drive it. Piped or in CI it must behave exactly as it always has.
         None if interactive() => runner::run_tui(TuiArgs::default()).await,

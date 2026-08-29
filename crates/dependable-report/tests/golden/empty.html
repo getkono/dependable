@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="generator" content="dependable-report 0.0.0-test">
+<meta name="generated" content="2023-11-14T22:13:20Z">
+<title>dependable report</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #ffffff;
+  --fg: #16181d;
+  --muted: #5c6370;
+  --line: #dfe3e8;
+  --card: #f7f8fa;
+  --accent: #1f6feb;
+  --bad: #b42318;
+  --ok: #1a7f37;
+  --warn: #9a6700;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0d1117;
+    --fg: #e6edf3;
+    --muted: #9198a1;
+    --line: #2a313c;
+    --card: #161b22;
+    --accent: #6aa2ff;
+    --bad: #ff7b72;
+    --ok: #3fb950;
+    --warn: #d29922;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  padding: 2rem 1.25rem 4rem;
+  background: var(--bg);
+  color: var(--fg);
+  font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+main, .page-head, .page-foot { max-width: 68rem; margin: 0 auto; }
+h1 { font-size: 1.6rem; margin: 0 0 .5rem; }
+h2 { font-size: 1.15rem; margin: 0 0 1rem; }
+code, .ver, .vector { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; font-size: .9em; }
+.muted { color: var(--muted); font-size: .85em; }
+.prose { max-width: 46rem; }
+.empty { color: var(--muted); font-style: italic; }
+
+.page-head .meta { display: grid; grid-template-columns: max-content 1fr; gap: .1rem .75rem; margin: 0 0 1.5rem; }
+.page-head dt { color: var(--muted); }
+.page-head dd { margin: 0; }
+.page-foot { margin-top: 2rem; padding-top: 1rem; border-top: 1px solid var(--line); color: var(--muted); font-size: .85em; }
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 1.25rem;
+  margin: 0 0 1.5rem;
+}
+
+.stats { display: flex; flex-wrap: wrap; gap: 1.5rem; list-style: none; padding: 0; margin: 0 0 1rem; }
+.stats li { display: flex; flex-direction: column; min-width: 7rem; }
+.stats .n { font-size: 1.5rem; font-weight: 650; }
+.stats .k { color: var(--muted); font-size: .8rem; }
+.stats .bad .n { color: var(--bad); }
+
+.notes { border-left: 3px solid var(--warn); padding: .5rem .9rem; margin: 0 0 1rem; }
+.notes-head { margin: 0; font-weight: 600; }
+.notes ul { margin: .35rem 0 0; padding-left: 1.1rem; }
+
+.chips { display: flex; flex-wrap: wrap; gap: .4rem; margin: 0 0 1rem; }
+.chip {
+  display: inline-block;
+  padding: .1rem .5rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  font-size: .78rem;
+  white-space: nowrap;
+}
+.sev-CRITICAL, .st-VULN { border-color: var(--bad); color: var(--bad); font-weight: 600; }
+.sev-HIGH { border-color: var(--bad); color: var(--bad); }
+.sev-MEDIUM, .st-OUTDATED, .st-UPDATE { border-color: var(--warn); color: var(--warn); }
+.sev-LOW, .st-PATCH { border-color: var(--accent); color: var(--accent); }
+.st-OK { border-color: var(--ok); color: var(--ok); }
+.st-ERROR { border-color: var(--bad); color: var(--bad); }
+.sev-UNRATED, .sev-NONE, .st-LOCAL, .st-GIT { color: var(--muted); }
+.withdrawn { color: var(--muted); text-transform: lowercase; }
+.score { color: var(--muted); font-size: .8rem; }
+
+table.grid { border-collapse: collapse; width: 100%; margin: 0 0 1rem; }
+table.grid caption { text-align: left; color: var(--muted); font-size: .85em; padding-bottom: .4rem; }
+table.grid th, table.grid td { border-bottom: 1px solid var(--line); padding: .45rem .6rem; text-align: left; vertical-align: top; }
+table.grid thead th { font-size: .78rem; text-transform: uppercase; letter-spacing: .03em; color: var(--muted); }
+table.grid .num { text-align: right; font-variant-numeric: tabular-nums; }
+.wide { display: block; overflow-x: auto; }
+
+.manifest { margin: 0 0 1rem; }
+.manifest > summary { cursor: pointer; padding: .35rem 0; font-weight: 600; }
+
+.adv-id { font-weight: 600; }
+.adv-title { max-width: 34rem; }
+.adv-details, .adv-refs { margin-top: .4rem; }
+.adv-details > summary, .adv-refs > summary { cursor: pointer; color: var(--accent); font-size: .85rem; }
+.adv-details-body {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 22rem;
+  overflow-y: auto;
+  margin-top: .4rem;
+  padding: .5rem .7rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: .82rem;
+}
+.adv-refs ul { margin: .3rem 0 0; padding-left: 1.1rem; overflow-wrap: anywhere; }
+a.ext { color: var(--accent); }
+.inert { color: var(--muted); text-decoration: line-through dotted; }
+
+.chart { display: flex; flex-wrap: wrap; gap: 2rem; align-items: flex-start; margin-bottom: 1.25rem; }
+.legend { list-style: none; padding: 0; margin: 0; }
+.legend li { display: flex; align-items: center; gap: .5rem; padding: .2rem 0; }
+.swatch { flex: none; border-radius: 2px; }
+.legend-name { min-width: 5rem; }
+.legend-count { min-width: 8rem; color: var(--muted); font-size: .85rem; font-variant-numeric: tabular-nums; }
+.bar-ok { fill: #1a7f37; }
+.bar-outdated { fill: #9a6700; }
+.bar-vulnerable { fill: #b42318; }
+.bar-other { fill: #8b949e; }
+
+@media print {
+  body { padding: 0; background: #fff; color: #000; }
+  .card { break-inside: avoid; border-color: #ccc; background: #fff; }
+  .adv-details, .adv-refs, .manifest { display: block; }
+  .adv-details-body { max-height: none; overflow: visible; }
+  .wide { overflow-x: visible; }
+  a.ext { color: #000; text-decoration: underline; }
+}
+</style>
+</head>
+<body>
+<header class="page-head">
+<h1>dependable report</h1>
+<dl class="meta">
+<dt>Root</dt><dd><code>&#x2f;proj</code></dd>
+<dt>Generated</dt><dd>2023-11-14T22:13:20Z</dd>
+<dt>Tool</dt><dd>dependable-report 0.0.0-test</dd>
+</dl>
+</header>
+<main>
+
+<section id="summary" class="card">
+<h2>1. Executive summary</h2>
+<ul class="stats">
+<li><span class="n">0</span><span class="k">dependencies</span></li>
+<li><span class="n">0</span><span class="k">manifests</span></li>
+<li><span class="n">—</span><span class="k">of 0 checkable up to date</span></li>
+<li class=""><span class="n">0</span><span class="k">vulnerable</span></li>
+<li class=""><span class="n">0</span><span class="k">critical advisories</span></li>
+<li><span class="n">—</span><span class="k">highest CVSS</span></li>
+</ul>
+<p class="chips">
+<span class="chip sev-CRITICAL">critical 0</span>
+<span class="chip sev-HIGH">high 0</span>
+<span class="chip sev-MEDIUM">medium 0</span>
+<span class="chip sev-LOW">low 0</span>
+<span class="chip sev-NONE">none 0</span>
+<span class="chip sev-UNRATED">unrated 0</span>
+</p>
+<table class="grid">
+<caption>Dependency status across every manifest</caption>
+<thead><tr><th scope="col">Status</th><th scope="col" class="num">Count</th></tr></thead>
+<tbody>
+<tr><th scope="row">Up to date</th><td class="num">0</td></tr>
+<tr><th scope="row">Patch available</th><td class="num">0</td></tr>
+<tr><th scope="row">Update available</th><td class="num">0</td></tr>
+<tr><th scope="row">Outdated</th><td class="num">0</td></tr>
+<tr><th scope="row">Vulnerable</th><td class="num">0</td></tr>
+<tr><th scope="row">Errored</th><td class="num">0</td></tr>
+<tr><th scope="row">Path (local)</th><td class="num">0</td></tr>
+<tr><th scope="row">Git</th><td class="num">0</td></tr>
+</tbody>
+</table>
+<p class="prose">
+0 advisory finding(s) across 0 distinct
+advisories.
+</p>
+</section>
+
+<section id="vulnerabilities" class="card">
+<h2>2. Vulnerability detail</h2>
+<p class="empty">No advisories affect this dependency tree.</p>
+</section>
+
+<section id="dependencies" class="card">
+<h2>3. Dependency status</h2>
+<p class="empty">No manifests were reported on.</p>
+</section>
+
+<section id="timeline" class="card">
+<h2>4. Advisory timeline</h2>
+<p class="empty">No advisories affect this dependency tree.</p>
+</section>
+
+<section id="ecosystems" class="card">
+<h2>5. Ecosystem breakdown</h2>
+<p class="empty">No dependencies to chart.</p>
+</section>
+</main>
+<footer class="page-foot">
+<p>Generated by dependable-report 0.0.0-test at 2023-11-14T22:13:20Z. This document is self-contained: it loads nothing over the network.</p>
+</footer>
+</body>
+</html>

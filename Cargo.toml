@@ -59,6 +59,10 @@ globset = "0.4"
 jiff = "0.2"
 # --- dependable-report (V2 reports) ---
 time = { version = "0.3", features = ["formatting"] }
+# Default features only. `loader` is deliberately NOT enabled: it is the feature
+# that would give templates filesystem access, and every template this workspace
+# renders is either compiled in with `include_str!` or handed over in memory.
+minijinja = "2"
 # dev
 wiremock = "0.6"
 tempfile = "3"

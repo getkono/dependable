@@ -295,6 +295,43 @@ The tree is the **resolved union graph** from `Cargo.lock`: unlike
 activation. When no `Cargo.lock` is present, `tree` prints a warning and falls
 back to a shallow graph of each member plus its direct declared dependencies.
 
+## HTML report (`report`)
+
+`dependable report` renders **one self-contained HTML document** — inline CSS,
+inline SVG charts, no external stylesheet, script, font, or image — so it opens
+offline from a single file and survives being emailed or dropped into a CI
+artifact. It goes to stdout by default:
+
+```bash
+dependable report . > report.html      # the obvious idiom
+dependable report . -o report.html     # write the file directly
+dependable report . --no-vuln          # skip the vulnerability scan
+dependable report . --manifest Cargo.toml --depth 1
+```
+
+Five sections: an executive summary, a vulnerability detail table (one row per
+dependency and advisory), a dependency status table per manifest, an advisory
+timeline ordered by publication date, and an ecosystem breakdown — a pie chart
+with a real table of the same figures beneath it, because the chart is decoration
+and the table is the data. Manifest paths are stored relative to the report root,
+so no absolute machine path lands in a document you share. Warnings the run would
+otherwise leave only on a console — a skipped ecosystem, an unreadable lockfile,
+vulnerability scanning being off — are carried into the document itself.
+
+Every value in the document is HTML-escaped, advisory links are restricted to
+`http`/`https` in Rust before they reach an `href`, and an advisory's Markdown
+description is shown escaped and pre-wrapped rather than rendered.
+
+To restyle it, drop replacements into `dependable-templates/` in the project root.
+Any of these eight names can be replaced wholesale: `report.html`, `styles.css`,
+`macros.html`, `summary.html`, `vulnerabilities.html`, `dependencies.html`,
+`timeline.html`, `ecosystems.html`. A file with an unrecognized name, or one that
+fails to parse, is a hard error naming the problem — there is no silent fall back
+to the built-in.
+
+`report` exits `0` whether or not it finds vulnerabilities: describing them is the
+command's job. Use `check --fail-on` or a `[policy]` block to gate a build.
+
 ## Use as a library
 
 `dependable-fetch` is the high-level library: depend on it alone to scan a
