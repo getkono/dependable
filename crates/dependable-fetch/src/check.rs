@@ -20,7 +20,8 @@ use futures::stream::{self, StreamExt};
 
 use crate::build_client;
 use crate::cache::{
-    DISK_CACHE_TTL, DiskCache, MetadataCache, VersionsCache, metadata_cache, versions_cache,
+    DISK_CACHE_TTL, DiskCache, MetadataCache, VersionsCache, WorkspaceCache, metadata_cache,
+    versions_cache, workspace_cache,
 };
 use crate::error::FetchError;
 use crate::osv::{Advisory, OsvClient, OsvQuery};
@@ -95,8 +96,14 @@ pub struct ManifestCheck {
     pub results: Vec<CheckResult>,
     /// Non-fatal degradations (e.g. an OSV outage that skipped vulnerability data).
     pub warnings: Vec<String>,
-    /// The manifest whose `[workspace.dependencies]` supplied any inherited constraint,
-    /// when one governed this check.
+    /// The manifest whose `[workspace.dependencies]` govern this one — itself, when it
+    /// declares its own `[workspace]`, else the nearest ancestor that does.
+    ///
+    /// Set whenever such a manifest was found, whether or not anything was actually
+    /// inherited from it: it names the table that *would* answer a `workspace = true`,
+    /// which is what a caller needs in order to say where a constraint came from **and**
+    /// where a missing one should have been. Absolute and symlink-resolved, per
+    /// [`nearest_workspace_root`](crate::nearest_workspace_root).
     ///
     /// Per-manifest rather than per-result, which is what keeps [`PathBuf`] — and the
     /// filesystem it implies — out of [`Item`] and out of the IO-free core. `None` for a
@@ -163,6 +170,7 @@ pub struct Checker {
     unstable: UnstableFilter,
     versions_cache: VersionsCache,
     metadata_cache: MetadataCache,
+    workspace_cache: WorkspaceCache,
     /// Persistent on-disk cache, consulted below the in-process cache. `None`
     /// disables it (`--no-cache`, or no resolvable cache directory).
     disk_cache: Option<Arc<DiskCache>>,
@@ -485,8 +493,34 @@ impl Checker {
         // A member's `dep.workspace = true` states no version of its own; the constraint
         // is in the root above it. Only a path can find that root, which is why this
         // resolves here and not in `check_manifest`.
-        let workspace = crate::discover::workspace_source(path, kind, &manifest);
+        let workspace = self.workspace_source(path, kind, &manifest).await;
         self.check_inner(kind, &manifest, lockfile, workspace).await
+    }
+
+    /// The workspace declarations governing `path`, read once per root per `Checker`.
+    ///
+    /// Every member of a workspace resolves against the same file, and parsing it once
+    /// per member is the same waste the versions cache exists to avoid — with the
+    /// difference that the answer is on local disk, so it only ever showed up as CPU. A
+    /// 500-crate workspace parsed one root manifest 500 times.
+    ///
+    /// Locating the root is still done per manifest: it is the walk that produces the key
+    /// this is cached on, and it is the cheap half.
+    async fn workspace_source(
+        &self,
+        path: &Path,
+        kind: ManifestKind,
+        manifest: &str,
+    ) -> Option<(PathBuf, Arc<Vec<Item>>)> {
+        let (root, root_content) = crate::discover::workspace_root_of(path, kind, manifest)?;
+        if let Some(hit) = self.workspace_cache.get(&root).await {
+            return Some((root, hit));
+        }
+        let declarations = Arc::new(crate::discover::workspace_declarations(&root_content));
+        self.workspace_cache
+            .insert(root.clone(), declarations.clone())
+            .await;
+        Some((root, declarations))
     }
 
     /// Read the lockfile governing `path`, whichever of its candidates exists.
@@ -513,7 +547,7 @@ impl Checker {
         kind: ManifestKind,
         manifest: &str,
         lockfile: Option<(LockfileKind, &str)>,
-        workspace: Option<(PathBuf, Vec<Item>)>,
+        workspace: Option<(PathBuf, Arc<Vec<Item>>)>,
     ) -> Result<ManifestCheck, CheckError> {
         let ecosystem = kind.ecosystem();
         let fetcher = self
@@ -735,11 +769,15 @@ impl Checker {
 /// itself still reports as unchecked, exactly as it did before inheritance was resolved
 /// at all; this is what stops that being silent.
 fn undeclared_inheritance(items: &[Item], root: &Path) -> Vec<String> {
+    let mut seen = HashSet::new();
     items
         .iter()
         .filter(|item| {
             item.source == PackageSource::Inherited && item.version_constraint.is_empty()
         })
+        // A member may inherit the same crate in `[dependencies]` and
+        // `[dev-dependencies]` both, which is one mistake to fix, not two to report.
+        .filter(|item| seen.insert(item.name.as_str()))
         .map(|item| {
             format!(
                 "`{}` is declared `workspace = true`, but {} declares no such dependency",
@@ -1106,6 +1144,7 @@ impl CheckerBuilder {
             unstable: self.unstable,
             versions_cache: versions_cache(),
             metadata_cache: metadata_cache(),
+            workspace_cache: workspace_cache(),
             disk_cache,
             progress: self.progress,
         })

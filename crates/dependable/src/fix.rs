@@ -431,12 +431,25 @@ mod tests {
         );
     }
 
-    /// The root is where an inherited version actually lives, and `fix` still bumps it
-    /// there — once, which is Cargo's own model.
+    /// The other half of the rule, and the half that makes it Cargo's own model: the
+    /// declaration a member inherits *is* rewritable, in the one file that holds it.
+    ///
+    /// The pairing is the point — the same crate, the same version, rewritten at the root
+    /// and refused at the member — so this asserts the gate itself and not just the
+    /// outcome, which a plain registry dependency would satisfy on its own.
     #[test]
     fn the_workspace_root_declaration_is_still_rewritten() {
         let root = "[workspace.dependencies]\nserde = \"1.0.100\"\n";
         let results = results_for(ManifestKind::CargoToml, root, &[("serde", "1.0.219")]);
+
+        let declaration = &results[0].item;
+        assert_eq!(declaration.kind, DependencyKind::Workspace);
+        assert!(
+            declaration.is_rewritable(),
+            "the version string is in this file, on line {}",
+            declaration.version_line
+        );
+        assert_eq!(declaration.version_line, 1, "and the span points at it");
 
         let (updated, records) = plan_fixes(root, &results, false);
 

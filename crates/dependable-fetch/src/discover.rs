@@ -136,12 +136,25 @@ pub fn find_lockfile(manifest: &Path, kind: ManifestKind) -> Option<(PathBuf, Lo
 /// [`workspace_source`] is what handles it inheriting from its own table. The walk stops
 /// at a repository boundary (a directory holding `.git`), so inheritance never resolves
 /// against a manifest belonging to an unrelated checkout above the project.
+///
+/// # Why the path is canonicalized first
+/// [`Path::parent`] is lexical: the parent of a relative `../sibling` is `..`, and the
+/// parent of *that* is `""` — which every subsequent `join` resolves against the **current
+/// directory**, a sibling of the manifest rather than an ancestor of it. Walking
+/// `dependable check --manifest ../other/Cargo.toml` from inside a workspace would
+/// otherwise hand `../other` that workspace's `[workspace.dependencies]`, and no `.git`
+/// check catches it, because the boundary is tested against the current directory too.
+///
+/// The returned path is therefore absolute and symlink-resolved, whatever `manifest` was
+/// spelled as. A manifest that cannot be canonicalized (it was deleted between discovery
+/// and here) belongs to no workspace.
 #[must_use]
 pub fn nearest_workspace_root(manifest: &Path) -> Option<(PathBuf, WorkspaceDecl, String)> {
+    let manifest = std::fs::canonicalize(manifest).ok()?;
     let mut dir = manifest.parent()?;
     loop {
         let candidate = dir.join("Cargo.toml");
-        if !same_file(&candidate, manifest)
+        if !same_file(&candidate, &manifest)
             && let Ok(content) = std::fs::read_to_string(&candidate)
             && let Some(workspace) = parse_workspace(&content)
         {
@@ -154,8 +167,7 @@ pub fn nearest_workspace_root(manifest: &Path) -> Option<(PathBuf, WorkspaceDecl
     }
 }
 
-/// The manifest whose `[workspace.dependencies]` governs `manifest`, and the declarations
-/// it offers — the input [`dependable_core::resolve_workspace_inheritance`] needs.
+/// The manifest whose `[workspace.dependencies]` govern `manifest`, and its text.
 ///
 /// A manifest declaring its own `[workspace]` governs **itself**: Cargo lets a root that
 /// is also a package write `serde.workspace = true` against its own table, and walking
@@ -163,20 +175,40 @@ pub fn nearest_workspace_root(manifest: &Path) -> Option<(PathBuf, WorkspaceDecl
 /// governs. `content` is the manifest's own text, already in the caller's hand, so the
 /// self case costs no extra read.
 ///
+/// Separate from [`workspace_declarations`] so a caller checking many members of one
+/// workspace can key a cache on the root's path and parse it only once; use
+/// [`workspace_source`] when that does not matter.
+///
 /// Returns `None` for a non-Cargo manifest and when no root is found.
+#[must_use]
+pub fn workspace_root_of(
+    manifest: &Path,
+    kind: ManifestKind,
+    content: &str,
+) -> Option<(PathBuf, String)> {
+    if kind != ManifestKind::CargoToml {
+        return None;
+    }
+    if parse_workspace(content).is_some() {
+        // Canonical, to match the shape [`nearest_workspace_root`] returns.
+        let root = std::fs::canonicalize(manifest).unwrap_or_else(|_| manifest.to_path_buf());
+        return Some((root, content.to_owned()));
+    }
+    let (root, _, root_content) = nearest_workspace_root(manifest)?;
+    Some((root, root_content))
+}
+
+/// The governing manifest and the declarations it offers — the input
+/// [`dependable_core::resolve_workspace_inheritance`] needs.
+///
+/// [`workspace_root_of`] followed by [`workspace_declarations`].
 #[must_use]
 pub fn workspace_source(
     manifest: &Path,
     kind: ManifestKind,
     content: &str,
 ) -> Option<(PathBuf, Vec<Item>)> {
-    if kind != ManifestKind::CargoToml {
-        return None;
-    }
-    if parse_workspace(content).is_some() {
-        return Some((manifest.to_path_buf(), workspace_declarations(content)));
-    }
-    let (root, _, root_content) = nearest_workspace_root(manifest)?;
+    let (root, root_content) = workspace_root_of(manifest, kind, content)?;
     Some((root, workspace_declarations(&root_content)))
 }
 
@@ -184,7 +216,8 @@ pub fn workspace_source(
 ///
 /// A manifest that will not parse declares nothing, which is the same answer as a
 /// manifest with no such table — neither is worth failing a whole check over.
-fn workspace_declarations(content: &str) -> Vec<Item> {
+#[must_use]
+pub fn workspace_declarations(content: &str) -> Vec<Item> {
     parse(ManifestKind::CargoToml, content)
         .map(|parsed| {
             parsed
@@ -527,7 +560,8 @@ mod tests {
         std::fs::create_dir_all(root.join(".git")).expect("mkdir .git");
         assert!(workspace_source(&solo, ManifestKind::CargoToml, content).is_none());
 
-        // A workspace root above a `package.json` governs nothing about it.
+        // A `package.json` has no Cargo workspace whatever sits above it — and is
+        // answered from its kind alone, without a walk.
         let js = root.join("web/package.json");
         write(&js, "{}");
         assert!(workspace_source(&js, ManifestKind::PackageJson, "{}").is_none());

@@ -43,7 +43,9 @@ struct ResultDto<'a> {
     locked_at: Option<&'a str>,
     /// The manifest that declared this constraint, when it was not `manifest` itself —
     /// a Cargo `dep.workspace = true` resolved against the workspace root. Absent
-    /// otherwise, so a consumer pinned to the documented shape is unaffected.
+    /// otherwise, so a consumer pinned to the documented shape is unaffected, and absent
+    /// in particular when the root declared nothing: naming a manifest as the source of a
+    /// constraint it never supplied would be worse than saying nothing.
     #[serde(skip_serializing_if = "Option::is_none")]
     inherited_from: Option<String>,
 }
@@ -73,9 +75,10 @@ pub fn render(reports: &[ManifestReport]) -> anyhow::Result<()> {
                 kind: result.item.kind.token(),
                 vulnerabilities: &result.current_vulnerabilities,
                 locked_at: result.item.locked_version.as_deref(),
-                inherited_from: (result.item.source == PackageSource::Inherited)
-                    .then(|| workspace_root.clone())
-                    .flatten(),
+                inherited_from: (result.item.source == PackageSource::Inherited
+                    && !result.item.version_constraint.is_empty())
+                .then(|| workspace_root.clone())
+                .flatten(),
             });
         }
     }

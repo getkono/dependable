@@ -1093,9 +1093,11 @@ async fn an_inherited_name_the_root_never_declared_is_reported() {
     .unwrap();
     let member = root.join("crates/app/Cargo.toml");
     std::fs::create_dir_all(member.parent().unwrap()).unwrap();
+    // Inherited in two sections: Cargo allows it, and it is one mistake to fix, not two
+    // to report.
     std::fs::write(
         &member,
-        "[package]\nname = \"app\"\n\n[dependencies]\ntokio.workspace = true\n",
+        "[package]\nname = \"app\"\n\n[dependencies]\ntokio.workspace = true\n\n[dev-dependencies]\ntokio.workspace = true\n",
     )
     .unwrap();
 
@@ -1109,7 +1111,12 @@ async fn an_inherited_name_the_root_never_declared_is_reported() {
 
     let check = checker.check_path(&member).await.unwrap();
 
-    assert_eq!(check.warnings.len(), 1, "{:?}", check.warnings);
+    assert_eq!(
+        check.warnings.len(),
+        1,
+        "once per name: {:?}",
+        check.warnings
+    );
     assert!(
         check.warnings[0].contains("`tokio`"),
         "{:?}",
@@ -1121,5 +1128,12 @@ async fn an_inherited_name_the_root_never_declared_is_reported() {
         check.warnings
     );
     // The dependency itself still reports as it always did — unchecked, not an error.
-    assert_eq!(check.results[0].status, DependencyStatus::Local);
+    assert_eq!(
+        check.results.len(),
+        2,
+        "both declarations are still reported"
+    );
+    for result in &check.results {
+        assert_eq!(result.status, DependencyStatus::Local);
+    }
 }

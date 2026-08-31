@@ -118,3 +118,80 @@ fn a_whole_workspace_scan_reports_the_root_and_the_member() {
     assert_eq!(doc["summary"]["manifests"], 2);
     assert_eq!(doc["summary"]["unique_packages"], 1, "serde is one package");
 }
+
+/// `Path::parent` is lexical: the parent of `../sibling` is `..`, whose parent is `""` —
+/// and every `join` onto `""` resolves against the **current directory**, a sibling of the
+/// target rather than an ancestor of it. So `dependable list --manifest ../other/Cargo.toml`
+/// run from inside a workspace handed `../other` that workspace's declarations, and the
+/// `.git` boundary did not catch it, because that check lands on the current directory too.
+///
+/// Two deliberate departures from the other tests here. The layout goes in the *system*
+/// temp directory rather than `CARGO_TARGET_TMPDIR`, because the latter lives inside this
+/// repository — which is itself a Cargo workspace, and a genuine ancestor, so the walk
+/// would legitimately find it and mask the bug. And it runs in a separate process, so the
+/// working directory it needs is not global state shared with every other test.
+#[test]
+fn a_relative_path_never_adopts_the_current_directorys_workspace() {
+    /// Distinctive, so the assertion can name the workspace that must not be consulted.
+    const SIBLING_ROOT: &str =
+        "[workspace]\nmembers = []\n\n[workspace.dependencies]\nserde = \"9.9.9\"\n";
+
+    let base = std::env::temp_dir().join("dependable-test-relative-workspace-escape");
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(base.join("myworkspace")).unwrap();
+    fs::create_dir_all(base.join("standalone")).unwrap();
+    let base = base.canonicalize().expect("canonical");
+
+    fs::write(base.join("myworkspace/Cargo.toml"), SIBLING_ROOT).unwrap();
+    // A sibling of that workspace, belonging to nothing.
+    fs::write(
+        base.join("standalone/Cargo.toml"),
+        "[package]\nname = \"standalone\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde.workspace = true\n",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_dependable"))
+        .current_dir(base.join("myworkspace"))
+        .args([
+            "list",
+            "--manifest",
+            "../standalone/Cargo.toml",
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("run dependable");
+    let doc: Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
+
+    let dependency = &doc["projects"][0]["dependencies"][0];
+    assert_eq!(dependency["name"], "serde");
+    assert_ne!(
+        dependency["constraint"], "9.9.9",
+        "took the constraint from a workspace that is not an ancestor: {dependency}"
+    );
+    assert_eq!(dependency["inherited"], false, "{dependency}");
+}
+
+/// `workspace_root` names the manifest that *governs* this one, whether or not anything
+/// came from it — so `inherited_from`, which claims a constraint's origin, has to say
+/// more than that. Naming a manifest as the source of a version it never declared would
+/// be worse than saying nothing, especially beside a warning that says the opposite.
+#[test]
+fn a_constraint_the_root_never_declared_is_attributed_to_nobody() {
+    let dir = workdir("workspace_undeclared_attribution");
+    fs::write(
+        dir.join("crates/app/Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\ntokio.workspace = true\n",
+    )
+    .unwrap();
+
+    let member = dir.join("crates/app/Cargo.toml");
+    let doc = check_json(&dir, &["check", "--manifest", member.to_str().unwrap()]);
+
+    let tokio = result(&doc, "crates/app/Cargo.toml", "tokio");
+    assert_eq!(tokio["status"], "LOCAL", "nothing to check: {tokio}");
+    assert!(
+        tokio["inherited_from"].is_null(),
+        "the root declares no tokio: {tokio}"
+    );
+}

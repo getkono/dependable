@@ -237,6 +237,13 @@ fn workspace_members_report_the_constraint_the_root_declares() {
     assert_eq!(leftpad["source"], "inherited");
     assert_eq!(leftpad["inherited"], true);
     assert_eq!(leftpad["kind"], "normal");
+    // The lockfile is applied *after* inheritance, so the locked version is chosen
+    // against the constraint the root supplied rather than against an empty one.
+    assert_eq!(leftpad["locked"], "1.0.5");
+    assert_eq!(
+        app["lockfile"], "Cargo.lock",
+        "the fixture's own, not the repo's"
+    );
 
     // The section the *member* declared it in survives inheritance, and so does an
     // alternate registry named only at the root.

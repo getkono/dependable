@@ -272,8 +272,11 @@ version. If the root declares a crate by `path` or `git`, the member inherits th
 instead, and there is no registry version to check. A member's own `path` entry always
 wins over a root declaration of the same name, exactly as Cargo resolves it.
 
-`check --format json` names the manifest a constraint came from in `inherited_from`,
-on the results that have one.
+`check --format json` names the manifest a constraint came from in `inherited_from`, on
+the results that have one — an absolute, symlink-resolved path, because the root is found
+by walking up rather than by anything the caller spelled, and a relative answer would be
+relative to a directory the caller never named. A dependency the root turns out not to
+declare gets no attribution at all, and a warning saying so.
 
 ## Project inventory (`list`)
 

@@ -16,10 +16,10 @@ use dependable_fetch::core::{
 };
 use dependable_fetch::{
     CheckError, Checker, DependencyStatus, Ecosystem, GoProxyFetcher, GraphSource, HexFetcher,
-    Item, JsrFetcher, ManifestKind, NpmFetcher, NuGetFetcher, PackagistFetcher, ParseError,
-    ProgressEvent, PubDevFetcher, PyPiFetcher, ScopedRegistry, TreeOptions, UnstableFilter,
-    WorkspaceGraphOptions, build_client, build_workspace_graph, nearest_workspace_root,
-    workspace_source,
+    Item, JsrFetcher, ManifestKind, NpmFetcher, NuGetFetcher, PackageSource, PackagistFetcher,
+    ParseError, ProgressEvent, PubDevFetcher, PyPiFetcher, ScopedRegistry, TreeOptions,
+    UnstableFilter, WorkspaceGraphOptions, build_client, build_workspace_graph,
+    nearest_workspace_root, workspace_source,
 };
 use dependable_tui::TuiOptions;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
@@ -606,17 +606,22 @@ pub async fn run_list(args: ListArgs) -> anyhow::Result<ExitCode> {
             }
         };
 
-        let lockfile = (!args.no_lock_file)
-            .then(|| apply_nearest_lockfile(manifest, kind, &root, &mut parsed.items))
-            .flatten();
         // A member writing `dep.workspace = true` states no version of its own; the
         // constraint lives in the workspace root. Same resolution `check` and `fix` get,
         // so an inventory and a check never disagree about what a member depends on.
+        //
+        // Before the lockfile, and in that order for a reason: a lockfile can hold several
+        // versions of one crate, and `pick_locked` chooses among them *by the declared
+        // constraint*. Resolving second would hand it an empty constraint and pick the
+        // highest — reporting `syn 2.0` locked against a member that inherits `syn = "1"`.
         let inherited = workspace_source(manifest, kind, &content)
             .map(|(_, declarations)| {
                 resolve_workspace_inheritance(&mut parsed.items, &declarations)
             })
             .unwrap_or_default();
+        let lockfile = (!args.no_lock_file)
+            .then(|| apply_nearest_lockfile(manifest, kind, &root, &mut parsed.items))
+            .flatten();
         let meta = parse_project(kind, &content);
         let (version, version_inherited) = resolve_version(manifest, kind, &meta);
 
@@ -829,6 +834,7 @@ pub async fn run_fix(args: FixArgs) -> anyhow::Result<ExitCode> {
         let Some(report) = engine.check_manifest(manifest).await? else {
             continue;
         };
+        report_inherited_skips(manifest, &report);
         let records = fix::apply_fixes(manifest, &report.results, args.all, args.dry_run)?;
         if records.is_empty() {
             continue;
@@ -889,6 +895,45 @@ fn resolve_report_settings(args: &crate::cli::ReportArgs, cfg: &Config) -> Setti
         registry: cfg.rust.registry.clone(),
         osv_url: cfg.vulnerability.osv_batch_url.clone(),
     }
+}
+
+/// Say which upgrades this manifest cannot make, and where they can be made instead.
+///
+/// A member inheriting `dep.workspace = true` is reported as outdated by `check` and then
+/// silently left alone by `fix`, because the version string is in the workspace root and
+/// there is no line here to rewrite. Without this the two commands appear to contradict
+/// each other, and nothing points at the file that can actually be changed.
+fn report_inherited_skips(manifest: &Path, report: &ManifestReport) {
+    let Some(root) = &report.workspace_root else {
+        return;
+    };
+    let mut names: Vec<&str> = report
+        .results
+        .iter()
+        .filter(|result| {
+            result.item.source == PackageSource::Inherited
+                && matches!(
+                    result.status,
+                    DependencyStatus::PatchAvailable
+                        | DependencyStatus::UpdateAvailable
+                        | DependencyStatus::Outdated
+                        | DependencyStatus::Vulnerable
+                )
+        })
+        .map(|result| result.item.name.as_str())
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    if names.is_empty() {
+        return;
+    }
+    eprintln!(
+        "note: {} inherits {} from the workspace; upgrade {} in {}",
+        manifest.display(),
+        names.join(", "),
+        if names.len() == 1 { "it" } else { "them" },
+        root.display()
+    );
 }
 
 /// Read whole-template overrides from `<root>/dependable-templates/`.

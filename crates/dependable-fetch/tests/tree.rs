@@ -244,22 +244,22 @@ fn falls_back_to_shallow_graph_without_lockfile() {
 }
 
 /// Without a lockfile the graph is built from manifests alone, and a member's
-/// `dep.workspace = true` is the one entry whose nature cannot be read from the member.
-/// Nothing here consults the root, so it classifies on what such an entry almost always
-/// is — a registry crate — rather than folding it in with the `path` deps it used to be
-/// indistinguishable from, which rendered every inherited crate as a local path.
+/// `dep.workspace = true` says nothing about what the crate *is*. The root's declaration
+/// does, and the root is already read here — so `centrally_declared` is classified from
+/// what the root says it is, not from a guess that would make every inherited crate a
+/// registry one (or, before inheritance existed at all, a local path).
 #[test]
-fn an_inherited_dependency_is_a_registry_crate_in_the_shallow_graph() {
+fn the_root_decides_what_an_inherited_dependency_is_in_the_shallow_graph() {
     let tmp = TempDir::new().unwrap();
     fs::write(
         tmp.path().join("Cargo.toml"),
-        "[workspace]\nresolver = \"2\"\nmembers = [\"crates/a\"]\n\n[workspace.dependencies]\nserde = \"1\"\n",
+        "[workspace]\nresolver = \"2\"\nmembers = [\"crates/a\"]\n\n[workspace.dependencies]\nserde = \"1\"\ncentrally_declared = { path = \"vendor/v\" }\n",
     )
     .unwrap();
     fs::create_dir_all(tmp.path().join("crates/a")).unwrap();
     fs::write(
         tmp.path().join("crates/a/Cargo.toml"),
-        "[package]\nname = \"a\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde.workspace = true\nvendored = { path = \"../../vendor/v\" }\n",
+        "[package]\nname = \"a\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde.workspace = true\ncentrally_declared.workspace = true\nvendored = { path = \"../../vendor/v\" }\n",
     )
     .unwrap();
 
@@ -267,5 +267,9 @@ fn an_inherited_dependency_is_a_registry_crate_in_the_shallow_graph() {
     assert_eq!(built.source, GraphSource::Manifests);
 
     assert_eq!(kind_of(&built.graph, "serde"), NodeKind::Registry);
+    // Declared centrally as a path, so it is a path crate wherever it is used — the case
+    // a "an inherited entry is probably a registry crate" guess gets wrong.
+    assert_eq!(kind_of(&built.graph, "centrally_declared"), NodeKind::Path);
+    // And a member's own path entry, which never depended on the root at all.
     assert_eq!(kind_of(&built.graph, "vendored"), NodeKind::Path);
 }

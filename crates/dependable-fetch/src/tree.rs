@@ -14,10 +14,11 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use dependable_core::{
-    CargoTomlParser, DependencyGraph, LockedPackage, LockfileKind, ManifestKind, PackageSource,
-    ParseError, Parser, ResolvedLockfile, parse, parse_bun_lock_graph, parse_cargo_lock_graph,
-    parse_composer_lock_graph, parse_mix_lock_graph, parse_package_lock_graph, parse_package_name,
-    parse_project, parse_workspace,
+    CargoTomlParser, DependencyGraph, DependencyKind, Item, LockedPackage, LockfileKind,
+    ManifestKind, PackageSource, ParseError, Parser, ResolvedLockfile, parse, parse_bun_lock_graph,
+    parse_cargo_lock_graph, parse_composer_lock_graph, parse_mix_lock_graph,
+    parse_package_lock_graph, parse_package_name, parse_project, parse_workspace,
+    resolve_workspace_inheritance,
 };
 use thiserror::Error;
 
@@ -132,7 +133,7 @@ pub fn build_workspace_graph(
         });
     }
 
-    let graph = shallow_graph(&members, &workspace_names, &roots);
+    let graph = shallow_graph(&members, &workspace_names, &roots, &root_content);
     Ok(WorkspaceGraph {
         graph,
         source: GraphSource::Manifests,
@@ -213,24 +214,37 @@ fn shallow_graph(
     members: &[(String, String)],
     workspace_names: &HashSet<String>,
     roots: &[String],
+    root_content: &str,
 ) -> DependencyGraph {
+    // A member's `dep.workspace = true` says nothing about what the crate *is* — the
+    // root's declaration does, and the root is already in hand here. Resolving against
+    // it is what tells a centrally-declared registry crate from a centrally-declared
+    // vendored path, which the member's own text cannot.
+    let declarations: Vec<Item> = CargoTomlParser
+        .parse(root_content)
+        .map(|m| m.items)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|item| item.kind == DependencyKind::Workspace)
+        .collect();
     let mut member_pkgs: Vec<LockedPackage> = Vec::new();
     let mut external_pkgs: Vec<LockedPackage> = Vec::new();
     let mut external_seen: HashSet<String> = HashSet::new();
 
     for (name, content) in members {
-        let items = CargoTomlParser
+        let mut items = CargoTomlParser
             .parse(content)
             .map(|m| m.items)
             .unwrap_or_default();
+        let _ = resolve_workspace_inheritance(&mut items, &declarations);
         let mut deps: Vec<String> = Vec::new();
         for item in &items {
             deps.push(item.name.clone());
             if !workspace_names.contains(&item.name) && external_seen.insert(item.name.clone()) {
-                // Synthesize a source so classification matches the item's kind. Only
-                // `path` is genuinely local: a `workspace = true` entry names a crate
-                // the root declares, which nothing here reads, so it classifies on the
-                // common case (a registry crate) rather than as the path entry it is not.
+                // Synthesize a source so classification matches the item's kind. An
+                // inherited entry has already taken its root declaration's source above,
+                // so a centrally-declared `path` crate lands on the `Local` arm and a
+                // centrally-declared registry crate does not.
                 let source = match item.source {
                     PackageSource::Git => Some("git+".to_owned()),
                     PackageSource::Local => None,
