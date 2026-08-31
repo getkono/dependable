@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use dependable_core::{
     CheckResult, DependencyStatus, Ecosystem, Item, LockfileKind, ManifestKind, PackageSource,
     UnstableFilter, apply_lockfile, check_version, parse, parse_lockfile_kind,
-    to_semver_constraint,
+    resolve_workspace_inheritance, to_semver_constraint,
 };
 use futures::stream::{self, StreamExt};
 
@@ -95,6 +95,14 @@ pub struct ManifestCheck {
     pub results: Vec<CheckResult>,
     /// Non-fatal degradations (e.g. an OSV outage that skipped vulnerability data).
     pub warnings: Vec<String>,
+    /// The manifest whose `[workspace.dependencies]` supplied any inherited constraint,
+    /// when one governed this check.
+    ///
+    /// Per-manifest rather than per-result, which is what keeps [`PathBuf`] — and the
+    /// filesystem it implies — out of [`Item`] and out of the IO-free core. `None` for a
+    /// manifest outside a workspace, and for [`Checker::check_manifest`], which is given
+    /// content with no file behind it and so has no tree to look up.
+    pub workspace_root: Option<PathBuf>,
 }
 
 impl ManifestCheck {
@@ -213,7 +221,10 @@ impl Checker {
         // Content with no file behind it: the manifest's first lockfile is the
         // only thing it can be attributed to.
         let lockfile = lockfile.and_then(|lock| Some((*kind.lockfiles().first()?, lock)));
-        self.check_inner(kind, manifest, lockfile).await
+        // No file, so no tree above it: a `dep.workspace = true` here stays unresolved
+        // and reports as it always has. [`Checker::check_path`] is the entry point that
+        // can answer the question.
+        self.check_inner(kind, manifest, lockfile, None).await
     }
 
     /// Check a manifest on disk: detect its kind, read it (and, when
@@ -471,7 +482,11 @@ impl Checker {
         let manifest = tokio::fs::read_to_string(path).await?;
         let lockfile = self.read_lockfile(path, kind).await;
         let lockfile = lockfile.as_ref().map(|(kind, lock)| (*kind, lock.as_str()));
-        self.check_inner(kind, &manifest, lockfile).await
+        // A member's `dep.workspace = true` states no version of its own; the constraint
+        // is in the root above it. Only a path can find that root, which is why this
+        // resolves here and not in `check_manifest`.
+        let workspace = crate::discover::workspace_source(path, kind, &manifest);
+        self.check_inner(kind, &manifest, lockfile, workspace).await
     }
 
     /// Read the lockfile governing `path`, whichever of its candidates exists.
@@ -498,6 +513,7 @@ impl Checker {
         kind: ManifestKind,
         manifest: &str,
         lockfile: Option<(LockfileKind, &str)>,
+        workspace: Option<(PathBuf, Vec<Item>)>,
     ) -> Result<ManifestCheck, CheckError> {
         let ecosystem = kind.ecosystem();
         let fetcher = self
@@ -507,6 +523,16 @@ impl Checker {
             .clone();
 
         let mut parsed = parse(kind, manifest)?;
+
+        // Fill in what the workspace root declares, before anything asks which items are
+        // checkable — an unresolved `dep.workspace = true` states no version, so it would
+        // otherwise be skipped exactly as a `path` entry is. The resolved item keeps
+        // `PackageSource::Inherited`, which is what keeps `--fix` off a span that means
+        // nothing in this file.
+        if let Some((_, declarations)) = &workspace {
+            // The resolved names are the caller's business; the annotated items are ours.
+            let _ = resolve_workspace_inheritance(&mut parsed.items, declarations);
+        }
 
         // Apply the lockfile to annotate locked versions, dispatching on the file
         // that was found rather than on the manifest beside it. An unparseable
@@ -566,6 +592,7 @@ impl Checker {
             ecosystem,
             results,
             warnings,
+            workspace_root: workspace.map(|(root, _)| root),
         };
 
         // Enrichment is a post-pass over the finished results, so it can equally

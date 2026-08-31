@@ -960,3 +960,121 @@ async fn a_plain_check_makes_no_metadata_request_at_all() {
         "the default check must not pay for data nothing asked for"
     );
 }
+
+/// A workspace member's `dep.workspace = true` is checked against the version the root
+/// declares — the whole point of the feature. Before this, the member's entry parsed as a
+/// constraint-less local dep and was skipped, so the crate was only ever checked at the
+/// root, and not at all when the root fell outside the scan.
+#[tokio::test]
+async fn a_member_is_checked_against_the_workspace_roots_constraint() {
+    let server = MockServer::start().await;
+    mount_index(&server).await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/app\"]\n\n[workspace.dependencies]\nserde = \"1.0.0\"\n",
+    )
+    .unwrap();
+    // The lockfile sits at the root too, so this also proves the member picks up both
+    // of the things that live above it — the locked version and the constraint.
+    std::fs::write(root.join("Cargo.lock"), LOCK).unwrap();
+    let member = root.join("crates/app/Cargo.toml");
+    std::fs::create_dir_all(member.parent().unwrap()).unwrap();
+    let content = "[package]\nname = \"app\"\n\n[dependencies]\nserde.workspace = true\n";
+    std::fs::write(&member, content).unwrap();
+
+    let checker = Checker::builder()
+        .http_client(build_client().unwrap())
+        .rust_registry(server.uri(), None)
+        .vulnerabilities(false)
+        .disk_cache(false)
+        .build()
+        .unwrap();
+
+    let check = checker.check_path(&member).await.unwrap();
+
+    let serde = check
+        .results
+        .iter()
+        .find(|r| r.item.name == "serde")
+        .expect("serde is declared");
+    assert_eq!(serde.item.version_constraint, "1.0.0", "from the root");
+    assert_eq!(serde.item.locked_version.as_deref(), Some("1.0.0"));
+    assert_eq!(serde.status, DependencyStatus::UpdateAvailable);
+    assert_eq!(serde.latest_available.as_deref(), Some("1.2.0"));
+    assert_eq!(serde.item.source, PackageSource::Inherited);
+    // The version string is in the root, so nothing here may be rewritten.
+    assert!(!serde.item.is_rewritable());
+    assert_eq!(
+        (
+            serde.item.version_line,
+            serde.item.version_col_start,
+            serde.item.version_col_end
+        ),
+        (0, 0, 0),
+        "no position in this file is truthful"
+    );
+    assert_eq!(
+        check.workspace_root.as_deref(),
+        Some(root.join("Cargo.toml").as_path())
+    );
+
+    // Same content with no file behind it: there is no tree to look up, so the entry
+    // stays unresolved and reports exactly as it did before.
+    let detached = checker
+        .check_manifest(ManifestKind::CargoToml, content, None)
+        .await
+        .unwrap();
+    let serde = detached
+        .results
+        .iter()
+        .find(|r| r.item.name == "serde")
+        .expect("serde is declared");
+    assert_eq!(serde.status, DependencyStatus::Local);
+    assert!(serde.item.version_constraint.is_empty());
+    assert!(detached.workspace_root.is_none());
+}
+
+/// A root declaring a crate by `path` lends the member a path dependency, not a registry
+/// version — which is what Cargo itself resolves.
+#[tokio::test]
+async fn a_path_declaration_is_inherited_as_a_path_dependency() {
+    let server = MockServer::start().await;
+    mount_index(&server).await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/app\"]\n\n[workspace.dependencies]\nhelper = { path = \"crates/helper\" }\n",
+    )
+    .unwrap();
+    let member = root.join("crates/app/Cargo.toml");
+    std::fs::create_dir_all(member.parent().unwrap()).unwrap();
+    std::fs::write(
+        &member,
+        "[package]\nname = \"app\"\n\n[dependencies]\nhelper.workspace = true\n",
+    )
+    .unwrap();
+
+    let checker = Checker::builder()
+        .http_client(build_client().unwrap())
+        .rust_registry(server.uri(), None)
+        .vulnerabilities(false)
+        .disk_cache(false)
+        .build()
+        .unwrap();
+
+    let check = checker.check_path(&member).await.unwrap();
+    let helper = &check.results[0];
+
+    assert_eq!(helper.item.name, "helper");
+    assert_eq!(helper.item.source, PackageSource::Local);
+    assert_eq!(helper.status, DependencyStatus::Local);
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "a path dependency has no registry to ask"
+    );
+}
