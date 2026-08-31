@@ -1,0 +1,7 @@
+# The report templates are embedded with `include_str!` and the golden documents
+# are compared byte-for-byte, so git must not rewrite their line endings. With a
+# CRLF checkout on Windows the template-sourced newlines become CRLF while the
+# advisory text coming from Rust string literals stays LF, and `html_golden`
+# fails on that difference alone.
+*.html text eol=lf
+*.css  text eol=lf
