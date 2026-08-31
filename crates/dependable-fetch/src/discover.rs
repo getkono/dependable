@@ -158,7 +158,7 @@ pub fn nearest_workspace_root(manifest: &Path) -> Option<(PathBuf, WorkspaceDecl
             && let Ok(content) = std::fs::read_to_string(&candidate)
             && let Some(workspace) = parse_workspace(&content)
         {
-            return Some((candidate, workspace, content));
+            return Some((simplified(candidate), workspace, content));
         }
         if dir.join(".git").exists() {
             return None;
@@ -191,7 +191,9 @@ pub fn workspace_root_of(
     }
     if parse_workspace(content).is_some() {
         // Canonical, to match the shape [`nearest_workspace_root`] returns.
-        let root = std::fs::canonicalize(manifest).unwrap_or_else(|_| manifest.to_path_buf());
+        let root = std::fs::canonicalize(manifest)
+            .map(simplified)
+            .unwrap_or_else(|_| manifest.to_path_buf());
         return Some((root, content.to_owned()));
     }
     let (root, _, root_content) = nearest_workspace_root(manifest)?;
@@ -227,6 +229,22 @@ pub fn workspace_declarations(content: &str) -> Vec<Item> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Drop Windows' `\\?\` extended-length prefix, which `std::fs::canonicalize` always
+/// applies and which no user wants to read.
+///
+/// Only the plain-drive form is simplified: every other verbatim prefix (a UNC share, a
+/// device path) has no equivalent without it, and shortening those would name a different
+/// file. A no-op everywhere else, since the prefix cannot occur.
+fn simplified(path: PathBuf) -> PathBuf {
+    let text = path.as_os_str().to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\")
+        && rest.as_bytes().get(1) == Some(&b':')
+    {
+        return PathBuf::from(rest);
+    }
+    path
 }
 
 /// Whether two paths name the same file. Compared after canonicalization, since a
@@ -493,10 +511,32 @@ mod tests {
         assert!(notices.is_empty(), "{notices:?}");
     }
 
+    /// Windows' canonical form is the `\\?\` extended-length one, which is correct and
+    /// unreadable. Testable on every platform, since it is pure string work.
+    #[test]
+    fn the_windows_extended_length_prefix_is_dropped_from_a_drive_path() {
+        assert_eq!(
+            simplified(PathBuf::from(r"\\?\D:\repo\Cargo.toml")),
+            PathBuf::from(r"D:\repo\Cargo.toml")
+        );
+        // A UNC share has no form without the prefix, so shortening it would name a
+        // different file.
+        let unc = PathBuf::from(r"\\?\UNC\server\share\Cargo.toml");
+        assert_eq!(simplified(unc.clone()), unc);
+        // And an ordinary POSIX path is untouched.
+        assert_eq!(
+            simplified(PathBuf::from("/repo/Cargo.toml")),
+            PathBuf::from("/repo/Cargo.toml")
+        );
+    }
+
     #[test]
     fn a_member_resolves_against_the_root_above_it() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path();
+        // Canonical, because the returned root is: on macOS the system temp directory is
+        // reached through a `/var` -> `/private/var` symlink, so the two spellings of the
+        // same file differ as strings.
+        let root = &dir.path().canonicalize().expect("canonical");
         write(
             &root.join("Cargo.toml"),
             "[workspace]\nmembers = [\"crates/app\"]\n\n[workspace.dependencies]\nserde = \"1.0.200\"\n",
@@ -520,7 +560,11 @@ mod tests {
     #[test]
     fn a_root_that_is_also_a_package_governs_itself() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let manifest = dir.path().join("Cargo.toml");
+        let manifest = dir
+            .path()
+            .canonicalize()
+            .expect("canonical")
+            .join("Cargo.toml");
         let content = "[package]\nname = \"root\"\n\n[workspace]\nmembers = []\n\n[workspace.dependencies]\nserde = \"1.0.200\"\n\n[dependencies]\nserde.workspace = true\n";
         write(&manifest, content);
 

@@ -970,7 +970,10 @@ async fn a_member_is_checked_against_the_workspace_roots_constraint() {
     let server = MockServer::start().await;
     mount_index(&server).await;
     let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
+    // Canonical, because the reported `workspace_root` is: on macOS the system temp
+    // directory is reached through a `/var` -> `/private/var` symlink, so the two
+    // spellings of the same file differ as strings.
+    let root = &dir.path().canonicalize().unwrap();
 
     std::fs::write(
         root.join("Cargo.toml"),

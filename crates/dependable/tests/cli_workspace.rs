@@ -77,12 +77,23 @@ fn a_member_checked_on_its_own_still_gets_the_roots_constraint() {
 
     let serde = result(&doc, "crates/app/Cargo.toml", "serde");
     assert_eq!(serde["current"], "1.0.100", "the root's constraint");
+    // Canonical on both sides: the reported root is symlink-resolved, and on macOS the
+    // temp directory is reached through one.
+    let expected = dir
+        .canonicalize()
+        .expect("canonical")
+        .join("Cargo.toml")
+        .to_string_lossy()
+        .replace('\\', "/");
+    // Windows canonicalization yields the `\\?\` extended-length form, which the reported
+    // path drops; slash-normalized, that prefix reads as `//?/`.
+    let expected = expected.strip_prefix("//?/").unwrap_or(&expected);
     assert_eq!(
         serde["inherited_from"]
             .as_str()
             .expect("attribution")
             .replace('\\', "/"),
-        format!("{}/Cargo.toml", dir.to_str().unwrap().replace('\\', "/")),
+        expected,
         "the manifest the constraint came from"
     );
     // The registry was asked, which is the whole point — it just was not listening.
