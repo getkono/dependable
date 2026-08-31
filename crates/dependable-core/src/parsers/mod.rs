@@ -1,4 +1,9 @@
-//! Manifest parsers. V1 ships the `Cargo.toml` parser; other ecosystems are deferred.
+//! Manifest parsers: one per [`ManifestKind`], each pure `&str` in, data out.
+//!
+//! The purity is the point — it is what lets every ecosystem be unit-tested
+//! without mocking, and it is the first bar a candidate ecosystem has to clear
+//! (see `docs/ECOSYSTEM-CANDIDATES.md`): a manifest that is a program rather than
+//! data cannot be read here.
 
 use crate::error::ParseError;
 use crate::manifest::{ManifestKind, ParsedManifest};
