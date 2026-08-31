@@ -107,6 +107,18 @@ pub fn resolve_workspace_inheritance(items: &mut [Item], declarations: &[Item]) 
         else {
             continue;
         };
+        // A declaration with neither a version nor a path/git source of its own — a root
+        // writing `serde = { workspace = true }` into its own table — supplies nothing.
+        // Reporting the name as resolved would be a lie, and would leave the item in the
+        // exact state this loop re-resolves, so a second pass would report it again.
+        if declaration.version_constraint.is_empty()
+            && !matches!(
+                declaration.source,
+                PackageSource::Local | PackageSource::Git
+            )
+        {
+            continue;
+        }
         item.version_constraint
             .clone_from(&declaration.version_constraint);
         item.registry.clone_from(&declaration.registry);
@@ -358,6 +370,20 @@ keywords = ["tui", "editor"]
             "no constraint means nothing to ask for"
         );
         assert!(!tokio.is_rewritable());
+    }
+
+    /// A root declaring an entry that supplies nothing — `serde = { workspace = true }`
+    /// in its own `[workspace.dependencies]` — leaves the member exactly as it was. It
+    /// must not be reported as resolved, or the returned names lie and a second pass
+    /// reports them again.
+    #[test]
+    fn a_declaration_that_supplies_nothing_resolves_nothing() {
+        let decls = declarations("[workspace.dependencies]\nserde = { workspace = true }\n");
+        let mut items = member("[dependencies]\nserde.workspace = true\n");
+
+        assert!(resolve_workspace_inheritance(&mut items, &decls).is_empty());
+        assert!(resolve_workspace_inheritance(&mut items, &decls).is_empty());
+        assert!(find(&items, "serde").version_constraint.is_empty());
     }
 
     /// Resolution runs once per manifest, but a second pass must not re-report or

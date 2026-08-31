@@ -1078,3 +1078,48 @@ async fn a_path_declaration_is_inherited_as_a_path_dependency() {
         "a path dependency has no registry to ask"
     );
 }
+
+/// Cargo refuses to build a member inheriting a crate the root never declared. Reporting
+/// it as an ordinary unchecked dependency, which is what it looks like once resolution
+/// finds nothing, would hide a broken manifest behind a shrug.
+#[tokio::test]
+async fn an_inherited_name_the_root_never_declared_is_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/app\"]\n\n[workspace.dependencies]\nserde = \"1.0.0\"\n",
+    )
+    .unwrap();
+    let member = root.join("crates/app/Cargo.toml");
+    std::fs::create_dir_all(member.parent().unwrap()).unwrap();
+    std::fs::write(
+        &member,
+        "[package]\nname = \"app\"\n\n[dependencies]\ntokio.workspace = true\n",
+    )
+    .unwrap();
+
+    let checker = Checker::builder()
+        .http_client(build_client().unwrap())
+        .rust_registry("http://127.0.0.1:1".to_string(), None)
+        .vulnerabilities(false)
+        .disk_cache(false)
+        .build()
+        .unwrap();
+
+    let check = checker.check_path(&member).await.unwrap();
+
+    assert_eq!(check.warnings.len(), 1, "{:?}", check.warnings);
+    assert!(
+        check.warnings[0].contains("`tokio`"),
+        "{:?}",
+        check.warnings
+    );
+    assert!(
+        check.warnings[0].contains("declares no such dependency"),
+        "{:?}",
+        check.warnings
+    );
+    // The dependency itself still reports as it always did — unchecked, not an error.
+    assert_eq!(check.results[0].status, DependencyStatus::Local);
+}

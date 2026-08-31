@@ -52,22 +52,31 @@ impl Item {
         }
     }
 
-    /// Whether the recorded version span points at a real value **in this manifest**,
-    /// and may therefore be rewritten in place.
+    /// Whether [`version_line`](Self::version_line) and the columns beside it describe a
+    /// place in **this** manifest — what a reporter needs before it points at one.
     ///
-    /// This is the one rule behind three consumers — `--fix`'s edits, SARIF regions, and
-    /// GitHub annotation lines — so none of them can drift from the others. It is
-    /// deliberately narrower than [`is_checkable`](Self::is_checkable): an inherited
-    /// dependency is worth checking, but its version string lives in the workspace root,
-    /// so no position in *this* file is truthful. Since `0` is a legal line and column
-    /// index, the absence of a position is carried by the source rather than by a
-    /// sentinel value — an item whose span was never recorded reads as `0/0/0`, which
-    /// every bounds check passes.
+    /// Since `0` is a legal line and column index, an unrecorded span is indistinguishable
+    /// from a real one by value; it has to be inferred from the source instead. Every
+    /// parser that declines to record a span also gives the item a source nothing would
+    /// fetch, so [`is_checkable`](Self::is_checkable) covers all of them but one: a
+    /// resolved [`Inherited`](PackageSource::Inherited) item is worth checking and still
+    /// has no home here, because its version string is in the workspace root.
+    #[must_use]
+    pub fn has_position(&self) -> bool {
+        self.is_checkable() && self.source != PackageSource::Inherited
+    }
+
+    /// Whether the recorded span may be rewritten in place — it points here, and there is
+    /// a value there to replace.
+    ///
+    /// Strictly narrower than [`has_position`](Self::has_position), which is why the two
+    /// are separate: a bare `requirements.txt` requirement (`numpy`) is checkable and sits
+    /// on a line worth reporting, but records a *zero-width* span, and writing a version
+    /// into it would produce `numpy1.5.0`. `--fix` gates on this; the reporters, which
+    /// only ever read the line, gate on `has_position`.
     #[must_use]
     pub fn is_rewritable(&self) -> bool {
-        self.is_checkable()
-            && self.source != PackageSource::Inherited
-            && !self.version_constraint.is_empty()
+        self.has_position() && !self.version_constraint.is_empty()
     }
 }
 
@@ -177,10 +186,27 @@ mod tests {
     }
 
     #[test]
-    fn a_registry_item_is_both_checkable_and_rewritable() {
+    fn a_registry_item_is_checkable_positioned_and_rewritable() {
         let serde = find(&items("[dependencies]\nserde = \"1.0\"\n"), "serde");
         assert!(serde.is_checkable());
+        assert!(serde.has_position());
         assert!(serde.is_rewritable());
+    }
+
+    /// A bare requirement declares no version, so there is nothing to rewrite — its span
+    /// is zero-width, and writing into it would produce `numpy1.5.0`. It is still on a
+    /// real line of a real file, which is what a reporter needs.
+    #[test]
+    fn a_constraint_less_requirement_has_a_position_but_nothing_to_rewrite() {
+        let parsed = parse(ManifestKind::RequirementsTxt, "flask==1.0\nnumpy\n")
+            .expect("parses")
+            .items;
+        let numpy = find(&parsed, "numpy");
+
+        assert!(numpy.is_checkable(), "a bare requirement is still fetched");
+        assert!(numpy.has_position(), "line 2 of this very file");
+        assert_eq!(numpy.version_line, 1);
+        assert!(!numpy.is_rewritable(), "the span is zero-width");
     }
 
     #[test]
@@ -191,6 +217,7 @@ mod tests {
         for name in ["util", "g"] {
             let item = find(&parsed, name);
             assert!(!item.is_checkable(), "{name}");
+            assert!(!item.has_position(), "{name}");
             assert!(!item.is_rewritable(), "{name}");
         }
     }
@@ -212,8 +239,9 @@ mod tests {
         let resolved = find(&parsed, "serde");
         assert!(resolved.is_checkable(), "the root supplied a constraint");
         assert!(
-            !resolved.is_rewritable(),
+            !resolved.has_position(),
             "a resolved constraint still has no home in this file"
         );
+        assert!(!resolved.is_rewritable());
     }
 }

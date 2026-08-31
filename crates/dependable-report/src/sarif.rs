@@ -45,6 +45,9 @@
 //!   serialized, and the payoff is byte-determinism.
 //! - **No `toolExecutionNotifications`.** Skipped and unparseable manifests are
 //!   already reported on stderr by the CLI.
+//! - **No `region` at all** for a dependency whose version lives in another file — a
+//!   Cargo `dep.workspace = true`, resolved against the workspace root. The result still
+//!   carries its `artifactLocation`, which SARIF permits; see [`start_line`].
 //! - **No `cvssVersion` property.**
 //!   [`AdvisorySeverity::cvss_version`](dependable_core::result::AdvisorySeverity::cvss_version)
 //!   is an enum with no stable display form; the vector string is emitted
@@ -192,14 +195,14 @@ fn findings(report: &Report) -> Vec<Finding> {
 /// SARIF's one-based `region.startLine` from [`Item::version_line`], which is
 /// zero-indexed — or `None` for an item whose recorded span means nothing in this file.
 ///
-/// [`Item::is_rewritable`] is the discriminator rather than the position itself, because
+/// [`Item::has_position`] is the discriminator rather than the position itself, because
 /// `0` is a legal line: a `requirements.txt` can declare on its first line. A workspace
 /// member inheriting `dep.workspace = true` is checkable, and so does reach here, but its
 /// version string lives in the root manifest. Emitting `startLine: 1` for it would point
 /// code scanning at the wrong line of the right file, so the finding is reported against
 /// the file with no region at all.
 fn start_line(item: &Item) -> Option<usize> {
-    item.is_rewritable().then(|| item.version_line + 1)
+    item.has_position().then(|| item.version_line + 1)
 }
 
 /// The advisory IDs affecting the version in use, sorted and deduplicated.

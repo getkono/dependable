@@ -529,9 +529,11 @@ impl Checker {
         // otherwise be skipped exactly as a `path` entry is. The resolved item keeps
         // `PackageSource::Inherited`, which is what keeps `--fix` off a span that means
         // nothing in this file.
-        if let Some((_, declarations)) = &workspace {
+        let mut warnings = Vec::new();
+        if let Some((root, declarations)) = &workspace {
             // The resolved names are the caller's business; the annotated items are ours.
             let _ = resolve_workspace_inheritance(&mut parsed.items, declarations);
+            warnings.extend(undeclared_inheritance(&parsed.items, root));
         }
 
         // Apply the lockfile to annotate locked versions, dispatching on the file
@@ -570,7 +572,6 @@ impl Checker {
             .map(|item| evaluate_item(item, &fetched, ecosystem, self.unstable))
             .collect();
 
-        let mut warnings = Vec::new();
         if let Some(osv) = &self.osv
             && let Err(e) = scan_vulnerabilities(osv, ecosystem, &mut results).await
         {
@@ -724,6 +725,29 @@ impl Checker {
             p(event);
         }
     }
+}
+
+/// Name every entry that says it inherits but that the governing root never declared.
+///
+/// Cargo refuses to build such a manifest, so it is a real error and not a shrug — but it
+/// is not this tool's error, and a version check that aborted on it would be less useful
+/// than one that reports everything else and says what it could not resolve. The item
+/// itself still reports as unchecked, exactly as it did before inheritance was resolved
+/// at all; this is what stops that being silent.
+fn undeclared_inheritance(items: &[Item], root: &Path) -> Vec<String> {
+    items
+        .iter()
+        .filter(|item| {
+            item.source == PackageSource::Inherited && item.version_constraint.is_empty()
+        })
+        .map(|item| {
+            format!(
+                "`{}` is declared `workspace = true`, but {} declares no such dependency",
+                item.name,
+                root.display()
+            )
+        })
+        .collect()
 }
 
 /// Evaluate one parsed item against the fetched version lists, applying the

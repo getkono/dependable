@@ -393,7 +393,7 @@ fn command(finding: &Finding<'_>, level: Level) -> String {
         // Same rule as the columns: a location this file cannot support is worse than
         // none. An inherited dependency's version lives in the workspace root, so its
         // recorded line is a zero that would annotate line 1 of the wrong file.
-        if finding.result.item.is_rewritable() {
+        if finding.result.item.has_position() {
             // Zero-indexed in the parser, one-based in the command.
             let line = finding.result.item.version_line + 1;
             properties.push(format!("line={line}"));
