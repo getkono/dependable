@@ -23,7 +23,8 @@ end-to-end and establishes the type model + traits that later ecosystems plug in
 | `dependable-tui` | library | The interactive terminal UI (ratatui): the dependency forest, recursive drill-down, glob search, and the package detail pane. Holds no IO of its own — it drives `dependable-fetch`. |
 | `dependable` | application | CLI: `check` / `list` / `tree` / `fix` / `tui`, with `table` / `json` / `text` output, `.dependable.toml` + `DEPENDABLE_*` config, and `--fail-on` CI exit codes. A bare `dependable` in a terminal opens the TUI. |
 
-`dependable-report` (the V2 crate) is **not** created in V1.
+`dependable-report` (the V2 crate) is scaffolded — the crate and its module slots
+exist, but it renders nothing yet and ships no user-visible command.
 
 ### 1a. Dependency tree (`tree`) — Rust, offline
 
@@ -153,7 +154,7 @@ Cross-cutting enablers (also V1.1): extend `Ecosystem`/`ManifestKind` enums + `d
 
 | Item | What it covers | Crate / dep | PRD |
 |---|---|---|---|
-| `dependable-report` crate | New 5th crate (`html/`, `sarif.rs`, `git.rs`, `policy.rs`) | `time` | §2, §3, §6 |
+| `dependable-report` crate | New 5th crate (`html/`, `sarif.rs`, `policy.rs`) | `time` | §2, §3, §6 |
 | OSV advisory enrichment | CVSS, severity, fixed versions, descriptions (feeds reports/SARIF/policy) | `POST /v1/query` | §5.6, §6.1 |
 | HTML reports | `dependable report`: exec summary, vuln/dep tables, SVG charts, self-contained | `minijinja`, `base64` | §6.1 |
 | Git comparative analysis | `--compare-to <ref>`: diff deps + vulns between tree and ref | `gix` | §6.2 |

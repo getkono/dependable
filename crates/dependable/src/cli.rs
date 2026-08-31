@@ -34,6 +34,13 @@ pub enum Command {
     Fix(FixArgs),
     /// Explore dependencies interactively (the default when run in a terminal).
     Tui(TuiArgs),
+    /// Generate a dependency and vulnerability report.
+    ///
+    /// Hidden while it is a scaffold: a release is cut from `master` on merge, so
+    /// a visible command that cannot do its job would ship to users.
+    #[cfg(feature = "report")]
+    #[command(hide = true)]
+    Report(ReportArgs),
 }
 
 impl Cli {
@@ -46,6 +53,8 @@ impl Cli {
             Some(Command::Tree(args)) => args.verbose,
             Some(Command::Fix(args)) => args.verbose,
             Some(Command::Tui(args)) => args.verbose,
+            #[cfg(feature = "report")]
+            Some(Command::Report(args)) => args.verbose,
             None => false,
         }
     }
@@ -196,6 +205,17 @@ impl Default for TuiArgs {
             verbose: false,
         }
     }
+}
+
+/// Arguments for `dependable report`.
+#[cfg(feature = "report")]
+#[derive(Args)]
+pub struct ReportArgs {
+    /// Project directory to report on (default: current directory).
+    pub path: Option<PathBuf>,
+    /// Verbose logging.
+    #[arg(short, long)]
+    pub verbose: bool,
 }
 
 /// Output format.

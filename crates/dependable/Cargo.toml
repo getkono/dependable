@@ -8,6 +8,12 @@ license.workspace = true
 repository.workspace = true
 default-run = "dependable"
 
+[features]
+default = ["report"]
+# The `report` subcommand. On by default so the workspace's clippy and test runs
+# (which build default features only) keep compiling and exercising it.
+report = ["dep:dependable-report"]
+
 [[bin]]
 name = "dependable"
 path = "src/main.rs"
@@ -15,6 +21,7 @@ path = "src/main.rs"
 [dependencies]
 dependable-fetch.workspace = true
 dependable-tui.workspace = true
+dependable-report = { workspace = true, optional = true }
 toml_edit.workspace = true
 clap.workspace = true
 tokio.workspace = true

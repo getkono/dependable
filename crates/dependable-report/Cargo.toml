@@ -1,0 +1,24 @@
+[package]
+name = "dependable-report"
+description = "HTML, SARIF, and policy reports for dependable."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["bin"]
+# The `dependable-report` binary. On by default so the workspace's clippy and
+# test runs (which build default features only) keep compiling it.
+bin = []
+
+[[bin]]
+name = "dependable-report"
+path = "src/main.rs"
+required-features = ["bin"]
+
+[dependencies]
+dependable-core.workspace = true
+thiserror.workspace = true
+time.workspace = true
