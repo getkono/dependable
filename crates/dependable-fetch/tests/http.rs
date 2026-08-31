@@ -148,6 +148,13 @@ async fn live_pypi_flask_has_versions() {
     let fetcher = PyPiFetcher::new(build_client().unwrap());
     let fetched = fetcher.fetch_versions("flask").await.unwrap();
     assert!(!fetched.versions.is_empty());
+    // A registry that answers must answer with something parseable: an empty-ish list
+    // satisfied the old assertion no matter what shape the response had.
+    assert!(
+        fetched.versions.iter().all(|v| !v.trim().is_empty()),
+        "blank version in {:?}",
+        fetched.versions
+    );
 }
 
 #[tokio::test]
@@ -206,6 +213,13 @@ async fn live_go_proxy_has_versions() {
     let fetcher = GoProxyFetcher::new(build_client().unwrap());
     let fetched = fetcher.fetch_versions("golang.org/x/text").await.unwrap();
     assert!(!fetched.versions.is_empty());
+    // A registry that answers must answer with something parseable: an empty-ish list
+    // satisfied the old assertion no matter what shape the response had.
+    assert!(
+        fetched.versions.iter().all(|v| !v.trim().is_empty()),
+        "blank version in {:?}",
+        fetched.versions
+    );
 }
 
 #[tokio::test]
@@ -305,6 +319,13 @@ async fn live_packagist_monolog_has_versions() {
     let fetcher = PackagistFetcher::new(build_client().unwrap());
     let fetched = fetcher.fetch_versions("monolog/monolog").await.unwrap();
     assert!(!fetched.versions.is_empty());
+    // A registry that answers must answer with something parseable: an empty-ish list
+    // satisfied the old assertion no matter what shape the response had.
+    assert!(
+        fetched.versions.iter().all(|v| !v.trim().is_empty()),
+        "blank version in {:?}",
+        fetched.versions
+    );
 }
 
 #[tokio::test]
@@ -330,6 +351,13 @@ async fn live_pub_dev_http_has_versions() {
     let fetcher = PubDevFetcher::new(build_client().unwrap());
     let fetched = fetcher.fetch_versions("http").await.unwrap();
     assert!(!fetched.versions.is_empty());
+    // A registry that answers must answer with something parseable: an empty-ish list
+    // satisfied the old assertion no matter what shape the response had.
+    assert!(
+        fetched.versions.iter().all(|v| !v.trim().is_empty()),
+        "blank version in {:?}",
+        fetched.versions
+    );
 }
 
 #[tokio::test]
@@ -375,6 +403,13 @@ async fn live_nuget_newtonsoft_has_versions() {
     let fetcher = NuGetFetcher::new(build_client().unwrap());
     let fetched = fetcher.fetch_versions("Newtonsoft.Json").await.unwrap();
     assert!(!fetched.versions.is_empty());
+    // A registry that answers must answer with something parseable: an empty-ish list
+    // satisfied the old assertion no matter what shape the response had.
+    assert!(
+        fetched.versions.iter().all(|v| !v.trim().is_empty()),
+        "blank version in {:?}",
+        fetched.versions
+    );
 }
 
 #[tokio::test]
@@ -400,6 +435,13 @@ async fn live_hex_phoenix_has_versions() {
     let fetcher = HexFetcher::new(build_client().unwrap());
     let fetched = fetcher.fetch_versions("phoenix").await.unwrap();
     assert!(!fetched.versions.is_empty());
+    // A registry that answers must answer with something parseable: an empty-ish list
+    // satisfied the old assertion no matter what shape the response had.
+    assert!(
+        fetched.versions.iter().all(|v| !v.trim().is_empty()),
+        "blank version in {:?}",
+        fetched.versions
+    );
 }
 
 #[tokio::test]
@@ -408,6 +450,13 @@ async fn live_npm_react_has_versions() {
     let fetcher = NpmFetcher::new(build_client().unwrap());
     let fetched = fetcher.fetch_versions("react").await.unwrap();
     assert!(!fetched.versions.is_empty());
+    // A registry that answers must answer with something parseable: an empty-ish list
+    // satisfied the old assertion no matter what shape the response had.
+    assert!(
+        fetched.versions.iter().all(|v| !v.trim().is_empty()),
+        "blank version in {:?}",
+        fetched.versions
+    );
 }
 
 #[tokio::test]
@@ -416,6 +465,13 @@ async fn live_jsr_std_path_has_versions() {
     let fetcher = JsrFetcher::new(build_client().unwrap());
     let fetched = fetcher.fetch_versions("@std/path").await.unwrap();
     assert!(!fetched.versions.is_empty());
+    // A registry that answers must answer with something parseable: an empty-ish list
+    // satisfied the old assertion no matter what shape the response had.
+    assert!(
+        fetched.versions.iter().all(|v| !v.trim().is_empty()),
+        "blank version in {:?}",
+        fetched.versions
+    );
 }
 
 #[tokio::test]
@@ -424,6 +480,13 @@ async fn live_crates_io_serde_has_versions() {
     let fetcher = CratesIoFetcher::new(build_client().unwrap());
     let fetched = fetcher.fetch_versions("serde").await.unwrap();
     assert!(!fetched.versions.is_empty());
+    // A registry that answers must answer with something parseable: an empty-ish list
+    // satisfied the old assertion no matter what shape the response had.
+    assert!(
+        fetched.versions.iter().all(|v| !v.trim().is_empty()),
+        "blank version in {:?}",
+        fetched.versions
+    );
 }
 
 #[tokio::test]

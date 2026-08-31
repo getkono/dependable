@@ -5,7 +5,7 @@ A composite action that installs the released `dependable` binary and runs
 
 ```yaml
 - uses: actions/checkout@v4
-- uses: getkono/dependable/.github/actions/dependable-check@v0.1.4
+- uses: getkono/dependable/.github/actions/dependable-check@v0.1.3
   with:
     fail-on: vulnerable
 ```
@@ -37,7 +37,7 @@ single valid document while the annotations still reach the pull request.
 | `fail-on` | `vulnerable` | `none`, `outdated`, `vulnerable`, or `any`. |
 | `format` | `table` | `table`, `json`, `text`, or `sarif` — what goes to stdout. |
 | `annotations` | `auto` | `auto`, `always`, or `never`. `never` also turns off the job summary. |
-| `version` | `latest` | A release tag such as `v0.1.4`, or `latest`. |
+| `version` | `latest` | A release tag such as `v0.1.3`, or `latest`. |
 | `args` | `''` | Extra arguments appended to `dependable check` verbatim. |
 
 **`fail-on` defaults to `vulnerable`, deviating from the CLI's `none`.** This is
@@ -59,7 +59,7 @@ Counts are deliberately not outputs: they would duplicate the JSON schema and
 drift from it.
 
 ```yaml
-- uses: getkono/dependable/.github/actions/dependable-check@v0.1.4
+- uses: getkono/dependable/.github/actions/dependable-check@v0.1.3
   id: deps
   continue-on-error: true
   with:
@@ -83,7 +83,7 @@ Releases are tagged `v{version}` only — there is **no floating `v1` tag** — 
 pin a full tag:
 
 ```yaml
-uses: getkono/dependable/.github/actions/dependable-check@v0.1.4
+uses: getkono/dependable/.github/actions/dependable-check@v0.1.3
 ```
 
 `version: latest` resolves the newest release at run time; pinning `version:` to
