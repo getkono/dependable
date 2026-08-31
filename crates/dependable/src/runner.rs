@@ -4,7 +4,7 @@
 //! [`dependable_fetch::Checker`]. This module owns only CLI concerns: config
 //! layering, manifest discovery, progress UX, output rendering, and exit codes.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
@@ -13,12 +13,13 @@ use anyhow::Context;
 use dependable_fetch::core::{
     AlternateRegistryDecl, NpmrcConfig, PackageField, ProjectMeta, WorkspaceDecl, apply_lockfile,
     parse, parse_cargo_config, parse_npmrc, parse_project, parse_workspace,
+    resolve_workspace_inheritance,
 };
 use dependable_fetch::{
     CheckError, Checker, DependencyKind, DependencyStatus, Ecosystem, GoProxyFetcher, GraphSource,
-    HexFetcher, Item, JsrFetcher, ManifestKind, NpmFetcher, NuGetFetcher, PackageSource,
-    PackagistFetcher, ParseError, ProgressEvent, PubDevFetcher, PyPiFetcher, ScopedRegistry,
-    TreeOptions, UnstableFilter, WorkspaceGraphOptions, build_client, build_workspace_graph,
+    HexFetcher, Item, JsrFetcher, ManifestKind, NpmFetcher, NuGetFetcher, PackagistFetcher,
+    ParseError, ProgressEvent, PubDevFetcher, PyPiFetcher, ScopedRegistry, TreeOptions,
+    UnstableFilter, WorkspaceGraphOptions, build_client, build_workspace_graph,
 };
 use dependable_tui::TuiOptions;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
@@ -679,27 +680,11 @@ fn inherit_workspace_constraints(
     let Some(declared) = workspace_declarations(manifest) else {
         return Vec::new();
     };
-    let mut inherited = Vec::new();
-    for item in items {
-        // Only an entry with nothing of its own to say can be inheriting.
-        if !item.version_constraint.is_empty() || item.source != PackageSource::Local {
-            continue;
-        }
-        let Some(source) = declared.get(&item.name) else {
-            continue;
-        };
-        item.version_constraint
-            .clone_from(&source.version_constraint);
-        item.source = source.source;
-        item.registry.clone_from(&source.registry);
-        inherited.push(item.name.clone());
-    }
-    inherited
+    resolve_workspace_inheritance(items, &declared)
 }
 
-/// The `[workspace.dependencies]` entries of the nearest ancestor workspace root, keyed
-/// by package name.
-fn workspace_declarations(manifest: &Path) -> Option<HashMap<String, Item>> {
+/// The `[workspace.dependencies]` entries of the nearest ancestor workspace root.
+fn workspace_declarations(manifest: &Path) -> Option<Vec<Item>> {
     let (_, content) = nearest_workspace_root(manifest)?;
     let parsed = parse(ManifestKind::CargoToml, &content).ok()?;
     Some(
@@ -707,7 +692,6 @@ fn workspace_declarations(manifest: &Path) -> Option<HashMap<String, Item>> {
             .items
             .into_iter()
             .filter(|item| item.kind == DependencyKind::Workspace)
-            .map(|item| (item.name.clone(), item))
             .collect(),
     )
 }

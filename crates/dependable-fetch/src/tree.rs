@@ -227,7 +227,10 @@ fn shallow_graph(
         for item in &items {
             deps.push(item.name.clone());
             if !workspace_names.contains(&item.name) && external_seen.insert(item.name.clone()) {
-                // Synthesize a source so classification matches the item's kind.
+                // Synthesize a source so classification matches the item's kind. Only
+                // `path` is genuinely local: a `workspace = true` entry names a crate
+                // the root declares, which nothing here reads, so it classifies on the
+                // common case (a registry crate) rather than as the path entry it is not.
                 let source = match item.source {
                     PackageSource::Git => Some("git+".to_owned()),
                     PackageSource::Local => None,

@@ -269,6 +269,7 @@ fn source_token(source: PackageSource) -> &'static str {
         PackageSource::Jsr => "jsr",
         PackageSource::Local => "local",
         PackageSource::Git => "git",
+        PackageSource::Inherited => "inherited",
         _ => "unknown",
     }
 }

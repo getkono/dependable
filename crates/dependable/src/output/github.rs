@@ -389,11 +389,16 @@ fn message(finding: &Finding<'_>, level: Level) -> String {
 fn command(finding: &Finding<'_>, level: Level) -> String {
     let mut properties = Vec::new();
     if let Some(file) = &finding.file {
-        // Zero-indexed in the parser, one-based in the command.
-        let line = finding.result.item.version_line + 1;
         properties.push(format!("file={}", escape_property(file)));
-        properties.push(format!("line={line}"));
-        properties.push(format!("endLine={line}"));
+        // Same rule as the columns: a location this file cannot support is worse than
+        // none. An inherited dependency's version lives in the workspace root, so its
+        // recorded line is a zero that would annotate line 1 of the wrong file.
+        if finding.result.item.is_rewritable() {
+            // Zero-indexed in the parser, one-based in the command.
+            let line = finding.result.item.version_line + 1;
+            properties.push(format!("line={line}"));
+            properties.push(format!("endLine={line}"));
+        }
     }
     properties.push(format!("title={}", escape_property(level.title())));
     format!(
@@ -769,7 +774,7 @@ pub fn emit(reports: &[ManifestReport], mode: AnnotationMode) {
 mod tests {
     use dependable_fetch::core::parse;
     use dependable_fetch::core::result::{AdvisoryReference, AdvisorySeverity, ReferenceKind};
-    use dependable_fetch::{Ecosystem, Item, ManifestKind};
+    use dependable_fetch::{Ecosystem, Item, ManifestKind, PackageSource};
 
     use super::*;
 
@@ -885,6 +890,26 @@ mod tests {
             lines.iter().any(|l| l.contains("line=12,endLine=12")),
             "{lines:?}"
         );
+    }
+
+    /// A workspace member's `dep.workspace = true` is checkable — so it does reach the
+    /// annotator — but its version string is in the root manifest. Annotating line 1 of
+    /// the member would point a reviewer at the wrong line of the right file, which is
+    /// the same trade the columns already lose.
+    #[test]
+    fn an_inherited_dependency_is_annotated_without_a_line() {
+        let mut result = vulnerable("serde", 0, 9.8);
+        result.item.source = PackageSource::Inherited;
+        result.item.version_constraint = "1.0.100".to_string();
+        assert!(result.item.is_checkable() && !result.item.is_rewritable());
+
+        let reports = vec![report("/w/crates/app/Cargo.toml", vec![result])];
+        let lines = lines_for(&reports);
+
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("file=crates/app/Cargo.toml"), "{lines:?}");
+        assert!(!lines[0].contains("line="), "{lines:?}");
+        assert!(!lines[0].contains("endLine="), "{lines:?}");
     }
 
     #[test]

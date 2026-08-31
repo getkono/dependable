@@ -9,6 +9,8 @@ use std::collections::BTreeMap;
 
 use toml_edit::{ImDocument, Item as TomlItem};
 
+use crate::item::{DependencyKind, Item, PackageSource};
+
 /// The `[workspace]` table of a Cargo manifest.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
@@ -70,6 +72,55 @@ pub fn parse_package_name(content: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Fill in the constraints `items` inherit from a workspace root's
+/// `[workspace.dependencies]`, returning the names resolved that way in item order.
+///
+/// Pure: `declarations` is simply the root manifest's own parsed items — locating and
+/// reading that manifest is the IO layer's job (`dependable_fetch::workspace_source`).
+/// Only entries with [`DependencyKind::Workspace`] are consulted, so a root that also
+/// declares its own `[dependencies]` cannot lend them to its members.
+///
+/// # Positions are deliberately untouched
+/// The version string being adopted lives in a *different file*, so no
+/// [`version_line`](Item::version_line) or column in the member manifest is truthful and
+/// none is invented. The resolved item keeps [`PackageSource::Inherited`], which is what
+/// [`Item::is_rewritable`] reads to keep `--fix` and the location-emitting reporters off
+/// a span that means nothing.
+///
+/// A root declaration that is itself a `path` or `git` entry hands the member
+/// [`PackageSource::Local`] / [`PackageSource::Git`]: the member does inherit, but what it
+/// inherits has no registry version to check. It is still reported as inherited, because
+/// that is where its definition came from.
+#[must_use]
+pub fn resolve_workspace_inheritance(items: &mut [Item], declarations: &[Item]) -> Vec<String> {
+    let mut resolved = Vec::new();
+    for item in items {
+        // Only an entry that says it inherits, and has nothing of its own to say, can be
+        // resolved. A `path` dependency sharing a name with a root declaration is not
+        // inheriting — Cargo uses the path — and must not be rewritten here.
+        if item.source != PackageSource::Inherited || !item.version_constraint.is_empty() {
+            continue;
+        }
+        let Some(declaration) = declarations
+            .iter()
+            .find(|d| d.kind == DependencyKind::Workspace && d.name == item.name)
+        else {
+            continue;
+        };
+        item.version_constraint
+            .clone_from(&declaration.version_constraint);
+        item.registry.clone_from(&declaration.registry);
+        if matches!(
+            declaration.source,
+            PackageSource::Local | PackageSource::Git
+        ) {
+            item.source = declaration.source;
+        }
+        resolved.push(item.name.clone());
+    }
+    resolved
+}
+
 /// Collect a TOML array of strings, ignoring non-string and missing values.
 fn string_array(item: Option<&TomlItem>) -> Vec<String> {
     item.and_then(TomlItem::as_array)
@@ -84,6 +135,32 @@ fn string_array(item: Option<&TomlItem>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifest::ManifestKind;
+    use crate::parsers::parse;
+
+    /// The `[workspace.dependencies]` entries of a root manifest, as the IO layer
+    /// would hand them over.
+    fn declarations(root: &str) -> Vec<Item> {
+        parse(ManifestKind::CargoToml, root)
+            .expect("root parses")
+            .items
+            .into_iter()
+            .filter(|item| item.kind == DependencyKind::Workspace)
+            .collect()
+    }
+
+    fn member(content: &str) -> Vec<Item> {
+        parse(ManifestKind::CargoToml, content)
+            .expect("member parses")
+            .items
+    }
+
+    fn find<'a>(items: &'a [Item], name: &str) -> &'a Item {
+        items
+            .iter()
+            .find(|item| item.name == name)
+            .unwrap_or_else(|| panic!("no item {name}"))
+    }
 
     #[test]
     fn parses_virtual_workspace_root() {
@@ -170,5 +247,128 @@ keywords = ["tui", "editor"]
         // Array-valued keys are deliberately omitted.
         assert!(!ws.package_defaults.contains_key("authors"));
         assert!(!ws.package_defaults.contains_key("keywords"));
+    }
+    #[test]
+    fn a_member_inherits_the_roots_constraint_and_registry() {
+        let decls = declarations(
+            "[workspace.dependencies]\nserde = { version = \"1.0.200\", registry = \"internal\" }\n",
+        );
+        let mut items =
+            member("[dependencies]\nserde = { workspace = true, features = [\"derive\"] }\n");
+
+        let resolved = resolve_workspace_inheritance(&mut items, &decls);
+
+        assert_eq!(resolved, ["serde"]);
+        let serde = find(&items, "serde");
+        assert_eq!(serde.version_constraint, "1.0.200");
+        assert_eq!(serde.registry.as_deref(), Some("internal"));
+        assert_eq!(serde.source, PackageSource::Inherited);
+        assert!(
+            serde.is_checkable(),
+            "a resolved constraint is worth asking about"
+        );
+    }
+
+    /// The version string lives in the root, so the member manifest has no truthful
+    /// position for it — and an invented one would be spliced into byte 0 of line 0 by
+    /// anything rewriting spans.
+    #[test]
+    fn inheriting_a_constraint_invents_no_position() {
+        let decls = declarations("[workspace.dependencies]\nserde = \"1.0.200\"\n");
+        let mut items =
+            member("[package]\nname = \"member\"\n\n[dependencies]\nserde.workspace = true\n");
+
+        let _ = resolve_workspace_inheritance(&mut items, &decls);
+
+        let serde = find(&items, "serde");
+        assert_eq!(
+            (
+                serde.version_line,
+                serde.version_col_start,
+                serde.version_col_end
+            ),
+            (0, 0, 0)
+        );
+        assert!(
+            !serde.is_rewritable(),
+            "nothing in this file may be rewritten"
+        );
+    }
+
+    /// Cargo resolves a member's `path` entry to the path, whatever the root says about
+    /// a crate of the same name. Telling the two apart is why `workspace = true` gets
+    /// its own source at parse time.
+    #[test]
+    fn a_path_dependency_sharing_a_name_is_never_promoted() {
+        let decls = declarations("[workspace.dependencies]\nutil = \"1.0.0\"\n");
+        let mut items = member("[dependencies]\nutil = { path = \"../util\" }\n");
+
+        let resolved = resolve_workspace_inheritance(&mut items, &decls);
+
+        assert!(resolved.is_empty(), "{resolved:?}");
+        let util = find(&items, "util");
+        assert_eq!(util.source, PackageSource::Local);
+        assert!(util.version_constraint.is_empty());
+    }
+
+    #[test]
+    fn a_path_or_git_root_declaration_is_inherited_as_such() {
+        let decls = declarations(
+            "[workspace.dependencies]\nutil = { path = \"crates/util\" }\ngitdep = { git = \"https://example.com/g\" }\n",
+        );
+        let mut items = member("[dependencies]\nutil.workspace = true\ngitdep.workspace = true\n");
+
+        let resolved = resolve_workspace_inheritance(&mut items, &decls);
+
+        assert_eq!(resolved, ["util", "gitdep"]);
+        assert_eq!(find(&items, "util").source, PackageSource::Local);
+        assert_eq!(find(&items, "gitdep").source, PackageSource::Git);
+        assert!(!find(&items, "util").is_checkable());
+        assert!(!find(&items, "gitdep").is_checkable());
+    }
+
+    /// A root's own `[dependencies]` are its own business — only the central
+    /// declarations are on offer.
+    #[test]
+    fn only_workspace_kind_declarations_are_consulted() {
+        let decls = parse(
+            ManifestKind::CargoToml,
+            "[dependencies]\nserde = \"1.0.200\"\n",
+        )
+        .expect("parses")
+        .items;
+        let mut items = member("[dependencies]\nserde.workspace = true\n");
+
+        assert!(resolve_workspace_inheritance(&mut items, &decls).is_empty());
+        assert!(find(&items, "serde").version_constraint.is_empty());
+    }
+
+    /// A member can name a crate the root never declared. That is a broken manifest, and
+    /// guessing a version for it would be worse than reporting nothing.
+    #[test]
+    fn an_undeclared_name_stays_unresolved_and_unchecked() {
+        let decls = declarations("[workspace.dependencies]\nserde = \"1\"\n");
+        let mut items = member("[dependencies]\ntokio.workspace = true\n");
+
+        assert!(resolve_workspace_inheritance(&mut items, &decls).is_empty());
+        let tokio = find(&items, "tokio");
+        assert_eq!(tokio.source, PackageSource::Inherited);
+        assert!(
+            !tokio.is_checkable(),
+            "no constraint means nothing to ask for"
+        );
+        assert!(!tokio.is_rewritable());
+    }
+
+    /// Resolution runs once per manifest, but a second pass must not re-report or
+    /// re-copy — the item already states a version of its own.
+    #[test]
+    fn resolution_is_idempotent() {
+        let decls = declarations("[workspace.dependencies]\nserde = \"1.0.200\"\n");
+        let mut items = member("[dependencies]\nserde.workspace = true\n");
+
+        assert_eq!(resolve_workspace_inheritance(&mut items, &decls), ["serde"]);
+        assert!(resolve_workspace_inheritance(&mut items, &decls).is_empty());
+        assert_eq!(find(&items, "serde").version_constraint, "1.0.200");
     }
 }
