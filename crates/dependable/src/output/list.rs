@@ -304,6 +304,7 @@ fn annotation(item: &Item) -> &'static str {
             DependencyKind::Peer => " (peer)",
             DependencyKind::Workspace => " (declared)",
             DependencyKind::Indirect => " (indirect)",
+            DependencyKind::Override => " (override)",
             _ => "",
         },
     }

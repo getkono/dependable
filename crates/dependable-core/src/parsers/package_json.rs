@@ -51,14 +51,65 @@ fn dependency_key(path: &[String]) -> Option<(&str, DependencyKind)> {
             .iter()
             .find(|(name, _)| name == section)
             .map(|(_, kind)| (dep.as_str(), *kind))
+            .or_else(|| (section == "catalog").then_some((dep.as_str(), DependencyKind::Workspace)))
             .or_else(|| {
-                (section == "catalog").then_some((dep.as_str(), DependencyKind::Workspace))
+                is_override_section(section)
+                    .then(|| override_name(dep))
+                    .flatten()
+                    .map(|name| (name, DependencyKind::Override))
             }),
         [section, _catalog, dep] if section == "catalogs" => {
             Some((dep.as_str(), DependencyKind::Workspace))
         }
+        // `pnpm.overrides`, and npm's nested form where an override is scoped to the
+        // parent that pulls the package in: `overrides.parent.child`.
+        [outer, inner, dep] if outer == "pnpm" && inner == "overrides" => {
+            override_name(dep).map(|name| (name, DependencyKind::Override))
+        }
+        [section, _parent, dep] if is_override_section(section) => {
+            override_name(dep).map(|name| (name, DependencyKind::Override))
+        }
         _ => None,
     }
+}
+
+/// Whether `section` is one of the maps that force a version onto the resolved tree.
+fn is_override_section(section: &str) -> bool {
+    matches!(section, "overrides" | "resolutions")
+}
+
+/// The package an override key names.
+///
+/// Yarn `resolutions` keys carry a path (`parent/child`, `**/lodash`) and npm's nested
+/// form uses `"."` to mean "the parent entry itself", which names no new package.
+fn override_name(key: &str) -> Option<&str> {
+    if key == "." {
+        return None;
+    }
+    // Segment first, then strip the version. Doing it the other way round cut `**/@scope/pkg`
+    // at the scope's own `@`, because that `@` is not at the start of the *key*.
+    //
+    // The package is the last segment — or the last *two* when the one before it is a
+    // scope, because `@scope/pkg` is one name that happens to contain a slash.
+    let mut start = key.rfind('/').map_or(0, |slash| slash + 1);
+    if start > 0 {
+        let head = &key[..start - 1];
+        if let Some(prev) = head.rfind('/') {
+            if key[prev + 1..].starts_with('@') {
+                start = prev + 1;
+            }
+        } else if head.starts_with('@') {
+            start = 0;
+        }
+    }
+    let name = &key[start..];
+    // A trailing `@version` selects a range, not part of the name. A *leading* `@` is the
+    // scope, so the offset has to be past the start.
+    let name = match name.rfind('@') {
+        Some(at) if at > 0 => &name[..at],
+        _ => name,
+    };
+    (!name.is_empty() && name != "*" && name != "**").then_some(name)
 }
 
 /// Build an [`Item`] for one dependency entry, resolving aliases and recording the
@@ -291,5 +342,50 @@ mod tests {
             .collect();
         assert!(reacts.contains(&"^18.0.0"));
         assert!(reacts.contains(&"^17.0.0"));
+    }
+
+    /// `overrides` and `resolutions` are how a vulnerable transitive dependency is
+    /// pinned to a patched version. Not reading them meant the pin was invisible, so a
+    /// stale one could never be reported.
+    #[test]
+    fn overrides_and_resolutions_are_collected() {
+        let content = r#"{
+          "dependencies": { "express": "^4.0.0" },
+          "overrides": { "minimist": "1.2.6" },
+          "resolutions": { "lodash": "4.17.21", "parent/debug": "4.3.4" },
+          "pnpm": { "overrides": { "glob-parent": ">=5.1.2" } }
+        }"#;
+        let m = PackageJsonParser.parse(content).expect("valid JSON");
+        let by_name = |n: &str| m.items.iter().find(|i| i.name == n).cloned();
+
+        for name in ["minimist", "lodash", "debug", "glob-parent"] {
+            let it = by_name(name).unwrap_or_else(|| panic!("{name} missing"));
+            assert_eq!(it.kind, DependencyKind::Override, "{name}");
+        }
+        assert_eq!(by_name("minimist").unwrap().version_constraint, "1.2.6");
+        assert_eq!(by_name("express").unwrap().kind, DependencyKind::Normal);
+    }
+
+    /// npm's nested form scopes an override to the parent that pulls the package in, and
+    /// spells "the parent itself" as `"."`, which names no new package.
+    #[test]
+    fn nested_override_keys_resolve_to_the_package_they_name() {
+        let content = r#"{ "overrides": { "foo": { ".": "1.0.0", "bar": "2.0.0" } } }"#;
+        let m = PackageJsonParser.parse(content).expect("valid JSON");
+        let names: Vec<&str> = m.items.iter().map(|i| i.name.as_str()).collect();
+        assert!(names.contains(&"bar"), "got {names:?}");
+        assert!(!names.contains(&"."), "got {names:?}");
+    }
+
+    #[test]
+    fn resolution_key_paths_and_globs_name_the_last_segment() {
+        assert_eq!(override_name("parent/child"), Some("child"));
+        assert_eq!(override_name("**/lodash"), Some("lodash"));
+        assert_eq!(override_name("@scope/pkg"), Some("@scope/pkg"));
+        assert_eq!(override_name("lodash@^4"), Some("lodash"));
+        assert_eq!(override_name("**/@scope/pkg"), Some("@scope/pkg"));
+        assert_eq!(override_name("parent/@scope/pkg"), Some("@scope/pkg"));
+        assert_eq!(override_name("@scope/pkg@^1"), Some("@scope/pkg"));
+        assert_eq!(override_name("."), None);
     }
 }

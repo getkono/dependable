@@ -121,6 +121,12 @@ pub enum DependencyKind {
     /// A transitive dependency the manifest records explicitly (`go.mod`'s
     /// `// indirect`). Not a direct dependency of the module.
     Indirect,
+    /// A version this manifest forces onto the tree regardless of what asked for it —
+    /// npm `overrides`, Yarn `resolutions`, `pnpm.overrides`.
+    ///
+    /// Worth reporting precisely because it is how a vulnerable transitive dependency is
+    /// remediated: the pin is the fix, and a stale pin is the fix having quietly expired.
+    Override,
 }
 
 impl DependencyKind {
@@ -135,15 +141,20 @@ impl DependencyKind {
             Self::Peer => "peer",
             Self::Workspace => "workspace",
             Self::Indirect => "indirect",
+            Self::Override => "override",
         }
     }
 
     /// Whether this is a dependency the package itself pulls in — everything except a
-    /// central declaration ([`Workspace`](Self::Workspace)) and a recorded transitive
-    /// ([`Indirect`](Self::Indirect)).
+    /// central declaration ([`Workspace`](Self::Workspace)), a recorded transitive
+    /// ([`Indirect`](Self::Indirect)), and a forced version ([`Override`](Self::Override)).
+    ///
+    /// An override names a package somewhere in the tree, not one this manifest depends
+    /// on, so counting it as direct would inflate the inventory with packages the
+    /// manifest never asked for.
     #[must_use]
     pub fn is_direct(self) -> bool {
-        !matches!(self, Self::Workspace | Self::Indirect)
+        !matches!(self, Self::Workspace | Self::Indirect | Self::Override)
     }
 }
 
