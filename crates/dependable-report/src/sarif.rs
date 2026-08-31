@@ -423,34 +423,65 @@ fn fingerprint(
 // URIs
 // ---------------------------------------------------------------------------
 
-/// A manifest path as a SARIF `artifactLocation.uri`: relative to the report
-/// root where possible, `/`-joined on every platform, percent-encoded.
+/// A manifest path as a SARIF `artifactLocation.uri`.
 ///
-/// A path outside `root` falls back to the path as given.
-/// [`Path::components`] normalizes `.` away, so `./crates/app/Cargo.toml`
-/// yields `crates/app/Cargo.toml` whether or not the prefix stripped. No
-/// filesystem access: nothing here canonicalizes or probes.
+/// A path under `root` becomes a relative URI, `/`-joined on every platform and
+/// percent-encoded — the form GitHub code scanning wants, since the log carries no
+/// `uriBaseId`. [`Path::components`] normalizes `.` away, so `./crates/app/Cargo.toml`
+/// yields `crates/app/Cargo.toml` whether or not the prefix stripped.
+///
+/// A path *outside* `root` cannot be expressed relatively, and emitting it as a bare
+/// path-absolute string produced a URI nothing resolves: consumers reject an absolute
+/// path with no base, and a Windows path additionally had its drive letter
+/// percent-encoded into `C%3A/Users/...`. Such a path becomes an absolute `file:` URI
+/// instead, where a drive prefix is legal and keeps its colon. A *relative* path outside
+/// the root stays relative — it is already the form a consumer can resolve.
+///
+/// No filesystem access: nothing here canonicalizes or probes.
 fn uri_for(root: &Path, path: &Path) -> String {
-    let relative = path.strip_prefix(root).unwrap_or(path);
-    let mut absolute = false;
+    if let Ok(relative) = path.strip_prefix(root) {
+        return encode_uri(&join_components(relative));
+    }
+    if path.is_absolute() {
+        return absolute_file_uri(path);
+    }
+    encode_uri(&join_components(path))
+}
+
+/// `/`-join a path's components, dropping `.` and any root or prefix.
+fn join_components(path: &Path) -> String {
+    let parts: Vec<String> = path
+        .components()
+        .filter_map(|component| match component {
+            Component::Prefix(_) | Component::RootDir | Component::CurDir => None,
+            Component::ParentDir => Some("..".to_string()),
+            Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+        })
+        .collect();
+    parts.join("/")
+}
+
+/// An absolute path as a `file:` URI, with each segment percent-encoded.
+fn absolute_file_uri(path: &Path) -> String {
+    let mut prefix: Option<String> = None;
     let mut parts: Vec<String> = Vec::new();
-    for component in relative.components() {
+    for component in path.components() {
         match component {
-            Component::Prefix(prefix) => {
-                parts.push(prefix.as_os_str().to_string_lossy().into_owned());
+            // `C:` — the colon is legal in a `file:` URI path and encoding it yields
+            // `C%3A`, which resolves to nothing.
+            Component::Prefix(p) => {
+                prefix = Some(p.as_os_str().to_string_lossy().replace('\\', "/"));
             }
-            Component::RootDir => absolute = true,
-            Component::CurDir => {}
+            Component::RootDir | Component::CurDir => {}
             Component::ParentDir => parts.push("..".to_string()),
-            Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
+            Component::Normal(part) => parts.push(encode_uri(&part.to_string_lossy())),
         }
     }
     let joined = parts.join("/");
-    encode_uri(&if absolute {
-        format!("/{joined}")
-    } else {
-        joined
-    })
+    match prefix {
+        Some(prefix) => format!("file:///{prefix}/{joined}"),
+        None => format!("file:///{joined}"),
+    }
 }
 
 /// Percent-encode every byte outside the URI-safe set, leaving `/` as the path
@@ -946,7 +977,9 @@ mod tests {
         // No uriBaseId: it would carry the developer's absolute path.
         assert!(location["artifactLocation"].get("uriBaseId").is_none());
 
-        // A path outside the root falls back to the path as given.
+        // An absolute path outside the root becomes a `file:` URI. A bare
+        // path-absolute string is not resolvable by a consumer that was given no
+        // `uriBaseId`, which this log deliberately omits.
         let outside = rendered(&report_at(
             PathBuf::from("/repo"),
             PathBuf::from("/elsewhere/Cargo.toml"),
@@ -954,7 +987,7 @@ mod tests {
         ));
         assert_eq!(
             results_of(&outside)[0]["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
-            "/elsewhere/Cargo.toml"
+            "file:///elsewhere/Cargo.toml"
         );
 
         // `.` components are normalized away even when the prefix does not strip.
@@ -1264,5 +1297,46 @@ mod tests {
         };
 
         assert_eq!(build(1_700_000_000), build(0));
+    }
+
+    /// A Windows path had its drive prefix percent-encoded into `C%3A/...`, which names
+    /// nothing. In a `file:` URI the colon is legal and must survive; the encoding still
+    /// applies to the segments, where a space is real.
+    ///
+    /// Windows-only: elsewhere a backslash is an ordinary character and `C:\...` is one
+    /// relative component, so there is no drive prefix to preserve. The CI matrix runs
+    /// the suite on `windows-latest`, which is where this bites.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_path_keeps_its_drive_and_encodes_its_segments() {
+        let uri = uri_for(
+            Path::new(r"D:\repo"),
+            Path::new(r"C:\Users\dev\my project\Cargo.toml"),
+        );
+        assert!(!uri.contains("%3A"), "the drive colon was encoded: {uri}");
+        assert_eq!(uri, "file:///C:/Users/dev/my%20project/Cargo.toml");
+    }
+
+    /// A space in a directory name still has to be encoded, in both forms.
+    #[test]
+    fn spaces_are_encoded_in_relative_and_absolute_uris() {
+        assert_eq!(
+            uri_for(Path::new("/repo"), Path::new("/repo/my app/Cargo.toml")),
+            "my%20app/Cargo.toml"
+        );
+        assert_eq!(
+            uri_for(Path::new("/repo"), Path::new("/other dir/Cargo.toml")),
+            "file:///other%20dir/Cargo.toml"
+        );
+    }
+
+    /// A relative path that does not sit under the root is already resolvable; turning it
+    /// into a `file:` URI would invent a base it never had.
+    #[test]
+    fn a_relative_path_outside_the_root_stays_relative() {
+        assert_eq!(
+            uri_for(Path::new("/repo"), Path::new("crates/app/Cargo.toml")),
+            "crates/app/Cargo.toml"
+        );
     }
 }
