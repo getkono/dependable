@@ -20,7 +20,13 @@ required-features = ["bin"]
 
 [dependencies]
 dependable-core.workspace = true
+semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
+
+[dev-dependencies]
+# Exercises the `[policy]` schema through a real TOML round-trip, in the crate
+# that owns the schema.
+toml_edit = { workspace = true, features = ["serde"] }

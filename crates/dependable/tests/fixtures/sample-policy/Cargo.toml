@@ -1,0 +1,12 @@
+# A policy fixture with nothing but path dependencies, so a check over it is
+# hermetic: a local dependency builds no registry fetch task and contributes no
+# OSV query, yet still yields a result the policy engine evaluates. That is what
+# makes an end-to-end `config -> policy -> exit code` test runnable in CI.
+[package]
+name = "sample-policy"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+left-pad = { path = "../left-pad" }
+openssl = { path = "../openssl" }
