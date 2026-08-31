@@ -237,6 +237,44 @@ conflicts with `--manifest`, which names one file and skips discovery altogether
 It is available on `fix` for a reason: without it, `dependable fix` would rewrite
 manifests that the matching `dependable check` deliberately left out.
 
+#### Inherited versions
+
+A Cargo workspace declares shared versions once, at the root, and members opt in by
+name:
+
+```toml
+# Cargo.toml
+[workspace.dependencies]
+serde = { version = "1.0.100", features = ["derive"] }
+
+# crates/app/Cargo.toml
+[dependencies]
+serde.workspace = true
+```
+
+`check`, `fix`, and `list` all read the root, so `crates/app` reports `serde` at
+`1.0.100` — including when you scan the member on its own with
+`--manifest crates/app/Cargo.toml`, or with a `--manifest-glob` the root does not
+match — the root is found by walking up from the member, stopping at the repository
+boundary.
+
+The crate is therefore reported once per manifest that declares it: at the root, and
+at each member that opts in. That is one entry per place a reader has to look, and it
+is how the status counts already work — `unique_packages` is the deduplicated number
+beside them.
+
+**`fix` rewrites an inherited version only at the root**, which is Cargo's own model:
+the version string is not in the member's file, so there is no line there to change,
+and running `fix` on a member leaves it byte-identical. For the same reason, SARIF
+results and GitHub annotations for an inherited dependency name the member's file
+without a line — the file is where the dependency is used, and no line in it is the
+version. If the root declares a crate by `path` or `git`, the member inherits that
+instead, and there is no registry version to check. A member's own `path` entry always
+wins over a root declaration of the same name, exactly as Cargo resolves it.
+
+`check --format json` names the manifest a constraint came from in `inherited_from`,
+on the results that have one.
+
 ## Project inventory (`list`)
 
 `dependable list` answers "what lives in this repository" — every manifest it
@@ -272,7 +310,7 @@ dependable list --licenses         # add each dependency's declared license
           "constraint": "1",
           "kind": "normal",
           "direct": true,
-          "source": "registry",
+          "source": "inherited",
           "locked": "1.0.228",
           "registry": null,
           "inherited": true,
@@ -297,6 +335,11 @@ Values a single manifest cannot supply are resolved from the repository and mark
 such: `version_inherited` for a Cargo `version.workspace = true`, `inherited` for a
 constraint taken from `[workspace.dependencies]`, and `lockfile` for the lockfile that
 supplied the locked versions — a workspace keeps one at its root, above its members.
+
+A dependency's `source` is `registry`, `jsr`, `git`, `local` (a `path` entry), or
+`inherited` — a Cargo `dep.workspace = true`, whose version is declared once at the
+workspace root. An inherited dependency is checked wherever it is used and rewritten
+only where it is declared; see [Monorepos and workspaces](#monorepos-and-workspaces).
 
 `license` appears only with `--licenses`, which — together with `--features` — is
 the one thing in `list` that touches the network: a license is published by the
@@ -513,7 +556,8 @@ is a composite action that installs the released binary and runs the check:
 
 It annotates the pull request — one `error` per vulnerable dependency, `warning`
 per outdated one, `notice` per one that could not be checked, each attached to
-the manifest line that declares it — and appends a summary table to the job
+the manifest line that declares it (to the manifest alone when the version lives
+elsewhere, as an inherited one does) — and appends a summary table to the job
 summary. See
 [`.github/actions/dependable-check`](.github/actions/dependable-check/README.md)
 for inputs, outputs, and permissions.

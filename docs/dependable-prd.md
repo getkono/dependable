@@ -424,7 +424,10 @@ Parsers receive only a `&str`. They are pure functions with no side effects.
 - String value: `serde = "1.0"` → version = `"1.0"`
 - Inline table: `serde = { version = "1.0", features = [...] }` → extract `version` key
 - Table section: multi-line expanded form → read `version` key
-- `path`, `git`, `workspace = true` entries → `PackageSource::Local` / `PackageSource::Git` / skip
+- `path`, `git` entries → `PackageSource::Local` / `PackageSource::Git` / skip
+- `workspace = true` entries → `PackageSource::Inherited`, resolved against the workspace
+  root's `[workspace.dependencies]` by the IO layer; checked everywhere, rewritten only at
+  the root
 
 **Pinned version detection:**
 - Constraint starting with `=` (no `==`, just `=`) → `isPinned = true`, exclude from `--update-all`
@@ -1128,7 +1131,7 @@ reason = "CVE-2023-xxxx fix"
 - **Deduplication:** same package checked across 5 `package.json` files → single HTTP request, merged results
 - **Workspace summary report:** rollup across all manifests
 - **Manifest filter:** `--manifest-glob "services/*/Cargo.toml"`
-- **Cargo workspace awareness:** parse `[workspace.dependencies]` and resolve `workspace = true` inheritance
+- **Cargo workspace awareness:** parse `[workspace.dependencies]` and resolve `workspace = true` inheritance *(shipped)*
 
 ---
 
