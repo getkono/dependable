@@ -224,3 +224,62 @@ fn manifest_glob_and_manifest_are_mutually_exclusive() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("--manifest-glob"), "{stderr}");
 }
+
+/// A member's `dep.workspace = true` states no version of its own, and an inventory that
+/// reported it that way would hide both the version in force and where it came from.
+#[test]
+fn workspace_members_report_the_constraint_the_root_declares() {
+    let doc = list_json(&fixture("sample-workspace-inherit"), &[]);
+
+    let app = project(&doc, "app");
+    let leftpad = dependency(app, "leftpad");
+    assert_eq!(leftpad["constraint"], "1.0.0", "from the root");
+    assert_eq!(leftpad["source"], "inherited");
+    assert_eq!(leftpad["inherited"], true);
+    assert_eq!(leftpad["kind"], "normal");
+
+    // The section the *member* declared it in survives inheritance, and so does an
+    // alternate registry named only at the root.
+    let rightpad = dependency(app, "rightpad");
+    assert_eq!(rightpad["constraint"], "2.0.0");
+    assert_eq!(rightpad["kind"], "dev");
+    assert_eq!(rightpad["registry"], "internal");
+
+    // Every member that opts in gets its own entry, against its own manifest.
+    let util = project(&doc, "util");
+    assert_eq!(dependency(util, "leftpad")["constraint"], "1.0.0");
+    assert_eq!(dependency(util, "leftpad")["inherited"], true);
+}
+
+/// Cargo resolves a member's `path` entry to the path whatever the root says about a
+/// crate of that name. Matching on the name alone would hand this one the root's version.
+#[test]
+fn a_path_override_is_not_treated_as_inherited() {
+    let doc = list_json(&fixture("sample-workspace-inherit"), &[]);
+    let util = dependency(project(&doc, "app"), "util");
+
+    assert_eq!(util["source"], "local");
+    assert_eq!(util["inherited"], false);
+    assert_eq!(util["constraint"], Value::Null);
+}
+
+/// The root's `[workspace.dependencies]` are central declarations, not dependencies of
+/// the root — and it inherits nothing, because it is what everything else inherits from.
+#[test]
+fn the_workspace_root_declares_rather_than_inherits() {
+    let doc = list_json(&fixture("sample-workspace-inherit"), &[]);
+    let root = doc["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["manifest"] == "Cargo.toml")
+        .expect("workspace root");
+
+    assert_eq!(root["role"], "workspace");
+    for name in ["leftpad", "rightpad", "util"] {
+        let declaration = dependency(root, name);
+        assert_eq!(declaration["kind"], "workspace", "{name}");
+        assert_eq!(declaration["direct"], false, "{name}");
+        assert_eq!(declaration["inherited"], false, "{name}");
+    }
+}

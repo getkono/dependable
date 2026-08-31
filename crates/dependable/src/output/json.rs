@@ -1,5 +1,6 @@
 //! JSON output (PRD §5.8 shape).
 
+use dependable_fetch::PackageSource;
 use serde::Serialize;
 
 use super::{ManifestReport, Summary, current_display};
@@ -40,6 +41,11 @@ struct ResultDto<'a> {
     kind: &'static str,
     vulnerabilities: &'a [String],
     locked_at: Option<&'a str>,
+    /// The manifest that declared this constraint, when it was not `manifest` itself —
+    /// a Cargo `dep.workspace = true` resolved against the workspace root. Absent
+    /// otherwise, so a consumer pinned to the documented shape is unaffected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inherited_from: Option<String>,
 }
 
 /// Serialize all reports as a single pretty JSON document to stdout.
@@ -51,6 +57,10 @@ pub fn render(reports: &[ManifestReport]) -> anyhow::Result<()> {
     let mut results = Vec::new();
     for report in reports {
         let manifest = report.path.display().to_string();
+        let workspace_root = report
+            .workspace_root
+            .as_ref()
+            .map(|root| root.display().to_string());
         for result in &report.results {
             results.push(ResultDto {
                 name: &result.item.name,
@@ -63,6 +73,9 @@ pub fn render(reports: &[ManifestReport]) -> anyhow::Result<()> {
                 kind: result.item.kind.token(),
                 vulnerabilities: &result.current_vulnerabilities,
                 locked_at: result.item.locked_version.as_deref(),
+                inherited_from: (result.item.source == PackageSource::Inherited)
+                    .then(|| workspace_root.clone())
+                    .flatten(),
             });
         }
     }

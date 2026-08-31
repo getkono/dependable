@@ -1,0 +1,11 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+leftpad = { workspace = true, features = ["std"] }
+util = { path = "../util" }
+
+[dev-dependencies]
+rightpad.workspace = true

@@ -22,6 +22,9 @@ pub struct ManifestReport {
     pub path: PathBuf,
     pub ecosystem: Ecosystem,
     pub results: Vec<CheckResult>,
+    /// The manifest whose `[workspace.dependencies]` supplied any inherited constraint.
+    /// `None` outside a workspace.
+    pub workspace_root: Option<PathBuf>,
 }
 
 /// Aggregate status counts across one or more reports.
@@ -175,6 +178,7 @@ mod tests {
                     dependable_fetch::CheckResult::new(item(declaration), status.clone())
                 })
                 .collect(),
+            workspace_root: None,
         }
     }
 

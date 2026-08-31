@@ -252,6 +252,7 @@ impl Engine {
                     path: path.to_path_buf(),
                     ecosystem: check.ecosystem,
                     results: check.results,
+                    workspace_root: check.workspace_root,
                 }))
             }
             Err(CheckError::UnsupportedEcosystem(eco)) => {

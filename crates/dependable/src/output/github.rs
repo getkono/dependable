@@ -814,6 +814,7 @@ mod tests {
             path: PathBuf::from(path),
             ecosystem: Ecosystem::Rust,
             results,
+            workspace_root: None,
         }
     }
 
