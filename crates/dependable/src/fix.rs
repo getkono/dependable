@@ -61,7 +61,11 @@ fn plan_fixes(content: &str, results: &[CheckResult], all: bool) -> (String, Vec
     let mut records = Vec::new();
     for result in results {
         let item = &result.item;
-        if !item.is_checkable() || item.version_constraint.is_empty() {
+        // `is_rewritable` and not `is_checkable`: a workspace member inheriting a
+        // constraint is worth checking, but its version string lives in the root, so its
+        // recorded span is `0/0/0` — which `apply_edits`' bounds check passes trivially,
+        // splicing the new version into byte 0 of line 0 of this file.
+        if !item.is_rewritable() {
             continue;
         }
         let updatable = matches!(
@@ -263,7 +267,9 @@ mod tests {
         assert_eq!(out, "a=1.9 b=2.9\n");
     }
 
-    use dependable_fetch::core::{ManifestKind, parse};
+    use dependable_fetch::core::{
+        DependencyKind, ManifestKind, parse, resolve_workspace_inheritance,
+    };
 
     /// Parse `content`, then build an `UpdateAvailable` result with the given
     /// compatible target for each named dependency — enough to drive `plan_fixes`.
@@ -380,5 +386,74 @@ mod tests {
             "name: my_app\n\ndependencies:\n  http: ^1.2.0\n  provider: ^6.1.0  # state mgmt\n\ndev_dependencies:\n  test: ^1.24.0\n"
         );
         assert_eq!(records.len(), 2);
+    }
+    /// The manifest-corruption guard.
+    ///
+    /// A resolved `dep.workspace = true` passes both of the guards `plan_fixes` used to
+    /// carry: it is checkable, and it has a constraint. Its span is still `0/0/0`, which
+    /// `apply_edits`' `start <= end && end <= len` check passes trivially — so the edit
+    /// would land as `replace_range(0..0, ..)`, prepending the version to the first line
+    /// of the member manifest and writing the wreckage to disk as a successful fix.
+    #[test]
+    fn an_inherited_constraint_is_never_written_into_the_member_manifest() {
+        let root = "[workspace.dependencies]\nserde = \"1.0.100\"\n";
+        let member = "[package]\nname = \"member\"\n\n[dependencies]\nserde.workspace = true\n";
+
+        let declarations: Vec<_> = parse(ManifestKind::CargoToml, root)
+            .unwrap()
+            .items
+            .into_iter()
+            .filter(|item| item.kind == DependencyKind::Workspace)
+            .collect();
+        let mut items = parse(ManifestKind::CargoToml, member).unwrap().items;
+        let resolved = resolve_workspace_inheritance(&mut items, &declarations);
+        assert_eq!(resolved, ["serde"], "the fixture must actually resolve");
+
+        let results: Vec<CheckResult> = items
+            .into_iter()
+            .map(|item| {
+                let mut result = CheckResult::new(item, DependencyStatus::UpdateAvailable);
+                result.latest_compatible = Some("1.0.219".to_string());
+                result
+            })
+            .collect();
+        assert!(
+            results[0].item.is_checkable() && !results[0].item.version_constraint.is_empty(),
+            "the old guards would both have passed"
+        );
+
+        let (updated, records) = plan_fixes(member, &results, false);
+
+        assert!(records.is_empty(), "{records:?}");
+        assert_eq!(
+            updated, member,
+            "the member manifest must be byte-identical"
+        );
+    }
+
+    /// The other half of the rule, and the half that makes it Cargo's own model: the
+    /// declaration a member inherits *is* rewritable, in the one file that holds it.
+    ///
+    /// The pairing is the point — the same crate, the same version, rewritten at the root
+    /// and refused at the member — so this asserts the gate itself and not just the
+    /// outcome, which a plain registry dependency would satisfy on its own.
+    #[test]
+    fn the_workspace_root_declaration_is_still_rewritten() {
+        let root = "[workspace.dependencies]\nserde = \"1.0.100\"\n";
+        let results = results_for(ManifestKind::CargoToml, root, &[("serde", "1.0.219")]);
+
+        let declaration = &results[0].item;
+        assert_eq!(declaration.kind, DependencyKind::Workspace);
+        assert!(
+            declaration.is_rewritable(),
+            "the version string is in this file, on line {}",
+            declaration.version_line
+        );
+        assert_eq!(declaration.version_line, 1, "and the span points at it");
+
+        let (updated, records) = plan_fixes(root, &results, false);
+
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(updated, "[workspace.dependencies]\nserde = \"1.0.219\"\n");
     }
 }

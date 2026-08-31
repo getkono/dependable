@@ -113,7 +113,8 @@ V1 is "done" when `dependable check .` runs end-to-end on a real Cargo project a
 
 - [ ] discovers `Cargo.toml` manifests under a path (depth-limited; skips `target/`, `node_modules/`, `.git/`, `vendor/`);
 - [ ] parses `[dependencies]`, `[dev-dependencies]`, `[build-dependencies]`, `[dependencies.<name>]`, `[workspace.dependencies]`, recording version **positions** for `--fix`;
-- [ ] classifies `path`/`git`/`workspace` deps as `Local`/`Git` and skips them;
+- [ ] classifies `path`/`git` deps as `Local`/`Git` and skips them; classifies
+      `workspace = true` as `Inherited` and resolves it against the workspace root;
 - [ ] reads `Cargo.lock` to show the locked version (toggle with `--no-lock-file`);
 - [ ] fetches available versions from the crates.io sparse index (yanked filtered out);
 - [ ] classifies each dep `UpToDate` / `PatchAvailable` / `UpdateAvailable` / `Outdated` via the semver engine;
@@ -163,7 +164,7 @@ Cross-cutting enablers (also V1.1): extend `Ecosystem`/`ManifestKind` enums + `d
 | GitHub Actions integration | PR annotations + job summary + published action | — | §6.3 |
 | GitLab Code Quality | Code Quality JSON report | `serde_json` | §6.3 |
 | First-party editor integration | Official LSP server and/or VSCode extension over `dependable-fetch`: inline outdated/vulnerable hints + quick-fixes | new crate / extension | §9, [`INTEGRATIONS.md`](INTEGRATIONS.md) §3 |
-| Workspace / monorepo | Cross-manifest dedup **(shipped)**, rollup **(shipped)**, `--manifest-glob` **(shipped)**; `workspace = true` inheritance for `check`/`fix` remains — see [#73](https://github.com/getkono/dependable/issues/73) | runner | §6.5 |
+| Workspace / monorepo | Cross-manifest dedup, rollup, `--manifest-glob`, and `workspace = true` inheritance for `check`/`fix`/`list` — all **shipped** | runner | §6.5 |
 | License visibility + allowlist | `list --licenses`; `[policy] allowed_licenses` over a documented SPDX subset. Go, JSR, NuGet, and pub.dev publish no registry license | registry fields | §6.4, §8 D6 |
 | PDF export | `--pdf` via headless chromium (HTML stays self-contained) — **V3** | system chromium | §6.1, §8 D4 |
 

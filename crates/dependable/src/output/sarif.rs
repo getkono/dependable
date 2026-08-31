@@ -83,6 +83,7 @@ mod tests {
             path: PathBuf::from(path),
             ecosystem: Ecosystem::Rust,
             results: Vec::new(),
+            workspace_root: None,
         }
     }
 

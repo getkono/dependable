@@ -8,10 +8,19 @@
 //! Recognition is by [`ManifestKind::detect`]; manifests whose ecosystem is
 //! unsupported or disabled are filtered by the caller, not here, so a frontend can
 //! still tell the user that a manifest was seen and skipped.
+//!
+//! Locating a Cargo workspace root lives here too. It is the same upward walk as
+//! [`find_lockfile`], answering the same shape of question — "which file above this one
+//! governs it" — and, like a lockfile, what it finds has to be read and parsed before it
+//! is useful. Reading it is IO; what to *do* with the result is
+//! [`dependable_core::resolve_workspace_inheritance`], which stays pure.
 
 use std::path::{Path, PathBuf};
 
-use dependable_core::{LockfileData, LockfileKind, ManifestKind, parse_lockfile_kind};
+use dependable_core::{
+    DependencyKind, Item, LockfileData, LockfileKind, ManifestKind, WorkspaceDecl, parse,
+    parse_lockfile_kind, parse_workspace,
+};
 
 /// Directories never descended into during discovery: build output, vendored
 /// dependencies, and VCS metadata. Dotted directories are skipped as well.
@@ -116,6 +125,135 @@ pub fn find_lockfile(manifest: &Path, kind: ManifestKind) -> Option<(PathBuf, Lo
             return None;
         }
         dir = dir.parent()?;
+    }
+}
+
+/// The nearest `Cargo.toml` declaring a `[workspace]` at or above `manifest`, with its
+/// path and content.
+///
+/// `manifest` itself is excluded, so a member always resolves against a root *above* it.
+/// A root that is also a package declares its own `[package]` values literally, and
+/// [`workspace_source`] is what handles it inheriting from its own table. The walk stops
+/// at a repository boundary (a directory holding `.git`), so inheritance never resolves
+/// against a manifest belonging to an unrelated checkout above the project.
+///
+/// # Why the path is canonicalized first
+/// [`Path::parent`] is lexical: the parent of a relative `../sibling` is `..`, and the
+/// parent of *that* is `""` — which every subsequent `join` resolves against the **current
+/// directory**, a sibling of the manifest rather than an ancestor of it. Walking
+/// `dependable check --manifest ../other/Cargo.toml` from inside a workspace would
+/// otherwise hand `../other` that workspace's `[workspace.dependencies]`, and no `.git`
+/// check catches it, because the boundary is tested against the current directory too.
+///
+/// The returned path is therefore absolute and symlink-resolved, whatever `manifest` was
+/// spelled as. A manifest that cannot be canonicalized (it was deleted between discovery
+/// and here) belongs to no workspace.
+#[must_use]
+pub fn nearest_workspace_root(manifest: &Path) -> Option<(PathBuf, WorkspaceDecl, String)> {
+    let manifest = std::fs::canonicalize(manifest).ok()?;
+    let mut dir = manifest.parent()?;
+    loop {
+        let candidate = dir.join("Cargo.toml");
+        if !same_file(&candidate, &manifest)
+            && let Ok(content) = std::fs::read_to_string(&candidate)
+            && let Some(workspace) = parse_workspace(&content)
+        {
+            return Some((simplified(candidate), workspace, content));
+        }
+        if dir.join(".git").exists() {
+            return None;
+        }
+        dir = dir.parent()?;
+    }
+}
+
+/// The manifest whose `[workspace.dependencies]` govern `manifest`, and its text.
+///
+/// A manifest declaring its own `[workspace]` governs **itself**: Cargo lets a root that
+/// is also a package write `serde.workspace = true` against its own table, and walking
+/// past it would leave those entries unresolved. Otherwise the nearest ancestor root
+/// governs. `content` is the manifest's own text, already in the caller's hand, so the
+/// self case costs no extra read.
+///
+/// Separate from [`workspace_declarations`] so a caller checking many members of one
+/// workspace can key a cache on the root's path and parse it only once; use
+/// [`workspace_source`] when that does not matter.
+///
+/// Returns `None` for a non-Cargo manifest and when no root is found.
+#[must_use]
+pub fn workspace_root_of(
+    manifest: &Path,
+    kind: ManifestKind,
+    content: &str,
+) -> Option<(PathBuf, String)> {
+    if kind != ManifestKind::CargoToml {
+        return None;
+    }
+    if parse_workspace(content).is_some() {
+        // Canonical, to match the shape [`nearest_workspace_root`] returns.
+        let root = std::fs::canonicalize(manifest)
+            .map(simplified)
+            .unwrap_or_else(|_| manifest.to_path_buf());
+        return Some((root, content.to_owned()));
+    }
+    let (root, _, root_content) = nearest_workspace_root(manifest)?;
+    Some((root, root_content))
+}
+
+/// The governing manifest and the declarations it offers — the input
+/// [`dependable_core::resolve_workspace_inheritance`] needs.
+///
+/// [`workspace_root_of`] followed by [`workspace_declarations`].
+#[must_use]
+pub fn workspace_source(
+    manifest: &Path,
+    kind: ManifestKind,
+    content: &str,
+) -> Option<(PathBuf, Vec<Item>)> {
+    let (root, root_content) = workspace_root_of(manifest, kind, content)?;
+    Some((root, workspace_declarations(&root_content)))
+}
+
+/// The `[workspace.dependencies]` entries of one parsed Cargo manifest.
+///
+/// A manifest that will not parse declares nothing, which is the same answer as a
+/// manifest with no such table — neither is worth failing a whole check over.
+#[must_use]
+pub fn workspace_declarations(content: &str) -> Vec<Item> {
+    parse(ManifestKind::CargoToml, content)
+        .map(|parsed| {
+            parsed
+                .items
+                .into_iter()
+                .filter(|item| item.kind == DependencyKind::Workspace)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Drop Windows' `\\?\` extended-length prefix, which `std::fs::canonicalize` always
+/// applies and which no user wants to read.
+///
+/// Only the plain-drive form is simplified: every other verbatim prefix (a UNC share, a
+/// device path) has no equivalent without it, and shortening those would name a different
+/// file. A no-op everywhere else, since the prefix cannot occur.
+fn simplified(path: PathBuf) -> PathBuf {
+    let text = path.as_os_str().to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\")
+        && rest.as_bytes().get(1) == Some(&b':')
+    {
+        return PathBuf::from(rest);
+    }
+    path
+}
+
+/// Whether two paths name the same file. Compared after canonicalization, since a
+/// discovered manifest (`./Cargo.toml`) and a candidate built while walking up
+/// (`Cargo.toml`) can spell one file two ways.
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
     }
 }
 
@@ -371,6 +509,129 @@ mod tests {
 
         let notices = lockfile_notices(&nested.join("package.json"), ManifestKind::PackageJson);
         assert!(notices.is_empty(), "{notices:?}");
+    }
+
+    /// Windows' canonical form is the `\\?\` extended-length one, which is correct and
+    /// unreadable. Testable on every platform, since it is pure string work.
+    #[test]
+    fn the_windows_extended_length_prefix_is_dropped_from_a_drive_path() {
+        assert_eq!(
+            simplified(PathBuf::from(r"\\?\D:\repo\Cargo.toml")),
+            PathBuf::from(r"D:\repo\Cargo.toml")
+        );
+        // A UNC share has no form without the prefix, so shortening it would name a
+        // different file.
+        let unc = PathBuf::from(r"\\?\UNC\server\share\Cargo.toml");
+        assert_eq!(simplified(unc.clone()), unc);
+        // And an ordinary POSIX path is untouched.
+        assert_eq!(
+            simplified(PathBuf::from("/repo/Cargo.toml")),
+            PathBuf::from("/repo/Cargo.toml")
+        );
+    }
+
+    #[test]
+    fn a_member_resolves_against_the_root_above_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Canonical, because the returned root is: on macOS the system temp directory is
+        // reached through a `/var` -> `/private/var` symlink, so the two spellings of the
+        // same file differ as strings.
+        let root = &dir.path().canonicalize().expect("canonical");
+        write(
+            &root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/app\"]\n\n[workspace.dependencies]\nserde = \"1.0.200\"\n",
+        );
+        let member = root.join("crates/app/Cargo.toml");
+        let content = "[package]\nname = \"app\"\n\n[dependencies]\nserde.workspace = true\n";
+        write(&member, content);
+
+        let (found, declarations) =
+            workspace_source(&member, ManifestKind::CargoToml, content).expect("a root");
+
+        // `simplified` on both sides: the reported root has Windows' `\\?\` prefix dropped,
+        // and `canonicalize` above put it there.
+        assert_eq!(found, simplified(root.join("Cargo.toml")));
+        assert_eq!(declarations.len(), 1);
+        assert_eq!(declarations[0].name, "serde");
+        assert_eq!(declarations[0].version_constraint, "1.0.200");
+    }
+
+    /// Cargo lets a root be a package too, and lets that package write
+    /// `serde.workspace = true` against its own table. Walking past itself to look for a
+    /// root above would leave exactly those entries unresolved.
+    #[test]
+    fn a_root_that_is_also_a_package_governs_itself() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest = dir
+            .path()
+            .canonicalize()
+            .expect("canonical")
+            .join("Cargo.toml");
+        let content = "[package]\nname = \"root\"\n\n[workspace]\nmembers = []\n\n[workspace.dependencies]\nserde = \"1.0.200\"\n\n[dependencies]\nserde.workspace = true\n";
+        write(&manifest, content);
+
+        let (found, declarations) =
+            workspace_source(&manifest, ManifestKind::CargoToml, content).expect("itself");
+
+        assert_eq!(found, simplified(manifest.clone()));
+        assert_eq!(declarations.len(), 1, "{declarations:?}");
+        assert_eq!(declarations[0].name, "serde");
+    }
+
+    /// The same boundary the lockfile search respects: an unrelated checkout above the
+    /// repository must never lend its `[workspace.dependencies]`.
+    #[test]
+    fn the_workspace_search_stops_at_a_repository_boundary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        write(
+            &root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"x\"]\n\n[workspace.dependencies]\nserde = \"1\"\n",
+        );
+        let member = root.join("repo/crates/app/Cargo.toml");
+        let content = "[package]\nname = \"app\"\n";
+        write(&member, content);
+        std::fs::create_dir_all(root.join("repo/.git")).expect("mkdir .git");
+
+        assert!(workspace_source(&member, ManifestKind::CargoToml, content).is_none());
+    }
+
+    #[test]
+    fn a_standalone_crate_and_a_non_cargo_manifest_have_no_workspace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let solo = root.join("Cargo.toml");
+        let content = "[package]\nname = \"solo\"\n";
+        write(&solo, content);
+        std::fs::create_dir_all(root.join(".git")).expect("mkdir .git");
+        assert!(workspace_source(&solo, ManifestKind::CargoToml, content).is_none());
+
+        // A `package.json` has no Cargo workspace whatever sits above it — and is
+        // answered from its kind alone, without a walk.
+        let js = root.join("web/package.json");
+        write(&js, "{}");
+        assert!(workspace_source(&js, ManifestKind::PackageJson, "{}").is_none());
+    }
+
+    /// Only the central declarations are on offer — a root's own `[dependencies]` are
+    /// its own business.
+    #[test]
+    fn only_central_declarations_are_offered() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        write(
+            &root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"app\"]\n\n[workspace.dependencies]\nserde = \"1\"\n\n[dependencies]\ntokio = \"1\"\n",
+        );
+        let member = root.join("app/Cargo.toml");
+        let content = "[package]\nname = \"app\"\n";
+        write(&member, content);
+
+        let (_, declarations) =
+            workspace_source(&member, ManifestKind::CargoToml, content).expect("a root");
+
+        let names: Vec<_> = declarations.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, ["serde"], "{declarations:?}");
     }
 
     #[test]

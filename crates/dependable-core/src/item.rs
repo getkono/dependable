@@ -38,9 +38,45 @@ impl Item {
 
     /// Whether this item should be fetched + version-checked. Local and git
     /// sources are skipped.
+    ///
+    /// An [`Inherited`](PackageSource::Inherited) item is checkable only once
+    /// [`resolve_workspace_inheritance`](crate::resolve_workspace_inheritance) has
+    /// supplied the workspace root's constraint. Unresolved, the manifest states no
+    /// version at all, and there is nothing to ask a registry for.
     #[must_use]
     pub fn is_checkable(&self) -> bool {
-        matches!(self.source, PackageSource::Registry | PackageSource::Jsr)
+        match self.source {
+            PackageSource::Registry | PackageSource::Jsr => true,
+            PackageSource::Inherited => !self.version_constraint.is_empty(),
+            _ => false,
+        }
+    }
+
+    /// Whether [`version_line`](Self::version_line) and the columns beside it describe a
+    /// place in **this** manifest — what a reporter needs before it points at one.
+    ///
+    /// Since `0` is a legal line and column index, an unrecorded span is indistinguishable
+    /// from a real one by value; it has to be inferred from the source instead. Every
+    /// parser that declines to record a span also gives the item a source nothing would
+    /// fetch, so [`is_checkable`](Self::is_checkable) covers all of them but one: a
+    /// resolved [`Inherited`](PackageSource::Inherited) item is worth checking and still
+    /// has no home here, because its version string is in the workspace root.
+    #[must_use]
+    pub fn has_position(&self) -> bool {
+        self.is_checkable() && self.source != PackageSource::Inherited
+    }
+
+    /// Whether the recorded span may be rewritten in place — it points here, and there is
+    /// a value there to replace.
+    ///
+    /// Strictly narrower than [`has_position`](Self::has_position), which is why the two
+    /// are separate: a bare `requirements.txt` requirement (`numpy`) is checkable and sits
+    /// on a line worth reporting, but records a *zero-width* span, and writing a version
+    /// into it would produce `numpy1.5.0`. `--fix` gates on this; the reporters, which
+    /// only ever read the line, gate on `has_position`.
+    #[must_use]
+    pub fn is_rewritable(&self) -> bool {
+        self.has_position() && !self.version_constraint.is_empty()
     }
 }
 
@@ -113,8 +149,99 @@ pub enum PackageSource {
     Registry,
     /// A JSR-hosted package (unused in V1).
     Jsr,
-    /// A `path`/`workspace` dependency — skipped for version checks.
+    /// A `path` dependency — skipped for version checks.
     Local,
     /// A git dependency — skipped for version checks.
     Git,
+    /// A Cargo `dep.workspace = true`: the manifest opts into a version declared in
+    /// the workspace root's `[workspace.dependencies]` and states none of its own.
+    ///
+    /// Reading `workspace = true` needs no filesystem, so the IO-free parser records it
+    /// — which is what keeps it distinct from a [`Local`](Self::Local) `path` entry that
+    /// happens to share a name with a root declaration. Resolving it against the root
+    /// does need IO, and is [`resolve_workspace_inheritance`](crate::resolve_workspace_inheritance)
+    /// applied by the caller that has the root in hand.
+    Inherited,
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::manifest::ManifestKind;
+    use crate::parsers::{cargo_workspace::resolve_workspace_inheritance, parse};
+
+    use super::*;
+
+    fn items(content: &str) -> Vec<Item> {
+        parse(ManifestKind::CargoToml, content)
+            .expect("parses")
+            .items
+    }
+
+    fn find(items: &[Item], name: &str) -> Item {
+        items
+            .iter()
+            .find(|item| item.name == name)
+            .unwrap_or_else(|| panic!("no item {name}"))
+            .clone()
+    }
+
+    #[test]
+    fn a_registry_item_is_checkable_positioned_and_rewritable() {
+        let serde = find(&items("[dependencies]\nserde = \"1.0\"\n"), "serde");
+        assert!(serde.is_checkable());
+        assert!(serde.has_position());
+        assert!(serde.is_rewritable());
+    }
+
+    /// A bare requirement declares no version, so there is nothing to rewrite — its span
+    /// is zero-width, and writing into it would produce `numpy1.5.0`. It is still on a
+    /// real line of a real file, which is what a reporter needs.
+    #[test]
+    fn a_constraint_less_requirement_has_a_position_but_nothing_to_rewrite() {
+        let parsed = parse(ManifestKind::RequirementsTxt, "flask==1.0\nnumpy\n")
+            .expect("parses")
+            .items;
+        let numpy = find(&parsed, "numpy");
+
+        assert!(numpy.is_checkable(), "a bare requirement is still fetched");
+        assert!(numpy.has_position(), "line 2 of this very file");
+        assert_eq!(numpy.version_line, 1);
+        assert!(!numpy.is_rewritable(), "the span is zero-width");
+    }
+
+    #[test]
+    fn path_and_git_items_are_neither() {
+        let parsed = items(
+            "[dependencies]\nutil = { path = \"../util\" }\ng = { git = \"https://example.com/g\" }\n",
+        );
+        for name in ["util", "g"] {
+            let item = find(&parsed, name);
+            assert!(!item.is_checkable(), "{name}");
+            assert!(!item.has_position(), "{name}");
+            assert!(!item.is_rewritable(), "{name}");
+        }
+    }
+
+    /// An inherited dependency is checkable once — and only once — the workspace root
+    /// has supplied a constraint. It is never rewritable, because the string it would
+    /// rewrite is in the root, not here.
+    #[test]
+    fn an_inherited_item_becomes_checkable_but_never_rewritable() {
+        let declarations = items("[workspace.dependencies]\nserde = \"1.0.200\"\n");
+        let mut parsed = items("[dependencies]\nserde.workspace = true\n");
+
+        let unresolved = find(&parsed, "serde");
+        assert!(!unresolved.is_checkable(), "no constraint yet");
+        assert!(!unresolved.is_rewritable());
+
+        let _ = resolve_workspace_inheritance(&mut parsed, &declarations);
+
+        let resolved = find(&parsed, "serde");
+        assert!(resolved.is_checkable(), "the root supplied a constraint");
+        assert!(
+            !resolved.has_position(),
+            "a resolved constraint still has no home in this file"
+        );
+        assert!(!resolved.is_rewritable());
+    }
 }

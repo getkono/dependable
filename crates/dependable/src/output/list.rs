@@ -269,6 +269,7 @@ fn source_token(source: PackageSource) -> &'static str {
         PackageSource::Jsr => "jsr",
         PackageSource::Local => "local",
         PackageSource::Git => "git",
+        PackageSource::Inherited => "inherited",
         _ => "unknown",
     }
 }
@@ -292,6 +293,10 @@ fn annotation(item: &Item) -> &'static str {
         PackageSource::Local => " (local)",
         PackageSource::Git => " (git)",
         PackageSource::Jsr => " (jsr)",
+        // An inherited entry that never found its declaration states no version, and
+        // would otherwise render as a bare `—` that reads like a parse failure. A
+        // resolved one falls through to its section, so a `dev` dep still says so.
+        PackageSource::Inherited if item.version_constraint.is_empty() => " (unresolved)",
         _ => match item.kind {
             DependencyKind::Dev => " (dev)",
             DependencyKind::Build => " (build)",

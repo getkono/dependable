@@ -14,13 +14,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use dependable_core::{
     CheckResult, DependencyStatus, Ecosystem, Item, LockfileKind, ManifestKind, PackageSource,
     UnstableFilter, apply_lockfile, check_version, parse, parse_lockfile_kind,
-    to_semver_constraint,
+    resolve_workspace_inheritance, to_semver_constraint,
 };
 use futures::stream::{self, StreamExt};
 
 use crate::build_client;
 use crate::cache::{
-    DISK_CACHE_TTL, DiskCache, MetadataCache, VersionsCache, metadata_cache, versions_cache,
+    DISK_CACHE_TTL, DiskCache, MetadataCache, VersionsCache, WorkspaceCache, metadata_cache,
+    versions_cache, workspace_cache,
 };
 use crate::error::FetchError;
 use crate::osv::{Advisory, OsvClient, OsvQuery};
@@ -95,6 +96,20 @@ pub struct ManifestCheck {
     pub results: Vec<CheckResult>,
     /// Non-fatal degradations (e.g. an OSV outage that skipped vulnerability data).
     pub warnings: Vec<String>,
+    /// The manifest whose `[workspace.dependencies]` govern this one — itself, when it
+    /// declares its own `[workspace]`, else the nearest ancestor that does.
+    ///
+    /// Set whenever such a manifest was found, whether or not anything was actually
+    /// inherited from it: it names the table that *would* answer a `workspace = true`,
+    /// which is what a caller needs in order to say where a constraint came from **and**
+    /// where a missing one should have been. Absolute and symlink-resolved, per
+    /// [`nearest_workspace_root`](crate::nearest_workspace_root).
+    ///
+    /// Per-manifest rather than per-result, which is what keeps [`PathBuf`] — and the
+    /// filesystem it implies — out of [`Item`] and out of the IO-free core. `None` for a
+    /// manifest outside a workspace, and for [`Checker::check_manifest`], which is given
+    /// content with no file behind it and so has no tree to look up.
+    pub workspace_root: Option<PathBuf>,
 }
 
 impl ManifestCheck {
@@ -155,6 +170,7 @@ pub struct Checker {
     unstable: UnstableFilter,
     versions_cache: VersionsCache,
     metadata_cache: MetadataCache,
+    workspace_cache: WorkspaceCache,
     /// Persistent on-disk cache, consulted below the in-process cache. `None`
     /// disables it (`--no-cache`, or no resolvable cache directory).
     disk_cache: Option<Arc<DiskCache>>,
@@ -213,7 +229,10 @@ impl Checker {
         // Content with no file behind it: the manifest's first lockfile is the
         // only thing it can be attributed to.
         let lockfile = lockfile.and_then(|lock| Some((*kind.lockfiles().first()?, lock)));
-        self.check_inner(kind, manifest, lockfile).await
+        // No file, so no tree above it: a `dep.workspace = true` here stays unresolved
+        // and reports as it always has. [`Checker::check_path`] is the entry point that
+        // can answer the question.
+        self.check_inner(kind, manifest, lockfile, None).await
     }
 
     /// Check a manifest on disk: detect its kind, read it (and, when
@@ -471,7 +490,37 @@ impl Checker {
         let manifest = tokio::fs::read_to_string(path).await?;
         let lockfile = self.read_lockfile(path, kind).await;
         let lockfile = lockfile.as_ref().map(|(kind, lock)| (*kind, lock.as_str()));
-        self.check_inner(kind, &manifest, lockfile).await
+        // A member's `dep.workspace = true` states no version of its own; the constraint
+        // is in the root above it. Only a path can find that root, which is why this
+        // resolves here and not in `check_manifest`.
+        let workspace = self.workspace_source(path, kind, &manifest).await;
+        self.check_inner(kind, &manifest, lockfile, workspace).await
+    }
+
+    /// The workspace declarations governing `path`, read once per root per `Checker`.
+    ///
+    /// Every member of a workspace resolves against the same file, and parsing it once
+    /// per member is the same waste the versions cache exists to avoid — with the
+    /// difference that the answer is on local disk, so it only ever showed up as CPU. A
+    /// 500-crate workspace parsed one root manifest 500 times.
+    ///
+    /// Locating the root is still done per manifest: it is the walk that produces the key
+    /// this is cached on, and it is the cheap half.
+    async fn workspace_source(
+        &self,
+        path: &Path,
+        kind: ManifestKind,
+        manifest: &str,
+    ) -> Option<(PathBuf, Arc<Vec<Item>>)> {
+        let (root, root_content) = crate::discover::workspace_root_of(path, kind, manifest)?;
+        if let Some(hit) = self.workspace_cache.get(&root).await {
+            return Some((root, hit));
+        }
+        let declarations = Arc::new(crate::discover::workspace_declarations(&root_content));
+        self.workspace_cache
+            .insert(root.clone(), declarations.clone())
+            .await;
+        Some((root, declarations))
     }
 
     /// Read the lockfile governing `path`, whichever of its candidates exists.
@@ -498,6 +547,7 @@ impl Checker {
         kind: ManifestKind,
         manifest: &str,
         lockfile: Option<(LockfileKind, &str)>,
+        workspace: Option<(PathBuf, Arc<Vec<Item>>)>,
     ) -> Result<ManifestCheck, CheckError> {
         let ecosystem = kind.ecosystem();
         let fetcher = self
@@ -507,6 +557,18 @@ impl Checker {
             .clone();
 
         let mut parsed = parse(kind, manifest)?;
+
+        // Fill in what the workspace root declares, before anything asks which items are
+        // checkable — an unresolved `dep.workspace = true` states no version, so it would
+        // otherwise be skipped exactly as a `path` entry is. The resolved item keeps
+        // `PackageSource::Inherited`, which is what keeps `--fix` off a span that means
+        // nothing in this file.
+        let mut warnings = Vec::new();
+        if let Some((root, declarations)) = &workspace {
+            // The resolved names are the caller's business; the annotated items are ours.
+            let _ = resolve_workspace_inheritance(&mut parsed.items, declarations);
+            warnings.extend(undeclared_inheritance(&parsed.items, root));
+        }
 
         // Apply the lockfile to annotate locked versions, dispatching on the file
         // that was found rather than on the manifest beside it. An unparseable
@@ -544,7 +606,6 @@ impl Checker {
             .map(|item| evaluate_item(item, &fetched, ecosystem, self.unstable))
             .collect();
 
-        let mut warnings = Vec::new();
         if let Some(osv) = &self.osv
             && let Err(e) = scan_vulnerabilities(osv, ecosystem, &mut results).await
         {
@@ -566,6 +627,7 @@ impl Checker {
             ecosystem,
             results,
             warnings,
+            workspace_root: workspace.map(|(root, _)| root),
         };
 
         // Enrichment is a post-pass over the finished results, so it can equally
@@ -697,6 +759,33 @@ impl Checker {
             p(event);
         }
     }
+}
+
+/// Name every entry that says it inherits but that the governing root never declared.
+///
+/// Cargo refuses to build such a manifest, so it is a real error and not a shrug — but it
+/// is not this tool's error, and a version check that aborted on it would be less useful
+/// than one that reports everything else and says what it could not resolve. The item
+/// itself still reports as unchecked, exactly as it did before inheritance was resolved
+/// at all; this is what stops that being silent.
+fn undeclared_inheritance(items: &[Item], root: &Path) -> Vec<String> {
+    let mut seen = HashSet::new();
+    items
+        .iter()
+        .filter(|item| {
+            item.source == PackageSource::Inherited && item.version_constraint.is_empty()
+        })
+        // A member may inherit the same crate in `[dependencies]` and
+        // `[dev-dependencies]` both, which is one mistake to fix, not two to report.
+        .filter(|item| seen.insert(item.name.as_str()))
+        .map(|item| {
+            format!(
+                "`{}` is declared `workspace = true`, but {} declares no such dependency",
+                item.name,
+                root.display()
+            )
+        })
+        .collect()
 }
 
 /// Evaluate one parsed item against the fetched version lists, applying the
@@ -1055,6 +1144,7 @@ impl CheckerBuilder {
             unstable: self.unstable,
             versions_cache: versions_cache(),
             metadata_cache: metadata_cache(),
+            workspace_cache: workspace_cache(),
             disk_cache,
             progress: self.progress,
         })

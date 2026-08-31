@@ -1,0 +1,19 @@
+# Hermetic: without a lockfile of its own the walk climbs out of the fixture and reads the
+# repository's, applying whatever it happens to hold to this fixture's items.
+#
+# `leftpad` is locked at two majors on purpose. Choosing between them needs the declared
+# constraint, which a member only has once its `workspace = true` has been resolved — so
+# this is what pins inheritance running *before* the lockfile is applied.
+version = 3
+
+[[package]]
+name = "leftpad"
+version = "1.0.5"
+
+[[package]]
+name = "leftpad"
+version = "2.4.0"
+
+[[package]]
+name = "rightpad"
+version = "2.0.1"

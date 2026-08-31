@@ -25,7 +25,9 @@ pub use cargo_package::{
     DependencySection, PackageField, parse_package_manifest,
 };
 pub use cargo_toml::{CargoTomlParser, parse_cargo_config};
-pub use cargo_workspace::{WorkspaceDecl, parse_package_name, parse_workspace};
+pub use cargo_workspace::{
+    WorkspaceDecl, parse_package_name, parse_workspace, resolve_workspace_inheritance,
+};
 pub use composer_json::ComposerJsonParser;
 pub use csproj::CsprojParser;
 pub use deno_json::DenoJsonParser;

@@ -45,6 +45,9 @@
 //!   serialized, and the payoff is byte-determinism.
 //! - **No `toolExecutionNotifications`.** Skipped and unparseable manifests are
 //!   already reported on stderr by the CLI.
+//! - **No `region` at all** for a dependency whose version lives in another file — a
+//!   Cargo `dep.workspace = true`, resolved against the workspace root. The result still
+//!   carries its `artifactLocation`, which SARIF permits; see [`start_line`].
 //! - **No `cvssVersion` property.**
 //!   [`AdvisorySeverity::cvss_version`](dependable_core::result::AdvisorySeverity::cvss_version)
 //!   is an enum with no stable display form; the vector string is emitted
@@ -130,7 +133,7 @@ struct Finding {
     message: String,
     uri: String,
     /// One-based, as SARIF requires.
-    start_line: usize,
+    start_line: Option<usize>,
     fingerprint: String,
     properties: ResultProperties,
 }
@@ -190,10 +193,16 @@ fn findings(report: &Report) -> Vec<Finding> {
 }
 
 /// SARIF's one-based `region.startLine` from [`Item::version_line`], which is
-/// zero-indexed. An item with no recorded position points at line 1, a valid
-/// region — such items are local- or git-sourced and never reach here anyway.
-fn start_line(item: &Item) -> usize {
-    item.version_line + 1
+/// zero-indexed — or `None` for an item whose recorded span means nothing in this file.
+///
+/// [`Item::has_position`] is the discriminator rather than the position itself, because
+/// `0` is a legal line: a `requirements.txt` can declare on its first line. A workspace
+/// member inheriting `dep.workspace = true` is checkable, and so does reach here, but its
+/// version string lives in the root manifest. Emitting `startLine: 1` for it would point
+/// code scanning at the wrong line of the right file, so the finding is reported against
+/// the file with no region at all.
+fn start_line(item: &Item) -> Option<usize> {
+    item.has_position().then(|| item.version_line + 1)
 }
 
 /// The advisory IDs affecting the version in use, sorted and deduplicated.
@@ -224,7 +233,7 @@ fn vulnerable_finding(
     id: &str,
     ecosystem: &'static str,
     uri: &str,
-    start_line: usize,
+    start_line: Option<usize>,
 ) -> Finding {
     let advisory = result.advisory(id);
     let current = current_version(result);
@@ -266,7 +275,7 @@ fn outdated_finding(
     ecosystem: &'static str,
     ecosystem_display: &'static str,
     uri: &str,
-    start_line: usize,
+    start_line: Option<usize>,
 ) -> Finding {
     let current = current_version(result);
     let latest = latest_version(result);
@@ -641,9 +650,7 @@ impl SarifResult {
                     artifact_location: ArtifactLocation {
                         uri: finding.uri.clone(),
                     },
-                    region: Region {
-                        start_line: finding.start_line,
-                    },
+                    region: finding.start_line.map(|start_line| Region { start_line }),
                 },
             }],
             partial_fingerprints,
@@ -664,7 +671,10 @@ struct Location {
 #[serde(rename_all = "camelCase")]
 struct PhysicalLocation {
     artifact_location: ArtifactLocation,
-    region: Region,
+    /// Absent when the finding has no truthful line in this file — see [`start_line`].
+    /// SARIF permits a bare `artifactLocation`, and consumers fall back to the file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    region: Option<Region>,
 }
 
 /// The file itself. No `uriBaseId` — see the module docs.
@@ -745,7 +755,7 @@ mod tests {
     use std::path::PathBuf;
 
     use dependable_core::result::{AdvisorySeverity, CvssVersion};
-    use dependable_core::{Ecosystem, ManifestKind, parse};
+    use dependable_core::{Ecosystem, ManifestKind, PackageSource, parse};
     use serde_json::Value;
     use time::OffsetDateTime;
 
@@ -894,6 +904,31 @@ mod tests {
         // Byte offsets are not code points, so no columns are emitted at all.
         assert!(region.get("startColumn").is_none());
         assert!(region.get("endColumn").is_none());
+    }
+
+    /// A workspace member inheriting `dep.workspace = true` is checkable, so it reaches
+    /// the renderer — but its version string is in the root manifest, and its recorded
+    /// span is a zero that would render as `startLine: 1`. Code scanning gets the file
+    /// and no line, rather than a confident pointer at the wrong one.
+    #[test]
+    fn an_inherited_dependency_gets_a_location_with_no_region() {
+        let mut result = outdated();
+        result.item.source = PackageSource::Inherited;
+        result.item.version_constraint = "1.0.100".to_string();
+        assert!(
+            result.item.is_checkable(),
+            "it must still produce a finding"
+        );
+        assert!(!result.item.is_rewritable());
+
+        let log = rendered(&report_of(vec![result]));
+        let location = &results_of(&log)[0]["locations"][0]["physicalLocation"];
+
+        assert_eq!(location["artifactLocation"]["uri"], "Cargo.toml");
+        assert!(
+            location.get("region").is_none(),
+            "no region at all: {location}"
+        );
     }
 
     // -- A.4 ----------------------------------------------------------------

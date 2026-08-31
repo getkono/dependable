@@ -5,8 +5,10 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use dependable_core::Item;
 use moka::future::Cache;
 
 use crate::registries::PackageMetadata;
@@ -51,6 +53,25 @@ pub fn metadata_cache() -> MetadataCache {
     Cache::builder()
         .time_to_live(Duration::from_secs(600))
         .max_capacity(10_000)
+        .build()
+}
+
+/// Caches a workspace root's `[workspace.dependencies]`, keyed by the root's path.
+///
+/// A monorepo asks the same question once per member — "what does the root declare" —
+/// and the answer is one file read plus a full `toml_edit` parse of bytes that have not
+/// changed. Without this, a 500-crate workspace pays for both 500 times over. The `Arc`
+/// is what makes a hit free rather than a clone of every declaration.
+pub type WorkspaceCache = Cache<PathBuf, Arc<Vec<Item>>>;
+
+/// A fresh workspace-declaration cache with a 5-minute TTL, matching the versions cache:
+/// a root edited mid-run is a rare enough thing to be worth one stale answer, and a
+/// process this long-lived is a server, not a CLI run.
+#[must_use]
+pub fn workspace_cache() -> WorkspaceCache {
+    Cache::builder()
+        .time_to_live(Duration::from_secs(300))
+        .max_capacity(1_000)
         .build()
 }
 

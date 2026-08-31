@@ -192,8 +192,13 @@ fn parse_dependency(
 
     // Table-like form: inline `{ version = "1.0", ... }` or `[dependencies.serde]`
     if let Some(table) = item.as_table_like() {
+        // `workspace = true` says the version lives in the root's
+        // `[workspace.dependencies]`, which this reader cannot see. Recording that as
+        // its own source — rather than folding it into `path` as a generic "local" —
+        // is what lets a caller with the root in hand resolve exactly these entries and
+        // leave a genuine `path` override alone.
         if table.get("workspace").and_then(TomlItem::as_bool) == Some(true) {
-            return Some(skip_item(name, PackageSource::Local, kind));
+            return Some(skip_item(name, PackageSource::Inherited, kind));
         }
         if table.contains_key("path") {
             return Some(skip_item(name, PackageSource::Local, kind));
@@ -310,13 +315,42 @@ mod tests {
         assert_eq!(sliced(content, it), "0.12");
     }
 
+    /// `workspace = true` is a reading of the manifest, not a claim that a root exists,
+    /// so it gets its own source here — and stays distinguishable from the `path` entry
+    /// it would otherwise be indistinguishable from.
     #[test]
-    fn path_and_git_and_workspace_are_classified() {
+    fn path_git_and_workspace_are_each_classified_separately() {
         let content = "[dependencies]\nlocal = { path = \"../local\" }\nfromgit = { git = \"https://example.com/x\" }\nshared = { workspace = true }\n";
         let m = parse(content);
         assert_eq!(find(&m, "local").source, PackageSource::Local);
         assert_eq!(find(&m, "fromgit").source, PackageSource::Git);
-        assert_eq!(find(&m, "shared").source, PackageSource::Local);
+        assert_eq!(find(&m, "shared").source, PackageSource::Inherited);
+        // Nothing is known about the version until a root is read.
+        assert!(find(&m, "shared").version_constraint.is_empty());
+        assert!(!find(&m, "shared").is_checkable());
+    }
+
+    /// Cargo lets a member add `features`, `optional`, and `default-features` alongside
+    /// `workspace = true`. None of them is a version, and none makes the entry local.
+    #[test]
+    fn workspace_inheritance_survives_the_options_cargo_allows_beside_it() {
+        let content = "[dependencies]\nserde = { workspace = true, features = [\"derive\"], optional = true }\n\n[dev-dependencies]\ntokio.workspace = true\n";
+        let m = parse(content);
+        let serde = find(&m, "serde");
+        assert_eq!(serde.source, PackageSource::Inherited);
+        assert_eq!(serde.kind, DependencyKind::Normal);
+        assert_eq!(
+            (
+                serde.version_line,
+                serde.version_col_start,
+                serde.version_col_end
+            ),
+            (0, 0, 0)
+        );
+        // The dotted form is the same entry written differently, and keeps its section.
+        let tokio = find(&m, "tokio");
+        assert_eq!(tokio.source, PackageSource::Inherited);
+        assert_eq!(tokio.kind, DependencyKind::Dev);
     }
 
     #[test]

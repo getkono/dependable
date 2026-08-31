@@ -52,6 +52,7 @@ pub use check::{CheckError, Checker, CheckerBuilder, ManifestCheck, ProgressEven
 // Manifest discovery (filesystem; shared by every frontend).
 pub use discover::{
     LockfileNotice, find_lockfile, find_manifests, locate_lockfile, lockfile_notices,
+    nearest_workspace_root, workspace_declarations, workspace_root_of, workspace_source,
 };
 
 // Workspace dependency graph (offline; reads Cargo.lock / manifests).
@@ -78,7 +79,7 @@ pub use dependable_core::{
     CheckResult, DependencyGraph, DependencyKind, DependencyStatus, Ecosystem, Evaluation, Item,
     LockfileKind, ManifestKind, Node, NodeKind, PackageSource, ParseError, ParsedManifest,
     PathPredicate, Placement, Tree, TreeNode, TreeOptions, UnstableFilter, Visit, Visitor,
-    WalkOptions,
+    WalkOptions, WorkspaceDecl, resolve_workspace_inheritance,
 };
 
 /// One-import convenience for consumers: `use dependable_fetch::prelude::*;`.

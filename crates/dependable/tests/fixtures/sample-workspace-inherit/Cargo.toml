@@ -1,0 +1,13 @@
+# A workspace whose members inherit their versions from the root, for the
+# `workspace = true` tests (excluded from the real build via the root Cargo.toml).
+#
+# `util` is declared centrally *and* used by `app` as a path override — Cargo resolves
+# that to the path, and so must we. It is the case a name-only match gets wrong.
+[workspace]
+resolver = "2"
+members = ["crates/app", "crates/util"]
+
+[workspace.dependencies]
+leftpad = "1.0.0"
+rightpad = { version = "2.0.0", registry = "internal" }
+util = { path = "crates/util" }

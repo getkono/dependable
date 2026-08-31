@@ -4,21 +4,22 @@
 //! [`dependable_fetch::Checker`]. This module owns only CLI concerns: config
 //! layering, manifest discovery, progress UX, output rendering, and exit codes.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use dependable_fetch::core::{
-    AlternateRegistryDecl, NpmrcConfig, PackageField, ProjectMeta, WorkspaceDecl, apply_lockfile,
-    parse, parse_cargo_config, parse_npmrc, parse_project, parse_workspace,
+    AlternateRegistryDecl, NpmrcConfig, PackageField, ProjectMeta, apply_lockfile, parse,
+    parse_cargo_config, parse_npmrc, parse_project, resolve_workspace_inheritance,
 };
 use dependable_fetch::{
-    CheckError, Checker, DependencyKind, DependencyStatus, Ecosystem, GoProxyFetcher, GraphSource,
-    HexFetcher, Item, JsrFetcher, ManifestKind, NpmFetcher, NuGetFetcher, PackageSource,
-    PackagistFetcher, ParseError, ProgressEvent, PubDevFetcher, PyPiFetcher, ScopedRegistry,
-    TreeOptions, UnstableFilter, WorkspaceGraphOptions, build_client, build_workspace_graph,
+    CheckError, Checker, DependencyStatus, Ecosystem, GoProxyFetcher, GraphSource, HexFetcher,
+    Item, JsrFetcher, ManifestKind, NpmFetcher, NuGetFetcher, PackageSource, PackagistFetcher,
+    ParseError, ProgressEvent, PubDevFetcher, PyPiFetcher, ScopedRegistry, TreeOptions,
+    UnstableFilter, WorkspaceGraphOptions, build_client, build_workspace_graph,
+    nearest_workspace_root, workspace_source,
 };
 use dependable_tui::TuiOptions;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
@@ -251,6 +252,7 @@ impl Engine {
                     path: path.to_path_buf(),
                     ecosystem: check.ecosystem,
                     results: check.results,
+                    workspace_root: check.workspace_root,
                 }))
             }
             Err(CheckError::UnsupportedEcosystem(eco)) => {
@@ -604,12 +606,22 @@ pub async fn run_list(args: ListArgs) -> anyhow::Result<ExitCode> {
             }
         };
 
+        // A member writing `dep.workspace = true` states no version of its own; the
+        // constraint lives in the workspace root. Same resolution `check` and `fix` get,
+        // so an inventory and a check never disagree about what a member depends on.
+        //
+        // Before the lockfile, and in that order for a reason: a lockfile can hold several
+        // versions of one crate, and `pick_locked` chooses among them *by the declared
+        // constraint*. Resolving second would hand it an empty constraint and pick the
+        // highest — reporting `syn 2.0` locked against a member that inherits `syn = "1"`.
+        let inherited = workspace_source(manifest, kind, &content)
+            .map(|(_, declarations)| {
+                resolve_workspace_inheritance(&mut parsed.items, &declarations)
+            })
+            .unwrap_or_default();
         let lockfile = (!args.no_lock_file)
             .then(|| apply_nearest_lockfile(manifest, kind, &root, &mut parsed.items))
             .flatten();
-        // A member writing `dep.workspace = true` states no version of its own; the
-        // constraint lives in the workspace root.
-        let inherited = inherit_workspace_constraints(manifest, kind, &mut parsed.items);
         let meta = parse_project(kind, &content);
         let (version, version_inherited) = resolve_version(manifest, kind, &meta);
 
@@ -661,57 +673,6 @@ fn apply_nearest_lockfile(
     Some(relative_to(root, &path))
 }
 
-/// Fill in the constraints a member inherits from `[workspace.dependencies]`, returning
-/// the names that were resolved that way.
-///
-/// A `dep.workspace = true` entry parses as a local dependency with no constraint —
-/// correct for version checking, which must skip it, but an inventory that reported it
-/// that way would hide both the version in force and the fact that the crate comes from
-/// a registry. The workspace root's own declaration supplies all of it.
-fn inherit_workspace_constraints(
-    manifest: &Path,
-    kind: ManifestKind,
-    items: &mut [Item],
-) -> Vec<String> {
-    if kind != ManifestKind::CargoToml {
-        return Vec::new();
-    }
-    let Some(declared) = workspace_declarations(manifest) else {
-        return Vec::new();
-    };
-    let mut inherited = Vec::new();
-    for item in items {
-        // Only an entry with nothing of its own to say can be inheriting.
-        if !item.version_constraint.is_empty() || item.source != PackageSource::Local {
-            continue;
-        }
-        let Some(source) = declared.get(&item.name) else {
-            continue;
-        };
-        item.version_constraint
-            .clone_from(&source.version_constraint);
-        item.source = source.source;
-        item.registry.clone_from(&source.registry);
-        inherited.push(item.name.clone());
-    }
-    inherited
-}
-
-/// The `[workspace.dependencies]` entries of the nearest ancestor workspace root, keyed
-/// by package name.
-fn workspace_declarations(manifest: &Path) -> Option<HashMap<String, Item>> {
-    let (_, content) = nearest_workspace_root(manifest)?;
-    let parsed = parse(ManifestKind::CargoToml, &content).ok()?;
-    Some(
-        parsed
-            .items
-            .into_iter()
-            .filter(|item| item.kind == DependencyKind::Workspace)
-            .map(|item| (item.name.clone(), item))
-            .collect(),
-    )
-}
-
 /// The manifest's version, resolving a Cargo `version.workspace = true` against the
 /// nearest ancestor `[workspace.package]` table. Returns the version and whether it was
 /// inherited.
@@ -741,40 +702,8 @@ fn workspace_package_defaults(
     if kind != ManifestKind::CargoToml {
         return None;
     }
-    let (workspace, _) = nearest_workspace_root(manifest)?;
+    let (_, workspace, _) = nearest_workspace_root(manifest)?;
     Some(workspace.package_defaults)
-}
-
-/// The nearest ancestor `Cargo.toml` declaring a `[workspace]`, with its content.
-///
-/// The manifest itself is excluded: a member inherits from a root above it, and a root
-/// that is also a package declares its own values literally. The walk stops at the
-/// repository root so inheritance never resolves against a manifest outside the project.
-fn nearest_workspace_root(manifest: &Path) -> Option<(WorkspaceDecl, String)> {
-    let mut dir = manifest.parent()?;
-    loop {
-        let candidate = dir.join("Cargo.toml");
-        if !same_file(&candidate, manifest)
-            && let Ok(content) = std::fs::read_to_string(&candidate)
-            && let Some(workspace) = parse_workspace(&content)
-        {
-            return Some((workspace, content));
-        }
-        if dir.join(".git").exists() {
-            return None;
-        }
-        dir = dir.parent()?;
-    }
-}
-
-/// Whether two paths name the same file. Compared after canonicalization, since a
-/// discovered manifest (`./Cargo.toml`) and a candidate built while walking up
-/// (`Cargo.toml`) can spell one file two ways.
-fn same_file(a: &Path, b: &Path) -> bool {
-    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => a == b,
-    }
 }
 
 /// A `*.csproj`'s project name is its file stem; `Directory.Packages.props` is a central
@@ -905,6 +834,7 @@ pub async fn run_fix(args: FixArgs) -> anyhow::Result<ExitCode> {
         let Some(report) = engine.check_manifest(manifest).await? else {
             continue;
         };
+        report_inherited_skips(manifest, &report);
         let records = fix::apply_fixes(manifest, &report.results, args.all, args.dry_run)?;
         if records.is_empty() {
             continue;
@@ -965,6 +895,45 @@ fn resolve_report_settings(args: &crate::cli::ReportArgs, cfg: &Config) -> Setti
         registry: cfg.rust.registry.clone(),
         osv_url: cfg.vulnerability.osv_batch_url.clone(),
     }
+}
+
+/// Say which upgrades this manifest cannot make, and where they can be made instead.
+///
+/// A member inheriting `dep.workspace = true` is reported as outdated by `check` and then
+/// silently left alone by `fix`, because the version string is in the workspace root and
+/// there is no line here to rewrite. Without this the two commands appear to contradict
+/// each other, and nothing points at the file that can actually be changed.
+fn report_inherited_skips(manifest: &Path, report: &ManifestReport) {
+    let Some(root) = &report.workspace_root else {
+        return;
+    };
+    let mut names: Vec<&str> = report
+        .results
+        .iter()
+        .filter(|result| {
+            result.item.source == PackageSource::Inherited
+                && matches!(
+                    result.status,
+                    DependencyStatus::PatchAvailable
+                        | DependencyStatus::UpdateAvailable
+                        | DependencyStatus::Outdated
+                        | DependencyStatus::Vulnerable
+                )
+        })
+        .map(|result| result.item.name.as_str())
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    if names.is_empty() {
+        return;
+    }
+    eprintln!(
+        "note: {} inherits {} from the workspace; upgrade {} in {}",
+        manifest.display(),
+        names.join(", "),
+        if names.len() == 1 { "it" } else { "them" },
+        root.display()
+    );
 }
 
 /// Read whole-template overrides from `<root>/dependable-templates/`.
