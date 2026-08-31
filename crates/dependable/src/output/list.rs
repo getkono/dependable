@@ -40,6 +40,9 @@ pub struct ProjectReport {
     pub items: Vec<Item>,
     /// Available feature flags per dependency, when `--features` was passed.
     pub features: BTreeMap<String, Vec<String>>,
+    /// The registry-declared license per dependency, when `--licenses` was
+    /// passed. An absent key is "not published to us", never "unlicensed".
+    pub licenses: BTreeMap<String, String>,
 }
 
 impl ProjectReport {
@@ -100,11 +103,12 @@ fn table(reports: &[ProjectReport]) {
                 &item.version_constraint
             };
             println!(
-                "  {} {}{}{}",
+                "  {} {}{}{}{}",
                 item.name,
                 constraint,
                 locked_note(item),
-                annotation(item)
+                annotation(item),
+                license_note(report, item)
             );
             if let Some(features) = report.features.get(&item.name)
                 && !features.is_empty()
@@ -121,14 +125,17 @@ fn text(reports: &[ProjectReport]) {
         let label = report.label();
         let manifest = posix(&report.relative);
         for item in &report.items {
+            // The license is emitted unconditionally, so every record keeps the
+            // same arity whether or not `--licenses` was passed.
             println!(
-                "{label}\t{}\t{manifest}\t{}\t{}\t{}\t{}\t{}",
+                "{label}\t{}\t{manifest}\t{}\t{}\t{}\t{}\t{}\t{}",
                 report.ecosystem.display_name(),
                 item.name,
                 blank_as_dash(&item.version_constraint),
                 item.kind.token(),
                 source_token(item.source),
                 item.locked_version.as_deref().unwrap_or("—"),
+                report.licenses.get(&item.name).map_or("—", String::as_str),
             );
         }
     }
@@ -169,6 +176,7 @@ fn json(reports: &[ProjectReport], root: &Path) -> anyhow::Result<()> {
                     registry: item.registry.as_deref(),
                     inherited: report.inherited.contains(&item.name),
                     features: report.features.get(&item.name).map(Vec::as_slice),
+                    license: report.licenses.get(&item.name).map(String::as_str),
                 })
                 .collect(),
         })
@@ -230,6 +238,18 @@ struct DependencyDto<'a> {
     inherited: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     features: Option<&'a [String]>,
+    /// The registry-declared license, when `--licenses` was passed and the
+    /// registry published one. Additive and optional, so the schema is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    license: Option<&'a str>,
+}
+
+/// ` [MIT OR Apache-2.0]` in table output, or nothing when no license is known.
+fn license_note(report: &ProjectReport, item: &Item) -> String {
+    match report.licenses.get(&item.name) {
+        Some(license) => format!(" [{license}]"),
+        None => String::new(),
+    }
 }
 
 /// A path with `/` separators, whatever the platform uses.

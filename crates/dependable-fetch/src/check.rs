@@ -147,6 +147,9 @@ pub struct Checker {
     /// enrichment costs one extra OSV request per vulnerable package version, so
     /// a plain check must not pay for data nothing asked for.
     advisory_details: bool,
+    /// Whether `check_*` runs the license-collection post-pass. Off by default:
+    /// it costs one metadata request per distinct dependency.
+    licenses: bool,
     concurrency: usize,
     read_lockfiles: bool,
     unstable: UnstableFilter,
@@ -359,6 +362,77 @@ impl Checker {
         }
     }
 
+    /// Attach each dependency's registry-declared license to its result.
+    ///
+    /// Costs one metadata request per **distinct** dependency name, run at the
+    /// checker's configured concurrency and served from the metadata cache when
+    /// a name was already looked up — so a second manifest naming the same
+    /// packages is free. Nothing else about a result is touched.
+    ///
+    /// Registries that publish no metadata endpoint (the Go module proxy, JSR,
+    /// NuGet, pub.dev) simply leave every license `None`; that is "we cannot
+    /// ask", not "unlicensed", and the distinction is the caller's to preserve.
+    /// Metadata is fetched from the ecosystem's default fetcher, so a crate from
+    /// an alternate Cargo registry is looked up on crates.io and typically comes
+    /// back without a license rather than with a wrong one.
+    ///
+    /// [`CheckerBuilder::licenses`] runs this automatically at the end of each
+    /// check. A failure is non-fatal there: the versions are still correct.
+    ///
+    /// # Errors
+    /// Returns the first [`CheckError`] a metadata request produced. The packages
+    /// that did succeed are still attached — a partial answer beats none.
+    pub async fn attach_licenses(
+        &self,
+        ecosystem: Ecosystem,
+        results: &mut [CheckResult],
+    ) -> Result<(), CheckError> {
+        let mut seen: HashSet<&str> = HashSet::new();
+        let names: Vec<String> = results
+            .iter()
+            .filter(|result| result.item.is_checkable())
+            .filter(|result| seen.insert(result.item.name.as_str()))
+            .map(|result| result.item.name.clone())
+            .collect();
+        if names.is_empty() {
+            return Ok(());
+        }
+
+        let checker = self;
+        let fetched: Vec<(String, Result<Option<PackageMetadata>, CheckError>)> =
+            stream::iter(names)
+                .map(move |name| async move {
+                    let metadata = checker.fetch_metadata(ecosystem, &name).await;
+                    (name, metadata)
+                })
+                .buffer_unordered(self.concurrency)
+                .collect()
+                .await;
+
+        let mut licenses: HashMap<String, String> = HashMap::new();
+        let mut failure: Option<CheckError> = None;
+        for (name, outcome) in fetched {
+            match outcome {
+                Ok(Some(metadata)) => {
+                    if let Some(license) = metadata.license {
+                        licenses.insert(name, license);
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => failure = failure.or(Some(e)),
+            }
+        }
+        for result in results.iter_mut() {
+            if let Some(license) = licenses.get(&result.item.name) {
+                result.license = Some(license.clone());
+            }
+        }
+        match failure {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
     /// Fetch the registry's public metadata for one package.
     ///
     /// This is deliberately **not** part of `check_*`: version checking never needs
@@ -475,6 +549,16 @@ impl Checker {
             && let Err(e) = scan_vulnerabilities(osv, ecosystem, &mut results).await
         {
             warnings.push(format!("vulnerability scan skipped: {e}"));
+        }
+
+        // License collection is a post-pass over the finished results, shaped
+        // exactly like the vulnerability scan above: it degrades to a warning
+        // rather than failing the check, because the version data is still
+        // correct and useful without a license column.
+        if self.licenses
+            && let Err(e) = self.attach_licenses(ecosystem, &mut results).await
+        {
+            warnings.push(format!("license collection skipped: {e}"));
         }
 
         let mut check = ManifestCheck {
@@ -726,6 +810,7 @@ pub struct CheckerBuilder {
     vulnerabilities: bool,
     include_ghsa: bool,
     advisory_details: bool,
+    licenses: bool,
     osv_url: String,
     concurrency: usize,
     read_lockfiles: bool,
@@ -747,6 +832,7 @@ impl Default for CheckerBuilder {
             vulnerabilities: true,
             include_ghsa: false,
             advisory_details: false,
+            licenses: false,
             osv_url: DEFAULT_OSV_BATCH_URL.to_string(),
             concurrency: DEFAULT_CONCURRENCY,
             read_lockfiles: true,
@@ -828,6 +914,17 @@ impl CheckerBuilder {
     /// OSV client there is nothing to enrich.
     pub fn advisory_details(mut self, enabled: bool) -> Self {
         self.advisory_details = enabled;
+        self
+    }
+
+    /// Collect each dependency's registry-declared license (default: false).
+    ///
+    /// Off by default because it is not free: one metadata request per distinct
+    /// dependency name, on top of the version lookups. Turn it on when something
+    /// is going to *use* the license — a `[policy] allowed_licenses` gate, or a
+    /// report that shows it. Registries with no metadata endpoint stay `None`.
+    pub fn licenses(mut self, enabled: bool) -> Self {
+        self.licenses = enabled;
         self
     }
 
@@ -938,6 +1035,7 @@ impl CheckerBuilder {
             jsr: self.jsr,
             osv,
             advisory_details: self.advisory_details,
+            licenses: self.licenses,
             concurrency: self.concurrency,
             read_lockfiles: self.read_lockfiles,
             unstable: self.unstable,

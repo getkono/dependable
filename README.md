@@ -206,6 +206,7 @@ dependable list                    # human-readable, one block per project
 dependable list --format json      # the full inventory
 dependable list --format text      # one tab-separated record per dependency
 dependable list --no-lock-file     # skip lockfiles (no locked versions)
+dependable list --licenses         # add each dependency's declared license
 ```
 
 ```json
@@ -231,7 +232,8 @@ dependable list --no-lock-file     # skip lockfiles (no locked versions)
           "source": "registry",
           "locked": "1.0.228",
           "registry": null,
-          "inherited": true
+          "inherited": true,
+          "license": "MIT OR Apache-2.0"
         }
       ]
     }
@@ -252,6 +254,14 @@ Values a single manifest cannot supply are resolved from the repository and mark
 such: `version_inherited` for a Cargo `version.workspace = true`, `inherited` for a
 constraint taken from `[workspace.dependencies]`, and `lockfile` for the lockfile that
 supplied the locked versions — a workspace keeps one at its root, above its members.
+
+`license` appears only with `--licenses`, which is the one thing in `list` that
+touches the network: a license is published by the registry, not written in the
+manifest, so it costs one metadata request per dependency. It is available for
+crates.io, npm, PyPI, Packagist, and Hex; the Go module proxy, JSR, NuGet, and
+pub.dev publish no metadata this tool can read, and are left blank rather than
+guessed at. `--licenses` uses the default registry URLs, because `list` reads no
+config file.
 
 Only *declared* dependencies are listed. The full resolved graph, transitive
 dependencies included, is what `tree` renders.
@@ -331,6 +341,53 @@ to the built-in.
 
 `report` exits `0` whether or not it finds vulnerabilities: describing them is the
 command's job. Use `check --fail-on` or a `[policy]` block to gate a build.
+
+## License policy (`[policy] allowed_licenses`)
+
+A `[policy]` block in `.dependable.toml` gates a build. Listing SPDX identifiers
+in `allowed_licenses` turns on license collection for `check` automatically and
+fails the run on a dependency whose declared license falls outside the list:
+
+```toml
+[policy]
+allowed_licenses = ["MIT", "Apache-2.0", "BSD-3-Clause"]
+unknown_licenses = "warn"   # ignore | warn | fail
+```
+
+**An empty `allowed_licenses` is inert.** With no entry the license rule does not
+run at all — `unknown_licenses` included — so a project that has not asked for
+license policy never sees a license finding.
+
+`unknown_licenses` governs the dependencies whose license could not be *measured*:
+none was published, or what was published is not a readable SPDX expression. It
+defaults to `warn`, because four of the nine registries publish no metadata at all
+and PyPI's license field is free text — failing on every unknown would make the
+rule unusable. What it never does is silently pass. A license that *was* read and
+is not on the list is always a violation, whatever this is set to. If you set an
+allowlist and no license data comes back at all, the run says so once rather than
+leaving you with an unexplained wall of warnings.
+
+The expression evaluator understands atoms, `OR`, `AND`, `WITH`, parentheses, and
+the legacy crates.io `MIT/Apache-2.0` slash, case-insensitively. Four limits are
+worth knowing:
+
+- **`AND` is a conjunction.** `(MIT OR Apache-2.0) AND Unicode-DFS-2016` is a
+  violation under `["MIT", "Apache-2.0"]`: there is no way to take the package
+  without also taking `Unicode-DFS-2016`.
+- **`WITH` is satisfied by the base license.** `Apache-2.0 WITH LLVM-exception`
+  passes on a plain `Apache-2.0` entry, because an SPDX exception only ever grants
+  *additional* permission. Naming the whole `A WITH B` pair works too. This is
+  more permissive than `cargo-deny`, which requires the exception to be listed.
+- **`+` is part of the identifier.** `GPL-2.0+` matches only an entry written
+  `GPL-2.0+`, never `GPL-2.0` — "or later" can pull in GPL-3.0.
+- **There is no identifier registry.** dependable knows your allowlist and nothing
+  else, so an identifier that parses but is not listed is a violation whether it is
+  real SPDX or a typo. `GPL-2.0` is not treated as `GPL-2.0-only`, and no
+  compatibility or copyleft reasoning is performed.
+
+Anything that is not an expression at all — `MIT License`, a pasted license body,
+an unbalanced parenthesis — is reported as unreadable under `unknown_licenses`
+rather than being reinterpreted.
 
 ## Use as a library
 

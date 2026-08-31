@@ -38,6 +38,9 @@ struct Settings {
     depth: usize,
     check_lockfile: bool,
     check_vuln: bool,
+    /// Whether to collect each dependency's registry-declared license. Only
+    /// `check` sets it, and only when `[policy] allowed_licenses` needs it.
+    licenses: bool,
     cache: bool,
     include_ghsa: bool,
     fail_on: FailOn,
@@ -72,6 +75,7 @@ fn resolve_check_settings(args: &CheckArgs, cfg: &Config) -> Settings {
         depth: args.depth,
         check_lockfile: !args.no_lock_file && cfg.global.lock_file,
         check_vuln: cfg.vulnerability.enabled && !args.no_vuln && !env_no_vuln,
+        licenses: policy_requires_licenses(cfg),
         cache: !args.no_cache && !env_no_cache,
         include_ghsa: args.include_ghsa || cfg.global.include_ghsa || env_ghsa,
         fail_on,
@@ -80,6 +84,22 @@ fn resolve_check_settings(args: &CheckArgs, cfg: &Config) -> Settings {
             .map_or_else(|| cfg.global.unstable.into(), Into::into),
         registry: cfg.rust.registry.clone(),
         osv_url: cfg.vulnerability.osv_batch_url.clone(),
+    }
+}
+
+/// Whether the config's `[policy]` block needs license data collected.
+///
+/// Always false in a build without the `report` feature, where the policy types
+/// do not exist at all.
+fn policy_requires_licenses(cfg: &Config) -> bool {
+    #[cfg(feature = "report")]
+    {
+        cfg.policy.requires_licenses()
+    }
+    #[cfg(not(feature = "report"))]
+    {
+        let _ = cfg;
+        false
     }
 }
 
@@ -100,6 +120,9 @@ impl Engine {
             // lookup per distinct vulnerable package version (a clean run pays
             // nothing) and is what gives the CVSS policy gate a score to compare.
             .advisory_details(settings.check_vuln)
+            // License collection costs one metadata request per dependency, so
+            // it rides on a `[policy] allowed_licenses` that will consume it.
+            .licenses(settings.licenses)
             .include_ghsa(settings.include_ghsa)
             .osv_url(settings.osv_url.clone())
             .concurrency(settings.concurrency)
@@ -614,7 +637,13 @@ pub async fn run_list(args: ListArgs) -> anyhow::Result<ExitCode> {
             inherited,
             items: parsed.items,
             features,
+            licenses: BTreeMap::new(),
         });
+    }
+
+    // A second pass, so one HTTP client serves every manifest.
+    if args.licenses {
+        crate::licenses::fetch_all(&mut reports).await?;
     }
 
     output::list::render(args.format, &reports, &root)?;
@@ -808,6 +837,7 @@ fn tui_settings(cfg: &Config) -> Settings {
         depth: 3,
         check_lockfile: cfg.global.lock_file,
         check_vuln: cfg.vulnerability.enabled,
+        licenses: false,
         cache: true,
         include_ghsa: cfg.global.include_ghsa,
         fail_on: FailOn::None,
@@ -857,6 +887,7 @@ pub async fn run_fix(args: FixArgs) -> anyhow::Result<ExitCode> {
         depth: args.depth,
         check_lockfile: cfg.global.lock_file,
         check_vuln: false,
+        licenses: false,
         cache: true,
         include_ghsa: false,
         fail_on: FailOn::None,
@@ -930,6 +961,7 @@ fn resolve_report_settings(args: &crate::cli::ReportArgs, cfg: &Config) -> Setti
         depth: args.depth,
         check_lockfile: cfg.global.lock_file,
         check_vuln: cfg.vulnerability.enabled && !args.no_vuln && !env_no_vuln,
+        licenses: false,
         cache: !env_no_cache,
         include_ghsa: cfg.global.include_ghsa || env_ghsa,
         // Reserved and unwired: a report exits 0 whatever it finds. Gating a

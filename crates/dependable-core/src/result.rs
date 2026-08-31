@@ -39,6 +39,13 @@ pub struct CheckResult {
     /// so. `current_vulnerabilities` stays the authoritative ID list; this is its
     /// enrichment, and an ID with no matching record here simply was not enriched.
     pub advisories: Vec<Advisory>,
+    /// The license expression the registry declared, verbatim.
+    ///
+    /// `None` means "not collected, or the registry published none" — never
+    /// "unlicensed". A plain check makes no metadata requests at all, so it
+    /// leaves this `None` everywhere; only a caller that asked for license
+    /// collection sees it filled in.
+    pub license: Option<String>,
 }
 
 impl CheckResult {
@@ -55,6 +62,7 @@ impl CheckResult {
             current_vulnerabilities: Vec::new(),
             all_vulnerabilities: HashMap::new(),
             advisories: Vec::new(),
+            license: None,
         }
     }
 
@@ -71,6 +79,7 @@ impl CheckResult {
             current_vulnerabilities: Vec::new(),
             all_vulnerabilities: HashMap::new(),
             advisories: Vec::new(),
+            license: None,
         }
     }
 
@@ -793,6 +802,7 @@ mod tests {
     fn a_fresh_result_carries_no_advisories() {
         let bare = CheckResult::new(item("serde"), DependencyStatus::Local);
         assert!(bare.advisories.is_empty());
+        assert_eq!(bare.license, None, "a plain check collects no license");
         assert_eq!(bare.max_cvss(), None);
         assert_eq!(bare.max_severity(), None);
 
@@ -806,6 +816,7 @@ mod tests {
             },
         );
         assert!(evaluated.advisories.is_empty());
+        assert_eq!(evaluated.license, None);
     }
 
     #[test]

@@ -78,6 +78,14 @@ struct Info {
     home_page: Option<String>,
     #[serde(default)]
     license: Option<String>,
+    /// PEP 639's `License-Expression`: a real SPDX expression, when the project
+    /// publishes one.
+    #[serde(default)]
+    license_expression: Option<String>,
+    /// The trove classifiers, which carry the license as a controlled vocabulary
+    /// where `license` is free text.
+    #[serde(default)]
+    classifiers: Vec<String>,
     #[serde(default)]
     version: Option<String>,
     #[serde(default)]
@@ -133,6 +141,148 @@ fn pypi_published(body: &InfoResponse) -> BTreeMap<String, String> {
         }
         _ => BTreeMap::new(),
     }
+}
+
+/// SPDX identifiers for the trove classifiers whose license is unambiguous.
+///
+/// Deliberately partial. `License :: OSI Approved :: BSD License` is **not**
+/// here: it covers BSD-2-Clause and BSD-3-Clause alike, which differ in a real
+/// obligation, and inventing one of them would be worse than reporting nothing —
+/// an allowlist would then approve a license the package never declared.
+/// `Apache Software License` is mapped, because Apache-1.x is extinct on PyPI
+/// and treating it as unknown would make the table useless for Python.
+const CLASSIFIER_SPDX: &[(&str, &str)] = &[
+    ("License :: OSI Approved :: MIT License", "MIT"),
+    (
+        "License :: OSI Approved :: MIT No Attribution License (MIT-0)",
+        "MIT-0",
+    ),
+    (
+        "License :: OSI Approved :: Apache Software License",
+        "Apache-2.0",
+    ),
+    ("License :: OSI Approved :: ISC License (ISCL)", "ISC"),
+    (
+        "License :: OSI Approved :: Mozilla Public License 2.0 (MPL 2.0)",
+        "MPL-2.0",
+    ),
+    (
+        "License :: OSI Approved :: Mozilla Public License 1.1 (MPL 1.1)",
+        "MPL-1.1",
+    ),
+    (
+        "License :: OSI Approved :: GNU General Public License v2 (GPLv2)",
+        "GPL-2.0",
+    ),
+    (
+        "License :: OSI Approved :: GNU General Public License v2 or later (GPLv2+)",
+        "GPL-2.0+",
+    ),
+    (
+        "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+        "GPL-3.0",
+    ),
+    (
+        "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+        "GPL-3.0+",
+    ),
+    (
+        "License :: OSI Approved :: GNU Lesser General Public License v2 (LGPLv2)",
+        "LGPL-2.0",
+    ),
+    (
+        "License :: OSI Approved :: GNU Lesser General Public License v2 or later (LGPLv2+)",
+        "LGPL-2.0+",
+    ),
+    (
+        "License :: OSI Approved :: GNU Lesser General Public License v3 (LGPLv3)",
+        "LGPL-3.0",
+    ),
+    (
+        "License :: OSI Approved :: GNU Lesser General Public License v3 or later (LGPLv3+)",
+        "LGPL-3.0+",
+    ),
+    (
+        "License :: OSI Approved :: GNU Affero General Public License v3",
+        "AGPL-3.0",
+    ),
+    (
+        "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+        "AGPL-3.0+",
+    ),
+    (
+        "License :: OSI Approved :: The Unlicense (Unlicense)",
+        "Unlicense",
+    ),
+    (
+        "License :: OSI Approved :: Boost Software License 1.0 (BSL-1.0)",
+        "BSL-1.0",
+    ),
+    (
+        "License :: OSI Approved :: Python Software Foundation License",
+        "PSF-2.0",
+    ),
+    (
+        "License :: OSI Approved :: Eclipse Public License 2.0 (EPL-2.0)",
+        "EPL-2.0",
+    ),
+    (
+        "License :: OSI Approved :: Eclipse Public License 1.0 (EPL-1.0)",
+        "EPL-1.0",
+    ),
+    ("License :: OSI Approved :: zlib/libpng License", "Zlib"),
+    (
+        "License :: CC0 1.0 Universal (CC0 1.0) Public Domain Dedication",
+        "CC0-1.0",
+    ),
+];
+
+/// The longest a free-text `info.license` may be before it is discarded.
+///
+/// PyPI's `license` field is prose, and a large minority of projects paste the
+/// **entire license body** into it. Sixty-four characters comfortably fits every
+/// real SPDX expression and excludes a pasted paragraph.
+const MAX_FREE_TEXT_LICENSE: usize = 64;
+
+/// The package's license, resolved from the most trustworthy field PyPI served.
+///
+/// In priority order:
+/// 1. `license_expression` (PEP 639) — already SPDX; used verbatim.
+/// 2. `classifiers` — a controlled vocabulary, mapped through
+///    [`CLASSIFIER_SPDX`] and joined with `OR` when several apply.
+/// 3. `license` — free text, and accepted **only** when it is short and
+///    single-line. A longer value is dropped rather than reported: handing a
+///    license body (or prose such as `"Apache 2.0"`, which is not an SPDX
+///    identifier) to a license allowlist manufactures a false verdict, where
+///    `None` is honestly "not published in a usable form".
+fn pypi_license(info: &Info) -> Option<String> {
+    if let Some(expression) = info
+        .license_expression
+        .as_deref()
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+    {
+        return Some(expression.to_string());
+    }
+
+    let mut mapped: Vec<&str> = Vec::new();
+    for classifier in &info.classifiers {
+        let trimmed = classifier.trim();
+        if let Some((_, spdx)) = CLASSIFIER_SPDX.iter().find(|(name, _)| *name == trimmed)
+            && !mapped.contains(spdx)
+        {
+            mapped.push(spdx);
+        }
+    }
+    if !mapped.is_empty() {
+        return Some(mapped.join(" OR "));
+    }
+
+    info.license
+        .as_deref()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && l.len() <= MAX_FREE_TEXT_LICENSE && !l.contains(['\n', '\r']))
+        .map(str::to_string)
 }
 
 /// PyPI records an author and a maintainer as two independent name/email pairs,
@@ -230,13 +380,14 @@ impl RegistryFetcher for PyPiFetcher {
             // Computed before the struct literal moves the fields they read.
             let owners = pypi_owners(&body.info);
             let published = pypi_published(&body);
+            let license = pypi_license(&body.info);
 
             Ok(Some(PackageMetadata {
                 description: body.info.summary,
                 repository: repository_url(&body.info.project_urls),
                 homepage: body.info.home_page,
                 documentation: body.info.project_urls.get("Documentation").cloned(),
-                license: body.info.license.filter(|l| !l.is_empty()),
+                license,
                 owners,
                 downloads: None,
                 latest_published: body
