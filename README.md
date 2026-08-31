@@ -75,6 +75,30 @@ reporting your dependencies as unlocked. A project with both is read from
 V2 reporting features and other deferred work are tracked as GitHub issues; see
 [`docs/SCOPE.md`](docs/SCOPE.md) for the finalized scope and deferral plan.
 
+### Not yet supported
+
+Three languages come up often enough to answer here. Each is absent for a different
+reason, and one of them is closer than it looks:
+
+- **Kotlin / Java / Scala** — the registry side is ready (Maven Central publishes
+  complete version lists, and `Maven` is the largest language ecosystem in OSV that
+  `dependable` does not yet cover). Gradle build scripts are programs, not manifests, so
+  only the declarative parts — `gradle/libs.versions.toml` version catalogs, and
+  `pom.xml` with literal versions — can be read without executing your build.
+- **Swift** — SwiftPM has no canonical registry: packages are git URLs and versions are
+  git tags, and `Package.swift` is executable Swift. `Package.resolved` is readable, so
+  locked versions and vulnerability scanning are feasible, but "outdated" is not.
+- **C / C++** — there is no canonical registry (vcpkg is a git repository of ports whose
+  versions are pinned by one baseline commit), vcpkg's `version-string` scheme is
+  unordered by design, and OSV publishes no advisory data for vcpkg or ConanCenter. This
+  one is declined rather than deferred.
+
+[`docs/ECOSYSTEM-CANDIDATES.md`](docs/ECOSYSTEM-CANDIDATES.md) gives the full reasoning,
+the bar an ecosystem has to clear, what would change these answers, and the languages
+that would clear it today but have no demand signal yet — Ruby among them. If you want
+one of those, [open an issue](https://github.com/getkono/dependable/issues) with the
+`ecosystem` label.
+
 ## How it fits alongside your other tools
 
 `dependable` **complements** Dependabot and Renovate rather than replacing them: they
