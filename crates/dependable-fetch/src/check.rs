@@ -97,6 +97,13 @@ pub struct ManifestCheck {
     pub results: Vec<CheckResult>,
     /// Non-fatal degradations (e.g. an OSV outage that skipped vulnerability data).
     pub warnings: Vec<String>,
+    /// Whether the vulnerability scan was requested but did not complete.
+    ///
+    /// Separate from [`warnings`](Self::warnings), and typed, because a caller has to be
+    /// able to *act* on it rather than parse prose: an empty advisory list means "nothing
+    /// was found" and "nothing was looked for" alike, and a `--fail-on vulnerable` gate
+    /// reading the first when the second is true reports a clean build it never checked.
+    pub vulnerability_scan_failed: bool,
     /// The manifest whose `[workspace.dependencies]` govern this one — itself, when it
     /// declares its own `[workspace]`, else the nearest ancestor that does.
     ///
@@ -617,10 +624,12 @@ impl Checker {
             })
             .collect();
 
+        let mut vulnerability_scan_failed = false;
         if let Some(osv) = &self.osv
             && let Err(e) = scan_vulnerabilities(osv, ecosystem, &mut results).await
         {
             warnings.push(format!("vulnerability scan skipped: {e}"));
+            vulnerability_scan_failed = true;
         }
 
         // License collection is a post-pass over the finished results, shaped
@@ -638,6 +647,7 @@ impl Checker {
             ecosystem,
             results,
             warnings,
+            vulnerability_scan_failed,
             workspace_root: workspace.map(|(root, _)| root),
         };
 

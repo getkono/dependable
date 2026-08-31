@@ -25,6 +25,25 @@ pub struct ManifestReport {
     /// The manifest whose `[workspace.dependencies]` supplied any inherited constraint.
     /// `None` outside a workspace.
     pub workspace_root: Option<PathBuf>,
+    /// Whether this manifest's results are complete enough to gate a build on.
+    ///
+    /// A scan that could not run produces the same empty advisory lists as a scan that
+    /// found nothing, so without this the exit code cannot tell a clean project from an
+    /// unreachable OSV.
+    pub integrity: ScanIntegrity,
+}
+
+/// How much of what a gate needs was actually established for one manifest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ScanIntegrity {
+    /// The vulnerability scan was asked for and did not complete.
+    pub vulnerability_scan_failed: bool,
+    /// How many dependencies could not be resolved against their registry at all.
+    ///
+    /// Such a dependency has no status to gate on: it is not up to date, not outdated,
+    /// and not known-clean. Counting them is what lets `--fail-on` refuse to certify a
+    /// run whose facts it never obtained.
+    pub unresolved: usize,
 }
 
 /// Aggregate status counts across one or more reports.
@@ -170,6 +189,7 @@ mod tests {
 
     fn report(path: &str, declarations: &[(&str, DependencyStatus)]) -> ManifestReport {
         ManifestReport {
+            integrity: ScanIntegrity::default(),
             path: PathBuf::from(path),
             ecosystem: Ecosystem::Rust,
             results: declarations

@@ -31,7 +31,7 @@ use crate::config::{Config, load_config};
 use crate::config::{PolicySource, load_policy};
 use crate::fix;
 use crate::output::list::ProjectReport;
-use crate::output::{self, ManifestReport};
+use crate::output::{self, ManifestReport, ScanIntegrity};
 
 /// Effective settings after layering CLI flags over env vars over config.
 struct Settings {
@@ -248,11 +248,20 @@ impl Engine {
                 for warning in &check.warnings {
                     eprintln!("warning: {} — {warning}", path.display());
                 }
+                let integrity = ScanIntegrity {
+                    vulnerability_scan_failed: check.vulnerability_scan_failed,
+                    unresolved: check
+                        .results
+                        .iter()
+                        .filter(|r| matches!(r.status, DependencyStatus::Error(_)))
+                        .count(),
+                };
                 Ok(Some(ManifestReport {
                     path: path.to_path_buf(),
                     ecosystem: check.ecosystem,
                     results: check.results,
                     workspace_root: check.workspace_root,
+                    integrity,
                 }))
             }
             Err(CheckError::UnsupportedEcosystem(eco)) => {
@@ -374,6 +383,21 @@ pub async fn run_check(args: CheckArgs) -> anyhow::Result<ExitCode> {
     // user explicitly asked for.
     #[cfg(feature = "report")]
     if let Some(policy) = &policy {
+        // The static check above proved the gate *could* be enforced; this one proves it
+        // *was*. A CVSS rule reads advisory lists, and a scan that never ran leaves those
+        // empty — indistinguishable from a project with no advisories, so the gate would
+        // pass vacuously on exactly the run that could not check it.
+        if policy.requires_cvss()
+            && reports
+                .iter()
+                .any(|r| r.integrity.vulnerability_scan_failed)
+        {
+            eprintln!(
+                "error: `[policy]` gates on advisory severity, but the vulnerability scan did not complete"
+            );
+            eprintln!("       refusing to pass a policy that was never evaluated");
+            return Ok(ExitCode::from(2));
+        }
         let root = args.path.clone().unwrap_or_else(|| PathBuf::from("."));
         let outcome = dependable_report::policy::evaluate(&build_report(root, &reports), policy);
         report_policy(&outcome);
@@ -1280,7 +1304,52 @@ fn expand_env(content: &str) -> String {
     out
 }
 
+/// Whether a gate can be honoured from what this run actually established.
+///
+/// `FailOn::None` gates on nothing, so nothing can be missing. Every other setting is a
+/// promise not to pass a build with a particular property, and a run that failed to look
+/// cannot keep it.
+fn gate_is_answerable(reports: &[ManifestReport], fail_on: FailOn) -> Result<(), String> {
+    if fail_on == FailOn::None {
+        return Ok(());
+    }
+    let scan_failed = reports
+        .iter()
+        .any(|r| r.integrity.vulnerability_scan_failed);
+    // `FailOn::Any` already fails on `DependencyStatus::Error`, so an unresolved
+    // dependency is not a hole there — it is the gate working. The other settings match
+    // only specific statuses and skip errors entirely, which is where a run that
+    // resolved nothing could still report success.
+    let unresolved: usize = if fail_on == FailOn::Any {
+        0
+    } else {
+        reports.iter().map(|r| r.integrity.unresolved).sum()
+    };
+    match (scan_failed, unresolved) {
+        (false, 0) => Ok(()),
+        (true, 0) => Err("the vulnerability scan did not complete".to_owned()),
+        (false, n) => Err(format!(
+            "{n} dependenc{} could not be resolved against {} registry",
+            if n == 1 { "y" } else { "ies" },
+            if n == 1 { "its" } else { "their" }
+        )),
+        (true, n) => Err(format!(
+            "the vulnerability scan did not complete and {n} dependenc{} could not be resolved",
+            if n == 1 { "y" } else { "ies" }
+        )),
+    }
+}
+
 fn exit_code(reports: &[ManifestReport], fail_on: FailOn) -> ExitCode {
+    // A gate whose inputs are missing must fail, not pass. `--fail-on vulnerable` with an
+    // unreachable OSV used to exit 0 while printing the errors that explain why it could
+    // not know — a green build that had never been checked, which is the one outcome a
+    // gate exists to prevent.
+    if let Err(reason) = gate_is_answerable(reports, fail_on) {
+        eprintln!("error: cannot honour --fail-on: {reason}");
+        eprintln!("       refusing to report a clean run that was never completed");
+        return ExitCode::from(2);
+    }
     let triggered = reports
         .iter()
         .flat_map(|report| &report.results)
@@ -1409,5 +1478,88 @@ mod tests {
         );
         // An unterminated `${` is emitted verbatim.
         assert_eq!(expand_env("a=${OPEN"), "a=${OPEN");
+    }
+
+    fn report_with(integrity: ScanIntegrity, statuses: &[DependencyStatus]) -> ManifestReport {
+        ManifestReport {
+            path: PathBuf::from("Cargo.toml"),
+            ecosystem: dependable_fetch::Ecosystem::Rust,
+            results: statuses
+                .iter()
+                .map(|s| {
+                    let item = dependable_fetch::core::parse(
+                        dependable_fetch::ManifestKind::CargoToml,
+                        "[dependencies]\nserde = \"1\"\n",
+                    )
+                    .expect("fixture manifest")
+                    .items
+                    .into_iter()
+                    .next()
+                    .expect("one dependency");
+                    dependable_fetch::CheckResult::new(item, s.clone())
+                })
+                .collect(),
+            workspace_root: None,
+            integrity,
+        }
+    }
+
+    /// The defect this exists to prevent: OSV unreachable, `--fail-on vulnerable` armed,
+    /// every result left non-vulnerable because nothing was ever asked — and the run
+    /// exiting 0, certifying a build it had not checked.
+    #[test]
+    fn a_failed_scan_cannot_pass_a_vulnerability_gate() {
+        let reports = vec![report_with(
+            ScanIntegrity {
+                vulnerability_scan_failed: true,
+                unresolved: 0,
+            },
+            &[DependencyStatus::UpToDate],
+        )];
+        assert!(gate_is_answerable(&reports, FailOn::Vulnerable).is_err());
+        assert!(gate_is_answerable(&reports, FailOn::Outdated).is_err());
+        assert!(gate_is_answerable(&reports, FailOn::Any).is_err());
+        // Nothing was gated on, so nothing can be missing.
+        assert!(gate_is_answerable(&reports, FailOn::None).is_ok());
+    }
+
+    /// A dependency the registry never answered for has no status to gate on. `Outdated`
+    /// and `Vulnerable` match specific statuses and skip errors entirely, so a run that
+    /// resolved nothing would otherwise report success.
+    #[test]
+    fn unresolved_dependencies_cannot_pass_a_status_gate() {
+        let reports = vec![report_with(
+            ScanIntegrity {
+                vulnerability_scan_failed: false,
+                unresolved: 3,
+            },
+            &[DependencyStatus::Error("offline".to_owned())],
+        )];
+        assert!(gate_is_answerable(&reports, FailOn::Vulnerable).is_err());
+        assert!(gate_is_answerable(&reports, FailOn::Outdated).is_err());
+        // `Any` already fails on `Error`, so this is the gate working, not a hole.
+        assert!(gate_is_answerable(&reports, FailOn::Any).is_ok());
+        assert_eq!(exit_code(&reports, FailOn::Any), ExitCode::from(1));
+    }
+
+    /// A complete run still gates on what it found, and still passes when it finds
+    /// nothing — the guard must not turn every check into a failure.
+    #[test]
+    fn a_complete_run_gates_on_its_findings_as_before() {
+        let clean = vec![report_with(
+            ScanIntegrity::default(),
+            &[DependencyStatus::UpToDate],
+        )];
+        assert!(gate_is_answerable(&clean, FailOn::Vulnerable).is_ok());
+        assert_eq!(exit_code(&clean, FailOn::Vulnerable), ExitCode::SUCCESS);
+
+        let vulnerable = vec![report_with(
+            ScanIntegrity::default(),
+            &[DependencyStatus::Vulnerable],
+        )];
+        assert_eq!(
+            exit_code(&vulnerable, FailOn::Vulnerable),
+            ExitCode::from(1)
+        );
     }
 }
