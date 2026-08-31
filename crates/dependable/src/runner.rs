@@ -61,11 +61,11 @@ fn resolve_check_settings(args: &CheckArgs, cfg: &Config) -> Settings {
         .ok()
         .and_then(|s| FailOn::from_env(&s));
 
-    let fail_on = if args.fail_on != FailOn::None {
-        args.fail_on
-    } else {
-        env_fail_on.unwrap_or(cfg.global.fail_on)
-    };
+    // Documented precedence, honoured for every value: CLI, then env, then config.
+    // The old test `args.fail_on != FailOn::None` could not tell an explicit
+    // `--fail-on none` from clap's default, so a config `fail_on` could not be turned
+    // off from the command line at all.
+    let fail_on = args.fail_on.or(env_fail_on).unwrap_or(cfg.global.fail_on);
 
     Settings {
         concurrency: args
@@ -78,6 +78,9 @@ fn resolve_check_settings(args: &CheckArgs, cfg: &Config) -> Settings {
         check_vuln: cfg.vulnerability.enabled && !args.no_vuln && !env_no_vuln,
         licenses: policy_requires_licenses(cfg),
         cache: !args.no_cache && !env_no_cache,
+        // `--include-ghsa` is a flag, so absence is indistinguishable from `false` and
+        // it can only ever widen the scan. OR-ing is therefore the whole contract: any
+        // layer asking for GHSA gets it, and no layer can silently take it away.
         include_ghsa: args.include_ghsa || cfg.global.include_ghsa || env_ghsa,
         fail_on,
         unstable: args
@@ -334,7 +337,8 @@ fn progress_sink() -> Arc<dyn Fn(ProgressEvent) + Send + Sync> {
 
 /// `dependable check`
 pub async fn run_check(args: CheckArgs) -> anyhow::Result<ExitCode> {
-    let cfg = load_config(&args.config);
+    let cfg =
+        load_config(&args.config).with_context(|| format!("reading {}", args.config.display()))?;
     let settings = resolve_check_settings(&args, &cfg);
     // Both policy steps run before discovery, so a misconfigured gate costs a
     // parse rather than a full network check.
@@ -760,7 +764,8 @@ fn relative_to(root: &Path, manifest: &Path) -> PathBuf {
 /// Returns an error if the checker cannot be built or the terminal cannot be
 /// configured.
 pub async fn run_tui(args: TuiArgs) -> anyhow::Result<ExitCode> {
-    let cfg = load_config(&args.config);
+    let cfg =
+        load_config(&args.config).with_context(|| format!("reading {}", args.config.display()))?;
     let settings = tui_settings(&cfg);
     // No progress bar: the UI draws its own screen.
     let engine = Engine::new(&settings, &cfg, false)?;
@@ -827,7 +832,8 @@ pub fn run_tree(args: TreeArgs) -> anyhow::Result<ExitCode> {
 
 /// `dependable fix`
 pub async fn run_fix(args: FixArgs) -> anyhow::Result<ExitCode> {
-    let cfg = load_config(&args.config);
+    let cfg =
+        load_config(&args.config).with_context(|| format!("reading {}", args.config.display()))?;
     let settings = Settings {
         concurrency: args.concurrency.unwrap_or(cfg.global.concurrency).max(1),
         depth: args.depth,
@@ -1043,7 +1049,8 @@ fn load_template_overrides(root: &Path) -> anyhow::Result<BTreeMap<String, Strin
 pub async fn run_report(args: crate::cli::ReportArgs) -> anyhow::Result<ExitCode> {
     use std::io::Write;
 
-    let cfg = load_config(&args.config);
+    let cfg =
+        load_config(&args.config).with_context(|| format!("reading {}", args.config.display()))?;
     let settings = resolve_report_settings(&args, &cfg);
     let root = args.path.clone().unwrap_or_else(|| PathBuf::from("."));
 
@@ -1561,5 +1568,47 @@ mod tests {
             exit_code(&vulnerable, FailOn::Vulnerable),
             ExitCode::from(1)
         );
+    }
+
+    /// Parse a real command line, so the test exercises the same `Option` clap produces
+    /// rather than a hand-built struct that could disagree with it.
+    fn check_args(argv: &[&str]) -> crate::cli::CheckArgs {
+        use clap::Parser as _;
+        let cli = crate::cli::Cli::try_parse_from(argv).expect("a valid command line");
+        match cli.command {
+            Some(crate::cli::Command::Check(args)) => args,
+            _ => panic!("expected the check subcommand"),
+        }
+    }
+
+    /// Documented precedence is CLI over env over config. `fail_on` inverted it: the
+    /// guard compared against `FailOn::None`, which is also clap's default, so an
+    /// explicit `--fail-on none` was indistinguishable from the flag being absent and a
+    /// config that armed the gate could not be disarmed from the command line.
+    #[test]
+    fn an_explicit_fail_on_none_beats_the_config() {
+        let mut cfg = Config::default();
+        cfg.global.fail_on = FailOn::Any;
+
+        let explicit = resolve_check_settings(
+            &check_args(&["dependable", "check", "--fail-on", "none"]),
+            &cfg,
+        );
+        assert_eq!(
+            explicit.fail_on,
+            FailOn::None,
+            "the command line was ignored"
+        );
+
+        // Absent, the config still governs.
+        let absent = resolve_check_settings(&check_args(&["dependable", "check"]), &cfg);
+        assert_eq!(absent.fail_on, FailOn::Any);
+
+        // And a non-default flag still wins, as it always did.
+        let vulnerable = resolve_check_settings(
+            &check_args(&["dependable", "check", "--fail-on", "vulnerable"]),
+            &cfg,
+        );
+        assert_eq!(vulnerable.fail_on, FailOn::Vulnerable);
     }
 }

@@ -125,14 +125,21 @@ fn an_unknown_severity_band_fails_the_run_and_lists_the_valid_ones() {
 }
 
 #[test]
-fn an_unrelated_config_typo_still_falls_back_to_defaults() {
-    // `load_config` stays lenient: only `[policy]` is strict, so tightening the
-    // gate did not tighten everything else.
+fn a_typo_outside_the_policy_block_is_also_an_error() {
+    // This used to assert the opposite: only `[policy]` was strict, and a typo anywhere
+    // else was silently dropped. That leniency was not a smaller version of the same
+    // safety — it was the hole. A dropped `[global]` key resets the table it is in, so
+    // one mistyped character put `fail_on` back to `none` and disarmed the CI gate,
+    // with nothing on stderr to say why.
     let config = config("policy_other_typo", "[global]\nconcurrencyy = 4\n");
 
     let output = check(&config, &["--no-vuln"], &[]);
+    let stderr = stderr(&output);
 
-    assert_eq!(code(&output), 0, "stderr: {}", stderr(&output));
+    assert_eq!(code(&output), 2, "stderr: {stderr}");
+    // The message names the offending key and the ones that would have worked.
+    assert!(stderr.contains("concurrencyy"), "stderr: {stderr}");
+    assert!(stderr.contains("concurrency"), "stderr: {stderr}");
 }
 
 #[test]
