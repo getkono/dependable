@@ -114,7 +114,9 @@ fn a_whole_workspace_scan_reports_the_root_and_the_member() {
 
     let doc = check_json(&dir, &["check", dir.to_str().unwrap()]);
 
-    let declared = result(&doc, "/Cargo.toml", "serde");
+    // Not `/Cargo.toml`: the member's path ends with that too, so a suffix that loose
+    // picks whichever result happens to come first.
+    let declared = result(&doc, "workspace_whole_scan/Cargo.toml", "serde");
     assert_eq!(declared["kind"], "workspace");
     assert!(
         declared["inherited_from"].is_null(),

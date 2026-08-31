@@ -31,6 +31,16 @@ name = "time"
 version = "0.2.7"
 "#;
 
+/// Drop Windows' `\\?\` extended-length prefix, which `canonicalize` applies and the
+/// reported workspace root does not carry. A no-op on every other platform.
+fn simplified(path: std::path::PathBuf) -> std::path::PathBuf {
+    let text = path.as_os_str().to_string_lossy();
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => std::path::PathBuf::from(rest),
+        _ => path,
+    }
+}
+
 /// Mount the crates.io sparse-index GETs for serde and time.
 async fn mount_index(server: &MockServer) {
     Mock::given(method("GET"))
@@ -1020,8 +1030,8 @@ async fn a_member_is_checked_against_the_workspace_roots_constraint() {
         "no position in this file is truthful"
     );
     assert_eq!(
-        check.workspace_root.as_deref(),
-        Some(root.join("Cargo.toml").as_path())
+        check.workspace_root.map(simplified),
+        Some(simplified(root.join("Cargo.toml")))
     );
 
     // Same content with no file behind it: there is no tree to look up, so the entry

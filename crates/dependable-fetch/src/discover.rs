@@ -548,7 +548,9 @@ mod tests {
         let (found, declarations) =
             workspace_source(&member, ManifestKind::CargoToml, content).expect("a root");
 
-        assert_eq!(found, root.join("Cargo.toml"));
+        // `simplified` on both sides: the reported root has Windows' `\\?\` prefix dropped,
+        // and `canonicalize` above put it there.
+        assert_eq!(found, simplified(root.join("Cargo.toml")));
         assert_eq!(declarations.len(), 1);
         assert_eq!(declarations[0].name, "serde");
         assert_eq!(declarations[0].version_constraint, "1.0.200");
@@ -571,7 +573,7 @@ mod tests {
         let (found, declarations) =
             workspace_source(&manifest, ManifestKind::CargoToml, content).expect("itself");
 
-        assert_eq!(found, manifest);
+        assert_eq!(found, simplified(manifest.clone()));
         assert_eq!(declarations.len(), 1, "{declarations:?}");
         assert_eq!(declarations[0].name, "serde");
     }
