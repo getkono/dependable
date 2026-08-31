@@ -113,6 +113,7 @@ dependable check . --fail-on vulnerable   # exit non-zero for CI
 dependable list .                 # every project and what it declares (offline)
 dependable tree .                 # render the dependency tree (Rust)
 dependable fix . --dry-run        # preview in-place upgrades
+dependable report . > report.html # a self-contained HTML report
 ```
 
 ## Interactive UI
@@ -181,6 +182,17 @@ serde    1.0.100  1.0.228  patch available
 tokio    1.20.0   1.52.3   3 vulnerabilities
 time     0.2.7    0.3.51   1 vulnerability
 ```
+
+### Network cost of the vulnerability scan
+
+With vulnerability scanning on (the default), `check` first asks OSV about every
+dependency in one batch, and then issues **one additional `POST /v1/query` per
+distinct vulnerable package version** to pull each advisory's full record —
+severity vector, fixing versions, published dates, links. A clean run pays nothing
+extra: with no vulnerable versions there is nothing to enrich. Those records are
+what give the CVSS policy gate a score to compare and the HTML report something to
+show. `--no-vuln` (or `[vulnerability] enabled = false`) skips the scan entirely
+and restores the previous behaviour.
 
 ## Project inventory (`list`)
 
@@ -282,6 +294,43 @@ The tree is the **resolved union graph** from `Cargo.lock`: unlike
 `cargo tree --edges` it does not distinguish normal/dev/build edges or feature
 activation. When no `Cargo.lock` is present, `tree` prints a warning and falls
 back to a shallow graph of each member plus its direct declared dependencies.
+
+## HTML report (`report`)
+
+`dependable report` renders **one self-contained HTML document** — inline CSS,
+inline SVG charts, no external stylesheet, script, font, or image — so it opens
+offline from a single file and survives being emailed or dropped into a CI
+artifact. It goes to stdout by default:
+
+```bash
+dependable report . > report.html      # the obvious idiom
+dependable report . -o report.html     # write the file directly
+dependable report . --no-vuln          # skip the vulnerability scan
+dependable report . --manifest Cargo.toml --depth 1
+```
+
+Five sections: an executive summary, a vulnerability detail table (one row per
+dependency and advisory), a dependency status table per manifest, an advisory
+timeline ordered by publication date, and an ecosystem breakdown — a pie chart
+with a real table of the same figures beneath it, because the chart is decoration
+and the table is the data. Manifest paths are stored relative to the report root,
+so no absolute machine path lands in a document you share. Warnings the run would
+otherwise leave only on a console — a skipped ecosystem, an unreadable lockfile,
+vulnerability scanning being off — are carried into the document itself.
+
+Every value in the document is HTML-escaped, advisory links are restricted to
+`http`/`https` in Rust before they reach an `href`, and an advisory's Markdown
+description is shown escaped and pre-wrapped rather than rendered.
+
+To restyle it, drop replacements into `dependable-templates/` in the project root.
+Any of these eight names can be replaced wholesale: `report.html`, `styles.css`,
+`macros.html`, `summary.html`, `vulnerabilities.html`, `dependencies.html`,
+`timeline.html`, `ecosystems.html`. A file with an unrecognized name, or one that
+fails to parse, is a hard error naming the problem — there is no silent fall back
+to the built-in.
+
+`report` exits `0` whether or not it finds vulnerabilities: describing them is the
+command's job. Use `check --fail-on` or a `[policy]` block to gate a build.
 
 ## Use as a library
 

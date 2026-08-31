@@ -1,0 +1,63 @@
+{# The chart is decoration; the table below it is the data. A text browser gets
+   nothing from the <svg> and everything from the <table>. #}
+<section id="ecosystems" class="card">
+<h2>5. Ecosystem breakdown</h2>
+{%- if ecosystems.rows %}
+<div class="chart">
+<svg class="pie" viewBox="0 0 220 220" width="220" height="220" role="img" aria-labelledby="pie-title pie-desc">
+<title id="pie-title">Dependencies by ecosystem</title>
+<desc id="pie-desc">A pie chart of {{ ecosystems.total }} dependencies split across {{ ecosystems.rows | length }} ecosystem(s). The same figures are in the table beneath it.</desc>
+{%- for slice in ecosystems.slices %}
+{%- if slice.full_circle %}
+<circle cx="110" cy="110" r="100" fill="{{ slice.color }}"></circle>
+{%- else %}
+<path d="{{ slice.path }}" fill="{{ slice.color }}"></path>
+{%- endif %}
+{%- endfor %}
+</svg>
+<ul class="legend">
+{%- for row in ecosystems.rows %}
+<li>
+<svg class="swatch" viewBox="0 0 10 10" width="10" height="10" aria-hidden="true"><rect width="10" height="10" fill="{{ row.color }}"></rect></svg>
+<span class="legend-name">{{ row.label }}</span>
+<span class="legend-count">{{ row.count }} ({{ row.percent }})</span>
+<svg class="bar" viewBox="0 0 120 8" width="120" height="8" role="img" aria-label="{{ row.label }} health: {{ row.up_to_date }} up to date, {{ row.outdated }} outdated, {{ row.vulnerable }} vulnerable, {{ row.other }} not checkable">
+{%- for seg in row.bar %}
+<rect x="{{ seg.x }}" y="0" width="{{ seg.width }}" height="8" class="{{ seg.class }}"><title>{{ seg.label }}</title></rect>
+{%- endfor %}
+</svg>
+</li>
+{%- endfor %}
+</ul>
+</div>
+<table class="grid">
+<caption>Dependencies and health by ecosystem</caption>
+<thead>
+<tr>
+<th scope="col">Ecosystem</th>
+<th scope="col" class="num">Dependencies</th>
+<th scope="col" class="num">Share</th>
+<th scope="col" class="num">Up to date</th>
+<th scope="col" class="num">Outdated</th>
+<th scope="col" class="num">Vulnerable</th>
+<th scope="col" class="num">Not checkable</th>
+</tr>
+</thead>
+<tbody>
+{%- for row in ecosystems.rows %}
+<tr>
+<th scope="row">{{ row.label }}</th>
+<td class="num">{{ row.count }}</td>
+<td class="num">{{ row.percent }}</td>
+<td class="num">{{ row.up_to_date }}</td>
+<td class="num">{{ row.outdated }}</td>
+<td class="num">{{ row.vulnerable }}</td>
+<td class="num">{{ row.other }}</td>
+</tr>
+{%- endfor %}
+</tbody>
+</table>
+{%- else %}
+<p class="empty">No dependencies to chart.</p>
+{%- endif %}
+</section>

@@ -26,9 +26,11 @@ pub mod html;
 pub mod model;
 pub mod policy;
 pub mod sarif;
+pub mod summary;
 
 pub use error::ReportError;
 pub use model::{ManifestResults, Report};
+pub use summary::{EcosystemSummary, SeverityCounts, Summary};
 
 /// The version of this crate, for report provenance
 /// (HTML footer, SARIF `tool.driver.version`).

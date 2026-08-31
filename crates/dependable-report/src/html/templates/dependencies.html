@@ -1,0 +1,49 @@
+{% import "macros.html" as m %}
+<section id="dependencies" class="card">
+<h2>3. Dependency status</h2>
+{%- if manifests %}
+{%- for manifest in manifests %}
+<details class="manifest" open>
+<summary><code>{{ manifest.path }}</code> — {{ manifest.ecosystem }} ({{ manifest.total }} dependencies)</summary>
+{%- if manifest.rows %}
+<table class="grid wide">
+<thead>
+<tr>
+<th scope="col">Package</th>
+<th scope="col">Declared</th>
+<th scope="col">Current</th>
+<th scope="col">Latest compatible</th>
+<th scope="col">Latest available</th>
+<th scope="col">Status</th>
+</tr>
+</thead>
+<tbody>
+{%- for row in manifest.rows %}
+<tr>
+<th scope="row">{{ row.name }}</th>
+<td><code>{{ row.constraint }}</code></td>
+<td>{{ m.version_cell(row.current) }}</td>
+<td>{{ m.version_cell(row.latest_compatible) }}</td>
+<td>{{ m.version_cell(row.latest_available) }}</td>
+<td>
+{{ m.status_chip(row.status_label, row.status_token) }}
+{%- if row.note %}
+<div class="muted">{{ row.note }}</div>
+{%- endif %}
+{%- if row.advisories %}
+<div class="muted">{{ row.advisories | join(", ") }}</div>
+{%- endif %}
+</td>
+</tr>
+{%- endfor %}
+</tbody>
+</table>
+{%- else %}
+<p class="empty">This manifest declares no dependencies.</p>
+{%- endif %}
+</details>
+{%- endfor %}
+{%- else %}
+<p class="empty">No manifests were reported on.</p>
+{%- endif %}
+</section>

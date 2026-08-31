@@ -1,0 +1,66 @@
+{% import "macros.html" as m %}
+<section id="vulnerabilities" class="card">
+<h2>2. Vulnerability detail</h2>
+{%- if vulnerabilities %}
+<table class="grid wide">
+<caption>One row per dependency and advisory, worst first</caption>
+<thead>
+<tr>
+<th scope="col">Severity</th>
+<th scope="col">Package</th>
+<th scope="col">Current</th>
+<th scope="col">Advisory</th>
+<th scope="col">Fixed in</th>
+<th scope="col">Manifest</th>
+</tr>
+</thead>
+<tbody>
+{%- for row in vulnerabilities %}
+<tr>
+<td>{{ m.severity_chip(row.severity_label, row.severity_token) }} <span class="score">{{ row.score }}</span></td>
+<td><strong>{{ row.package }}</strong><br><span class="muted">{{ row.constraint }}</span></td>
+<td>{{ m.version_cell(row.current) }}</td>
+<td>
+<div class="adv-id">{{ m.ext_link(row.advisory_url, row.advisory_id) }}{% if row.withdrawn %} <span class="chip withdrawn">withdrawn</span>{% endif %}</div>
+<div class="adv-title">{{ row.title }}</div>
+{%- if row.aliases %}
+<div class="muted">also known as {{ row.aliases | join(", ") }}</div>
+{%- endif %}
+{%- if row.cwe_ids %}
+<div class="muted">weaknesses: {{ row.cwe_ids | join(", ") }}</div>
+{%- endif %}
+{%- if row.vector %}
+<div class="muted vector">{{ row.vector }}</div>
+{%- endif %}
+{%- if row.details %}
+<details class="adv-details">
+<summary>Published description</summary>
+<div class="adv-details-body">{{ row.details }}</div>
+</details>
+{%- endif %}
+{%- if row.references %}
+<details class="adv-refs">
+<summary>References ({{ row.references | length }})</summary>
+<ul>
+{%- for link in row.references %}
+<li><span class="muted">{{ link.kind }}</span> {{ m.ext_link(link.url, link.text) }}</li>
+{%- endfor %}
+</ul>
+</details>
+{%- endif %}
+</td>
+<td>{{ m.version_cell(row.fixed) }}</td>
+<td><code>{{ row.manifest }}</code></td>
+</tr>
+{%- endfor %}
+</tbody>
+</table>
+<p class="prose muted">
+Published descriptions are shown as the publisher wrote them, escaped and
+pre-wrapped rather than rendered as Markdown: an advisory is third-party text,
+and Markdown permits raw HTML inside it.
+</p>
+{%- else %}
+<p class="empty">No advisories affect this dependency tree.</p>
+{%- endif %}
+</section>

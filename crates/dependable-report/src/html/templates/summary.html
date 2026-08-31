@@ -1,0 +1,49 @@
+{% import "macros.html" as m %}
+<section id="summary" class="card">
+<h2>1. Executive summary</h2>
+{%- if notes %}
+<div class="notes" role="note">
+<p class="notes-head">Notes from this run</p>
+<ul>
+{%- for note in notes %}
+<li>{{ note }}</li>
+{%- endfor %}
+</ul>
+</div>
+{%- endif %}
+<ul class="stats">
+<li><span class="n">{{ summary.total }}</span><span class="k">dependencies</span></li>
+<li><span class="n">{{ summary.manifests }}</span><span class="k">manifests</span></li>
+<li><span class="n">{{ summary.up_to_date_percent }}</span><span class="k">of {{ summary.checkable }} checkable up to date</span></li>
+<li class="{% if summary.vulnerable %}bad{% endif %}"><span class="n">{{ summary.vulnerable }}</span><span class="k">vulnerable</span></li>
+<li class="{% if summary.severity.critical %}bad{% endif %}"><span class="n">{{ summary.severity.critical }}</span><span class="k">critical advisories</span></li>
+<li><span class="n">{{ summary.max_cvss }}</span><span class="k">highest CVSS</span></li>
+</ul>
+<p class="chips">
+{{ m.severity_chip("critical " ~ summary.severity.critical, "CRITICAL") }}
+{{ m.severity_chip("high " ~ summary.severity.high, "HIGH") }}
+{{ m.severity_chip("medium " ~ summary.severity.medium, "MEDIUM") }}
+{{ m.severity_chip("low " ~ summary.severity.low, "LOW") }}
+{{ m.severity_chip("none " ~ summary.severity.none, "NONE") }}
+{{ m.severity_chip("unrated " ~ summary.severity.unrated, "UNRATED") }}
+</p>
+<table class="grid">
+<caption>Dependency status across every manifest</caption>
+<thead><tr><th scope="col">Status</th><th scope="col" class="num">Count</th></tr></thead>
+<tbody>
+<tr><th scope="row">Up to date</th><td class="num">{{ summary.up_to_date }}</td></tr>
+<tr><th scope="row">Patch available</th><td class="num">{{ summary.patch_available }}</td></tr>
+<tr><th scope="row">Update available</th><td class="num">{{ summary.update_available }}</td></tr>
+<tr><th scope="row">Outdated</th><td class="num">{{ summary.outdated }}</td></tr>
+<tr><th scope="row">Vulnerable</th><td class="num">{{ summary.vulnerable }}</td></tr>
+<tr><th scope="row">Errored</th><td class="num">{{ summary.error }}</td></tr>
+<tr><th scope="row">Path (local)</th><td class="num">{{ summary.local }}</td></tr>
+<tr><th scope="row">Git</th><td class="num">{{ summary.git }}</td></tr>
+</tbody>
+</table>
+<p class="prose">
+{{ summary.advisory_instances }} advisory finding(s) across {{ summary.distinct_advisories }} distinct
+advisories{% if summary.withdrawn_advisories %}, {{ summary.withdrawn_advisories }} of them withdrawn by
+the publisher{% endif %}.
+</p>
+</section>

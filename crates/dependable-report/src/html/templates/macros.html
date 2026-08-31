@@ -1,0 +1,6 @@
+{# Shared building blocks. The signatures here are part of the override
+   contract: changing one breaks anyone who overrode a section that calls it. #}
+{% macro severity_chip(label, token) %}<span class="chip sev-{{ token }}">{{ label }}</span>{% endmacro %}
+{% macro status_chip(label, token) %}<span class="chip st-{{ token }}">{{ label }}</span>{% endmacro %}
+{% macro version_cell(value) %}<code class="ver">{{ value }}</code>{% endmacro %}
+{% macro ext_link(url, label) %}{% if url %}<a class="ext" href="{{ url }}" rel="noopener noreferrer external">{{ label }}</a>{% else %}<span class="ext inert" title="not linked: only http and https URLs are linked">{{ label }}</span>{% endif %}{% endmacro %}

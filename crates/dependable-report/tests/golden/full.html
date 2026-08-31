@@ -1,0 +1,520 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="generator" content="dependable-report 0.0.0-test">
+<meta name="generated" content="2023-11-14T22:13:20Z">
+<title>dependable report</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #ffffff;
+  --fg: #16181d;
+  --muted: #5c6370;
+  --line: #dfe3e8;
+  --card: #f7f8fa;
+  --accent: #1f6feb;
+  --bad: #b42318;
+  --ok: #1a7f37;
+  --warn: #9a6700;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0d1117;
+    --fg: #e6edf3;
+    --muted: #9198a1;
+    --line: #2a313c;
+    --card: #161b22;
+    --accent: #6aa2ff;
+    --bad: #ff7b72;
+    --ok: #3fb950;
+    --warn: #d29922;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  padding: 2rem 1.25rem 4rem;
+  background: var(--bg);
+  color: var(--fg);
+  font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+main, .page-head, .page-foot { max-width: 68rem; margin: 0 auto; }
+h1 { font-size: 1.6rem; margin: 0 0 .5rem; }
+h2 { font-size: 1.15rem; margin: 0 0 1rem; }
+code, .ver, .vector { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; font-size: .9em; }
+.muted { color: var(--muted); font-size: .85em; }
+.prose { max-width: 46rem; }
+.empty { color: var(--muted); font-style: italic; }
+
+.page-head .meta { display: grid; grid-template-columns: max-content 1fr; gap: .1rem .75rem; margin: 0 0 1.5rem; }
+.page-head dt { color: var(--muted); }
+.page-head dd { margin: 0; }
+.page-foot { margin-top: 2rem; padding-top: 1rem; border-top: 1px solid var(--line); color: var(--muted); font-size: .85em; }
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 1.25rem;
+  margin: 0 0 1.5rem;
+}
+
+.stats { display: flex; flex-wrap: wrap; gap: 1.5rem; list-style: none; padding: 0; margin: 0 0 1rem; }
+.stats li { display: flex; flex-direction: column; min-width: 7rem; }
+.stats .n { font-size: 1.5rem; font-weight: 650; }
+.stats .k { color: var(--muted); font-size: .8rem; }
+.stats .bad .n { color: var(--bad); }
+
+.notes { border-left: 3px solid var(--warn); padding: .5rem .9rem; margin: 0 0 1rem; }
+.notes-head { margin: 0; font-weight: 600; }
+.notes ul { margin: .35rem 0 0; padding-left: 1.1rem; }
+
+.chips { display: flex; flex-wrap: wrap; gap: .4rem; margin: 0 0 1rem; }
+.chip {
+  display: inline-block;
+  padding: .1rem .5rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  font-size: .78rem;
+  white-space: nowrap;
+}
+.sev-CRITICAL, .st-VULN { border-color: var(--bad); color: var(--bad); font-weight: 600; }
+.sev-HIGH { border-color: var(--bad); color: var(--bad); }
+.sev-MEDIUM, .st-OUTDATED, .st-UPDATE { border-color: var(--warn); color: var(--warn); }
+.sev-LOW, .st-PATCH { border-color: var(--accent); color: var(--accent); }
+.st-OK { border-color: var(--ok); color: var(--ok); }
+.st-ERROR { border-color: var(--bad); color: var(--bad); }
+.sev-UNRATED, .sev-NONE, .st-LOCAL, .st-GIT { color: var(--muted); }
+.withdrawn { color: var(--muted); text-transform: lowercase; }
+.score { color: var(--muted); font-size: .8rem; }
+
+table.grid { border-collapse: collapse; width: 100%; margin: 0 0 1rem; }
+table.grid caption { text-align: left; color: var(--muted); font-size: .85em; padding-bottom: .4rem; }
+table.grid th, table.grid td { border-bottom: 1px solid var(--line); padding: .45rem .6rem; text-align: left; vertical-align: top; }
+table.grid thead th { font-size: .78rem; text-transform: uppercase; letter-spacing: .03em; color: var(--muted); }
+table.grid .num { text-align: right; font-variant-numeric: tabular-nums; }
+.wide { display: block; overflow-x: auto; }
+
+.manifest { margin: 0 0 1rem; }
+.manifest > summary { cursor: pointer; padding: .35rem 0; font-weight: 600; }
+
+.adv-id { font-weight: 600; }
+.adv-title { max-width: 34rem; }
+.adv-details, .adv-refs { margin-top: .4rem; }
+.adv-details > summary, .adv-refs > summary { cursor: pointer; color: var(--accent); font-size: .85rem; }
+.adv-details-body {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 22rem;
+  overflow-y: auto;
+  margin-top: .4rem;
+  padding: .5rem .7rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: .82rem;
+}
+.adv-refs ul { margin: .3rem 0 0; padding-left: 1.1rem; overflow-wrap: anywhere; }
+a.ext { color: var(--accent); }
+.inert { color: var(--muted); text-decoration: line-through dotted; }
+
+.chart { display: flex; flex-wrap: wrap; gap: 2rem; align-items: flex-start; margin-bottom: 1.25rem; }
+.legend { list-style: none; padding: 0; margin: 0; }
+.legend li { display: flex; align-items: center; gap: .5rem; padding: .2rem 0; }
+.swatch { flex: none; border-radius: 2px; }
+.legend-name { min-width: 5rem; }
+.legend-count { min-width: 8rem; color: var(--muted); font-size: .85rem; font-variant-numeric: tabular-nums; }
+.bar-ok { fill: #1a7f37; }
+.bar-outdated { fill: #9a6700; }
+.bar-vulnerable { fill: #b42318; }
+.bar-other { fill: #8b949e; }
+
+@media print {
+  body { padding: 0; background: #fff; color: #000; }
+  .card { break-inside: avoid; border-color: #ccc; background: #fff; }
+  .adv-details, .adv-refs, .manifest { display: block; }
+  .adv-details-body { max-height: none; overflow: visible; }
+  .wide { overflow-x: visible; }
+  a.ext { color: #000; text-decoration: underline; }
+}
+</style>
+</head>
+<body>
+<header class="page-head">
+<h1>dependable report</h1>
+<dl class="meta">
+<dt>Root</dt><dd><code>&#x2f;proj</code></dd>
+<dt>Generated</dt><dd>2023-11-14T22:13:20Z</dd>
+<dt>Tool</dt><dd>dependable-report 0.0.0-test</dd>
+</dl>
+</header>
+<main>
+
+<section id="summary" class="card">
+<h2>1. Executive summary</h2>
+<div class="notes" role="note">
+<p class="notes-head">Notes from this run</p>
+<ul>
+<li>Elixir is disabled in config; mix.exs was skipped.</li>
+</ul>
+</div>
+<ul class="stats">
+<li><span class="n">7</span><span class="k">dependencies</span></li>
+<li><span class="n">2</span><span class="k">manifests</span></li>
+<li><span class="n">16.7%</span><span class="k">of 6 checkable up to date</span></li>
+<li class="bad"><span class="n">2</span><span class="k">vulnerable</span></li>
+<li class="bad"><span class="n">1</span><span class="k">critical advisories</span></li>
+<li><span class="n">9.8</span><span class="k">highest CVSS</span></li>
+</ul>
+<p class="chips">
+<span class="chip sev-CRITICAL">critical 1</span>
+<span class="chip sev-HIGH">high 1</span>
+<span class="chip sev-MEDIUM">medium 0</span>
+<span class="chip sev-LOW">low 0</span>
+<span class="chip sev-NONE">none 0</span>
+<span class="chip sev-UNRATED">unrated 1</span>
+</p>
+<table class="grid">
+<caption>Dependency status across every manifest</caption>
+<thead><tr><th scope="col">Status</th><th scope="col" class="num">Count</th></tr></thead>
+<tbody>
+<tr><th scope="row">Up to date</th><td class="num">1</td></tr>
+<tr><th scope="row">Patch available</th><td class="num">1</td></tr>
+<tr><th scope="row">Update available</th><td class="num">0</td></tr>
+<tr><th scope="row">Outdated</th><td class="num">1</td></tr>
+<tr><th scope="row">Vulnerable</th><td class="num">2</td></tr>
+<tr><th scope="row">Errored</th><td class="num">1</td></tr>
+<tr><th scope="row">Path (local)</th><td class="num">1</td></tr>
+<tr><th scope="row">Git</th><td class="num">0</td></tr>
+</tbody>
+</table>
+<p class="prose">
+3 advisory finding(s) across 3 distinct
+advisories, 1 of them withdrawn by
+the publisher.
+</p>
+</section>
+
+<section id="vulnerabilities" class="card">
+<h2>2. Vulnerability detail</h2>
+<table class="grid wide">
+<caption>One row per dependency and advisory, worst first</caption>
+<thead>
+<tr>
+<th scope="col">Severity</th>
+<th scope="col">Package</th>
+<th scope="col">Current</th>
+<th scope="col">Advisory</th>
+<th scope="col">Fixed in</th>
+<th scope="col">Manifest</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><span class="chip sev-CRITICAL">critical</span> <span class="score">9.8</span></td>
+<td><strong>time</strong><br><span class="muted">0.2.7</span></td>
+<td><code class="ver">0.2.7</code></td>
+<td>
+<div class="adv-id"><a class="ext" href="https:&#x2f;&#x2f;rustsec.org&#x2f;advisories&#x2f;RUSTSEC-2020-0071.html" rel="noopener noreferrer external">RUSTSEC-2020-0071</a></div>
+<div class="adv-title">Potential segfault in the time crate</div>
+<div class="muted">also known as CVE-2020-26235</div>
+<div class="muted">weaknesses: CWE-416</div>
+<div class="muted vector">CVSS:3.1&#x2f;AV:N&#x2f;AC:L&#x2f;PR:N&#x2f;UI:N&#x2f;S:U&#x2f;C:H&#x2f;I:H&#x2f;A:H</div>
+<details class="adv-details">
+<summary>Published description</summary>
+<div class="adv-details-body">Unix-like operating systems may segfault due to dereferencing a dangling pointer in specific circumstances.
+
+## Workarounds
+
+Do not set the environment from more than one thread.</div>
+</details>
+<details class="adv-refs">
+<summary>References (2)</summary>
+<ul>
+<li><span class="muted">advisory</span> <a class="ext" href="https:&#x2f;&#x2f;rustsec.org&#x2f;advisories&#x2f;RUSTSEC-2020-0071.html" rel="noopener noreferrer external">https:&#x2f;&#x2f;rustsec.org&#x2f;advisories&#x2f;RUSTSEC-2020-0071.html</a></li>
+<li><span class="muted">web</span> <span class="ext inert" title="not linked: only http and https URLs are linked">javascript:alert(1)</span></li>
+</ul>
+</details>
+</td>
+<td><code class="ver">0.2.23</code></td>
+<td><code>Cargo.toml</code></td>
+</tr>
+<tr>
+<td><span class="chip sev-HIGH">high</span> <span class="score">7.2</span></td>
+<td><strong>lodash</strong><br><span class="muted">4.17.20</span></td>
+<td><code class="ver">4.17.20</code></td>
+<td>
+<div class="adv-id"><a class="ext" href="https:&#x2f;&#x2f;github.com&#x2f;advisories&#x2f;GHSA-35jh-r3h4-6jhm" rel="noopener noreferrer external">GHSA-35jh-r3h4-6jhm</a> <span class="chip withdrawn">withdrawn</span></div>
+<div class="adv-title">Command injection in lodash</div>
+<details class="adv-refs">
+<summary>References (1)</summary>
+<ul>
+<li><span class="muted">advisory</span> <a class="ext" href="https:&#x2f;&#x2f;github.com&#x2f;advisories&#x2f;GHSA-35jh-r3h4-6jhm" rel="noopener noreferrer external">https:&#x2f;&#x2f;github.com&#x2f;advisories&#x2f;GHSA-35jh-r3h4-6jhm</a></li>
+</ul>
+</details>
+</td>
+<td><code class="ver">4.17.21</code></td>
+<td><code>web&#x2f;package.json</code></td>
+</tr>
+<tr>
+<td><span class="chip sev-UNRATED">unrated</span> <span class="score">—</span></td>
+<td><strong>time</strong><br><span class="muted">0.2.7</span></td>
+<td><code class="ver">0.2.7</code></td>
+<td>
+<div class="adv-id"><span class="ext inert" title="not linked: only http and https URLs are linked">GHSA-wcg3-cvx6-7396</span></div>
+<div class="adv-title">Unrated advisory with no publication date</div>
+</td>
+<td><code class="ver">—</code></td>
+<td><code>Cargo.toml</code></td>
+</tr>
+</tbody>
+</table>
+<p class="prose muted">
+Published descriptions are shown as the publisher wrote them, escaped and
+pre-wrapped rather than rendered as Markdown: an advisory is third-party text,
+and Markdown permits raw HTML inside it.
+</p>
+</section>
+
+<section id="dependencies" class="card">
+<h2>3. Dependency status</h2>
+<details class="manifest" open>
+<summary><code>Cargo.toml</code> — Rust (5 dependencies)</summary>
+<table class="grid wide">
+<thead>
+<tr>
+<th scope="col">Package</th>
+<th scope="col">Declared</th>
+<th scope="col">Current</th>
+<th scope="col">Latest compatible</th>
+<th scope="col">Latest available</th>
+<th scope="col">Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<th scope="row">time</th>
+<td><code>0.2.7</code></td>
+<td><code class="ver">0.2.7</code></td>
+<td><code class="ver">0.2.27</code></td>
+<td><code class="ver">0.3.51</code></td>
+<td>
+<span class="chip st-VULN">vulnerable</span>
+<div class="muted">GHSA-wcg3-cvx6-7396, RUSTSEC-2020-0071</div>
+</td>
+</tr>
+<tr>
+<th scope="row">serde</th>
+<td><code>1.0.228</code></td>
+<td><code class="ver">1.0.228</code></td>
+<td><code class="ver">1.0.228</code></td>
+<td><code class="ver">1.0.228</code></td>
+<td>
+<span class="chip st-OK">up to date</span>
+</td>
+</tr>
+<tr>
+<th scope="row">regex</th>
+<td><code>1.5</code></td>
+<td><code class="ver">1.5.4</code></td>
+<td><code class="ver">1.5.6</code></td>
+<td><code class="ver">1.12.4</code></td>
+<td>
+<span class="chip st-OUTDATED">outdated</span>
+</td>
+</tr>
+<tr>
+<th scope="row">dependable-core</th>
+<td><code></code></td>
+<td><code class="ver"></code></td>
+<td><code class="ver">—</code></td>
+<td><code class="ver">—</code></td>
+<td>
+<span class="chip st-LOCAL">local</span>
+</td>
+</tr>
+<tr>
+<th scope="row">brokenpkg</th>
+<td><code>2</code></td>
+<td><code class="ver">2</code></td>
+<td><code class="ver">—</code></td>
+<td><code class="ver">—</code></td>
+<td>
+<span class="chip st-ERROR">error</span>
+<div class="muted">502 Bad Gateway from the index</div>
+</td>
+</tr>
+</tbody>
+</table>
+</details>
+<details class="manifest" open>
+<summary><code>web&#x2f;package.json</code> — npm (2 dependencies)</summary>
+<table class="grid wide">
+<thead>
+<tr>
+<th scope="col">Package</th>
+<th scope="col">Declared</th>
+<th scope="col">Current</th>
+<th scope="col">Latest compatible</th>
+<th scope="col">Latest available</th>
+<th scope="col">Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<th scope="row">left-pad</th>
+<td><code>^1.3.0</code></td>
+<td><code class="ver">1.3.0</code></td>
+<td><code class="ver">1.3.1</code></td>
+<td><code class="ver">1.3.1</code></td>
+<td>
+<span class="chip st-PATCH">patch available</span>
+</td>
+</tr>
+<tr>
+<th scope="row">lodash</th>
+<td><code>4.17.20</code></td>
+<td><code class="ver">4.17.20</code></td>
+<td><code class="ver">4.17.21</code></td>
+<td><code class="ver">4.17.21</code></td>
+<td>
+<span class="chip st-VULN">vulnerable</span>
+<div class="muted">GHSA-35jh-r3h4-6jhm</div>
+</td>
+</tr>
+</tbody>
+</table>
+</details>
+</section>
+
+<section id="timeline" class="card">
+<h2>4. Advisory timeline</h2>
+<p class="prose muted">
+Every advisory affecting this tree, newest publication first. Advisories the
+publisher never dated are listed last.
+</p>
+<table class="grid wide">
+<caption>Advisories by publication date</caption>
+<thead>
+<tr>
+<th scope="col">Published</th>
+<th scope="col">Advisory</th>
+<th scope="col">Package</th>
+<th scope="col">Current</th>
+<th scope="col">First fix</th>
+<th scope="col">Latest available</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><time>2021-02-15T00:00:00Z</time></td>
+<td>
+<div class="adv-id"><a class="ext" href="https:&#x2f;&#x2f;github.com&#x2f;advisories&#x2f;GHSA-35jh-r3h4-6jhm" rel="noopener noreferrer external">GHSA-35jh-r3h4-6jhm</a> <span class="chip withdrawn">withdrawn</span></div>
+<div class="adv-title">Command injection in lodash</div>
+</td>
+<td>lodash</td>
+<td><code class="ver">4.17.20</code></td>
+<td><code class="ver">4.17.21</code></td>
+<td><code class="ver">4.17.21</code></td>
+</tr>
+<tr>
+<td><time>2020-11-18T00:00:00Z</time></td>
+<td>
+<div class="adv-id"><a class="ext" href="https:&#x2f;&#x2f;rustsec.org&#x2f;advisories&#x2f;RUSTSEC-2020-0071.html" rel="noopener noreferrer external">RUSTSEC-2020-0071</a></div>
+<div class="adv-title">Potential segfault in the time crate</div>
+</td>
+<td>time</td>
+<td><code class="ver">0.2.7</code></td>
+<td><code class="ver">0.2.23</code></td>
+<td><code class="ver">0.3.51</code></td>
+</tr>
+<tr>
+<td><time>—</time></td>
+<td>
+<div class="adv-id"><span class="ext inert" title="not linked: only http and https URLs are linked">GHSA-wcg3-cvx6-7396</span></div>
+<div class="adv-title">Unrated advisory with no publication date</div>
+</td>
+<td>time</td>
+<td><code class="ver">0.2.7</code></td>
+<td><code class="ver">—</code></td>
+<td><code class="ver">0.3.51</code></td>
+</tr>
+</tbody>
+</table>
+</section>
+
+<section id="ecosystems" class="card">
+<h2>5. Ecosystem breakdown</h2>
+<div class="chart">
+<svg class="pie" viewBox="0 0 220 220" width="220" height="220" role="img" aria-labelledby="pie-title pie-desc">
+<title id="pie-title">Dependencies by ecosystem</title>
+<desc id="pie-desc">A pie chart of 7 dependencies split across 2 ecosystem(s). The same figures are in the table beneath it.</desc>
+<path d="M 110.0000 110.0000 L 110.0000 10.0000 A 100.0000 100.0000 0 1 1 12.5072 132.2521 Z" fill="#b7410e"></path>
+<path d="M 110.0000 110.0000 L 12.5072 132.2521 A 100.0000 100.0000 0 0 1 110.0000 10.0000 Z" fill="#cb3837"></path>
+</svg>
+<ul class="legend">
+<li>
+<svg class="swatch" viewBox="0 0 10 10" width="10" height="10" aria-hidden="true"><rect width="10" height="10" fill="#b7410e"></rect></svg>
+<span class="legend-name">Rust</span>
+<span class="legend-count">5 (71.4%)</span>
+<svg class="bar" viewBox="0 0 120 8" width="120" height="8" role="img" aria-label="Rust health: 1 up to date, 1 outdated, 1 vulnerable, 2 not checkable">
+<rect x="0.0000" y="0" width="24.0000" height="8" class="bar-ok"><title>up to date: 1</title></rect>
+<rect x="24.0000" y="0" width="24.0000" height="8" class="bar-outdated"><title>outdated: 1</title></rect>
+<rect x="48.0000" y="0" width="24.0000" height="8" class="bar-vulnerable"><title>vulnerable: 1</title></rect>
+<rect x="72.0000" y="0" width="48.0000" height="8" class="bar-other"><title>not checkable: 2</title></rect>
+</svg>
+</li>
+<li>
+<svg class="swatch" viewBox="0 0 10 10" width="10" height="10" aria-hidden="true"><rect width="10" height="10" fill="#cb3837"></rect></svg>
+<span class="legend-name">npm</span>
+<span class="legend-count">2 (28.6%)</span>
+<svg class="bar" viewBox="0 0 120 8" width="120" height="8" role="img" aria-label="npm health: 0 up to date, 1 outdated, 1 vulnerable, 0 not checkable">
+<rect x="0.0000" y="0" width="60.0000" height="8" class="bar-outdated"><title>outdated: 1</title></rect>
+<rect x="60.0000" y="0" width="60.0000" height="8" class="bar-vulnerable"><title>vulnerable: 1</title></rect>
+</svg>
+</li>
+</ul>
+</div>
+<table class="grid">
+<caption>Dependencies and health by ecosystem</caption>
+<thead>
+<tr>
+<th scope="col">Ecosystem</th>
+<th scope="col" class="num">Dependencies</th>
+<th scope="col" class="num">Share</th>
+<th scope="col" class="num">Up to date</th>
+<th scope="col" class="num">Outdated</th>
+<th scope="col" class="num">Vulnerable</th>
+<th scope="col" class="num">Not checkable</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<th scope="row">Rust</th>
+<td class="num">5</td>
+<td class="num">71.4%</td>
+<td class="num">1</td>
+<td class="num">1</td>
+<td class="num">1</td>
+<td class="num">2</td>
+</tr>
+<tr>
+<th scope="row">npm</th>
+<td class="num">2</td>
+<td class="num">28.6%</td>
+<td class="num">0</td>
+<td class="num">1</td>
+<td class="num">1</td>
+<td class="num">0</td>
+</tr>
+</tbody>
+</table>
+</section>
+</main>
+<footer class="page-foot">
+<p>Generated by dependable-report 0.0.0-test at 2023-11-14T22:13:20Z. This document is self-contained: it loads nothing over the network.</p>
+</footer>
+</body>
+</html>

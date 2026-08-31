@@ -18,4 +18,13 @@ pub enum ReportError {
     /// A report could not be serialized (see [`sarif::render`](crate::sarif::render)).
     #[error("failed to serialize report: {0}")]
     Serialize(#[from] serde_json::Error),
+    /// A template could not be compiled or rendered (see
+    /// [`html::render`](crate::html::render)).
+    ///
+    /// The wrapped [`minijinja::Error`] carries the template name and the line
+    /// the failure occurred on, which is the whole point of surfacing it rather
+    /// than flattening it to a `String`: a caller who supplied a broken template
+    /// override needs to know *where* it broke.
+    #[error("failed to render report template: {0}")]
+    Template(#[from] minijinja::Error),
 }

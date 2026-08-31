@@ -905,23 +905,212 @@ pub async fn run_fix(args: FixArgs) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `dependable report` — scaffolded; the renderer lands with issue #14.
+/// The directory `dependable report` reads template overrides from, relative to
+/// the report root.
+#[cfg(feature = "report")]
+const TEMPLATE_DIR: &str = "dependable-templates";
+
+/// Effective settings for `dependable report`.
 ///
-/// Bails immediately: no discovery, no filesystem walk, no network. `main`
-/// prints the message to stderr and exits 2, leaving stdout empty.
+/// A focused resolver beside [`resolve_check_settings`] rather than a coercion of
+/// [`ReportArgs`] into [`CheckArgs`]: `report` deliberately has no `--fail-on`,
+/// `--unstable`, `--format`, or `--ecosystem`, and inventing values for them
+/// would be worse than twenty honest lines.
+#[cfg(feature = "report")]
+fn resolve_report_settings(args: &crate::cli::ReportArgs, cfg: &Config) -> Settings {
+    let env_no_vuln = std::env::var_os("DEPENDABLE_NO_VULN").is_some();
+    let env_no_cache = std::env::var_os("DEPENDABLE_NO_CACHE").is_some();
+    let env_ghsa = std::env::var_os("DEPENDABLE_INCLUDE_GHSA").is_some();
+    let env_concurrency = std::env::var("DEPENDABLE_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok());
+
+    Settings {
+        concurrency: env_concurrency.unwrap_or(cfg.global.concurrency).max(1),
+        depth: args.depth,
+        check_lockfile: cfg.global.lock_file,
+        check_vuln: cfg.vulnerability.enabled && !args.no_vuln && !env_no_vuln,
+        cache: !env_no_cache,
+        include_ghsa: cfg.global.include_ghsa || env_ghsa,
+        // Reserved and unwired: a report exits 0 whatever it finds. Gating a
+        // build is `check`'s job, and exit 1 belongs to the policy engine.
+        fail_on: FailOn::None,
+        unstable: cfg.global.unstable.into(),
+        registry: cfg.rust.registry.clone(),
+        osv_url: cfg.vulnerability.osv_batch_url.clone(),
+    }
+}
+
+/// Read whole-template overrides from `<root>/dependable-templates/`.
+///
+/// The directory is taken literally — no ancestor search, no `$XDG_CONFIG_HOME`,
+/// no `$HOME`. One discoverable, per-project place, and nothing outside the
+/// repository can silently restyle a report.
+///
+/// Only files sitting directly in that directory and ending `.html` or `.css` are
+/// considered, so a `README.md` left there is ignored rather than rejected. A
+/// considered file whose name is not one of
+/// [`dependable_report::html::TEMPLATE_NAMES`] is a hard error naming the valid
+/// set: an override with a typo that silently does nothing is the worst outcome
+/// of the three.
 ///
 /// # Errors
 ///
-/// Always — report rendering is not implemented yet.
+/// When the directory cannot be listed, a considered file cannot be read or is
+/// not UTF-8, or a considered file is not a known template name.
 #[cfg(feature = "report")]
-pub fn run_report(args: crate::cli::ReportArgs) -> anyhow::Result<ExitCode> {
-    let root = args.path.unwrap_or_else(|| PathBuf::from("."));
-    anyhow::bail!(
-        "`dependable report` is not implemented yet (dependable-report v{} is a scaffold); \
-         would report on {}",
-        dependable_report::VERSION,
-        root.display()
-    )
+fn load_template_overrides(root: &Path) -> anyhow::Result<BTreeMap<String, String>> {
+    use dependable_report::html::TEMPLATE_NAMES;
+
+    let dir = root.join(TEMPLATE_DIR);
+    if !dir.is_dir() {
+        return Ok(BTreeMap::new());
+    }
+    let mut names: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(&dir)
+        .with_context(|| format!("reading template overrides from {}", dir.display()))?
+    {
+        let entry = entry.with_context(|| format!("listing {}", dir.display()))?;
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.ends_with(".html") || name.ends_with(".css") {
+            names.push(name);
+        }
+    }
+    // Sorted, so which of several bad names is reported first does not depend on
+    // directory iteration order.
+    names.sort();
+
+    let mut overrides = BTreeMap::new();
+    for name in names {
+        anyhow::ensure!(
+            TEMPLATE_NAMES.contains(&name.as_str()),
+            "{}: `{name}` is not a template this report renders; valid names are: {}",
+            dir.display(),
+            TEMPLATE_NAMES.join(", ")
+        );
+        let path = dir.join(&name);
+        let source = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading the template override {}", path.display()))?;
+        overrides.insert(name, source);
+    }
+    Ok(overrides)
+}
+
+/// `dependable report`
+///
+/// Discovers manifests, checks each through the same [`Checker`] every other
+/// command uses, and renders one self-contained HTML document. The document goes
+/// to **stdout** unless `--output` names a file, which makes
+/// `dependable report > report.html` the obvious idiom and keeps the command free
+/// of filesystem side effects by default.
+///
+/// Manifest paths are stored relative to the report root, so no absolute machine
+/// path lands in a document that gets emailed. (Pass an absolute root and you get
+/// absolute paths — your choice.)
+///
+/// Exit codes: `0` when a document was rendered — finding vulnerabilities is this
+/// command's job, not a failure — and `0` with a note on stderr when there is
+/// nothing to report on. `2` for a discovery, fetch, template, or IO failure.
+/// `1` is reserved for the policy engine and is not raised here.
+///
+/// # Errors
+///
+/// When the checker cannot be built, a manifest cannot be checked, a template
+/// override is unknown or malformed, or the output file cannot be written.
+#[cfg(feature = "report")]
+pub async fn run_report(args: crate::cli::ReportArgs) -> anyhow::Result<ExitCode> {
+    use std::io::Write;
+
+    let cfg = load_config(&args.config);
+    let settings = resolve_report_settings(&args, &cfg);
+    let root = args.path.clone().unwrap_or_else(|| PathBuf::from("."));
+
+    // Before discovery and before the network: a bad override must not cost a
+    // full check first.
+    let overrides = load_template_overrides(&root)?;
+
+    let manifests = collect_manifests(args.manifest.as_deref(), Some(&root), settings.depth);
+    if manifests.is_empty() {
+        eprintln!("No supported manifests found.");
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let mut notes: Vec<String> = Vec::new();
+    if !settings.check_vuln {
+        notes.push(
+            "Vulnerability scanning was disabled for this run, so the advisory sections are empty."
+                .to_owned(),
+        );
+    }
+
+    let engine = Engine::new(&settings, &cfg, !args.quiet)?;
+    let mut report = dependable_report::Report::new(root.clone());
+    for manifest in &manifests {
+        for notice in lockfile_notes(manifest) {
+            notes.push(notice);
+        }
+        match engine.check_manifest(manifest).await? {
+            Some(checked) => report.push(dependable_report::ManifestResults::new(
+                relative_to(&root, &checked.path),
+                checked.ecosystem,
+                checked.results,
+            )),
+            None => notes.push(format!(
+                "Skipped {}: its ecosystem is not enabled or not yet supported.",
+                relative_to(&root, manifest).display()
+            )),
+        }
+    }
+
+    let mut options = dependable_report::html::HtmlOptions::new()
+        .with_title(format!("dependable report — {}", root.display()));
+    for (name, source) in overrides {
+        options = options.with_override(name, source);
+    }
+    // A report is frequently the only artifact a reviewer sees, so a warning that
+    // exists only on a CI console is a warning that does not exist.
+    if !args.quiet {
+        for note in notes {
+            options = options.with_note(note);
+        }
+    }
+
+    let document =
+        dependable_report::html::render(&report, &options).context("rendering the HTML report")?;
+
+    match args.output {
+        // `--output` does not create parent directories: silently materializing a
+        // tree the user did not ask for is worse than saying the path is wrong.
+        Some(path) => {
+            std::fs::write(&path, document.as_bytes())
+                .with_context(|| format!("writing the report to {}", path.display()))?;
+            eprintln!("wrote {}", path.display());
+        }
+        None => {
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            out.write_all(document.as_bytes())
+                .context("writing the report to stdout")?;
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Lockfile notices for one manifest, as document notes.
+///
+/// The same notices [`Engine::check_manifest`] prints to stderr; a reader of the
+/// document has no access to that console.
+#[cfg(feature = "report")]
+fn lockfile_notes(manifest: &Path) -> Vec<String> {
+    ManifestKind::detect(manifest).map_or_else(Vec::new, |kind| {
+        dependable_fetch::lockfile_notices(manifest, kind)
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    })
 }
 
 fn collect_manifests(manifest: Option<&Path>, path: Option<&Path>, depth: usize) -> Vec<PathBuf> {

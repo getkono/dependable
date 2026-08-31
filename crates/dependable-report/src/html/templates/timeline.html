@@ -1,0 +1,40 @@
+{% import "macros.html" as m %}
+<section id="timeline" class="card">
+<h2>4. Advisory timeline</h2>
+{%- if timeline %}
+<p class="prose muted">
+Every advisory affecting this tree, newest publication first. Advisories the
+publisher never dated are listed last.
+</p>
+<table class="grid wide">
+<caption>Advisories by publication date</caption>
+<thead>
+<tr>
+<th scope="col">Published</th>
+<th scope="col">Advisory</th>
+<th scope="col">Package</th>
+<th scope="col">Current</th>
+<th scope="col">First fix</th>
+<th scope="col">Latest available</th>
+</tr>
+</thead>
+<tbody>
+{%- for row in timeline %}
+<tr>
+<td><time>{{ row.published }}</time></td>
+<td>
+<div class="adv-id">{{ m.ext_link(row.advisory_url, row.advisory_id) }}{% if row.withdrawn %} <span class="chip withdrawn">withdrawn</span>{% endif %}</div>
+<div class="adv-title">{{ row.title }}</div>
+</td>
+<td>{{ row.package }}</td>
+<td>{{ m.version_cell(row.current) }}</td>
+<td>{{ m.version_cell(row.first_fix) }}</td>
+<td>{{ m.version_cell(row.latest_available) }}</td>
+</tr>
+{%- endfor %}
+</tbody>
+</table>
+{%- else %}
+<p class="empty">No advisories affect this dependency tree.</p>
+{%- endif %}
+</section>

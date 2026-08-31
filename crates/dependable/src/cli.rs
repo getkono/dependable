@@ -34,12 +34,8 @@ pub enum Command {
     Fix(FixArgs),
     /// Explore dependencies interactively (the default when run in a terminal).
     Tui(TuiArgs),
-    /// Generate a dependency and vulnerability report.
-    ///
-    /// Hidden while it is a scaffold: a release is cut from `master` on merge, so
-    /// a visible command that cannot do its job would ship to users.
+    /// Render a self-contained HTML dependency and vulnerability report.
     #[cfg(feature = "report")]
-    #[command(hide = true)]
     Report(ReportArgs),
 }
 
@@ -208,11 +204,33 @@ impl Default for TuiArgs {
 }
 
 /// Arguments for `dependable report`.
+///
+/// Deliberately narrower than [`CheckArgs`]: there is no `--format` (HTML *is*
+/// the format; SARIF is `check --format sarif`) and no `--fail-on` (a report
+/// describes what is there, and exiting non-zero is `check`'s job).
 #[cfg(feature = "report")]
 #[derive(Args)]
 pub struct ReportArgs {
     /// Project directory to report on (default: current directory).
     pub path: Option<PathBuf>,
+    /// Report on a single manifest file instead of discovering them.
+    #[arg(long)]
+    pub manifest: Option<PathBuf>,
+    /// Config file path.
+    #[arg(long, default_value = ".dependable.toml")]
+    pub config: PathBuf,
+    /// How many directories deep to search.
+    #[arg(long, default_value_t = 3)]
+    pub depth: usize,
+    /// Skip vulnerability scanning.
+    #[arg(long)]
+    pub no_vuln: bool,
+    /// Write the document here instead of stdout.
+    #[arg(short, long)]
+    pub output: Option<PathBuf>,
+    /// Suppress the progress bar and leave run warnings out of the document.
+    #[arg(short, long)]
+    pub quiet: bool,
     /// Verbose logging.
     #[arg(short, long)]
     pub verbose: bool,
