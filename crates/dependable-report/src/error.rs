@@ -15,4 +15,7 @@ pub enum ReportError {
     /// [`Report::generated_at_rfc3339`](crate::Report::generated_at_rfc3339)).
     #[error("failed to format timestamp: {0}")]
     Format(#[from] time::error::Format),
+    /// A report could not be serialized (see [`sarif::render`](crate::sarif::render)).
+    #[error("failed to serialize report: {0}")]
+    Serialize(#[from] serde_json::Error),
 }

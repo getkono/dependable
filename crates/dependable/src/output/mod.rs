@@ -1,13 +1,15 @@
-//! Output rendering: table (default), JSON, and machine-readable text.
+//! Output rendering: table (default), JSON, machine-readable text, and SARIF.
 
 use std::path::PathBuf;
 
 use dependable_fetch::{CheckResult, DependencyStatus, Ecosystem};
 
-use crate::cli::Format;
+use crate::cli::CheckFormat;
 
 pub mod json;
 pub mod list;
+#[cfg(feature = "report")]
+pub mod sarif;
 pub mod table;
 pub mod text;
 pub mod tree;
@@ -62,11 +64,15 @@ impl Summary {
 ///
 /// # Errors
 /// Propagates serialization / IO errors from the chosen renderer.
-pub fn render(format: Format, reports: &[ManifestReport], quiet: bool) -> anyhow::Result<()> {
+pub fn render(format: CheckFormat, reports: &[ManifestReport], quiet: bool) -> anyhow::Result<()> {
     match format {
-        Format::Table => table::render(reports, quiet),
-        Format::Json => json::render(reports),
-        Format::Text => text::render(reports),
+        CheckFormat::Table => table::render(reports, quiet),
+        CheckFormat::Json => json::render(reports),
+        CheckFormat::Text => text::render(reports),
+        // `quiet` is ignored, exactly as it is for JSON: a machine-readable
+        // document is either emitted whole or not at all.
+        #[cfg(feature = "report")]
+        CheckFormat::Sarif => sarif::render(reports),
     }
 }
 
