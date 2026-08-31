@@ -838,10 +838,15 @@ pub async fn run_fix(args: FixArgs) -> anyhow::Result<ExitCode> {
         concurrency: args.concurrency.unwrap_or(cfg.global.concurrency).max(1),
         depth: args.depth,
         check_lockfile: cfg.global.lock_file,
-        check_vuln: false,
+        // A vulnerable-but-current dependency is exactly the one worth upgrading, and
+        // `fix.rs` has always had a `Vulnerable` arm — it was simply unreachable.
+        check_vuln: cfg.vulnerability.enabled && !args.no_vuln,
         licenses: false,
-        cache: true,
-        include_ghsa: false,
+        // `fix` writes to the user's manifests, so it must be able to refuse a cached
+        // answer. Without this it decided what to write from an hour-old cache with no
+        // way to bypass it.
+        cache: !args.no_cache,
+        include_ghsa: cfg.global.include_ghsa,
         fail_on: FailOn::None,
         unstable: cfg.global.unstable.into(),
         registry: cfg.rust.registry.clone(),
@@ -859,22 +864,34 @@ pub async fn run_fix(args: FixArgs) -> anyhow::Result<ExitCode> {
     }
 
     let engine = Engine::new(&settings, &cfg, true)?;
-    let mut total = 0;
+
+    // Plan every manifest before writing any of them. Writing as it went left the tree
+    // half-rewritten when a later manifest failed — and because the report was printed
+    // *after* each write, the failing iteration also destroyed the record of what had
+    // already changed.
+    let mut planned = Vec::new();
     for manifest in &manifests {
         let Some(report) = engine.check_manifest(manifest).await? else {
             continue;
         };
         report_inherited_skips(manifest, &report);
-        let records = fix::apply_fixes(manifest, &report.results, args.all, args.dry_run)?;
-        if records.is_empty() {
+        planned.push(fix::plan(manifest, &report.results, args.all)?);
+    }
+
+    let mut total = 0;
+    for plan in &planned {
+        if plan.records.is_empty() {
             continue;
+        }
+        if !args.dry_run {
+            fix::commit(plan)?;
         }
         println!(
             "{}{}",
-            manifest.display(),
+            plan.path.display(),
             if args.dry_run { " (dry run)" } else { "" }
         );
-        for record in &records {
+        for record in &plan.records {
             println!("  {} {} → {}", record.name, record.from, record.to);
             total += 1;
         }

@@ -195,6 +195,12 @@ pub struct FixArgs {
     /// Print what would change without writing.
     #[arg(long)]
     pub dry_run: bool,
+    /// Ignore the on-disk registry cache (always fetch fresh).
+    #[arg(long)]
+    pub no_cache: bool,
+    /// Skip vulnerability scanning, so a vulnerable dependency is not upgraded for it.
+    #[arg(long)]
+    pub no_vuln: bool,
     #[arg(long, default_value_t = 3)]
     pub depth: usize,
     #[arg(long)]
