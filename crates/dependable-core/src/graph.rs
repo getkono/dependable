@@ -177,6 +177,36 @@ pub struct WalkOptions<'a> {
     /// A node this rejects is skipped along with its whole subtree, but its
     /// siblings keep their slot indices.
     pub include: Option<PathPredicate<'a>>,
+    /// Maximum number of node appearances to emit before the walk stops. `None` =
+    /// unlimited, which is only safe when the caller bounds the walk some other way.
+    ///
+    /// The walk enumerates *paths*, not nodes. With [`dedupe`](Self::dedupe) on, each
+    /// node expands at most once and the count is bounded by the graph; with it off,
+    /// a dependency graph shaped like a ladder has a number of distinct simple paths
+    /// exponential in its size, and a real lockfile does not finish. The budget is what
+    /// makes an unbounded walk terminate rather than appear to hang.
+    pub max_visits: Option<usize>,
+}
+
+/// Default appearance budget for one walk — far above any real dependency forest, and
+/// far below the point at which an exponential walk stops looking like a hang.
+pub const DEFAULT_MAX_VISITS: usize = 1_000_000;
+
+/// Hard recursion ceiling, independent of [`WalkOptions::max_depth`].
+///
+/// The walk is recursive, so depth costs stack. No real dependency chain approaches
+/// this; a cyclic graph cannot reach it (back-edges are cut), but a synthesized or
+/// corrupt lockfile can, and overflowing the stack aborts the process.
+pub const MAX_WALK_DEPTH: usize = 512;
+
+/// What one [`DependencyGraph::walk`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WalkStats {
+    /// Node appearances emitted.
+    pub visits: usize,
+    /// Whether the walk stopped early on [`WalkOptions::max_visits`] or
+    /// [`MAX_WALK_DEPTH`], so the result is a prefix of the forest rather than all of it.
+    pub truncated: bool,
 }
 
 impl Default for WalkOptions<'_> {
@@ -188,6 +218,7 @@ impl Default for WalkOptions<'_> {
             prefix: &[],
             expand: None,
             include: None,
+            max_visits: Some(DEFAULT_MAX_VISITS),
         }
     }
 }
@@ -197,6 +228,12 @@ impl Default for WalkOptions<'_> {
 pub struct Tree {
     /// The root nodes, each with their expanded subtree.
     pub roots: Vec<TreeNode>,
+    /// Whether the walk stopped on its appearance budget or depth ceiling, so this is a
+    /// prefix of the forest rather than all of it.
+    ///
+    /// A truncated tree that does not say so is a wrong answer wearing a complete one's
+    /// clothes; a renderer is expected to tell the reader.
+    pub truncated: bool,
 }
 
 /// One node in a [`Tree`], referencing a graph node by index.
@@ -308,10 +345,14 @@ impl DependencyGraph {
         &self.nodes
     }
 
-    /// The direct dependencies of node `idx`.
+    /// The direct dependencies of node `idx`, or an empty slice if `idx` is not a node
+    /// in this graph.
+    ///
+    /// Indexing directly would panic, and this is public API on a library whose stated
+    /// audience is other tools holding indices they got from somewhere else.
     #[must_use]
     pub fn deps_of(&self, idx: usize) -> &[usize] {
-        &self.edges[idx]
+        self.edges.get(idx).map_or(&[], Vec::as_slice)
     }
 
     /// The root node indices.
@@ -361,9 +402,10 @@ impl DependencyGraph {
             ..WalkOptions::default()
         };
         let mut builder = TreeBuilder::default();
-        self.walk(&walk, &mut builder);
+        let stats = self.walk(&walk, &mut builder);
         Tree {
             roots: builder.roots,
+            truncated: stats.truncated,
         }
     }
 
@@ -377,19 +419,22 @@ impl DependencyGraph {
     /// Only subtrees that [`WalkOptions::expand`] admits are descended into, so
     /// a caller showing a mostly-closed tree pays for what it shows rather than
     /// for what the graph holds.
-    pub fn walk(&self, opts: &WalkOptions<'_>, visitor: &mut dyn Visitor) {
+    pub fn walk(&self, opts: &WalkOptions<'_>, visitor: &mut dyn Visitor) -> WalkStats {
         let mut walker = Walker {
             graph: self,
             opts,
             path: opts.prefix.to_vec(),
             expanded: HashSet::new(),
             on_path: HashSet::new(),
+            budget: opts.max_visits.unwrap_or(usize::MAX),
+            stats: WalkStats::default(),
         };
         for (slot, &root) in self.roots.iter().enumerate() {
             walker.path.push(slot);
             walker.visit(root, 0, visitor);
             walker.path.pop();
         }
+        walker.stats
     }
 }
 
@@ -403,15 +448,26 @@ struct Walker<'a> {
     expanded: HashSet<usize>,
     /// Nodes on the path from a root to here, for cutting cycles.
     on_path: HashSet<usize>,
+    /// Appearances still allowed before the walk stops.
+    budget: usize,
+    stats: WalkStats,
 }
 
 impl Walker<'_> {
     fn visit(&mut self, node: usize, depth: usize, visitor: &mut dyn Visitor) {
+        // Both guards sit above `visitor.enter` so that a stopped walk never leaves an
+        // `enter` without its `leave` — the builder's stack discipline depends on it.
+        if self.budget == 0 || depth >= MAX_WALK_DEPTH {
+            self.stats.truncated = true;
+            return;
+        }
         if let Some(include) = self.opts.include
             && !include(&self.path)
         {
             return;
         }
+        self.budget -= 1;
+        self.stats.visits += 1;
         // Copied out of `self` so the child list stays borrowed from the graph
         // rather than from the walker, which the recursion below borrows anew.
         let deps: &[usize] = &self.graph.edges[node];
@@ -835,7 +891,8 @@ source = "registry+https://x"
             flatten(
                 &g,
                 &Tree {
-                    roots: vec![b_root.clone()]
+                    roots: vec![b_root.clone()],
+                    truncated: false,
                 }
             ),
             vec![("b", "0.1.0", false), ("serde", "1.0.0", false)],
@@ -1084,5 +1141,108 @@ source = "registry+https://x"
                 ("app", "0.1.0", false),
             ]
         );
+    }
+
+    /// The walk recurses, so depth costs stack. A chain longer than the ceiling is
+    /// truncated rather than allowed to overflow and abort the process.
+    #[test]
+    fn a_very_deep_chain_terminates_and_says_it_was_truncated() {
+        let depth = MAX_WALK_DEPTH + 50;
+        let mut nodes = Vec::new();
+        let mut edges: Vec<Vec<usize>> = Vec::new();
+        for n in 0..depth {
+            nodes.push(Node {
+                name: format!("c{n}"),
+                version: "1.0.0".to_string(),
+                kind: NodeKind::Registry,
+            });
+            edges.push(if n + 1 < depth { vec![n + 1] } else { vec![] });
+        }
+        let g = DependencyGraph {
+            root_slots: std::iter::once((0, 0)).collect(),
+            nodes,
+            edges,
+            roots: vec![0],
+        };
+        let tree = g.tree(&TreeOptions::default());
+        assert!(
+            tree.truncated,
+            "a chain past the ceiling must report truncation"
+        );
+    }
+
+    /// With `dedupe` off the walk enumerates simple paths, and a ladder-shaped graph has
+    /// exponentially many. This used to run until it was killed.
+    #[test]
+    fn an_exponential_walk_is_bounded_by_its_budget() {
+        // 40 layers of two nodes each: 2^40 distinct root-to-leaf paths.
+        let layers = 40usize;
+        let mut nodes = Vec::new();
+        let mut edges: Vec<Vec<usize>> = Vec::new();
+        for layer in 0..layers {
+            for side in 0..2 {
+                nodes.push(Node {
+                    name: format!("n{layer}_{side}"),
+                    version: "1.0.0".to_string(),
+                    kind: NodeKind::Registry,
+                });
+                let next = (layer + 1) * 2;
+                edges.push(if layer + 1 < layers {
+                    vec![next, next + 1]
+                } else {
+                    vec![]
+                });
+            }
+        }
+        let g = DependencyGraph {
+            root_slots: std::iter::once((0, 0)).collect(),
+            nodes,
+            edges,
+            roots: vec![0],
+        };
+        let opts = WalkOptions {
+            dedupe: false,
+            collapse_roots: false,
+            max_visits: Some(10_000),
+            ..WalkOptions::default()
+        };
+        let mut builder = TreeBuilder::default();
+        let stats = g.walk(&opts, &mut builder);
+        assert!(stats.truncated);
+        assert!(
+            stats.visits <= 10_000,
+            "emitted {} appearances",
+            stats.visits
+        );
+    }
+
+    /// A node index from outside this graph must not panic the library.
+    #[test]
+    fn deps_of_an_unknown_index_is_empty() {
+        let g = DependencyGraph {
+            root_slots: std::collections::HashMap::new(),
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            roots: Vec::new(),
+        };
+        assert!(g.deps_of(0).is_empty());
+        assert!(g.deps_of(usize::MAX).is_empty());
+    }
+
+    /// A self-edge is a cycle of length one; it is cut like any other back-edge.
+    #[test]
+    fn a_self_edge_terminates() {
+        let g = DependencyGraph {
+            root_slots: std::iter::once((0, 0)).collect(),
+            nodes: vec![Node {
+                name: "a".to_string(),
+                version: "1.0.0".to_string(),
+                kind: NodeKind::Registry,
+            }],
+            edges: vec![vec![0]],
+            roots: vec![0],
+        };
+        let tree = g.tree(&TreeOptions::default());
+        assert!(!tree.truncated, "a self-edge is cut, not budgeted away");
     }
 }

@@ -19,7 +19,7 @@ pub use ecosystem::Ecosystem;
 pub use error::ParseError;
 pub use graph::{
     DependencyGraph, Node, NodeKind, PathPredicate, Placement, Tree, TreeNode, TreeOptions, Visit,
-    Visitor, WalkOptions,
+    Visitor, WalkOptions, WalkStats,
 };
 pub use item::{DependencyKind, Item, PackageSource};
 pub use lockfiles::{

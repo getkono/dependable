@@ -50,6 +50,13 @@ fn ascii(graph: &DependencyGraph, opts: &TreeOptions) -> String {
         }
         write_node(&mut out, graph, root, "", true, true);
     }
+    // A tree that ran out of budget is a prefix, and a prefix that does not say so reads
+    // as the whole graph. `--no-dedupe` on a large lockfile is how a reader gets here.
+    if tree.truncated {
+        out.push_str(
+            "\n(tree truncated: too many paths to draw — narrow it with --depth, or drop --no-dedupe)\n",
+        );
+    }
     out
 }
 
