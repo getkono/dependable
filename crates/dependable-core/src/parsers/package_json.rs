@@ -76,13 +76,21 @@ fn build_item(key: &str, kind: DependencyKind, entry: &JsonStringValue, starts: 
             let global_start = entry.content_start + version_offset;
             let global_end = entry.content_end;
             let (line, col_start) = offset_to_line_col(starts, global_start);
+            // `version_offset` indexes the *decoded* value. That only lands on the right
+            // source byte while the two are identical, so an escaped string reports its
+            // line and declines the span rather than handing `--fix` a drifted offset.
+            let col_end = if entry.escaped {
+                col_start
+            } else {
+                col_start + global_end.saturating_sub(global_start)
+            };
             Item {
                 name,
                 version_constraint: constraint,
                 source,
                 version_line: line,
                 version_col_start: col_start,
-                version_col_end: col_start + global_end.saturating_sub(global_start),
+                version_col_end: col_end,
                 registry: None,
                 locked_version: None,
                 kind,

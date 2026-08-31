@@ -74,9 +74,16 @@ impl Item {
     /// on a line worth reporting, but records a *zero-width* span, and writing a version
     /// into it would produce `numpy1.5.0`. `--fix` gates on this; the reporters, which
     /// only ever read the line, gate on `has_position`.
+    ///
+    /// The width is checked directly rather than inferred from the constraint. A parser
+    /// that knows its offsets have drifted — a JSON value whose escapes make the source
+    /// span and the decoded value disagree — collapses the span to signal exactly that,
+    /// and the constraint it parsed is still perfectly non-empty.
     #[must_use]
     pub fn is_rewritable(&self) -> bool {
-        self.has_position() && !self.version_constraint.is_empty()
+        self.has_position()
+            && !self.version_constraint.is_empty()
+            && self.version_col_end > self.version_col_start
     }
 }
 
