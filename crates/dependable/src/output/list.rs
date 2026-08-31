@@ -12,6 +12,7 @@ use dependable_fetch::{DependencyKind, Ecosystem, Item, PackageSource};
 use serde::Serialize;
 
 use crate::cli::Format;
+use crate::output::posix;
 
 /// The identifier of the JSON document's shape. Consumers can pin on it; any
 /// incompatible change to the shape takes a new version.
@@ -250,18 +251,6 @@ fn license_note(report: &ProjectReport, item: &Item) -> String {
         Some(license) => format!(" [{license}]"),
         None => String::new(),
     }
-}
-
-/// A path with `/` separators, whatever the platform uses.
-///
-/// The machine-readable formats are consumed by tooling that joins these paths with
-/// paths from elsewhere (git, a config file, another tool's output), all of which speak
-/// `/` — so a Windows run must not produce a differently-shaped document.
-fn posix(path: &Path) -> String {
-    path.components()
-        .map(|c| c.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/")
 }
 
 /// A stable token for a project's role.

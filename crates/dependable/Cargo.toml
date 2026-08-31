@@ -24,6 +24,7 @@ dependable-tui.workspace = true
 dependable-report = { workspace = true, optional = true }
 toml_edit.workspace = true
 clap.workspace = true
+globset.workspace = true
 tokio.workspace = true
 owo-colors.workspace = true
 indicatif.workspace = true

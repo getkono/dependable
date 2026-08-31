@@ -10,8 +10,15 @@ struct Output<'a> {
     results: Vec<ResultDto<'a>>,
 }
 
+/// The `summary` object of the `check --format json` document.
+///
+/// `manifests` and `unique_packages` are additive: every other key keeps its
+/// name, its type, and its per-declaration meaning, so a consumer pinned to the
+/// documented shape is unaffected.
 #[derive(Serialize)]
 struct SummaryDto {
+    manifests: usize,
+    unique_packages: usize,
     total: usize,
     up_to_date: usize,
     patch_available: usize,
@@ -62,6 +69,8 @@ pub fn render(reports: &[ManifestReport]) -> anyhow::Result<()> {
 
     let output = Output {
         summary: SummaryDto {
+            manifests: summary.manifests,
+            unique_packages: summary.unique_packages,
             total: summary.total,
             up_to_date: summary.up_to_date,
             patch_available: summary.patch_available,

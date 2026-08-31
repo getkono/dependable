@@ -614,6 +614,20 @@ impl Checker {
 
     /// Run every fetch task concurrently, serving and populating the in-process
     /// versions cache (keyed per registry), and emitting one progress cycle.
+    ///
+    /// Because the cache lives on the `Checker` rather than on the call, a
+    /// caller that checks several manifests through one `Checker` pays for a
+    /// shared package exactly once — which is what makes a monorepo cost one
+    /// request per distinct package rather than one per declaration.
+    ///
+    /// # Precondition
+    /// **Manifests must be checked one at a time through a given `Checker`.**
+    /// The lookup here is a plain `get` followed later by an `insert`, not
+    /// moka's `try_get_with`, so there is no in-flight coalescing: two manifests
+    /// checked concurrently would both miss the cache and both issue the
+    /// request. The concurrency inside a single manifest is safe — its tasks are
+    /// already deduplicated by `(cache_key, name)` before they get here. Anyone
+    /// parallelising the *manifest* loop must add coalescing here first.
     async fn fetch_all(&self, tasks: Vec<FetchTask>) -> FetchedMap {
         let total = tasks.len();
         self.emit(ProgressEvent::Started { total });

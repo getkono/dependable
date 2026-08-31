@@ -22,8 +22,16 @@ pub fn render(reports: &[ManifestReport], quiet: bool) -> anyhow::Result<()> {
     }
     if reports.len() > 1 {
         println!();
-        print!("Overall — ");
-        print_totals(&Summary::of(reports));
+        let summary = Summary::of(reports);
+        // The scope of the rollup, said out loud: how many manifests it spans and
+        // how many distinct packages they actually depend on. The totals that
+        // follow stay per-declaration, because that is what there is to act on.
+        print!(
+            "Overall ({}, {}) — ",
+            counted(summary.manifests, "manifest", "manifests"),
+            counted(summary.unique_packages, "unique package", "unique packages")
+        );
+        print_totals(&summary);
     }
     Ok(())
 }
@@ -107,6 +115,15 @@ fn status_cell(result: &CheckResult) -> String {
         "{}",
         text.if_supports_color(Stream::Stdout, |t| t.style(style))
     )
+}
+
+/// `n singular` / `n plural`, since English will not derive one from the other.
+fn counted(count: usize, singular: &str, plural: &str) -> String {
+    if count == 1 {
+        format!("{count} {singular}")
+    } else {
+        format!("{count} {plural}")
+    }
 }
 
 fn print_totals(summary: &Summary) {

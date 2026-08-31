@@ -111,6 +111,7 @@ dependable check [PATH]           # check a project (default: current dir)
 dependable check . --format json  # machine-readable output (also: text)
 dependable check . --fail-on vulnerable   # exit non-zero for CI
 dependable check . --annotations always   # GitHub Actions annotations + job summary
+dependable check . --manifest-glob 'services/*/Cargo.toml'  # one slice of a monorepo
 dependable list .                 # every project and what it declares (offline)
 dependable tree .                 # render the dependency tree (Rust)
 dependable fix . --dry-run        # preview in-place upgrades
@@ -195,6 +196,47 @@ what give the CVSS policy gate a score to compare and the HTML report something 
 show. `--no-vuln` (or `[vulnerability] enabled = false`) skips the scan entirely
 and restores the previous behaviour.
 
+### Monorepos and workspaces
+
+`check`, `fix`, and `list` walk every manifest under the path you give them, and
+a repository with many members shares most of its dependencies. Each distinct
+package is looked up **once per run**, whichever manifests declare it: one
+request to the registry and one entry in the vulnerability scan, then the same
+answer applied to each manifest, against that manifest's own declared
+constraint. What each manifest says about a package stays its own — which is why
+`fix` still rewrites the right line in the right file.
+
+A multi-manifest run ends with a rollup that says how far it reached:
+
+```
+Overall (4 manifests, 37 unique packages) — Totals: 30 up to date · 5 patch · 2 update
+```
+
+The status counts are per *declaration*, not per package: a crate that is
+outdated in three members counts three times, because it is three edits to make,
+and because `--fail-on` gates one result at a time. `unique_packages` is the
+deduplicated number, and sits beside them. `--format json` carries both in its
+`summary` object.
+
+To work on part of a repository, filter discovery with `--manifest-glob`:
+
+```bash
+dependable check . --manifest-glob 'services/*/Cargo.toml'
+dependable check . --manifest-glob 'services/**/Cargo.toml' --depth 5
+dependable fix . --manifest-glob 'crates/*/Cargo.toml' --dry-run
+```
+
+Patterns match each manifest's path relative to the directory being scanned,
+written with `/` on every platform. `*` and `?` stop at `/` — `services/*/Cargo.toml`
+does not reach `services/a/vendor/b/Cargo.toml` — and `**` crosses it. The flag is
+repeatable and a manifest matching any pattern is kept. It composes with `--depth`,
+which still bounds the walk (and defaults to 3, so a deeper pattern needs a bigger
+number; `dependable` tells you when a pattern matched none of what it searched). It
+conflicts with `--manifest`, which names one file and skips discovery altogether.
+
+It is available on `fix` for a reason: without it, `dependable fix` would rewrite
+manifests that the matching `dependable check` deliberately left out.
+
 ## Project inventory (`list`)
 
 `dependable list` answers "what lives in this repository" — every manifest it
@@ -256,9 +298,11 @@ such: `version_inherited` for a Cargo `version.workspace = true`, `inherited` fo
 constraint taken from `[workspace.dependencies]`, and `lockfile` for the lockfile that
 supplied the locked versions — a workspace keeps one at its root, above its members.
 
-`license` appears only with `--licenses`, which is the one thing in `list` that
-touches the network: a license is published by the registry, not written in the
-manifest, so it costs one metadata request per dependency. It is available for
+`license` appears only with `--licenses`, which — together with `--features` — is
+the one thing in `list` that touches the network: a license is published by the
+registry, not written in the manifest, so it costs one metadata request per
+dependency. `--features` costs one index request per *distinct* crate in the
+repository, however many members declare it. It is available for
 crates.io, npm, PyPI, Packagist, and Hex; the Go module proxy, JSR, NuGet, and
 pub.dev publish no metadata this tool can read, and are left blank rather than
 guessed at. `--licenses` uses the default registry URLs, because `list` reads no

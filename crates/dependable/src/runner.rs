@@ -15,13 +15,13 @@ use dependable_fetch::core::{
     parse, parse_cargo_config, parse_npmrc, parse_project, parse_workspace,
 };
 use dependable_fetch::{
-    CheckError, Checker, CratesIoFetcher, DependencyKind, DependencyStatus, Ecosystem,
-    GoProxyFetcher, GraphSource, HexFetcher, Item, JsrFetcher, ManifestKind, NpmFetcher,
-    NuGetFetcher, PackageSource, PackagistFetcher, ParseError, ProgressEvent, PubDevFetcher,
-    PyPiFetcher, RegistryFetcher, ScopedRegistry, TreeOptions, UnstableFilter,
-    WorkspaceGraphOptions, build_client, build_workspace_graph,
+    CheckError, Checker, DependencyKind, DependencyStatus, Ecosystem, GoProxyFetcher, GraphSource,
+    HexFetcher, Item, JsrFetcher, ManifestKind, NpmFetcher, NuGetFetcher, PackageSource,
+    PackagistFetcher, ParseError, ProgressEvent, PubDevFetcher, PyPiFetcher, ScopedRegistry,
+    TreeOptions, UnstableFilter, WorkspaceGraphOptions, build_client, build_workspace_graph,
 };
 use dependable_tui::TuiOptions;
+use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use indicatif::{ProgressBar, ProgressStyle};
 
 use crate::cli::{CheckArgs, FailOn, FixArgs, ListArgs, TreeArgs, TuiArgs};
@@ -342,7 +342,8 @@ pub async fn run_check(args: CheckArgs) -> anyhow::Result<ExitCode> {
         args.manifest.as_deref(),
         args.path.as_deref(),
         settings.depth,
-    );
+        &args.manifest_glob,
+    )?;
     if manifests.is_empty() {
         eprintln!("No supported manifests found.");
         return Ok(ExitCode::SUCCESS);
@@ -568,21 +569,16 @@ fn warn_policy_ignored(config: &Path) {
 /// sibling lockfile applied. Only `--features` touches the network.
 pub async fn run_list(args: ListArgs) -> anyhow::Result<ExitCode> {
     let root = args.path.clone().unwrap_or_else(|| PathBuf::from("."));
-    let manifests = collect_manifests(args.manifest.as_deref(), args.path.as_deref(), args.depth);
+    let manifests = collect_manifests(
+        args.manifest.as_deref(),
+        args.path.as_deref(),
+        args.depth,
+        &args.manifest_glob,
+    )?;
     if manifests.is_empty() {
         eprintln!("No supported manifests found.");
         return Ok(ExitCode::SUCCESS);
     }
-    // `--features` fetches crates.io feature flags, so `list` only touches the
-    // network when it is set. Feature data is crates.io-only (Rust manifests).
-    let feature_fetcher = if args.features {
-        Some(CratesIoFetcher::new(
-            build_client().context("building HTTP client")?,
-        ))
-    } else {
-        None
-    };
-
     let mut reports = Vec::new();
     for manifest in &manifests {
         let Some(kind) = ManifestKind::detect(manifest) else {
@@ -617,19 +613,6 @@ pub async fn run_list(args: ListArgs) -> anyhow::Result<ExitCode> {
         let meta = parse_project(kind, &content);
         let (version, version_inherited) = resolve_version(manifest, kind, &meta);
 
-        let mut features = BTreeMap::new();
-        if let Some(fetcher) = &feature_fetcher {
-            for item in &parsed.items {
-                if kind.ecosystem() == Ecosystem::Rust
-                    && item.is_checkable()
-                    && let Ok(fetched) = fetcher.fetch_versions(&item.name).await
-                    && !fetched.features.is_empty()
-                {
-                    features.insert(item.name.clone(), fetched.features);
-                }
-            }
-        }
-
         reports.push(ProjectReport {
             relative: relative_to(&root, manifest),
             ecosystem: kind.ecosystem(),
@@ -641,12 +624,17 @@ pub async fn run_list(args: ListArgs) -> anyhow::Result<ExitCode> {
             lockfile,
             inherited,
             items: parsed.items,
-            features,
+            features: BTreeMap::new(),
             licenses: BTreeMap::new(),
         });
     }
 
-    // A second pass, so one HTTP client serves every manifest.
+    // Second passes, so one HTTP client — and one request per distinct package —
+    // serves every manifest. Fetching inside the loop above asked the registry the
+    // same question once per member that declared the crate.
+    if args.features {
+        crate::features::fetch_all(&mut reports).await?;
+    }
     if args.licenses {
         crate::licenses::fetch_all(&mut reports).await?;
     }
@@ -904,7 +892,8 @@ pub async fn run_fix(args: FixArgs) -> anyhow::Result<ExitCode> {
         args.manifest.as_deref(),
         args.path.as_deref(),
         settings.depth,
-    );
+        &args.manifest_glob,
+    )?;
     if manifests.is_empty() {
         eprintln!("No supported manifests found.");
         return Ok(ExitCode::SUCCESS);
@@ -1069,7 +1058,8 @@ pub async fn run_report(args: crate::cli::ReportArgs) -> anyhow::Result<ExitCode
     // full check first.
     let overrides = load_template_overrides(&root)?;
 
-    let manifests = collect_manifests(args.manifest.as_deref(), Some(&root), settings.depth);
+    // `report` has no `--manifest-glob`: it describes a repository as a whole.
+    let manifests = collect_manifests(args.manifest.as_deref(), Some(&root), settings.depth, &[])?;
     if manifests.is_empty() {
         eprintln!("No supported manifests found.");
         return Ok(ExitCode::SUCCESS);
@@ -1150,12 +1140,78 @@ fn lockfile_notes(manifest: &Path) -> Vec<String> {
     })
 }
 
-fn collect_manifests(manifest: Option<&Path>, path: Option<&Path>, depth: usize) -> Vec<PathBuf> {
+/// The manifests a command should act on: the one named by `--manifest`, else the
+/// depth-limited walk of `path`, narrowed by any `--manifest-glob` patterns.
+///
+/// The globs filter *after* the walk rather than pruning inside it: `path` still
+/// roots the scan and `--depth` still bounds it, so the three compose instead of
+/// competing, and there stays exactly one walk implementation — in
+/// `dependable-fetch`, which knows nothing about globs.
+fn collect_manifests(
+    manifest: Option<&Path>,
+    path: Option<&Path>,
+    depth: usize,
+    globs: &[String],
+) -> anyhow::Result<Vec<PathBuf>> {
     if let Some(manifest) = manifest {
-        return vec![manifest.to_path_buf()];
+        // `--manifest` names one exact file and bypasses discovery entirely, so
+        // there is no discovered set for a glob to filter. clap rejects the
+        // combination rather than letting one of them be silently ignored.
+        return Ok(vec![manifest.to_path_buf()]);
     }
     let root = path.map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-    dependable_fetch::find_manifests(&root, depth)
+    let found = dependable_fetch::find_manifests(&root, depth);
+    if globs.is_empty() {
+        return Ok(found);
+    }
+    let set = manifest_globs(globs)?;
+    let kept: Vec<PathBuf> = found
+        .iter()
+        .filter(|manifest| set.is_match(output::posix(&relative_to(&root, manifest))))
+        .cloned()
+        .collect();
+    if kept.is_empty() && !found.is_empty() {
+        // `--depth` defaults to 3, so a pattern deeper than that matches nothing
+        // however well it is written. Say what was searched, not just that the
+        // answer was empty.
+        eprintln!(
+            "no manifest matched {} (searched {} manifest{} up to --depth {depth})",
+            globs.join(", "),
+            found.len(),
+            if found.len() == 1 { "" } else { "s" }
+        );
+    }
+    Ok(kept)
+}
+
+/// Compile `--manifest-glob` patterns into a matcher over manifest paths, with
+/// union semantics: a manifest matching any pattern is kept.
+///
+/// These are **paths**, so `literal_separator(true)`: `*` and `?` stop at `/` and
+/// only `**` crosses it. `crates/*/Cargo.toml` names one level of members, and
+/// nobody who writes that expects `crates/a/vendor/b/Cargo.toml` back. Matching is
+/// case-sensitive for the same reason — a path is not a name.
+///
+/// This is deliberately the opposite of [`dependable_tui::filter::Filter`], which
+/// matches **package names** and therefore sets `literal_separator(false)` so `*`
+/// spans `/` and `@types/*` works. Neither rule is right for both jobs, which is
+/// why the two do not share a type.
+///
+/// # Errors
+/// Returns an error if a pattern is not a valid glob. A typo silently matching
+/// nothing would be indistinguishable from a correct pattern with no hits.
+fn manifest_globs(patterns: &[String]) -> anyhow::Result<GlobSet> {
+    let mut builder = GlobSetBuilder::new();
+    for pattern in patterns {
+        let glob = GlobBuilder::new(pattern)
+            .literal_separator(true)
+            .build()
+            .with_context(|| format!("invalid --manifest-glob pattern: {pattern}"))?;
+        builder.add(glob);
+    }
+    builder
+        .build()
+        .context("compiling --manifest-glob patterns")
 }
 
 /// Cargo's home directory: `$CARGO_HOME`, else `~/.cargo`. Returns `None` when
@@ -1298,6 +1354,79 @@ mod tests {
         );
         // No home at all -> unresolvable, so alt-registry auth is simply disabled.
         assert_eq!(resolve_cargo_home(None, None), None);
+    }
+
+    /// The monorepo fixture: `services/{a,b}/Cargo.toml`, one level deeper at
+    /// `services/a/nested/Cargo.toml`, and `tools/lint/Cargo.toml` outside it.
+    fn monorepo() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample-monorepo")
+    }
+
+    fn matched(globs: &[&str]) -> Vec<String> {
+        let globs: Vec<String> = globs.iter().map(|g| (*g).to_string()).collect();
+        let root = monorepo();
+        collect_manifests(None, Some(&root), 4, &globs)
+            .expect("the patterns are valid")
+            .iter()
+            .map(|m| output::posix(&relative_to(&root, m)))
+            .collect()
+    }
+
+    #[test]
+    fn a_star_in_a_manifest_glob_does_not_cross_a_slash() {
+        assert_eq!(
+            matched(&["services/*/Cargo.toml"]),
+            vec!["services/a/Cargo.toml", "services/b/Cargo.toml"],
+            "`*` stops at `/`, so the manifest a level deeper is excluded"
+        );
+    }
+
+    #[test]
+    fn a_double_star_crosses_a_slash() {
+        assert_eq!(
+            matched(&["services/**/Cargo.toml"]),
+            vec![
+                "services/a/Cargo.toml",
+                "services/a/nested/Cargo.toml",
+                "services/b/Cargo.toml",
+            ]
+        );
+    }
+
+    #[test]
+    fn repeated_patterns_are_a_union() {
+        assert_eq!(
+            matched(&["services/a/Cargo.toml", "tools/*/Cargo.toml"]),
+            vec!["services/a/Cargo.toml", "tools/lint/Cargo.toml"]
+        );
+    }
+
+    #[test]
+    fn no_pattern_keeps_every_discovered_manifest() {
+        assert_eq!(matched(&[]).len(), 4);
+    }
+
+    #[test]
+    fn a_pattern_matching_nothing_yields_nothing_rather_than_everything() {
+        assert!(matched(&["apps/*/Cargo.toml"]).is_empty());
+    }
+
+    #[test]
+    fn an_explicit_manifest_is_returned_whatever_the_patterns() {
+        // clap rejects the combination, so this only documents that the glob
+        // never silently filters away a file the user named outright.
+        let named = PathBuf::from("some/other/Cargo.toml");
+        assert_eq!(
+            collect_manifests(Some(&named), None, 3, &["nope/*".to_string()])
+                .expect("the pattern is valid"),
+            vec![named]
+        );
+    }
+
+    #[test]
+    fn an_unparseable_pattern_is_an_error_not_an_empty_result() {
+        let root = monorepo();
+        assert!(collect_manifests(None, Some(&root), 4, &["services/[".to_string()]).is_err());
     }
 
     #[test]

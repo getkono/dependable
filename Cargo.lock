@@ -551,6 +551,7 @@ dependencies = [
  "dependable-report",
  "dependable-tui",
  "figment",
+ "globset",
  "indicatif",
  "owo-colors",
  "serde",

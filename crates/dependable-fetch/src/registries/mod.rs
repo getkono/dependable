@@ -274,6 +274,38 @@ pub async fn fetch_licenses(
         .await
 }
 
+/// Fetch the feature flags each of `names` declares, from one registry, concurrently.
+///
+/// The sibling of [`fetch_licenses`], and here for the same reason: the
+/// concurrency primitive belongs beside the fetchers, not in a frontend. Only
+/// registries whose version listing carries feature data — crates.io — return
+/// anything; everywhere else the flags are empty and the name is omitted.
+///
+/// `names` is taken as given, so a caller that wants one request per distinct
+/// package must deduplicate before calling. Per-package failures are
+/// **swallowed** and packages that declare no features are omitted, so an absent
+/// key means "nothing to show", never "this failed".
+pub async fn fetch_features(
+    fetcher: &dyn RegistryFetcher,
+    names: &[String],
+    concurrency: usize,
+) -> BTreeMap<String, Vec<String>> {
+    futures::stream::iter(names)
+        .map(|name| async move {
+            let features = fetcher
+                .fetch_versions(name)
+                .await
+                .ok()
+                .map(|fetched| fetched.features)
+                .filter(|features| !features.is_empty())?;
+            Some((name.clone(), features))
+        })
+        .buffer_unordered(concurrency.max(1))
+        .filter_map(|entry| async move { entry })
+        .collect()
+        .await
+}
+
 /// Whether `ecosystem`'s registry publishes package metadata at all.
 ///
 /// Four of the nine registries implement no metadata endpoint this crate can

@@ -344,6 +344,83 @@ async fn vulnerabilities_disabled_skips_osv() {
     assert!(by_name("time").current_vulnerabilities.is_empty());
 }
 
+/// Two workspace members declaring the same crate must cost ONE registry request.
+///
+/// This is the monorepo guarantee: `run_check` builds one [`Checker`] and loops
+/// manifests through it, and the checker's in-process versions cache is keyed by
+/// `(registry, name)` rather than by manifest. Nothing about that is enforced by
+/// a type, so it is asserted here — a future change to the manifest loop (or to
+/// the cache's lifetime) fails loudly instead of silently doubling the traffic.
+///
+/// The disk cache is off so the assertion is about the in-process cache alone.
+#[tokio::test]
+async fn one_checker_fetches_a_shared_package_once_across_manifests() {
+    const MEMBER_A: &str = r#"
+[dependencies]
+serde = "1"
+"#;
+    // Declared on a different line, and beside a dependency the first member does
+    // not have, so the two manifests are genuinely different documents.
+    const MEMBER_B: &str = r#"
+[dependencies]
+local-thing = { path = "../local" }
+serde = "1"
+"#;
+
+    let server = MockServer::start().await;
+    // `.expect(1)` is the assertion; wiremock verifies it when the server drops.
+    Mock::given(method("GET"))
+        .and(path("/se/rd/serde"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(concat!(
+            "{\"name\":\"serde\",\"vers\":\"1.0.0\",\"yanked\":false}\n",
+            "{\"name\":\"serde\",\"vers\":\"1.2.0\",\"yanked\":false}\n",
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let checker = Checker::builder()
+        .http_client(build_client().unwrap())
+        .rust_registry(server.uri(), None)
+        .vulnerabilities(false)
+        .disk_cache(false)
+        .build()
+        .unwrap();
+
+    let first = checker
+        .check_manifest(ManifestKind::CargoToml, MEMBER_A, None)
+        .await
+        .unwrap();
+    let second = checker
+        .check_manifest(ManifestKind::CargoToml, MEMBER_B, None)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        1,
+        "the second manifest must be served from the checker's versions cache"
+    );
+
+    // What is shared is the version list. Everything a rewrite needs — the line
+    // and columns of the constraint — comes from each manifest's own parse, so
+    // the two results describe their own files, not each other's.
+    let serde = |check: &dependable_fetch::ManifestCheck| {
+        check
+            .results
+            .iter()
+            .find(|r| r.item.name == "serde")
+            .expect("serde is declared")
+            .clone()
+    };
+    let (a, b) = (serde(&first), serde(&second));
+    assert_eq!(a.latest_available, b.latest_available);
+    assert_ne!(
+        a.item.version_line, b.item.version_line,
+        "position data is per-manifest even though the fetch is shared"
+    );
+}
+
 #[tokio::test]
 async fn disk_cache_serves_a_second_checker() {
     let server = MockServer::start().await;

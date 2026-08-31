@@ -186,3 +186,41 @@ fn table_format_labels_each_project() {
         "{out}"
     );
 }
+
+#[test]
+fn manifest_glob_narrows_discovery_without_letting_a_star_cross_a_slash() {
+    let root = fixture("sample-monorepo");
+    let doc = list_json(
+        &root,
+        &["--depth", "4", "--manifest-glob", "services/*/Cargo.toml"],
+    );
+
+    let manifests: Vec<&str> = doc["projects"]
+        .as_array()
+        .expect("projects array")
+        .iter()
+        .map(|p| p["manifest"].as_str().expect("a manifest path"))
+        .collect();
+    assert_eq!(
+        manifests,
+        vec!["services/a/Cargo.toml", "services/b/Cargo.toml"],
+        "`tools/` is outside the pattern and `services/a/nested/` is a level too deep"
+    );
+}
+
+#[test]
+fn manifest_glob_and_manifest_are_mutually_exclusive() {
+    let output = Command::new(env!("CARGO_BIN_EXE_dependable"))
+        .args([
+            "list",
+            "--manifest",
+            "Cargo.toml",
+            "--manifest-glob",
+            "*/Cargo.toml",
+        ])
+        .output()
+        .expect("run dependable");
+    assert!(!output.status.success(), "the combination must be rejected");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--manifest-glob"), "{stderr}");
+}
