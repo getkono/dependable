@@ -598,6 +598,7 @@ dependencies = [
  "dependable-core",
  "semver",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "time",
  "toml_edit",
