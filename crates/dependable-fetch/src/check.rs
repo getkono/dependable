@@ -752,12 +752,11 @@ impl Checker {
                 let progress = self.progress.clone();
                 let counter = counter.clone();
                 async move {
-                    let result = task
-                        .fetcher
-                        .fetch_versions(&task.name)
-                        .await
-                        .map(|fetched| fetched.versions)
-                        .map_err(|e| e.to_string());
+                    let result =
+                        crate::retry::with_retry(|| task.fetcher.fetch_versions(&task.name))
+                            .await
+                            .map(|fetched| fetched.versions)
+                            .map_err(|e| e.to_string());
                     let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
                     if let Some(p) = &progress {
                         p(ProgressEvent::Advanced {
@@ -908,14 +907,25 @@ fn to_semver_versions(versions: &[String], ecosystem: Ecosystem) -> Vec<String> 
 /// the two produce identical cache keys, and so the advisories describe the exact
 /// version that was flagged.
 fn osv_query_for(result: &CheckResult, ecosystem: Ecosystem) -> Option<OsvQuery> {
-    if !result.item.is_checkable() || matches!(result.status, DependencyStatus::Error(_)) {
+    if !result.item.is_checkable() {
         return None;
     }
-    let version = result
-        .item
-        .locked_version
-        .clone()
-        .or_else(|| result.latest_compatible.clone())?;
+    // A registry failure used to exclude the dependency from the scan entirely. But OSV
+    // needs no registry data — only a name and a version — and the lockfile already
+    // supplied one before any fetch happened. Skipping it meant a rate-limited package
+    // was not merely unresolved but *unaudited*, which is the more expensive half.
+    //
+    // `latest_compatible` is not a fallback here: on an errored fetch there is no version
+    // list behind it, so only a locked version is trustworthy.
+    let version = if matches!(result.status, DependencyStatus::Error(_)) {
+        result.item.locked_version.clone()?
+    } else {
+        result
+            .item
+            .locked_version
+            .clone()
+            .or_else(|| result.latest_compatible.clone())?
+    };
     Some(OsvQuery {
         ecosystem: ecosystem.osv_name().to_string(),
         name: result.item.name.clone(),
@@ -1276,12 +1286,28 @@ mod tests {
         assert!(osv_query_for(&result, Ecosystem::Rust).is_none());
     }
 
+    /// A registry failure used to exclude the dependency from the vulnerability scan.
+    /// But the lockfile already named the version, and OSV needs nothing from the
+    /// registry — so a rate-limited package was not merely unresolved, it was unaudited.
+    /// The fixture is the real case: `time 0.2.7` carries RUSTSEC-2020-0071.
     #[test]
-    fn an_errored_result_is_never_queried() {
+    fn an_errored_result_is_still_audited_when_the_lockfile_named_a_version() {
         let mut declared = registry_item();
         declared.locked_version = Some("0.2.7".to_string());
         let result = CheckResult::new(
             declared,
+            DependencyStatus::Error("registry unreachable".to_string()),
+        );
+        let query = osv_query_for(&result, Ecosystem::Rust).expect("the locked version is known");
+        assert_eq!(query.version, "0.2.7");
+    }
+
+    /// Without a lockfile there is no version to ask about: `latest_compatible` is not a
+    /// fallback here, because an errored fetch has no version list behind it.
+    #[test]
+    fn an_errored_result_with_no_locked_version_is_not_queried() {
+        let result = CheckResult::new(
+            registry_item(),
             DependencyStatus::Error("registry unreachable".to_string()),
         );
         assert!(osv_query_for(&result, Ecosystem::Rust).is_none());

@@ -44,6 +44,7 @@ pub mod discover;
 pub mod error;
 pub mod osv;
 pub mod registries;
+mod retry;
 pub mod tree;
 
 // High-level entry point (recommended for embedding).
@@ -105,5 +106,9 @@ pub fn build_client() -> Result<reqwest::Client, reqwest::Error> {
             std::env::consts::OS
         ))
         .timeout(Duration::from_secs(10))
+        // Separate from the total timeout: a host that accepts the connection and then
+        // stalls is a different failure from one that never answers at all, and without
+        // this a black-holed address spends the entire request budget on the handshake.
+        .connect_timeout(Duration::from_secs(5))
         .build()
 }
