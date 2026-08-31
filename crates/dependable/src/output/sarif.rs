@@ -96,22 +96,41 @@ mod tests {
         assert_eq!(scan_root(&[]), PathBuf::from("."));
     }
 
+    /// A root that is genuinely absolute on the platform the test runs on.
+    ///
+    /// `/repo` is *relative* on Windows — [`Path::is_absolute`] there wants a
+    /// drive or UNC prefix — so a Unix-only fixture sends [`scan_root`] down its
+    /// all-relative early return and asserts nothing about the branch under
+    /// test. The production path is unaffected: a real Windows manifest path is
+    /// `C:\...` and is absolute.
+    #[cfg(windows)]
+    const ABS_ROOT: &str = r"C:\repo";
+    #[cfg(not(windows))]
+    const ABS_ROOT: &str = "/repo";
+
+    /// `ABS_ROOT` joined with a forward-slashed relative path. Windows accepts
+    /// `/` as a separator and `Path` compares component-wise, so the mixed
+    /// separators in `C:\repo/crates/app` are irrelevant to the assertions.
+    fn abs(relative: &str) -> String {
+        format!("{ABS_ROOT}/{relative}")
+    }
+
     #[test]
     fn scan_root_is_the_common_ancestor_of_absolute_manifests() {
         assert_eq!(
             scan_root(&[
-                report("/repo/Cargo.toml"),
-                report("/repo/crates/app/Cargo.toml"),
-                report("/repo/crates/lib/Cargo.toml"),
+                report(&abs("Cargo.toml")),
+                report(&abs("crates/app/Cargo.toml")),
+                report(&abs("crates/lib/Cargo.toml")),
             ]),
-            PathBuf::from("/repo")
+            PathBuf::from(ABS_ROOT)
         );
         assert_eq!(
             scan_root(&[
-                report("/repo/crates/app/Cargo.toml"),
-                report("/repo/crates/lib/Cargo.toml"),
+                report(&abs("crates/app/Cargo.toml")),
+                report(&abs("crates/lib/Cargo.toml")),
             ]),
-            PathBuf::from("/repo/crates")
+            PathBuf::from(abs("crates"))
         );
     }
 
