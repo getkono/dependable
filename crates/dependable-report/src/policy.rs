@@ -725,14 +725,51 @@ pub fn evaluate(report: &Report, policy: &Policy) -> PolicyOutcome {
             }
 
             // 5/6. CVSS gate, then the unrated advisories it could not see.
-            if result.advisories.is_empty() {
-                continue;
-            }
             let Some(threshold_score) = threshold_score else {
                 continue;
             };
+
+            // A withdrawn advisory has been retracted by its publisher. The rest of the
+            // codebase already knows this — the summary counts them, the HTML report
+            // flags them — and only the gate that fails the build was blind to it.
+            let live: Vec<Advisory> = result
+                .advisories
+                .iter()
+                .filter(|a| !a.is_withdrawn())
+                .cloned()
+                .collect();
+
+            if live.is_empty() {
+                // `advisories` is enrichment; `current_vulnerabilities` is the finding.
+                // Treating an empty enrichment as "nothing to gate on" let a dependency
+                // that is *known vulnerable* — but whose enrichment failed, or was never
+                // requested — pass every severity gate in silence. That is the package
+                // the gate exists to catch. It has no score, so it is unrated, and the
+                // `unrated_advisories` knob decides, exactly as for a scored-but-unrated
+                // advisory.
+                if result.current_vulnerabilities.is_empty() {
+                    continue;
+                }
+                let level = match policy.unrated_advisories {
+                    UnratedPolicy::Ignore => continue,
+                    UnratedPolicy::Warn => Level::Warning,
+                    UnratedPolicy::Fail => Level::Violation,
+                };
+                push(
+                    level,
+                    cvss_rule,
+                    Detail::Unrated {
+                        count: result.current_vulnerabilities.len(),
+                        advisories: result.current_vulnerabilities.clone(),
+                        best_known: None,
+                    },
+                    None,
+                );
+                continue;
+            }
+
             let mut violated = false;
-            if let Some(score) = result.max_cvss()
+            if let Some(score) = Advisory::max_cvss(&live)
                 && score >= threshold_score
             {
                 violated = true;
@@ -742,12 +779,12 @@ pub fn evaluate(report: &Report, policy: &Policy) -> PolicyOutcome {
                     Detail::Cvss {
                         score,
                         threshold: threshold_score,
-                        advisories: over_score(&result.advisories, threshold_score),
+                        advisories: over_score(&live, threshold_score),
                     },
                     None,
                 );
             } else if let (Some(band), Some(threshold_band)) =
-                (result.max_severity(), threshold_band)
+                (Advisory::max_severity(&live), threshold_band)
                 && band >= threshold_band
             {
                 // A published band with no scorable vector. Reported as a band
@@ -759,13 +796,13 @@ pub fn evaluate(report: &Report, policy: &Policy) -> PolicyOutcome {
                     Detail::Severity {
                         band,
                         threshold: threshold_band,
-                        advisories: over_band(&result.advisories, threshold_band),
+                        advisories: over_band(&live, threshold_band),
                     },
                     None,
                 );
             }
 
-            let unrated = unrated_ids(&result.advisories);
+            let unrated = unrated_ids(&live);
             if violated || unrated.is_empty() {
                 continue;
             }
@@ -780,7 +817,7 @@ pub fn evaluate(report: &Report, policy: &Policy) -> PolicyOutcome {
                 Detail::Unrated {
                     count: unrated.len(),
                     advisories: unrated,
-                    best_known: result.max_cvss(),
+                    best_known: Advisory::max_cvss(&live),
                 },
                 None,
             );
@@ -827,17 +864,29 @@ fn parse_version(raw: &str, ecosystem: Ecosystem) -> Option<semver::Version> {
 
 /// How many breaking releases separate `current` from `latest`.
 ///
-/// Under `0.x` the **minor** is the breaking axis — which is how the version
-/// checker already classifies compatibility — so `0.1 → 0.9` is eight breaking
-/// releases behind, not zero. Counting it as zero would make the gate blind to
-/// exactly the churn it exists to catch.
+/// Under `0.x` the **minor** is the breaking axis — which is how the version checker
+/// already classifies compatibility — so `0.1 -> 0.9` is eight breaking releases behind,
+/// not zero. Counting it as zero would make the gate blind to exactly the churn it
+/// exists to catch.
+///
+/// Crossing out of `0.x` counts the crossing itself plus each major after it, so
+/// `0.1 -> 1.0` is one and `0.1 -> 3.0` is three. Previously this branch subtracted the
+/// majors alone, which made the measure *shrink* when a dependency was further behind:
+/// `0.1 -> 0.9` scored 8, and the moment upstream shipped `1.0` the same project scored
+/// 1 and a `max_major_behind = 2` gate it had been failing began to pass.
+///
+/// # Limitation
+/// The 0.x releases skipped on the way out of the line are not counted, because the set
+/// of published versions is not available here — only the two endpoints are. For a
+/// dependency whose upstream has since crossed 1.0, this is therefore a lower bound.
 fn major_distance(current: &semver::Version, latest: &semver::Version) -> u64 {
-    if current.major != latest.major {
-        latest.major.saturating_sub(current.major)
-    } else if current.major == 0 {
-        latest.minor.saturating_sub(current.minor)
-    } else {
-        0
+    match (current.major, latest.major) {
+        // Both on the 0.x line: the minor is the breaking axis.
+        (0, 0) => latest.minor.saturating_sub(current.minor),
+        // Leaving 0.x: the crossing is one breaking release, plus each major past 1.0.
+        (0, to) => to,
+        // Both past 1.0: the major is the breaking axis.
+        (from, to) => to.saturating_sub(from),
     }
 }
 
@@ -1025,6 +1074,12 @@ reason = "CVE-2023-xxxx fix"
 
     fn scored(id: &str, score: f64) -> Advisory {
         Advisory::new(id).with_severity(AdvisorySeverity::from_score(score))
+    }
+
+    /// `withdrawn` is a plain field with no builder; this keeps the fixtures readable.
+    fn withdrawn(mut advisory: Advisory) -> Advisory {
+        advisory.withdrawn = Some("2024-01-01T00:00:00Z".to_owned());
+        advisory
     }
 
     fn banded(id: &str, label: &str) -> Advisory {
@@ -1757,5 +1812,115 @@ reason = "CVE-2023-xxxx fix"
                 "`{key}` is not a key of the documented policy block"
             );
         }
+    }
+
+    /// The gate's whole purpose is the package that is known vulnerable. Treating an
+    /// empty *enrichment* list as "nothing to gate on" let exactly that package through:
+    /// enrichment is opt-in and can fail, while `current_vulnerabilities` is the finding.
+    #[test]
+    fn a_known_vulnerable_dependency_without_enrichment_does_not_pass_silently() {
+        let mut result = checked("openssl = \"0.10\"");
+        result.status = DependencyStatus::Vulnerable;
+        result.current_vulnerabilities = vec!["RUSTSEC-2020-0071".to_owned()];
+        assert!(result.advisories.is_empty(), "enrichment did not run");
+
+        // Under the default `warn`, it is reported rather than passing in silence.
+        let warned = evaluate(&rust(vec![result.clone()]), &policy("max_cvss = 7.0\n"));
+        assert!(
+            warned
+                .findings
+                .iter()
+                .any(|f| matches!(f.rule, Rule::MaxCvss | Rule::FailOnSeverity)),
+            "no finding: {:?}",
+            warned.findings
+        );
+
+        // Under `fail`, it fails the build.
+        let failed = evaluate(
+            &rust(vec![result]),
+            &policy("max_cvss = 7.0\nunrated_advisories = \"fail\"\n"),
+        );
+        assert!(failed.has_violations());
+    }
+
+    /// A retracted advisory is not a finding. The summary and the HTML report both know
+    /// this already; only the gate that fails the build did not.
+    #[test]
+    fn a_withdrawn_advisory_does_not_fail_the_build() {
+        let mut result = checked("openssl = \"0.10\"");
+        result.status = DependencyStatus::Vulnerable;
+        result.current_vulnerabilities = vec!["RUSTSEC-2020-0071".to_owned()];
+        result.advisories = vec![withdrawn(scored("RUSTSEC-2020-0071", 9.8))];
+
+        let outcome = evaluate(
+            &rust(vec![result]),
+            &policy("max_cvss = 7.0\nunrated_advisories = \"ignore\"\n"),
+        );
+        assert!(
+            !outcome.has_violations(),
+            "a withdrawn advisory failed the build: {:?}",
+            outcome.findings
+        );
+    }
+
+    /// A live advisory alongside a withdrawn one still fails: filtering the retracted one
+    /// must not disarm the gate.
+    #[test]
+    fn a_live_advisory_beside_a_withdrawn_one_still_fails() {
+        let mut result = checked("openssl = \"0.10\"");
+        result.status = DependencyStatus::Vulnerable;
+        result.current_vulnerabilities = vec!["A".to_owned(), "B".to_owned()];
+        result.advisories = vec![withdrawn(scored("A", 9.8)), scored("B", 8.1)];
+        let outcome = evaluate(&rust(vec![result]), &policy("max_cvss = 7.0\n"));
+        assert!(outcome.has_violations());
+    }
+
+    /// Being further behind must never measure as being closer. `0.1 -> 0.9` scored 8
+    /// while `0.1 -> 1.0` scored 1, so shipping `1.0.0` un-failed the gate.
+    #[test]
+    fn crossing_out_of_zero_x_does_not_shrink_the_distance() {
+        let v = |s: &str| semver::Version::parse(s).unwrap();
+        assert_eq!(major_distance(&v("0.1.0"), &v("0.9.0")), 8);
+        assert_eq!(major_distance(&v("0.1.0"), &v("1.0.0")), 1);
+        assert_eq!(major_distance(&v("0.1.0"), &v("3.0.0")), 3);
+        // Monotonic in the major once past 1.0.
+        assert!(
+            major_distance(&v("0.1.0"), &v("3.0.0")) > major_distance(&v("0.1.0"), &v("1.0.0"))
+        );
+        assert_eq!(major_distance(&v("1.0.0"), &v("3.0.0")), 2);
+        assert_eq!(major_distance(&v("4.0.0"), &v("1.0.0")), 0);
+    }
+
+    /// `cvss.rs` scores only v3.0 and v3.1 vectors, so a v4-only advisory carries no
+    /// score and no band and is therefore *unrated* — which under the default `warn`
+    /// passes a `max_cvss` gate. This pins that behaviour so the day v4 scoring lands,
+    /// or the default changes, it is a deliberate edit and not a silent drift.
+    #[test]
+    fn a_v4_only_advisory_is_unrated_and_the_default_only_warns() {
+        let mut result = checked("openssl = \"0.10\"");
+        result.status = DependencyStatus::Vulnerable;
+        result.current_vulnerabilities = vec!["CVE-2025-0001".to_owned()];
+        result.advisories = vec![Advisory::new("CVE-2025-0001").with_severity(
+            AdvisorySeverity::default().with_vector(
+                "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H",
+                dependable_core::result::CvssVersion::V4,
+            ),
+        )];
+
+        let warned = evaluate(&rust(vec![result.clone()]), &policy("max_cvss = 7.0\n"));
+        assert!(!warned.has_violations(), "default is warn, not fail");
+        assert!(
+            warned
+                .findings
+                .iter()
+                .any(|f| matches!(f.rule, Rule::MaxCvss | Rule::FailOnSeverity))
+        );
+
+        // `fail` is how an operator closes this gap today.
+        let failed = evaluate(
+            &rust(vec![result]),
+            &policy("max_cvss = 7.0\nunrated_advisories = \"fail\"\n"),
+        );
+        assert!(failed.has_violations());
     }
 }
