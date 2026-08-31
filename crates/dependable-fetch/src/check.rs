@@ -7,6 +7,7 @@
 //! [`crate::OsvClient`]) remain public for callers who want to compose by hand.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -191,8 +192,15 @@ struct FetchTask {
 /// The result of one fetch task: `(name, cache_key, versions-or-error)`.
 type FetchOutcome = (String, String, Result<Vec<String>, String>);
 
-/// Fetched versions (or a per-package error message) keyed by package name.
-type FetchedMap = HashMap<String, Result<Vec<String>, String>>;
+/// Fetched versions (or a per-package error message), keyed by `(cache_key, name)`.
+///
+/// Keyed by the same pair the fetch tasks are deduplicated by, and for the same reason:
+/// a name alone is not unique within a manifest. A `Cargo.toml` naming one crate from
+/// crates.io and another of the same name from a private registry, or a `deno.json`
+/// importing both `jsr:foo` and `npm:foo`, issues two tasks — and a name-keyed map
+/// collapsed them into one slot, so whichever request finished last silently answered
+/// for both.
+type FetchedMap = HashMap<(String, String), Result<Vec<String>, String>>;
 
 impl Checker {
     /// Start configuring a checker.
@@ -603,7 +611,10 @@ impl Checker {
         let mut results: Vec<CheckResult> = parsed
             .items
             .iter()
-            .map(|item| evaluate_item(item, &fetched, ecosystem, self.unstable))
+            .map(|item| {
+                let (_, cache_key) = self.route_item(item, &fetcher, ecosystem);
+                evaluate_item(item, &fetched, &cache_key, ecosystem, self.unstable)
+            })
             .collect();
 
         if let Some(osv) = &self.osv
@@ -666,12 +677,23 @@ impl Checker {
         if let Some(alias) = &item.registry
             && let Some(fetcher) = self.rust_registries.get(alias)
         {
-            return (
-                fetcher.clone(),
-                format!("{}::{alias}", ecosystem.osv_name()),
-            );
+            // `:` is not a legal character in a Windows path component, and this key
+            // becomes a directory name under the disk-cache root.
+            return (fetcher.clone(), format!("{}-{alias}", ecosystem.osv_name()));
         }
-        (default.clone(), ecosystem.osv_name().to_string())
+        (
+            default.clone(),
+            default_cache_key(default.as_ref(), ecosystem),
+        )
+    }
+
+    /// Whether this checker reads and writes the on-disk registry cache.
+    ///
+    /// Exposed so a caller — and this crate's own tests — can assert that a checker it
+    /// did not explicitly opt in has no filesystem side effects.
+    #[must_use]
+    pub fn uses_disk_cache(&self) -> bool {
+        self.disk_cache.is_some()
     }
 
     /// Run every fetch task concurrently, serving and populating the in-process
@@ -699,14 +721,16 @@ impl Checker {
         for task in tasks {
             let key = (task.cache_key.clone(), task.name.clone());
             if let Some(versions) = self.versions_cache.get(&key).await {
-                out.insert(task.name.clone(), Ok(versions));
+                out.insert(key, Ok(versions));
             } else if let Some(disk) = &self.disk_cache
                 && let Some(versions) = disk.get(&task.cache_key, &task.name).await
             {
                 // Disk hit: warm the in-process cache so sibling manifests in this
                 // run hit moka instead of re-reading the file.
-                self.versions_cache.insert(key, versions.clone()).await;
-                out.insert(task.name.clone(), Ok(versions));
+                self.versions_cache
+                    .insert(key.clone(), versions.clone())
+                    .await;
+                out.insert(key, Ok(versions));
             } else {
                 to_fetch.push(task);
             }
@@ -747,7 +771,7 @@ impl Checker {
                     disk.put(&cache_key, &name, versions).await;
                 }
             }
-            out.insert(name, result);
+            out.insert((cache_key, name), result);
         }
 
         self.emit(ProgressEvent::Finished);
@@ -790,9 +814,31 @@ fn undeclared_inheritance(items: &[Item], root: &Path) -> Vec<String> {
 
 /// Evaluate one parsed item against the fetched version lists, applying the
 /// configured pre-release filter before classification.
+/// The cache key for an ecosystem's default fetcher.
+///
+/// A checker pointed at a private index or a mirror answers different questions than one
+/// pointed at the public registry, and the on-disk cache records only `(key, name)`. With
+/// the key naming the ecosystem alone, a run against a mirror wrote entries a later
+/// public run read back as its own — and the entry's name guard cannot catch it, because
+/// the name matches. Only a non-default root is scoped, so existing entries stay valid.
+fn default_cache_key(fetcher: &dyn RegistryFetcher, ecosystem: Ecosystem) -> String {
+    let base = ecosystem.osv_name();
+    match fetcher.registry_root() {
+        Some(root)
+            if root.trim_end_matches('/') != ecosystem.default_registry().trim_end_matches('/') =>
+        {
+            let mut hasher = DefaultHasher::new();
+            root.hash(&mut hasher);
+            format!("{base}-{:016x}", hasher.finish())
+        }
+        _ => base.to_string(),
+    }
+}
+
 fn evaluate_item(
     item: &Item,
     fetched: &FetchedMap,
+    cache_key: &str,
     ecosystem: Ecosystem,
     unstable: UnstableFilter,
 ) -> CheckResult {
@@ -803,7 +849,7 @@ fn evaluate_item(
         };
         return CheckResult::new(item.clone(), status);
     }
-    match fetched.get(&item.name) {
+    match fetched.get(&(cache_key.to_owned(), item.name.clone())) {
         Some(Ok(versions)) => {
             // The current version drives `IncludeIfCurrent`: the locked version if
             // known, else the declared constraint (its pre-release markers, if any,
@@ -918,7 +964,8 @@ pub struct CheckerBuilder {
     concurrency: usize,
     read_lockfiles: bool,
     unstable: UnstableFilter,
-    disk_cache: bool,
+    /// `None` until a caller says either way; see [`CheckerBuilder::disk_cache`].
+    disk_cache: Option<bool>,
     disk_cache_dir: Option<PathBuf>,
     progress: Option<ProgressSink>,
 }
@@ -940,7 +987,7 @@ impl Default for CheckerBuilder {
             concurrency: DEFAULT_CONCURRENCY,
             read_lockfiles: true,
             unstable: UnstableFilter::default(),
-            disk_cache: true,
+            disk_cache: None,
             disk_cache_dir: None,
             progress: None,
         }
@@ -1058,14 +1105,25 @@ impl CheckerBuilder {
     /// Enable or disable the persistent on-disk registry cache (default: enabled).
     /// When enabled, registry version lists are cached under the OS cache directory
     /// with a short TTL so repeat and CI runs avoid re-fetching. Maps to `--no-cache`.
+    /// Turn the on-disk cache on or off explicitly. An explicit choice always wins,
+    /// whatever order the builder is called in.
+    ///
+    /// Unset, the cache is on only when [`CheckerBuilder::disk_cache_dir`] named a
+    /// directory. It used to default to on *with the shared OS cache directory*, so
+    /// merely constructing a checker gave it write access to a location every other run
+    /// on the machine reads — a side effect no library consumer asked for, and the one
+    /// that let this repository's own test suite write fabricated version lists into the
+    /// developer's real cache, where later runs read them back as registry truth.
     pub fn disk_cache(mut self, enabled: bool) -> Self {
-        self.disk_cache = enabled;
+        self.disk_cache = Some(enabled);
         self
     }
 
-    /// Override the on-disk cache directory (default: the OS cache directory).
-    /// Mainly for tests and embedders that want an isolated cache location; has no
-    /// effect when [`CheckerBuilder::disk_cache`] is disabled.
+    /// Use `dir` as the on-disk cache directory, and — absent an explicit
+    /// [`CheckerBuilder::disk_cache`] — enable the cache.
+    ///
+    /// Naming a directory is itself an opt-in: a caller that chose an isolated location
+    /// means to use it. An explicit `disk_cache(false)` still wins.
     pub fn disk_cache_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.disk_cache_dir = Some(dir.into());
         self
@@ -1126,8 +1184,10 @@ impl CheckerBuilder {
 
         // Resolve the disk cache: enabled + a usable directory (explicit override
         // or the OS default). If no directory resolves, the disk cache is simply off.
-        let disk_cache = self
-            .disk_cache
+        // An explicit choice wins; otherwise the cache is on only when a directory was
+        // named. Nothing falls back to the shared OS cache root without being asked.
+        let enabled = self.disk_cache.unwrap_or(self.disk_cache_dir.is_some());
+        let disk_cache = enabled
             .then(|| self.disk_cache_dir.or_else(DiskCache::default_root))
             .flatten()
             .map(|dir| Arc::new(DiskCache::new(dir, DISK_CACHE_TTL)));

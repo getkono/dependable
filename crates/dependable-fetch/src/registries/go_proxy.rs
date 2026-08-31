@@ -44,6 +44,10 @@ impl GoProxyFetcher {
 }
 
 impl RegistryFetcher for GoProxyFetcher {
+    fn registry_root(&self) -> Option<&str> {
+        Some(&self.base_url)
+    }
+
     fn fetch_versions<'a>(
         &'a self,
         name: &'a str,
