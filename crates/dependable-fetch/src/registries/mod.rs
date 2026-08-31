@@ -1,4 +1,9 @@
-//! Registry fetchers. V1 ships the crates.io sparse-index fetcher.
+//! Registry fetchers: one [`RegistryFetcher`] per ecosystem, over a shared
+//! `reqwest` client.
+//!
+//! The trait shape assumes a registry that identifies a package by a single
+//! string and can return its complete version list — see
+//! `docs/ECOSYSTEM-CANDIDATES.md` for why that assumption is load-bearing.
 
 use std::collections::BTreeMap;
 

@@ -29,8 +29,9 @@ pub struct AlternateRegistryDecl {
     pub auth_token: Option<String>,
 }
 
-/// Distinguishes manifest files. Only [`ManifestKind::CargoToml`] is parsed in
-/// V1; the rest exist so detection and the ecosystem mapping are forward-stable.
+/// Distinguishes manifest files. Every variant has a parser; the mapping to
+/// [`Ecosystem`] is many-to-one, since several manifest formats can belong to one
+/// registry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ManifestKind {

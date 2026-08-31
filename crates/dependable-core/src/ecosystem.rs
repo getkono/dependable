@@ -4,9 +4,11 @@ use serde::{Deserialize, Serialize};
 
 /// A package ecosystem.
 ///
-/// Only [`Ecosystem::Rust`] is wired end-to-end in V1; the remaining variants
-/// exist so the data model (and OSV/registry mappings) stay stable as ecosystems
-/// are added.
+/// Every variant is wired end-to-end: a parser, a registry fetcher, and an OSV
+/// mapping. Which languages that adds up to is a wider question than this enum —
+/// `deno.json` and `pnpm-workspace.yaml` are both [`Ecosystem::Npm`] — so the
+/// **Supported languages** table in `README.md` is authoritative for status, and
+/// `docs/ECOSYSTEM-CANDIDATES.md` records what a new variant has to clear.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum Ecosystem {
