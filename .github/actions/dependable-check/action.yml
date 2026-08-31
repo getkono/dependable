@@ -1,0 +1,216 @@
+name: dependable-check
+description: >-
+  Check dependency versions and known vulnerabilities, annotating the pull
+  request and writing a job summary.
+author: getkono
+
+branding:
+  icon: package
+  color: purple
+
+inputs:
+  path:
+    description: 'Project directory to scan.'
+    required: false
+    default: '.'
+  manifest:
+    description: 'Check a single manifest file instead of discovering them. Empty means discover.'
+    required: false
+    default: ''
+  config:
+    description: 'Config file path.'
+    required: false
+    default: '.dependable.toml'
+  fail-on:
+    description: >-
+      Result level that fails the step: none, outdated, vulnerable, or any.
+      Defaults to vulnerable, deviating from the CLI default of none, because an
+      action that never fails is not a gate.
+    required: false
+    default: 'vulnerable'
+  format:
+    description: 'What goes to stdout: table, json, text, or sarif.'
+    required: false
+    default: 'table'
+  annotations:
+    description: >-
+      GitHub annotations and job summary: auto (on under the runner), always, or
+      never.
+    required: false
+    default: 'auto'
+  version:
+    description: >-
+      Release tag to install, such as v0.1.4, or latest. Pinning a tag skips the
+      releases API call, so a workflow with no contents read permission must pin.
+    required: false
+    default: 'latest'
+  args:
+    description: >-
+      Extra arguments appended to the check command verbatim. Word-split like a
+      run block, so it carries the same trust level as one.
+    required: false
+    default: ''
+
+outputs:
+  exit-code:
+    description: >-
+      The CLI exit code: 0 clean, 1 the fail-on threshold was met, 2 a tool
+      error. Always set, so a continue-on-error caller can branch on it.
+    value: ${{ steps.check.outputs.exit-code }}
+  json-path:
+    description: >-
+      Path to the captured JSON document. Set only when format is json; empty
+      otherwise.
+    value: ${{ steps.check.outputs.json-path }}
+
+runs:
+  using: composite
+  steps:
+    # Inputs reach every script through `env:` and never through `${{ }}` inside
+    # a `run:` body: interpolating into the script text is the classic Actions
+    # injection sink, and a caller can wire `github.event.*` into an input.
+    - name: Install dependable
+      shell: bash
+      env:
+        INPUT_VERSION: ${{ inputs.version }}
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+
+        # Exactly the matrix release-binaries.yml publishes. There is no
+        # aarch64-pc-windows-msvc asset, so that pair fails here by name rather
+        # than as a confusing 404 further down.
+        case "${RUNNER_OS}/${RUNNER_ARCH}" in
+          Linux/X64)   target=x86_64-unknown-linux-gnu;  ext=tar.gz ;;
+          Linux/ARM64) target=aarch64-unknown-linux-gnu; ext=tar.gz ;;
+          macOS/X64)   target=x86_64-apple-darwin;       ext=tar.gz ;;
+          macOS/ARM64) target=aarch64-apple-darwin;      ext=tar.gz ;;
+          Windows/X64) target=x86_64-pc-windows-msvc;    ext=zip ;;
+          *)
+            echo "::error::dependable publishes no binary for ${RUNNER_OS}/${RUNNER_ARCH}"
+            exit 1
+            ;;
+        esac
+
+        tag="${INPUT_VERSION}"
+        if [ "${tag}" = "latest" ]; then
+          if ! command -v jq >/dev/null 2>&1; then
+            echo "::error::resolving the latest release needs jq, which is not installed; pin the version input to a tag instead"
+            exit 1
+          fi
+          auth=()
+          if [ -n "${GH_TOKEN}" ]; then
+            auth=(-H "Authorization: Bearer ${GH_TOKEN}")
+          fi
+          tag="$(curl -fsSL -H 'Accept: application/vnd.github+json' "${auth[@]}" \
+            https://api.github.com/repos/getkono/dependable/releases/latest | jq -r '.tag_name')"
+          if [ -z "${tag}" ] || [ "${tag}" = "null" ]; then
+            echo "::error::could not resolve the latest dependable release; pin the version input to a tag"
+            exit 1
+          fi
+        fi
+
+        dest="${RUNNER_TEMP}/dependable-install"
+        # Git Bash hands us Windows paths; cygpath is the only reliable bridge.
+        if command -v cygpath >/dev/null 2>&1; then
+          dest="$(cygpath -u "${RUNNER_TEMP}")/dependable-install"
+        fi
+        mkdir -p "${dest}"
+        cd "${dest}"
+
+        archive="dependable-${target}.${ext}"
+        base="https://github.com/getkono/dependable/releases/download/${tag}"
+        echo "Installing dependable ${tag} (${target})"
+        curl -fsSL -o "${archive}" "${base}/${archive}"
+        curl -fsSL -o "${archive}.sha256" "${base}/${archive}.sha256"
+
+        # Integrity, not authenticity: the checksum is published in the same
+        # release as the archive, so it catches a corrupted download, not a
+        # compromised release. Real provenance needs signing/attestation.
+        if command -v sha256sum >/dev/null 2>&1; then
+          sha256sum -c "${archive}.sha256"
+        elif command -v shasum >/dev/null 2>&1; then
+          shasum -a 256 -c "${archive}.sha256"
+        else
+          echo "::error::neither sha256sum nor shasum is available to verify the download"
+          exit 1
+        fi
+
+        if [ "${ext}" = "zip" ]; then
+          if command -v unzip >/dev/null 2>&1; then
+            unzip -q -o "${archive}"
+          elif command -v powershell >/dev/null 2>&1; then
+            win_archive="${dest}/${archive}"
+            win_dest="${dest}"
+            if command -v cygpath >/dev/null 2>&1; then
+              win_archive="$(cygpath -w "${dest}/${archive}")"
+              win_dest="$(cygpath -w "${dest}")"
+            fi
+            powershell -NoProfile -Command \
+              "Expand-Archive -Force -LiteralPath '${win_archive}' -DestinationPath '${win_dest}'"
+          else
+            echo "::error::no unzip or powershell available to extract ${archive}"
+            exit 1
+          fi
+        else
+          tar -xzf "${archive}"
+        fi
+
+        entry="${dest}"
+        if command -v cygpath >/dev/null 2>&1; then
+          entry="$(cygpath -w "${dest}")"
+        fi
+        echo "${entry}" >> "${GITHUB_PATH}"
+
+    - name: Run dependable check
+      id: check
+      shell: bash
+      env:
+        INPUT_PATH: ${{ inputs.path }}
+        INPUT_MANIFEST: ${{ inputs.manifest }}
+        INPUT_CONFIG: ${{ inputs.config }}
+        INPUT_FAIL_ON: ${{ inputs.fail-on }}
+        INPUT_FORMAT: ${{ inputs.format }}
+        INPUT_ANNOTATIONS: ${{ inputs.annotations }}
+        INPUT_ARGS: ${{ inputs.args }}
+      run: |
+        # No `set -e`: exit 1 is a legitimate result here, and the code has to be
+        # published as an output before the step re-exits with it.
+        set -uo pipefail
+
+        argv=(check)
+        if [ -n "${INPUT_PATH}" ]; then argv+=("${INPUT_PATH}"); fi
+        if [ -n "${INPUT_MANIFEST}" ]; then argv+=(--manifest "${INPUT_MANIFEST}"); fi
+        if [ -n "${INPUT_CONFIG}" ]; then argv+=(--config "${INPUT_CONFIG}"); fi
+        argv+=(--fail-on "${INPUT_FAIL_ON}")
+        argv+=(--format "${INPUT_FORMAT}")
+        argv+=(--annotations "${INPUT_ANNOTATIONS}")
+        if [ -n "${INPUT_ARGS}" ]; then
+          # Word-split on purpose: the same trust level as a `run:` block.
+          # shellcheck disable=SC2206
+          extra=(${INPUT_ARGS})
+          argv+=("${extra[@]}")
+        fi
+
+        json_path=''
+        if [ "${INPUT_FORMAT}" = 'json' ]; then
+          out="${RUNNER_TEMP}/dependable.json"
+          if command -v cygpath >/dev/null 2>&1; then
+            out="$(cygpath -u "${RUNNER_TEMP}")/dependable.json"
+          fi
+          dependable "${argv[@]}" | tee "${out}"
+          code=${PIPESTATUS[0]}
+          json_path="${out}"
+          if command -v cygpath >/dev/null 2>&1; then
+            json_path="$(cygpath -w "${out}")"
+          fi
+        else
+          dependable "${argv[@]}"
+          code=$?
+        fi
+
+        {
+          echo "exit-code=${code}"
+          echo "json-path=${json_path}"
+        } >> "${GITHUB_OUTPUT}"
+        exit "${code}"

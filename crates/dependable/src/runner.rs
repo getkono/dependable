@@ -358,6 +358,11 @@ pub async fn run_check(args: CheckArgs) -> anyhow::Result<ExitCode> {
     }
 
     output::render(args.format, &reports, args.quiet)?;
+    // Before the policy gate, so annotations are printed whether or not policy
+    // short-circuits the run. `emit` returns `()` and never `Result`, so no
+    // GitHub-integration failure can reach `main`'s error arm and turn a clean
+    // run into exit 2.
+    output::github::emit(&reports, args.annotations);
 
     // `[policy]` composes with `--fail-on` rather than replacing it: they gate
     // different things (a rules gate over scores, names, and versions, versus a

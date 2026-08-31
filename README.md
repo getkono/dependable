@@ -110,6 +110,7 @@ dependable                        # explore dependencies interactively (TUI)
 dependable check [PATH]           # check a project (default: current dir)
 dependable check . --format json  # machine-readable output (also: text)
 dependable check . --fail-on vulnerable   # exit non-zero for CI
+dependable check . --annotations always   # GitHub Actions annotations + job summary
 dependable list .                 # every project and what it declares (offline)
 dependable tree .                 # render the dependency tree (Rust)
 dependable fix . --dry-run        # preview in-place upgrades
@@ -456,8 +457,38 @@ hook runs format/lint checks plus the test suite and coverage.
 
 ## CI/CD
 
-GitHub Actions runs format checks, linting, and tests on pushes to `main` and on
-pull requests, plus a coverage job that uploads an `lcov.info` artifact.
+Any CI system can use `--fail-on` and `--format json`. On GitHub Actions there
+is a composite action that installs the released binary and runs the check:
+
+```yaml
+- uses: actions/checkout@v4
+- uses: getkono/dependable/.github/actions/dependable-check@v0.1.4
+  with:
+    fail-on: vulnerable
+```
+
+It annotates the pull request — one `error` per vulnerable dependency, `warning`
+per outdated one, `notice` per one that could not be checked, each attached to
+the manifest line that declares it — and appends a summary table to the job
+summary. See
+[`.github/actions/dependable-check`](.github/actions/dependable-check/README.md)
+for inputs, outputs, and permissions.
+
+The same thing without the action, from any `dependable` on the runner:
+
+```yaml
+- run: dependable check . --fail-on vulnerable
+```
+
+`--annotations` chooses when: `auto` (the default) turns them on exactly when
+`GITHUB_ACTIONS` is `true`, `always` reproduces them locally, `never` silences
+both the annotations and the job summary. Annotations go to **stderr**, so
+`--format json` and `--format sarif` still put a single valid document on
+stdout.
+
+This repository's own GitHub Actions workflow runs format checks, linting, and
+tests on pushes to `main` and on pull requests, plus a coverage job that uploads
+an `lcov.info` artifact.
 
 ## License
 

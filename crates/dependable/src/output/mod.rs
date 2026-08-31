@@ -1,4 +1,5 @@
-//! Output rendering: table (default), JSON, machine-readable text, and SARIF.
+//! Output rendering: table (default), JSON, machine-readable text, and SARIF,
+//! plus the GitHub Actions side channels in [`github`].
 
 use std::path::PathBuf;
 
@@ -6,6 +7,7 @@ use dependable_fetch::{CheckResult, DependencyStatus, Ecosystem};
 
 use crate::cli::CheckFormat;
 
+pub mod github;
 pub mod json;
 pub mod list;
 #[cfg(feature = "report")]
