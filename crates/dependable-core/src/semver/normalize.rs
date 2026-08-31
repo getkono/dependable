@@ -81,15 +81,23 @@ const PYTHON_PRERELEASE: &[&str] = &[
     ".experimental",
     ".canary",
     ".pre",
-    ".post",
 ];
 
 /// Whether `version` looks like a pre-release / unstable version for `ecosystem`.
 ///
-/// Uses a case-insensitive substring match against a marker set, plus Python's
-/// implicit forms (`1.0a1`, `1.0b2`, `1.0rc1`).
+/// A version that parses as semver answers for itself — that is the definition, and it
+/// is exact in both directions. The marker list is the fallback for the many ecosystem
+/// versions that are *not* semver (PEP 440, NuGet's four-part versions, Go's `v` prefix),
+/// where a substring is the best available signal.
+///
+/// The substring test alone was wrong both ways: `1.0.0-M1` and `1.0.0-unstable.3` are
+/// pre-releases carrying no listed marker, and `1.2.3+build-rc` is a *stable* release
+/// whose build metadata happens to contain one.
 #[must_use]
 pub fn is_prerelease(version: &str, ecosystem: Ecosystem) -> bool {
+    if let Ok(parsed) = ::semver::Version::parse(version.trim_start_matches('v')) {
+        return !parsed.pre.is_empty();
+    }
     let lower = version.to_ascii_lowercase();
     if UNIVERSAL_PRERELEASE.iter().any(|m| lower.contains(m)) {
         return true;
@@ -216,13 +224,44 @@ mod tests {
 
     #[test]
     fn python_specific_prereleases() {
-        for v in ["1.0a1", "1.0b2", "1.0rc1", "1.0.dev3", "1.0.post1"] {
+        for v in ["1.0a1", "1.0b2", "1.0rc1", "1.0.dev3"] {
             assert!(is_prerelease(v, Ecosystem::Python), "{v}");
         }
         // The `[ab]\d` rule must not fire on non-Python ecosystems.
         assert!(!is_prerelease("1.0a1", Ecosystem::Rust));
         // A bare stable version is never a pre-release.
         assert!(!is_prerelease("1.0.0", Ecosystem::Python));
+    }
+
+    /// PEP 440 orders `1.0 < 1.0.post1`: a post-release is a *later* release of the same
+    /// version, not a preview of it. Treating it as unstable hid it from the default
+    /// filter, so a project on `1.0` was told it was current.
+    #[test]
+    fn a_python_post_release_is_not_a_prerelease() {
+        for v in ["1.0.post1", "1.0.post2", "2.1.post0"] {
+            assert!(!is_prerelease(v, Ecosystem::Python), "{v}");
+        }
+        // A post-release of a pre-release is still a pre-release.
+        assert!(is_prerelease("1.0rc1.post1", Ecosystem::Python));
+    }
+
+    /// The old substring test was wrong in both directions, and each direction cost
+    /// something: a missed pre-release is recommended as an upgrade, and a stable
+    /// release whose build metadata happens to read `-rc` is hidden from one.
+    #[test]
+    fn semver_versions_are_classified_by_parsing_not_by_substring() {
+        for v in [
+            "1.0.0-M1",
+            "1.0.0-CR2",
+            "1.0.0-unstable.3",
+            "1.0.0-0",
+            "4.0.0-insiders",
+        ] {
+            assert!(is_prerelease(v, Ecosystem::Rust), "{v}");
+        }
+        for v in ["1.2.3+build-rc", "1.2.3+alpha", "1.0.0", "10.20.30"] {
+            assert!(!is_prerelease(v, Ecosystem::Rust), "{v}");
+        }
     }
 
     #[test]

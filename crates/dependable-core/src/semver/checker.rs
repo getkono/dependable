@@ -62,17 +62,31 @@ pub fn check_version(constraint: &str, versions: &[String], locked_at: Option<&s
     // parse and being misreported. `--fix` still never rewrites the tag (see the
     // fix layer), so the manifest keeps tracking the channel.
     let req = match to_version_req(constraint) {
-        Ok(req) => Some(req),
-        Err(_) if is_latest_tag(constraint) => Some(VersionReq::STAR),
-        Err(_) => None,
+        Ok(req) => req,
+        // An absent requirement means "any version" — a bare `numpy` in a requirements
+        // file, or a manifest entry that names no range. `VersionReq` rejects the empty
+        // string, so the intent has to be spelled out.
+        Err(_) if constraint.trim().is_empty() => VersionReq::STAR,
+        Err(_) if is_latest_tag(constraint) => VersionReq::STAR,
+        // A constraint we cannot read is not an upgrade recommendation. It used to fall
+        // through as `UpdateAvailable`, which reads as "a newer version is waiting for
+        // you" — the one message a dependency whose requirement was never understood
+        // must not send. npm-native ranges (`^1 || ^2`, `>=1.0.0 <2.0.0`, `1.x`) all
+        // land here.
+        Err(e) => {
+            return Evaluation {
+                status: DependencyStatus::Error(format!("unparseable constraint: {e}")),
+                latest_compatible: None,
+                latest_available: Some(latest_available.to_string()),
+                patch_available: false,
+            };
+        }
     };
-    let latest_compatible = req
-        .as_ref()
-        .and_then(|r| parsed.iter().rev().find(|v| r.matches(v)).cloned());
+    let latest_compatible = parsed.iter().rev().find(|v| req.matches(v)).cloned();
     let locked = locked_at.and_then(|s| Version::parse(s).ok());
 
     // A locked version that no longer satisfies the declared constraint.
-    if let (Some(req), Some(locked)) = (req.as_ref(), locked.as_ref())
+    if let Some(locked) = locked.as_ref()
         && !req.matches(locked)
     {
         return Evaluation {
@@ -90,7 +104,15 @@ pub fn check_version(constraint: &str, versions: &[String], locked_at: Option<&s
         None => DependencyStatus::UpdateAvailable,
         Some(cur) if *cur >= latest_available => DependencyStatus::UpToDate,
         Some(cur) => match latest_compatible.as_ref() {
-            Some(lc) if lc > cur && lc.major == cur.major && lc.minor == cur.minor => {
+            // Under semver's 0.x rules the leftmost non-zero component is the breaking
+            // axis, so on `0.0.z` every bump is breaking and nothing there is a patch.
+            // Calling it one would hand `--fix` a green light it has not earned.
+            Some(lc)
+                if lc > cur
+                    && lc.major == cur.major
+                    && lc.minor == cur.minor
+                    && !(cur.major == 0 && cur.minor == 0) =>
+            {
                 DependencyStatus::PatchAvailable
             }
             _ => DependencyStatus::UpdateAvailable,
@@ -177,5 +199,67 @@ mod tests {
     fn latest_dist_tag_with_no_versions_still_errors() {
         let e = check_version("latest", &vers(&["not-a-version"]), None);
         assert!(matches!(e.status, DependencyStatus::Error(_)));
+    }
+
+    /// A requirement nobody could parse is not an upgrade recommendation. npm-native
+    /// ranges reach the Rust `semver` crate untranslated, and every one of them used to
+    /// come back as `UpdateAvailable` — indistinguishable from a real available upgrade.
+    #[test]
+    fn an_unparseable_constraint_is_an_error_not_an_upgrade() {
+        let versions = vec!["1.0.0".to_string(), "2.0.0".to_string()];
+        for constraint in [
+            "^1 || ^2",
+            ">=1.0.0 <2.0.0",
+            "next",
+            "not-a-range",
+            "workspace:^",
+        ] {
+            let ev = check_version(constraint, &versions, None);
+            assert!(
+                matches!(ev.status, DependencyStatus::Error(_)),
+                "{constraint} yielded {:?}",
+                ev.status
+            );
+            assert!(ev.latest_compatible.is_none(), "{constraint}");
+            // The registry answered, so what it said is still worth reporting.
+            assert_eq!(
+                ev.latest_available.as_deref(),
+                Some("2.0.0"),
+                "{constraint}"
+            );
+        }
+    }
+
+    /// An empty constraint is `*`, not an error — a bare `numpy` in a requirements file
+    /// is a legitimate declaration and must keep resolving.
+    #[test]
+    fn an_empty_constraint_still_resolves() {
+        let versions = vec!["1.0.0".to_string(), "2.0.0".to_string()];
+        let ev = check_version("", &versions, None);
+        assert!(
+            !matches!(ev.status, DependencyStatus::Error(_)),
+            "{:?}",
+            ev.status
+        );
+        assert_eq!(ev.latest_compatible.as_deref(), Some("2.0.0"));
+    }
+
+    /// Under semver's 0.x rules the leftmost non-zero component is the breaking axis, so
+    /// on `0.0.z` there is no compatible axis left and nothing is a patch.
+    #[test]
+    fn zero_zero_versions_have_no_patch_axis() {
+        let versions = vec!["0.0.3".to_string(), "0.0.4".to_string()];
+        let ev = check_version("^0.0.3", &versions, Some("0.0.3"));
+        assert_eq!(
+            ev.status,
+            DependencyStatus::UpdateAvailable,
+            "0.0.3 -> 0.0.4 is a breaking bump"
+        );
+        assert!(!ev.patch_available);
+
+        // `0.2.z` still has one: the patch component floats under `^0.2.3`.
+        let versions = vec!["0.2.3".to_string(), "0.2.9".to_string()];
+        let ev = check_version("^0.2.3", &versions, Some("0.2.3"));
+        assert_eq!(ev.status, DependencyStatus::PatchAvailable);
     }
 }
