@@ -158,6 +158,10 @@ pub struct Checker {
     /// Fetcher for [`PackageSource::Jsr`] items (a sub-registry of the npm
     /// ecosystem), used for Deno `jsr:` dependencies.
     jsr: Option<Arc<dyn RegistryFetcher>>,
+    /// Ecosystems that publish no registry and that the caller has nonetheless
+    /// asked to check. `registries` is the on switch for every ecosystem that has
+    /// a fetcher; this is the on switch for the ones that cannot have one.
+    registryless: HashSet<Ecosystem>,
     osv: Option<Arc<OsvClient>>,
     /// Whether `check_*` runs the advisory-enrichment post-pass. Off by default:
     /// enrichment costs one extra OSV request per vulnerable package version, so
@@ -564,7 +568,7 @@ impl Checker {
         // "is not enabled or not yet supported" rather than half-checked.
         let fetcher = match self.registries.get(&ecosystem) {
             Some(fetcher) => Some(fetcher.clone()),
-            None if !ecosystem.has_registry() => None,
+            None if !ecosystem.has_registry() && self.registryless.contains(&ecosystem) => None,
             None => return Err(CheckError::UnsupportedEcosystem(ecosystem)),
         };
 
@@ -1096,6 +1100,7 @@ pub struct CheckerBuilder {
     rust_alt_registries: Vec<(String, String, Option<String>)>,
     extra_registries: Vec<(Ecosystem, Arc<dyn RegistryFetcher>)>,
     jsr: Option<Arc<dyn RegistryFetcher>>,
+    registryless: Vec<Ecosystem>,
     vulnerabilities: bool,
     include_ghsa: bool,
     advisory_details: bool,
@@ -1118,6 +1123,7 @@ impl Default for CheckerBuilder {
             rust_alt_registries: Vec::new(),
             extra_registries: Vec::new(),
             jsr: None,
+            registryless: Vec::new(),
             vulnerabilities: true,
             include_ghsa: false,
             advisory_details: false,
@@ -1169,6 +1175,24 @@ impl CheckerBuilder {
     /// forward-compatible extension point for npm, PyPI, Go, and others.
     pub fn registry(mut self, ecosystem: Ecosystem, fetcher: Arc<dyn RegistryFetcher>) -> Self {
         self.extra_registries.push((ecosystem, fetcher));
+        self
+    }
+
+    /// Check an ecosystem that publishes no registry, and so has no fetcher to
+    /// register.
+    ///
+    /// For every other ecosystem [`CheckerBuilder::registry`] *is* the switch: a
+    /// `Checker` with no fetcher for one skips its manifests with
+    /// [`CheckError::UnsupportedEcosystem`]. An ecosystem with nothing to register
+    /// would otherwise have no off switch at all, and declining it has to stay
+    /// possible — the answers it gives are shaped differently from every other
+    /// ecosystem's, reporting *vulnerable* but never *outdated*.
+    ///
+    /// Off by default, exactly as every non-Rust ecosystem is. Passing an ecosystem
+    /// for which [`Ecosystem::has_registry`] is `true` does nothing: that ecosystem
+    /// is enabled by registering its fetcher.
+    pub fn registryless(mut self, ecosystem: Ecosystem) -> Self {
+        self.registryless.push(ecosystem);
         self
     }
 
@@ -1322,6 +1346,7 @@ impl CheckerBuilder {
             registries,
             rust_registries,
             jsr: self.jsr,
+            registryless: self.registryless.into_iter().collect(),
             osv,
             advisory_details: self.advisory_details,
             licenses: self.licenses,
@@ -1382,6 +1407,7 @@ mod tests {
     fn offline_checker() -> Checker {
         Checker::builder()
             .rust_registry("http://127.0.0.1:1".to_string(), None)
+            .registryless(Ecosystem::Swift)
             .vulnerabilities(false)
             .disk_cache(false)
             .build()
@@ -1452,6 +1478,30 @@ mod tests {
                 "{ecosystem:?} has a registry and was switched off, so it must be skipped, not checked"
             );
         }
+    }
+
+    /// Having no registry is not the same as being asked for. A caller that never
+    /// opted in gets the same skip every other unregistered ecosystem gets, which
+    /// is what gives `[swift] enabled = false` something to do.
+    #[tokio::test]
+    async fn a_registryless_ecosystem_not_asked_for_is_skipped() {
+        let checker = Checker::builder()
+            .rust_registry("http://127.0.0.1:1".to_string(), None)
+            .vulnerabilities(false)
+            .disk_cache(false)
+            .build()
+            .expect("a checker builds without a network");
+
+        let outcome = checker
+            .check_manifest(ManifestKind::PackageSwift, "", Some(PACKAGE_RESOLVED))
+            .await;
+        assert!(
+            matches!(
+                outcome,
+                Err(CheckError::UnsupportedEcosystem(Ecosystem::Swift))
+            ),
+            "an ecosystem nobody asked for is off, registry or no registry"
+        );
     }
 
     /// Two ways to have no fetcher, two different answers. This is the pair a
