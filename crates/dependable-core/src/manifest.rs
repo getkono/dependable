@@ -232,11 +232,18 @@ pub struct UnreadableLockfile {
     pub reason: &'static str,
 }
 
+/// Where a Gradle build declares its subprojects.
+///
+/// This is the file that makes a directory below it *part of this build* rather
+/// than a separate one, which is what lets a build root's catalog speak for a
+/// subdirectory that has no catalog of its own.
+const GRADLE_SETTINGS: &[&str] = &["settings.gradle.kts", "settings.gradle"];
+
 /// Where a Gradle build root announces itself.
 ///
-/// `settings.gradle*` is the definition — it is the file that names the
-/// subprojects — and a catalog is included because a single-project build has a
-/// catalog and often no settings file at all.
+/// [`GRADLE_SETTINGS`] is the definition, and a catalog is included because a
+/// single-project build has a catalog and often no settings file at all — it is
+/// still a build root, and the walk out of a subdirectory must not cross it.
 const GRADLE_BUILD_ROOTS: &[&str] = &[
     "settings.gradle.kts",
     "settings.gradle",
@@ -257,6 +264,7 @@ const GRADLE_BUILD_SCRIPTS: &[UnreadableManifest] = &[
                  Declare dependencies in `gradle/libs.versions.toml` to have them checked.",
         superseded_by: &["gradle/libs.versions.toml"],
         build_root_markers: GRADLE_BUILD_ROOTS,
+        subproject_markers: GRADLE_SETTINGS,
         ecosystem: Ecosystem::Jvm,
     },
     UnreadableManifest {
@@ -265,6 +273,7 @@ const GRADLE_BUILD_SCRIPTS: &[UnreadableManifest] = &[
                  Declare dependencies in `gradle/libs.versions.toml` to have them checked.",
         superseded_by: &["gradle/libs.versions.toml"],
         build_root_markers: GRADLE_BUILD_ROOTS,
+        subproject_markers: GRADLE_SETTINGS,
         ecosystem: Ecosystem::Jvm,
     },
 ];
@@ -308,6 +317,17 @@ pub struct UnreadableManifest {
     /// repository boundary), so supersession never resolves against an unrelated
     /// build further up the tree.
     pub build_root_markers: &'static [&'static str],
+    /// File names an **ancestor** must hold for its readable alternative to cover
+    /// this directory as well.
+    ///
+    /// A build root's catalog serves the subprojects that build root declares, and
+    /// `settings.gradle*` is where they are declared. Without this test a
+    /// single-project build at the repository root — a catalog, no settings file —
+    /// silently absorbs any other build script anywhere beneath it, and the one
+    /// script whose dependencies really are unread is the one nobody is told about.
+    /// A readable alternative sitting *beside* the unreadable file needs no such
+    /// evidence: it is the same directory.
+    pub subproject_markers: &'static [&'static str],
     /// The ecosystem this manifest belongs to, so a scan can stay quiet about an
     /// ecosystem the user has turned off — a warning about an unread manifest is
     /// advice to enable something, and it is noise for someone who disabled it.
