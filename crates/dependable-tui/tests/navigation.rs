@@ -19,7 +19,7 @@ fn project(label: &str, packages: &[(&str, &str, &[&str])]) -> Project {
         .map(|(i, (name, version, deps))| {
             LockedPackage::new(
                 (*name).to_owned(),
-                (*version).to_owned(),
+                Some((*version).to_owned()),
                 // The first package is the project itself; the rest are external.
                 (i > 0).then(|| "registry+https://example.com".to_owned()),
                 deps.iter().map(|d| (*d).to_owned()).collect(),
@@ -47,7 +47,7 @@ fn workspace(label: &str, members: usize, packages: &[(&str, &str, &[&str])]) ->
         .map(|(i, (name, version, deps))| {
             LockedPackage::new(
                 (*name).to_owned(),
-                (*version).to_owned(),
+                Some((*version).to_owned()),
                 // A member has no `source`; everything else came from a registry.
                 (i >= members).then(|| "registry+https://example.com".to_owned()),
                 deps.iter().map(|d| (*d).to_owned()).collect(),
@@ -581,7 +581,7 @@ fn a_registry_namesake_of_a_member_still_expands_in_the_tree() {
     app.apply(Action::Expand); // a -> the registry `b`
 
     let namesake = &app.rows()[2];
-    assert_eq!(namesake.version, "9.0.0");
+    assert_eq!(namesake.version.as_deref(), Some("9.0.0"));
     assert!(
         namesake.redirect.is_none(),
         "the registry crate has no top-level entry of its own"

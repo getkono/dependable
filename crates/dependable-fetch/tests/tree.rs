@@ -193,15 +193,15 @@ fn duplicate_versions_are_distinct_nodes() {
     write_workspace(tmp.path());
     write_lockfile(tmp.path());
     let built = build_workspace_graph(tmp.path(), &WorkspaceGraphOptions::default()).unwrap();
-    let versions: Vec<&str> = built
+    let versions: Vec<Option<&str>> = built
         .graph
         .nodes()
         .iter()
         .filter(|n| n.name == "syn")
-        .map(|n| n.version.as_str())
+        .map(|n| n.version.as_deref())
         .collect();
-    assert!(versions.contains(&"1.0.0"));
-    assert!(versions.contains(&"2.0.0"));
+    assert!(versions.contains(&Some("1.0.0")));
+    assert!(versions.contains(&Some("2.0.0")));
 }
 
 #[test]
@@ -241,6 +241,160 @@ fn falls_back_to_shallow_graph_without_lockfile() {
     let a = flat.iter().position(|(n, _)| n == "a");
     assert!(a.is_some());
     assert!(flat.iter().any(|(n, _)| n == "b"));
+
+    // A member's own version is declared, not resolved: `crates/a` says
+    // `version = "0.1.0"` and that *is* what the crate is, lockfile or not.
+    let version_of = |name: &str| {
+        g.nodes()
+            .iter()
+            .find(|n| n.name == name)
+            .unwrap_or_else(|| panic!("a node for {name}"))
+            .version
+            .as_deref()
+    };
+    assert_eq!(version_of("a"), Some("0.1.0"));
+    assert_eq!(version_of("b"), Some("0.1.0"));
+    assert_eq!(version_of("c"), Some("0.1.0"));
+
+    // A dependency is the other case: the manifest declares a constraint, and
+    // nothing here resolved it. The graph says so rather than recording a blank
+    // string that reads downstream as a version.
+    assert_eq!(version_of("serde"), None);
+    assert_eq!(version_of("gitdep"), None);
+    assert!(
+        g.nodes().iter().all(|n| n.version != Some(String::new())),
+        "and never the empty string"
+    );
+}
+
+/// A member with `version.workspace = true` still has a version — the root's
+/// `[workspace.package]` declares it, and the root is already read here. Reading
+/// only the literal would report every member of a version-inheriting workspace
+/// as unknown, which is the majority shape for a Cargo workspace.
+#[test]
+fn a_member_inheriting_its_version_from_the_workspace_root_still_reports_one() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    fs::write(
+        dir.join("Cargo.toml"),
+        r#"
+[workspace]
+resolver = "2"
+members = ["crates/a"]
+
+[workspace.package]
+version = "3.1.4"
+"#,
+    )
+    .unwrap();
+    let crate_dir = dir.join("crates").join("a");
+    fs::create_dir_all(&crate_dir).unwrap();
+    fs::write(
+        crate_dir.join("Cargo.toml"),
+        r#"
+[package]
+name = "a"
+version.workspace = true
+"#,
+    )
+    .unwrap();
+
+    let built = build_workspace_graph(dir, &WorkspaceGraphOptions::default()).unwrap();
+    assert_eq!(built.source, GraphSource::Manifests);
+    let a = built
+        .graph
+        .nodes()
+        .iter()
+        .find(|n| n.name == "a")
+        .expect("a node for the member");
+    assert_eq!(a.version.as_deref(), Some("3.1.4"));
+}
+
+/// The walk descends into a nested, **independent** workspace — a `cargo fuzz` or
+/// `examples/` tree with its own `[workspace]` — because Cargo already ignores such
+/// a subtree, so nobody lists it in `[workspace] exclude`. The outer root has no
+/// authority over those crates, so its `[workspace.package] version` must not be
+/// handed to them: that would turn "no version" into a confidently wrong one.
+/// A version the nested crate states outright is still its own, and still reported.
+#[test]
+fn a_nested_independent_workspace_does_not_inherit_the_outer_roots_version() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    fs::write(
+        dir.join("Cargo.toml"),
+        r#"
+[workspace]
+resolver = "2"
+members = ["crates/a"]
+
+[workspace.package]
+version = "1.0.0"
+"#,
+    )
+    .unwrap();
+    let member = dir.join("crates").join("a");
+    fs::create_dir_all(&member).unwrap();
+    fs::write(
+        member.join("Cargo.toml"),
+        r#"
+[package]
+name = "a"
+version.workspace = true
+"#,
+    )
+    .unwrap();
+    let fuzz = dir.join("fuzz");
+    fs::create_dir_all(&fuzz).unwrap();
+    fs::write(
+        fuzz.join("Cargo.toml"),
+        r#"
+[workspace]
+
+[workspace.package]
+version = "0.0.0"
+
+[package]
+name = "a-fuzz"
+version.workspace = true
+"#,
+    )
+    .unwrap();
+    // A crate below the nested root is out of reach too, however deep.
+    let inner = fuzz.join("crates").join("stated");
+    fs::create_dir_all(&inner).unwrap();
+    fs::write(
+        inner.join("Cargo.toml"),
+        r#"
+[package]
+name = "a-fuzz-stated"
+version = "7.7.7"
+"#,
+    )
+    .unwrap();
+
+    let built = build_workspace_graph(dir, &WorkspaceGraphOptions::default()).unwrap();
+    assert_eq!(built.source, GraphSource::Manifests);
+    let version_of = |name: &str| {
+        built
+            .graph
+            .nodes()
+            .iter()
+            .find(|n| n.name == name)
+            .unwrap_or_else(|| panic!("a node for {name}"))
+            .version
+            .clone()
+    };
+    assert_eq!(version_of("a").as_deref(), Some("1.0.0"));
+    assert_eq!(
+        version_of("a-fuzz"),
+        None,
+        "the outer root does not govern a nested workspace's crate"
+    );
+    assert_eq!(
+        version_of("a-fuzz-stated").as_deref(),
+        Some("7.7.7"),
+        "but a version the crate states outright is still its own"
+    );
 }
 
 /// Without a lockfile the graph is built from manifests alone, and a member's

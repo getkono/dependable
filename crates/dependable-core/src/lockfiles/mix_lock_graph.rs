@@ -79,7 +79,7 @@ pub fn parse_mix_lock_graph(content: &str) -> Result<ResolvedLockfile, ParseErro
 
         packages.push(LockedPackage::new(
             name,
-            version,
+            Some(version),
             Some(HEX_SOURCE.to_owned()),
             dependencies,
         ));
@@ -195,7 +195,7 @@ mod tests {
         let mut found: Vec<(&str, &str)> = resolved
             .packages
             .iter()
-            .map(|p| (p.name.as_str(), p.version.as_str()))
+            .map(|p| (p.name.as_str(), p.version.as_deref().unwrap_or_default()))
             .collect();
         found.sort_unstable();
         assert_eq!(

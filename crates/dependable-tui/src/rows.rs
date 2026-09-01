@@ -56,8 +56,15 @@ pub struct Row {
     pub node: Option<usize>,
     /// Display name.
     pub name: String,
-    /// Resolved version, empty when unknown.
-    pub version: String,
+    /// The version this row is at, or `None` when nothing read one — a project
+    /// row, or a dependency in a graph built from manifests alone, where the
+    /// manifest declared a constraint and nothing resolved it.
+    ///
+    /// An [`Option`] rather than an empty string, and never `Some("")`, because
+    /// the difference is a difference in what the UI may claim: a known version
+    /// can be compared against the registry, and an unknown one can only be
+    /// reported as unknown.
+    pub version: Option<String>,
     /// How the node relates to the workspace; `None` for a project row.
     pub node_kind: Option<NodeKind>,
     /// Whether the row has children to expand.
@@ -100,7 +107,7 @@ pub fn visible(
             project: index,
             node: None,
             name: project.label.clone(),
-            version: String::new(),
+            version: None,
             node_kind: None,
             has_children: !project.graph.roots().is_empty(),
             expanded: is_open,

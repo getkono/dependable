@@ -108,7 +108,8 @@ pub fn build_workspace_graph(
 
     let excluded = excluded_dirs(&root_dir, &root_content);
     let members = collect_members(&root_dir, &excluded);
-    let workspace_names: HashSet<String> = members.iter().map(|(name, _)| name.clone()).collect();
+    let workspace_names: HashSet<String> =
+        members.iter().map(|member| member.name.clone()).collect();
 
     let roots: Vec<String> = match &opts.package {
         Some(pkg) => vec![pkg.clone()],
@@ -166,23 +167,51 @@ fn excluded_dirs(root_dir: &Path, root_content: &str) -> HashSet<PathBuf> {
         .unwrap_or_default()
 }
 
-/// Collect `(package name, manifest content)` for every crate under `root_dir`,
-/// deduplicated by name. A crate is treated as in-workspace iff its
-/// `[package] name` appears here — this sidesteps needing a glob engine.
-fn collect_members(root_dir: &Path, excluded: &HashSet<PathBuf>) -> Vec<(String, String)> {
+/// A crate manifest found under the scan root.
+struct Member {
+    /// The crate's `[package] name`.
+    name: String,
+    /// The manifest's text.
+    content: String,
+    /// Whether the scan root is this crate's **nearest** `[workspace]` ancestor,
+    /// and so whether the root's `[workspace.package]` table governs it.
+    ///
+    /// False for a crate inside a nested, independent workspace — a `fuzz/` or
+    /// `examples/` directory with its own `[workspace]` table. Cargo resolves
+    /// those against *their* root; the scan root has no authority over them.
+    governed_by_root: bool,
+}
+
+/// Collect a [`Member`] for every crate under `root_dir`, deduplicated by name.
+/// A crate is treated as in-workspace iff its `[package] name` appears here —
+/// this sidesteps needing a glob engine.
+fn collect_members(root_dir: &Path, excluded: &HashSet<PathBuf>) -> Vec<Member> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
-    walk_members(root_dir, excluded, &mut seen, &mut out, 64);
+    walk_members(root_dir, root_dir, excluded, &mut seen, &mut out, 64, true);
     out
+}
+
+/// Whether `dir` holds a `Cargo.toml` declaring a `[workspace]` table.
+fn declares_workspace(dir: &Path) -> bool {
+    std::fs::read_to_string(dir.join("Cargo.toml"))
+        .is_ok_and(|content| parse_workspace(&content).is_some())
 }
 
 fn walk_members(
     dir: &Path,
+    root_dir: &Path,
     excluded: &HashSet<PathBuf>,
     seen: &mut HashSet<String>,
-    out: &mut Vec<(String, String)>,
+    out: &mut Vec<Member>,
     depth_left: usize,
+    governed: bool,
 ) {
+    // A nested `[workspace]` is a workspace root in its own right. Cargo already
+    // ignores such a subtree, so nobody lists it in `[workspace] exclude`, and the
+    // walk still descends into it — but the scan root's `[workspace.package]` has
+    // no authority there, so nothing at or below this manifest may inherit from it.
+    let governed = governed && (dir == root_dir || !declares_workspace(dir));
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -197,21 +226,44 @@ fn walk_members(
             {
                 continue;
             }
-            walk_members(&path, excluded, seen, out, depth_left - 1);
+            walk_members(
+                &path,
+                root_dir,
+                excluded,
+                seen,
+                out,
+                depth_left - 1,
+                governed,
+            );
         } else if path.file_name().and_then(|n| n.to_str()) == Some("Cargo.toml")
             && let Ok(content) = std::fs::read_to_string(&path)
             && let Some(name) = parse_package_name(&content)
             && seen.insert(name.clone())
         {
-            out.push((name, content));
+            out.push(Member {
+                name,
+                content,
+                governed_by_root: governed,
+            });
         }
     }
 }
 
 /// Build a shallow graph from member manifests when there is no `Cargo.lock`:
-/// each member plus its direct declared dependencies, versions unresolved.
+/// each member plus its direct declared dependencies.
+///
+/// A member's *own* version is read from its `[package] version` — a path member
+/// is not resolved against anything, so what the manifest declares **is** its
+/// version, whether or not a lockfile exists. Its dependencies are a different
+/// matter: a manifest declares a constraint, not a resolution, so those stay
+/// unknown.
+///
+/// `version.workspace = true` is resolved against the root's `[workspace.package]`
+/// only for a member the root actually governs (see [`Member::governed_by_root`]).
+/// A crate in a nested, independent workspace keeps no version at all: reporting
+/// nothing is honest, where borrowing an unrelated root's number would not be.
 fn shallow_graph(
-    members: &[(String, String)],
+    members: &[Member],
     workspace_names: &HashSet<String>,
     roots: &[String],
     root_content: &str,
@@ -227,13 +279,18 @@ fn shallow_graph(
         .into_iter()
         .filter(|item| item.kind == DependencyKind::Workspace)
         .collect();
+    // `[workspace.package]`, the source a member's `version.workspace = true`
+    // inherits from. A member that inherits its version still has one.
+    let package_defaults = parse_workspace(root_content)
+        .map(|ws| ws.package_defaults)
+        .unwrap_or_default();
     let mut member_pkgs: Vec<LockedPackage> = Vec::new();
     let mut external_pkgs: Vec<LockedPackage> = Vec::new();
     let mut external_seen: HashSet<String> = HashSet::new();
 
-    for (name, content) in members {
+    for member in members {
         let mut items = CargoTomlParser
-            .parse(content)
+            .parse(&member.content)
             .map(|m| m.items)
             .unwrap_or_default();
         let _ = resolve_workspace_inheritance(&mut items, &declarations);
@@ -252,7 +309,9 @@ fn shallow_graph(
                 };
                 external_pkgs.push(LockedPackage::new(
                     item.name.clone(),
-                    String::new(),
+                    // A manifest declares a constraint, not a resolved version;
+                    // nothing here read one.
+                    None,
                     source,
                     Vec::new(),
                 ));
@@ -260,7 +319,24 @@ fn shallow_graph(
         }
         deps.sort();
         deps.dedup();
-        member_pkgs.push(LockedPackage::new(name.clone(), String::new(), None, deps));
+        // The member's declared version, inherited one included. Unlike a
+        // dependency's constraint this is not a range to resolve — it is what
+        // this crate is — so leaving it unknown would understate what the
+        // manifest already said.
+        let version = parse_project(ManifestKind::CargoToml, &member.content)
+            .version
+            .as_ref()
+            .and_then(|field| {
+                if member.governed_by_root {
+                    field.resolve(&package_defaults, "version")
+                } else {
+                    // Not this root's crate to resolve — take only what its own
+                    // manifest states outright.
+                    field.literal()
+                }
+            })
+            .map(str::to_owned);
+        member_pkgs.push(LockedPackage::new(member.name.clone(), version, None, deps));
     }
 
     member_pkgs.append(&mut external_pkgs);
@@ -307,7 +383,9 @@ pub fn build_project_graph(
         .clone()
         .or_else(|| project_name_from_path(manifest))
         .unwrap_or_else(|| kind.ecosystem().display_name().to_owned());
-    let root_version = meta.literal_version().unwrap_or_default().to_owned();
+    // A manifest that declares no version of its own — a `pom.xml` inheriting
+    // from a `<parent>`, a `*.csproj` — leaves this unknown rather than blank.
+    let root_version: Option<String> = meta.literal_version().map(str::to_owned);
 
     // The project's own declared dependencies, used as the root's edges whenever the
     // lockfile carries no entry for the project itself.
@@ -322,7 +400,13 @@ pub fn build_project_graph(
     };
 
     if !has_graph_parser(kind) {
-        let graph = direct_graph(&root_name, &root_version, &direct, &workspace_names, &roots);
+        let graph = direct_graph(
+            &root_name,
+            root_version.as_deref(),
+            &direct,
+            &workspace_names,
+            &roots,
+        );
         return Ok(WorkspaceGraph {
             graph,
             source: GraphSource::Unsupported,
@@ -330,7 +414,13 @@ pub fn build_project_graph(
     }
 
     let Some((lock_path, lock_kind)) = crate::discover::locate_lockfile(manifest, kind) else {
-        let graph = direct_graph(&root_name, &root_version, &direct, &workspace_names, &roots);
+        let graph = direct_graph(
+            &root_name,
+            root_version.as_deref(),
+            &direct,
+            &workspace_names,
+            &roots,
+        );
         // Distinguish "there is none" from "there is one we cannot use".
         let source = if crate::discover::lockfile_notices(manifest, kind).is_empty() {
             GraphSource::Manifests
@@ -343,7 +433,13 @@ pub fn build_project_graph(
     // The manifest has *a* format we can read edges from, but the one actually
     // on disk may not be it.
     let Some(parser) = graph_parser(lock_kind) else {
-        let graph = direct_graph(&root_name, &root_version, &direct, &workspace_names, &roots);
+        let graph = direct_graph(
+            &root_name,
+            root_version.as_deref(),
+            &direct,
+            &workspace_names,
+            &roots,
+        );
         return Ok(WorkspaceGraph {
             graph,
             source: GraphSource::Unsupported,
@@ -351,7 +447,7 @@ pub fn build_project_graph(
     };
 
     let resolved = parser(&read(&lock_path)?)?;
-    let resolved = with_root(resolved, &root_name, &root_version, direct);
+    let resolved = with_root(resolved, &root_name, root_version.as_deref(), direct);
     Ok(WorkspaceGraph {
         graph: DependencyGraph::from_resolved(&resolved, &workspace_names, &roots),
         source: GraphSource::Lockfile,
@@ -394,7 +490,7 @@ fn has_graph_parser(kind: ManifestKind) -> bool {
 fn with_root(
     mut resolved: ResolvedLockfile,
     root_name: &str,
-    root_version: &str,
+    root_version: Option<&str>,
     direct: Vec<String>,
 ) -> ResolvedLockfile {
     if let Some(existing) = resolved
@@ -412,7 +508,7 @@ fn with_root(
     }
     let mut packages = vec![LockedPackage::new(
         root_name.to_owned(),
-        root_version.to_owned(),
+        root_version.map(str::to_owned),
         None,
         direct,
     )];
@@ -424,14 +520,14 @@ fn with_root(
 /// unresolved. Used when no resolved graph is available.
 fn direct_graph(
     root_name: &str,
-    root_version: &str,
+    root_version: Option<&str>,
     direct: &[String],
     workspace_names: &HashSet<String>,
     roots: &[String],
 ) -> DependencyGraph {
     let mut packages = vec![LockedPackage::new(
         root_name.to_owned(),
-        root_version.to_owned(),
+        root_version.map(str::to_owned),
         None,
         direct.to_vec(),
     )];
@@ -440,7 +536,9 @@ fn direct_graph(
         if name != root_name && seen.insert(name.as_str()) {
             packages.push(LockedPackage::new(
                 name.clone(),
-                String::new(),
+                // A manifest names its dependencies; nothing here resolved one
+                // to a version, and saying so is the point of the `None`.
+                None,
                 Some("registry+".to_owned()),
                 Vec::new(),
             ));
