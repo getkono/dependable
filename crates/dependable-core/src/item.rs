@@ -47,11 +47,16 @@ impl Item {
     /// nothing to ask a registry for; a check reports such an item as
     /// [`Undetermined`](crate::result::DependencyStatus::Undetermined) rather than
     /// claiming it has no registry.
+    ///
+    /// A [`Locked`](PackageSource::Locked) item is read the same way and for the same
+    /// reason: the version is real and worth asking a registry about, it simply was
+    /// not written here. A lockfile entry that recorded no version at all — a branch
+    /// pin — states nothing to check either.
     #[must_use]
     pub fn is_checkable(&self) -> bool {
         match self.source {
             PackageSource::Registry | PackageSource::Jsr => true,
-            PackageSource::Inherited => !self.version_constraint.is_empty(),
+            PackageSource::Inherited | PackageSource::Locked => !self.version_constraint.is_empty(),
             _ => false,
         }
     }
@@ -62,14 +67,25 @@ impl Item {
     /// Since `0` is a legal line and column index, an unrecorded span is indistinguishable
     /// from a real one by value; it has to be inferred from the source instead. Every
     /// parser that declines to record a span also gives the item a source nothing would
-    /// fetch, so [`is_checkable`](Self::is_checkable) covers all of them but one: a
+    /// fetch, so [`is_checkable`](Self::is_checkable) covers all of them but two: a
     /// resolved [`Inherited`](PackageSource::Inherited) item is worth checking and still
     /// has no home here, because the version string it was resolved from belongs to
     /// another entry — a workspace root's table, a catalog `[versions]` alias, a shared
-    /// POM `<properties>` value.
+    /// POM `<properties>` value — and a [`Locked`](PackageSource::Locked) item is worth
+    /// checking with no manifest entry anywhere to belong to.
+    ///
+    /// Both are named here explicitly rather than inferred from anything about the
+    /// item, so a source added later starts out *without* a position and has to be
+    /// added to this list deliberately. Getting that wrong is not a compile error: it
+    /// silently hands the new source line `0` of this file, points reporters at it,
+    /// and lets [`is_rewritable`](Self::is_rewritable) write over it.
     #[must_use]
     pub fn has_position(&self) -> bool {
-        self.is_checkable() && self.source != PackageSource::Inherited
+        self.is_checkable()
+            && !matches!(
+                self.source,
+                PackageSource::Inherited | PackageSource::Locked
+            )
     }
 
     /// Whether the recorded span may be rewritten in place — it points here, and there is
@@ -162,8 +178,9 @@ pub enum PackageSource {
     Local,
     /// A git dependency — skipped for version checks.
     Git,
-    /// The dependency's version is declared somewhere other than this entry, so
-    /// there is no version string here to check against or to rewrite.
+    /// The dependency's version is declared **elsewhere in a manifest** — another
+    /// entry, another table, another file — so there is no version string on this
+    /// entry to check against or to rewrite.
     ///
     /// Three parsers emit it, for the same reason and with the same consequences:
     ///
@@ -189,7 +206,32 @@ pub enum PackageSource {
     /// would rewrite is not this dependency's own. Empty, no version was found at
     /// all, and a check reports
     /// [`DependencyStatus::Undetermined`](crate::result::DependencyStatus::Undetermined).
+    ///
+    /// A version that came from a *lockfile* is [`Locked`](Self::Locked), not this. It
+    /// was never declared, so there is no central declaration for a consumer reading
+    /// `inherited` to go and bump.
     Inherited,
+    /// The version came from a **lockfile**, and no manifest declares it anywhere.
+    ///
+    /// SwiftPM is the case that needs it. A `Package.swift` is a Swift *program*, so
+    /// this crate declines to read dependencies out of it; the entries come from
+    /// `Package.resolved` instead, which records what the resolver picked and nothing
+    /// about what was asked for. The package is real and published, so it is worth
+    /// checking and worth scanning for advisories — but there is no manifest span
+    /// anywhere to point at or to rewrite, which is what
+    /// [`has_position`](Item::has_position) reads the source to decide.
+    ///
+    /// Mechanically identical to [`Inherited`](Self::Inherited)
+    /// ([`is_checkable`](Item::is_checkable) without
+    /// [`has_position`](Item::has_position)), and kept apart from it because the two
+    /// tell a consumer different things. *Inherited* invites going to the central
+    /// declaration and bumping it; a locked entry has no such declaration, and a
+    /// consumer filtering on it would be chasing a file that does not exist.
+    ///
+    /// Distinct from a [`Registry`](Self::Registry) item that merely carries a
+    /// [`locked_version`](Item::locked_version): that one was declared, was read from
+    /// a manifest, and has a span. This one has no declaration behind it at all.
+    Locked,
 }
 
 #[cfg(test)]
@@ -248,6 +290,38 @@ mod tests {
             assert!(!item.has_position(), "{name}");
             assert!(!item.is_rewritable(), "{name}");
         }
+    }
+
+    /// The invariant `Locked` exists to hold. It has to behave exactly as `Inherited`
+    /// does — checked, never pointed at, never rewritten — and nothing in the compiler
+    /// enforces that: `PackageSource` is `#[non_exhaustive]` and every match on it
+    /// carries a wildcard arm, so a `Locked` that fell through `is_checkable` would
+    /// stop being checked, and one omitted from `has_position` would silently claim
+    /// line 1 of a file that never declared it and become rewritable by `--fix`.
+    #[test]
+    fn a_locked_item_is_checkable_and_has_no_position() {
+        let mut item = find(&items("[dependencies]\nserde = \"1.0.200\"\n"), "serde");
+        item.source = PackageSource::Locked;
+        item.locked_version = Some("1.0.200".to_owned());
+
+        assert!(
+            item.is_checkable(),
+            "a lockfile pin is a real version to check"
+        );
+        assert!(
+            !item.has_position(),
+            "no manifest declared it, so no line may be pointed at"
+        );
+        assert!(
+            !item.is_rewritable(),
+            "`--fix` has nothing here to write to"
+        );
+
+        item.version_constraint.clear();
+        assert!(
+            !item.is_checkable(),
+            "a pin with no version recorded states nothing to check"
+        );
     }
 
     /// An inherited dependency is checkable once — and only once — the workspace root
