@@ -722,7 +722,17 @@ fn workspace_package_defaults(
     if kind != ManifestKind::CargoToml {
         return None;
     }
-    let (_, _, content) = nearest_workspace_root(manifest, kind)?;
+    let (_, root_kind, content) = nearest_workspace_root(manifest, kind)?;
+    // Checked rather than assumed. Cargo's descriptor names one candidate today, so
+    // this always holds — but pairing a kind with each candidate name is precisely
+    // what makes a second candidate of another kind possible, and reading someone
+    // else's file as a `[workspace.package]` table would answer with its contents
+    // instead of declining. Every other caller now uses the kind the walk returned;
+    // this one hard-codes Cargo because scalar inheritance is Cargo-only, so the
+    // guard is how it says so.
+    if root_kind != ManifestKind::CargoToml {
+        return None;
+    }
     Some(parse_workspace(&content)?.package_defaults)
 }
 
