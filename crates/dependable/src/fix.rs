@@ -155,9 +155,21 @@ fn rewrite_constraint(original: &str, new_version: &str) -> Option<String> {
 
 /// Whether `rest` — a constraint with its leading operator prefix already
 /// stripped — floats over a range of versions rather than naming one.
+///
+/// A wildcard segment is not always the whole dot-segment: Composer appends a
+/// stability flag to the constraint (`2.8.*@dev`), which qualifies the range
+/// rather than forming part of a version, so it is cut off before the segments
+/// are read. `*` and `+` are then matched by their leading character too, since
+/// neither can legitimately begin a version segment — semver build metadata and
+/// Go's `+incompatible` attach their `+` to the end of a numeric segment
+/// (`0+incompatible`), never the start. `x`/`X` stay an exact whole-segment
+/// match, because a letter *can* legitimately lead a segment inside a prerelease
+/// or build identifier (`1.0.0-alpha+exp.sha.5114f85`).
 fn is_wildcard(rest: &str) -> bool {
-    rest.split('.')
-        .any(|segment| matches!(segment, "*" | "x" | "X" | "+"))
+    let versionish = rest.split('@').next().unwrap_or(rest);
+    versionish
+        .split('.')
+        .any(|segment| matches!(segment, "x" | "X") || segment.starts_with(['*', '+']))
 }
 
 /// Apply byte-range edits to `content`, operating per line. Edits on the same
@@ -258,6 +270,78 @@ mod tests {
         assert_eq!(rewrite_constraint("*", "2.0.0"), None);
     }
 
+    /// A wildcard segment is not always the whole dot-segment. Composer allows a
+    /// stability flag after the constraint, so `"symfony/symfony": "2.8.*@dev"`
+    /// splits into `["2", "8", "*@dev"]` — no segment *equals* a wildcard, and a
+    /// whole-segment guard hands back `7.0.0`, an exact pin in Composer that
+    /// destroys both the wildcard and the stability flag. That is issue #87 one
+    /// flag away from the guard.
+    #[test]
+    fn rewrite_declines_a_wildcard_wearing_a_stability_flag() {
+        assert_eq!(rewrite_constraint("2.8.*@dev", "7.0.0"), None);
+        assert_eq!(rewrite_constraint("2.8.x@dev", "7.0.0"), None);
+        assert_eq!(rewrite_constraint("1.*@stable", "7.0.0"), None);
+        assert_eq!(rewrite_constraint("*@dev", "7.0.0"), None);
+        assert_eq!(rewrite_constraint("^2.8.*@dev", "7.0.0"), None);
+    }
+
+    /// The other side of the guard: every concrete form the shipped parsers
+    /// actually emit must stay rewritable. A wildcard test that also swallowed
+    /// build metadata, a Go pseudo-version, or a prerelease identifier would
+    /// silently stop `fix` from working on ordinary dependencies, so each shape
+    /// is asserted by name.
+    #[test]
+    fn rewrite_leaves_every_concrete_version_form_rewritable() {
+        // Go: a pseudo-version and the `+incompatible` marker.
+        assert_eq!(
+            rewrite_constraint("v0.0.0-20191109021931-daa7c04131f5", "1.5.0").as_deref(),
+            Some("v1.5.0")
+        );
+        assert_eq!(
+            rewrite_constraint("v2.0.0+incompatible", "1.5.0").as_deref(),
+            Some("v1.5.0")
+        );
+        // Semver build metadata and prereleases — note the dotted identifiers,
+        // which a leading-character test for `x` would have to survive.
+        assert_eq!(
+            rewrite_constraint("1.2.3+build.5", "1.5.0").as_deref(),
+            Some("1.5.0")
+        );
+        assert_eq!(
+            rewrite_constraint("1.0.0-alpha+exp.sha.5114f85", "1.5.0").as_deref(),
+            Some("1.5.0")
+        );
+        // From the semver spec itself: a prerelease whose identifiers include `x`.
+        assert_eq!(
+            rewrite_constraint("1.0.0-x.7.z.92", "1.5.0").as_deref(),
+            Some("1.5.0")
+        );
+        // NuGet's four-part version.
+        assert_eq!(
+            rewrite_constraint("1.0.0.4", "1.5.0").as_deref(),
+            Some("1.5.0")
+        );
+        // Python epochs and compatible-release operators.
+        assert_eq!(
+            rewrite_constraint("1!2.0", "1.5.0").as_deref(),
+            Some("1.5.0")
+        );
+        assert_eq!(
+            rewrite_constraint("~=1.4", "1.5.0").as_deref(),
+            Some("~=1.5.0")
+        );
+        // Hex's `~>`, whose space belongs to the operator prefix.
+        assert_eq!(
+            rewrite_constraint("~> 1.0", "1.5.0").as_deref(),
+            Some("~> 1.5.0")
+        );
+        // Declined already, and for a different reason: NuGet's bracketed range
+        // holds a comma. The wildcard guard must not change that verdict.
+        assert_eq!(rewrite_constraint("[1.0,2.0)", "1.5.0"), None);
+        // Python's `==1.*` is a wildcard, and stays declined.
+        assert_eq!(rewrite_constraint("==1.*", "1.5.0"), None);
+    }
+
     #[test]
     fn rewrite_skips_space_and_pipe_compound_constraints() {
         // npm / pubspec space-separated ranges and `||` alternations can't collapse
@@ -312,7 +396,9 @@ mod tests {
     };
 
     /// Parse `content`, then build an `UpdateAvailable` result with the given
-    /// compatible target for each named dependency — enough to drive `plan_fixes`.
+    /// target for each named dependency — enough to drive `plan_fixes`. The target
+    /// fills both `latest_compatible` and `latest_available`, so the same fixture
+    /// drives the default path and the `--all` path, which read different fields.
     fn results_for(
         kind: ManifestKind,
         content: &str,
@@ -329,6 +415,7 @@ mod tests {
                     .map(|(_, target)| {
                         let mut result = CheckResult::new(item, DependencyStatus::UpdateAvailable);
                         result.latest_compatible = Some((*target).to_string());
+                        result.latest_available = Some((*target).to_string());
                         result
                     })
             })
@@ -524,5 +611,59 @@ mod tests {
 
         assert!(records.is_empty(), "{records:?}");
         assert_eq!(updated, content, "the manifest must be byte-identical");
+    }
+
+    /// The same harm under `--all`, which is the branch that reaches it directly.
+    ///
+    /// With `all`, `plan_fixes` takes `latest_available` instead of
+    /// `latest_compatible` and stops skipping pinned items, so a wildcard arrives at
+    /// `rewrite_constraint` with the newest release outside its range — no lockfile
+    /// and no compatible upgrade needed. The Composer fixture carries a stability
+    /// flag, the form that used to slip past the whole-segment guard: `2.8.*@dev`
+    /// would become `7.0.0`, an exact pin that loses the wildcard *and* the flag.
+    #[test]
+    fn a_wildcard_dependency_is_left_untouched_by_fix_all() {
+        let content = r#"{
+  "require": {
+    "symfony/symfony": "2.8.*@dev",
+    "monolog/monolog": "^2.0"
+  }
+}
+"#;
+        let results = results_for(
+            ManifestKind::ComposerJson,
+            content,
+            &[("symfony/symfony", "7.0.0"), ("monolog/monolog", "2.9.1")],
+        );
+        assert_eq!(results.len(), 2, "the fixture must produce two items");
+        assert!(
+            results
+                .iter()
+                .all(|result| result.latest_available.is_some()),
+            "the `--all` branch reads `latest_available`, so the fixture must set it"
+        );
+
+        let (updated, records) = plan_fixes(content, &results, true);
+
+        // The wildcard is declined; its non-wildcard neighbour still gets fixed, so
+        // this asserts the guard and not a `--all` path that simply does nothing.
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.name.as_str())
+                .collect::<Vec<_>>(),
+            ["monolog/monolog"],
+            "{records:?}"
+        );
+        assert_eq!(
+            updated,
+            r#"{
+  "require": {
+    "symfony/symfony": "2.8.*@dev",
+    "monolog/monolog": "^2.9.1"
+  }
+}
+"#
+        );
     }
 }
