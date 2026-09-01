@@ -1431,6 +1431,110 @@ impl CheckerBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every ecosystem's default fetcher has to scope its cache key when it is pointed
+    /// somewhere other than the public registry.
+    ///
+    /// The on-disk cache records only `(key, name)`, so a fetcher that reports no
+    /// registry root writes a mirror's version list under the public registry's key and
+    /// a later default run reads it back as its own — the name guard cannot catch it,
+    /// because the name matches. `MavenCentralFetcher` landed after the scoping did and
+    /// was the one impl that never got `registry_root`, so a `[jvm] registry` mirror's
+    /// answers were cached as Maven Central's. Driving all nine here means the tenth
+    /// implementation cannot repeat it.
+    #[test]
+    fn every_default_fetcher_scopes_a_non_default_registry() {
+        use crate::registries::{
+            CratesIoFetcher, GoProxyFetcher, HexFetcher, MavenCentralFetcher, NpmFetcher,
+            NuGetFetcher, PackagistFetcher, PubDevFetcher, PyPiFetcher,
+        };
+
+        const MIRROR: &str = "https://nexus.corp.example/repository/proxy";
+        let client = reqwest::Client::new();
+        let mirrors: Vec<(Ecosystem, Arc<dyn RegistryFetcher>)> = vec![
+            (
+                Ecosystem::Rust,
+                Arc::new(CratesIoFetcher::with_registry(client.clone(), MIRROR, None)),
+            ),
+            (
+                Ecosystem::Go,
+                Arc::new(GoProxyFetcher::with_proxy(client.clone(), MIRROR)),
+            ),
+            (
+                Ecosystem::Npm,
+                Arc::new(NpmFetcher::with_registry(client.clone(), MIRROR)),
+            ),
+            (
+                Ecosystem::Python,
+                Arc::new(PyPiFetcher::with_registry(client.clone(), MIRROR)),
+            ),
+            (
+                Ecosystem::Php,
+                Arc::new(PackagistFetcher::with_registry(client.clone(), MIRROR)),
+            ),
+            (
+                Ecosystem::Dart,
+                Arc::new(PubDevFetcher::with_registry(client.clone(), MIRROR)),
+            ),
+            (
+                Ecosystem::CSharp,
+                Arc::new(NuGetFetcher::with_registry(client.clone(), MIRROR)),
+            ),
+            (
+                Ecosystem::Elixir,
+                Arc::new(HexFetcher::with_registry(client.clone(), MIRROR)),
+            ),
+            (
+                Ecosystem::Jvm,
+                Arc::new(MavenCentralFetcher::with_registry(client.clone(), MIRROR)),
+            ),
+        ];
+        for (ecosystem, fetcher) in &mirrors {
+            assert_ne!(
+                default_cache_key(fetcher.as_ref(), *ecosystem),
+                ecosystem.osv_name(),
+                "{ecosystem:?} caches a mirror's answers under the public registry's key"
+            );
+        }
+
+        // The default registry keeps the bare key, so existing cache entries stay valid.
+        let defaults: Vec<(Ecosystem, Arc<dyn RegistryFetcher>)> = vec![
+            (
+                Ecosystem::Rust,
+                Arc::new(CratesIoFetcher::new(client.clone())),
+            ),
+            (Ecosystem::Go, Arc::new(GoProxyFetcher::new(client.clone()))),
+            (Ecosystem::Npm, Arc::new(NpmFetcher::new(client.clone()))),
+            (
+                Ecosystem::Python,
+                Arc::new(PyPiFetcher::new(client.clone())),
+            ),
+            (
+                Ecosystem::Php,
+                Arc::new(PackagistFetcher::new(client.clone())),
+            ),
+            (
+                Ecosystem::Dart,
+                Arc::new(PubDevFetcher::new(client.clone())),
+            ),
+            (
+                Ecosystem::CSharp,
+                Arc::new(NuGetFetcher::new(client.clone())),
+            ),
+            (Ecosystem::Elixir, Arc::new(HexFetcher::new(client.clone()))),
+            (
+                Ecosystem::Jvm,
+                Arc::new(MavenCentralFetcher::new(client.clone())),
+            ),
+        ];
+        for (ecosystem, fetcher) in &defaults {
+            assert_eq!(
+                default_cache_key(fetcher.as_ref(), *ecosystem),
+                ecosystem.osv_name(),
+                "{ecosystem:?} rescoped its own default registry"
+            );
+        }
+    }
     use dependable_core::parse;
 
     /// The single item declared by `manifest`. Built through the parser because
