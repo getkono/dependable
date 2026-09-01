@@ -269,6 +269,70 @@ fn no_lock_file_does_not_empty_a_swift_dependency_list() {
     );
 }
 
+/// The same flag on the command that decides the exit code. `list` was taught that a
+/// `Package.resolved` is the dependency list rather than an annotation on one; `check`
+/// was not, so `--no-lock-file` handed the OSV scan an empty item list. A Swift project
+/// with a known-vulnerable pin then reported clean and exited 0 — a silent security
+/// false negative, and the exact inversion the flag's own help text disclaims.
+#[test]
+fn no_lock_file_does_not_empty_what_check_scans() {
+    let manifest = fixture("sample-swift/Package.swift");
+    let output = run(&[
+        "check",
+        "--manifest",
+        manifest.to_str().unwrap(),
+        "--no-lock-file",
+        "--no-vuln",
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        stdout.contains("github.com/apple/swift-nio"),
+        "the pins are what `check` has to scan; stdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("(0 dependencies)") && !stdout.contains("nothing to check"),
+        "an empty scan of a resolved project is a false clean bill; stdout: {stdout}"
+    );
+    assert!(
+        !stderr.contains("no dependency with a version to check was found here at all"),
+        "there are four; stderr: {stderr}"
+    );
+
+    // The exit code is what a CI job acts on, and it was the part that silently
+    // inverted: nothing scanned means nothing found means success.
+    let gated = run(&[
+        "check",
+        "--manifest",
+        manifest.to_str().unwrap(),
+        "--no-lock-file",
+        "--no-vuln",
+        "--fail-on",
+        "any",
+    ]);
+    assert_eq!(
+        gated.status.code(),
+        Some(1),
+        "`--fail-on any` over four undetermined pins must fail exactly as it does without the flag"
+    );
+
+    // …and `--format json` must publish the same list, not a summary of nothing.
+    let json = run(&[
+        "check",
+        "--manifest",
+        manifest.to_str().unwrap(),
+        "--no-lock-file",
+        "--no-vuln",
+        "--format",
+        "json",
+    ]);
+    let doc: serde_json::Value =
+        serde_json::from_slice(&json.stdout).expect("`check --format json` emits JSON");
+    assert_eq!(doc["summary"]["total"], 6, "{doc}");
+    assert_eq!(doc["summary"]["undetermined"], 4, "{doc}");
+}
+
 /// The other half of the same flag: for a lockfile that only *annotates* a list the
 /// manifest already produced, `--no-lock-file` must still suppress it. Fixing Swift
 /// by ignoring the flag everywhere would have taken this with it.
