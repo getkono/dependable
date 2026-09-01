@@ -1319,6 +1319,29 @@ fn expand_env(content: &str) -> String {
     out
 }
 
+/// The exit code for a finished run under the configured gate.
+///
+/// # Where [`DependencyStatus::Undetermined`] sits
+///
+/// It is **clean** under `--fail-on vulnerable` and `--fail-on outdated`, and
+/// **not clean** under `--fail-on any`.
+///
+/// Those two named gates ask a specific question — is anything vulnerable, is
+/// anything behind — and an unread version answers neither. Failing a build that
+/// asked about vulnerabilities because a POM defers to its `<parent>` would make
+/// the flag mean something other than what it says.
+///
+/// `--fail-on any` asks the general one: is every dependency checked and current.
+/// A dependency whose version was never read is not current — it is unestablished,
+/// and exiting `0` asserts something this run never determined. That is precisely
+/// how a parent-inheriting POM used to pass green while dependable had read
+/// nothing at all. It is grouped with the failures rather than with
+/// [`DependencyStatus::Local`] and [`DependencyStatus::Git`], which are clean
+/// because they were skipped *on purpose*: there is no registry behind them, so
+/// there is nothing a stricter run could ever learn.
+///
+/// The status never travels alone: `check` emits a manifest-level warning on
+/// stderr naming the dependencies involved, so a failing job says what to fix.
 fn exit_code(reports: &[ManifestReport], fail_on: FailOn) -> ExitCode {
     let triggered = reports
         .iter()
@@ -1332,6 +1355,8 @@ fn exit_code(reports: &[ManifestReport], fail_on: FailOn) -> ExitCode {
                     | DependencyStatus::UpdateAvailable
                     | DependencyStatus::Vulnerable
             ),
+            // `Undetermined` is absent from this clean list on purpose — see the
+            // doc comment above.
             FailOn::Any => !matches!(
                 result.status,
                 DependencyStatus::UpToDate | DependencyStatus::Local | DependencyStatus::Git
