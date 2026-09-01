@@ -11,6 +11,7 @@ use figment::providers::{Format as _, Serialized, Toml};
 use serde::{Deserialize, Serialize};
 
 use crate::cli::{FailOn, UnstableFilter};
+use dependable_fetch::Ecosystem;
 #[cfg(feature = "report")]
 use dependable_report::policy::Policy;
 
@@ -48,6 +49,32 @@ pub struct Config {
     #[cfg(feature = "report")]
     #[serde(default)]
     pub policy: Policy,
+}
+
+impl Config {
+    /// Whether `ecosystem` is switched on.
+    ///
+    /// The one place the per-ecosystem `enabled` flags are read as a set rather
+    /// than one at a time, so a question asked *before* a checker exists — should
+    /// discovery warn that this project's manifests could not be read? — gets the
+    /// same answer the checker would give.
+    #[must_use]
+    pub fn ecosystem_enabled(&self, ecosystem: Ecosystem) -> bool {
+        match ecosystem {
+            Ecosystem::Rust => self.rust.enabled,
+            Ecosystem::Go => self.go.enabled,
+            Ecosystem::Npm => self.npm.enabled,
+            Ecosystem::Python => self.python.enabled,
+            Ecosystem::Php => self.php.enabled,
+            Ecosystem::Dart => self.dart.enabled,
+            Ecosystem::CSharp => self.csharp.enabled,
+            Ecosystem::Elixir => self.elixir.enabled,
+            Ecosystem::Jvm => self.jvm.enabled,
+            // `Ecosystem` is `#[non_exhaustive]`: a variant added there but not
+            // configured here is on, which is what every ecosystem defaults to.
+            _ => true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -354,6 +354,7 @@ pub async fn run_check(args: CheckArgs) -> anyhow::Result<ExitCode> {
         args.path.as_deref(),
         settings.depth,
         &args.manifest_glob,
+        &|ecosystem| cfg.ecosystem_enabled(ecosystem),
     )?;
     if manifests.is_empty() {
         eprintln!("No supported manifests found.");
@@ -585,6 +586,8 @@ pub async fn run_list(args: ListArgs) -> anyhow::Result<ExitCode> {
         args.path.as_deref(),
         args.depth,
         &args.manifest_glob,
+        // `list` reads no config file, so every ecosystem is on.
+        &|_| true,
     )?;
     if manifests.is_empty() {
         eprintln!("No supported manifests found.");
@@ -835,6 +838,7 @@ pub async fn run_fix(args: FixArgs) -> anyhow::Result<ExitCode> {
         args.path.as_deref(),
         settings.depth,
         &args.manifest_glob,
+        &|ecosystem| cfg.ecosystem_enabled(ecosystem),
     )?;
     if manifests.is_empty() {
         eprintln!("No supported manifests found.");
@@ -1041,7 +1045,13 @@ pub async fn run_report(args: crate::cli::ReportArgs) -> anyhow::Result<ExitCode
     let overrides = load_template_overrides(&root)?;
 
     // `report` has no `--manifest-glob`: it describes a repository as a whole.
-    let manifests = collect_manifests(args.manifest.as_deref(), Some(&root), settings.depth, &[])?;
+    let manifests = collect_manifests(
+        args.manifest.as_deref(),
+        Some(&root),
+        settings.depth,
+        &[],
+        &|ecosystem| cfg.ecosystem_enabled(ecosystem),
+    )?;
     if manifests.is_empty() {
         eprintln!("No supported manifests found.");
         return Ok(ExitCode::SUCCESS);
@@ -1134,6 +1144,7 @@ fn collect_manifests(
     path: Option<&Path>,
     depth: usize,
     globs: &[String],
+    enabled: &dyn Fn(Ecosystem) -> bool,
 ) -> anyhow::Result<Vec<PathBuf>> {
     if let Some(manifest) = manifest {
         // `--manifest` names one exact file and bypasses discovery entirely, so
@@ -1142,12 +1153,14 @@ fn collect_manifests(
         return Ok(vec![manifest.to_path_buf()]);
     }
     let root = path.map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-    // Manifests we recognise but cannot read produce nothing for the walk to return,
-    // so this is the only point at which their absence can be reported at all.
-    for notice in dependable_fetch::manifest_notices(&root, depth) {
+    // One walk for both answers. Manifests we recognise but cannot read produce
+    // nothing for the walk to return, so this is the only point at which their
+    // absence can be reported at all.
+    let found = dependable_fetch::discover(&root, depth, enabled);
+    for notice in &found.notices {
         eprintln!("warning: {notice}");
     }
-    let found = dependable_fetch::find_manifests(&root, depth);
+    let found = found.manifests;
     if globs.is_empty() {
         return Ok(found);
     }
@@ -1352,7 +1365,7 @@ mod tests {
     fn matched(globs: &[&str]) -> Vec<String> {
         let globs: Vec<String> = globs.iter().map(|g| (*g).to_string()).collect();
         let root = monorepo();
-        collect_manifests(None, Some(&root), 4, &globs)
+        collect_manifests(None, Some(&root), 4, &globs, &|_| true)
             .expect("the patterns are valid")
             .iter()
             .map(|m| output::posix(&relative_to(&root, m)))
@@ -1404,7 +1417,7 @@ mod tests {
         // never silently filters away a file the user named outright.
         let named = PathBuf::from("some/other/Cargo.toml");
         assert_eq!(
-            collect_manifests(Some(&named), None, 3, &["nope/*".to_string()])
+            collect_manifests(Some(&named), None, 3, &["nope/*".to_string()], &|_| true)
                 .expect("the pattern is valid"),
             vec![named]
         );
@@ -1413,7 +1426,10 @@ mod tests {
     #[test]
     fn an_unparseable_pattern_is_an_error_not_an_empty_result() {
         let root = monorepo();
-        assert!(collect_manifests(None, Some(&root), 4, &["services/[".to_string()]).is_err());
+        assert!(
+            collect_manifests(None, Some(&root), 4, &["services/[".to_string()], &|_| true)
+                .is_err()
+        );
     }
 
     #[test]

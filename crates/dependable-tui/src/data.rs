@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use dependable_fetch::core::check_version;
 use dependable_fetch::{
-    Checker, Ecosystem, ManifestKind, WorkspaceGraphOptions, build_project_graph, find_manifests,
+    Checker, Ecosystem, ManifestKind, WorkspaceGraphOptions, build_project_graph,
 };
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -32,13 +32,16 @@ pub fn discover_projects(root: &Path, depth: usize) -> (Vec<Project>, Vec<String
     let mut projects = Vec::new();
     let mut notices = Vec::new();
 
-    // A manifest we cannot read yields no project, so nothing later in this loop
-    // could ever mention it.
-    for notice in dependable_fetch::manifest_notices(root, depth) {
+    // One walk answers both. A manifest we cannot read yields no project, so
+    // nothing later in this loop could ever mention it.
+    //
+    // The TUI reads no config file, so every ecosystem counts as enabled.
+    let found = dependable_fetch::discover(root, depth, |_| true);
+    for notice in &found.notices {
         notices.push(notice.to_string());
     }
 
-    for manifest in find_manifests(root, depth) {
+    for manifest in found.manifests {
         let Some(kind) = ManifestKind::detect(&manifest) else {
             continue;
         };

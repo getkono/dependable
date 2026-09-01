@@ -232,23 +232,40 @@ pub struct UnreadableLockfile {
     pub reason: &'static str,
 }
 
+/// Where a Gradle build root announces itself.
+///
+/// `settings.gradle*` is the definition — it is the file that names the
+/// subprojects — and a catalog is included because a single-project build has a
+/// catalog and often no settings file at all.
+const GRADLE_BUILD_ROOTS: &[&str] = &[
+    "settings.gradle.kts",
+    "settings.gradle",
+    "gradle/libs.versions.toml",
+];
+
 /// Gradle's build scripts, which are programs rather than data.
 ///
 /// Both spellings, because a project may use either and neither is readable. The
 /// catalog that supersedes them sits in a subdirectory, which is why supersession is
-/// a relative path rather than a sibling name.
+/// a relative path rather than a sibling name — and it sits in the **build root's**
+/// subdirectory, which is why supersession is resolved by walking up to
+/// `build_root_markers` rather than by looking beside the script.
 const GRADLE_BUILD_SCRIPTS: &[UnreadableManifest] = &[
     UnreadableManifest {
         file_name: "build.gradle.kts",
         reason: "a Gradle build script, which cannot be read without executing it. \
                  Declare dependencies in `gradle/libs.versions.toml` to have them checked.",
         superseded_by: &["gradle/libs.versions.toml"],
+        build_root_markers: GRADLE_BUILD_ROOTS,
+        ecosystem: Ecosystem::Jvm,
     },
     UnreadableManifest {
         file_name: "build.gradle",
         reason: "a Gradle build script, which cannot be read without executing it. \
                  Declare dependencies in `gradle/libs.versions.toml` to have them checked.",
         superseded_by: &["gradle/libs.versions.toml"],
+        build_root_markers: GRADLE_BUILD_ROOTS,
+        ecosystem: Ecosystem::Jvm,
     },
 ];
 
@@ -273,9 +290,28 @@ pub struct UnreadableManifest {
     pub file_name: &'static str,
     /// Why it cannot be read, phrased for the person who has to fix it.
     pub reason: &'static str,
-    /// Paths, relative to the directory holding it, whose presence means the
-    /// dependencies are declared somewhere readable after all.
+    /// Paths whose presence means the dependencies are declared somewhere readable
+    /// after all, relative to the **build root** — not to the directory holding the
+    /// unreadable file.
+    ///
+    /// The two are the same directory only in a single-module project. A Gradle
+    /// catalog is build-root scoped: one `<root>/gradle/libs.versions.toml` serves
+    /// every subproject, and a subproject has no `gradle/` directory of its own. A
+    /// directory-local test therefore calls every module of a *correctly* configured
+    /// multi-module build unread, and tells each of them to declare its dependencies
+    /// in a catalog that already holds them.
     pub superseded_by: &'static [&'static str],
+    /// File names that mark the build root `superseded_by` resolves against, tried
+    /// in each directory on the way up from the unreadable file.
+    ///
+    /// The walk stops at the first directory holding one of these (or at the
+    /// repository boundary), so supersession never resolves against an unrelated
+    /// build further up the tree.
+    pub build_root_markers: &'static [&'static str],
+    /// The ecosystem this manifest belongs to, so a scan can stay quiet about an
+    /// ecosystem the user has turned off — a warning about an unread manifest is
+    /// advice to enable something, and it is noise for someone who disabled it.
+    pub ecosystem: Ecosystem,
 }
 
 /// A lockfile format we can read.
