@@ -13,8 +13,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use dependable_core::{
     CheckResult, DependencyStatus, Ecosystem, Evaluation, Item, LockfileKind, ManifestKind,
-    PackageSource, UnstableFilter, apply_lockfile, check_version, parse, parse_lockfile_kind,
-    resolve_workspace_inheritance, to_semver_constraint,
+    PackageSource, UnstableFilter, apply_lockfile, check_version, lockfile_items, parse,
+    parse_lockfile_kind, resolve_workspace_inheritance, to_semver_constraint,
 };
 use futures::stream::{self, StreamExt};
 use semver::Version as SemverVersion;
@@ -551,11 +551,22 @@ impl Checker {
         workspace: Option<(PathBuf, Arc<Vec<Item>>)>,
     ) -> Result<ManifestCheck, CheckError> {
         let ecosystem = kind.ecosystem();
-        let fetcher = self
-            .registries
-            .get(&ecosystem)
-            .ok_or(CheckError::UnsupportedEcosystem(ecosystem))?
-            .clone();
+        // An ecosystem that publishes **no registry at all** is not an unsupported
+        // one: there is nothing to register, and its dependencies are still worth
+        // scanning for vulnerabilities. Returning `UnsupportedEcosystem` here would
+        // drop the manifest before the OSV scan ran, which is the whole feature
+        // silently absent.
+        //
+        // Every other ecosystem keeps the contract it has always had, and that is
+        // the point of asking [`Ecosystem::has_registry`] rather than merely
+        // observing that no fetcher is registered: a *config-disabled* ecosystem
+        // has a registry and is switched off, so it must still be skipped with
+        // "is not enabled or not yet supported" rather than half-checked.
+        let fetcher = match self.registries.get(&ecosystem) {
+            Some(fetcher) => Some(fetcher.clone()),
+            None if !ecosystem.has_registry() => None,
+            None => return Err(CheckError::UnsupportedEcosystem(ecosystem)),
+        };
 
         let mut parsed = parse(kind, manifest)?;
 
@@ -577,40 +588,54 @@ impl Checker {
         // lockfile is ignored — the dependency is simply checked without a locked
         // version. `apply_lockfile` only annotates existing items, never inserts,
         // so transitive deps are never introduced.
-        if let Some((lock_kind, lock)) = lockfile
-            && let Ok(data) = parse_lockfile_kind(lock_kind, lock)
-        {
-            apply_lockfile(&mut parsed.items, &data);
+        if let Some((lock_kind, lock)) = lockfile {
+            if let Some(pins) = lockfile_items(lock_kind, lock) {
+                // The one lockfile that *is* the dependency list. Its manifest is a
+                // program this crate declines to read, so without this a Swift
+                // project reports zero dependencies with a `Package.resolved` full
+                // of them sitting beside it. Appending rather than replacing keeps
+                // the rule that a lockfile never removes what a manifest declared.
+                parsed.items.extend(pins);
+            } else if let Ok(data) = parse_lockfile_kind(lock_kind, lock) {
+                apply_lockfile(&mut parsed.items, &data);
+            }
         }
 
         if let Some(warning) = deferred_versions(&parsed.items, kind) {
             warnings.push(warning);
         }
 
-        // Build the fetch task list, routing each checkable item to a fetcher:
-        // JSR-sourced items (Deno `jsr:` deps) to the JSR fetcher, items naming a
-        // resolved alternate Rust registry to that registry, and everything else
-        // to the ecosystem fetcher — each with a distinct cache key. Deduplicated
-        // by (cache_key, name).
-        let mut seen: HashSet<(String, String)> = HashSet::new();
-        let mut tasks: Vec<FetchTask> = Vec::new();
-        for item in parsed.items.iter().filter(|i| i.is_checkable()) {
-            let (task_fetcher, cache_key) = self.route_item(item, &fetcher, ecosystem);
-            if seen.insert((cache_key.clone(), item.name.clone())) {
-                tasks.push(FetchTask {
-                    name: item.name.clone(),
-                    fetcher: task_fetcher,
-                    cache_key,
-                });
+        let mut results: Vec<CheckResult> = if let Some(fetcher) = &fetcher {
+            // Build the fetch task list, routing each checkable item to a fetcher:
+            // JSR-sourced items (Deno `jsr:` deps) to the JSR fetcher, items naming a
+            // resolved alternate Rust registry to that registry, and everything else
+            // to the ecosystem fetcher — each with a distinct cache key. Deduplicated
+            // by (cache_key, name).
+            let mut seen: HashSet<(String, String)> = HashSet::new();
+            let mut tasks: Vec<FetchTask> = Vec::new();
+            for item in parsed.items.iter().filter(|i| i.is_checkable()) {
+                let (task_fetcher, cache_key) = self.route_item(item, fetcher, ecosystem);
+                if seen.insert((cache_key.clone(), item.name.clone())) {
+                    tasks.push(FetchTask {
+                        name: item.name.clone(),
+                        fetcher: task_fetcher,
+                        cache_key,
+                    });
+                }
             }
-        }
 
-        let fetched = self.fetch_all(tasks).await;
-        let mut results: Vec<CheckResult> = parsed
-            .items
-            .iter()
-            .map(|item| evaluate_item(item, &fetched, ecosystem, self.unstable))
-            .collect();
+            let fetched = self.fetch_all(tasks).await;
+            parsed
+                .items
+                .iter()
+                .map(|item| evaluate_item(item, &fetched, ecosystem, self.unstable))
+                .collect()
+        } else {
+            // Nothing to ask, so nothing is claimed. The OSV scan below still runs:
+            // it needs a package and a version, not a registry, and the lockfile
+            // supplied both.
+            parsed.items.iter().map(without_a_registry).collect()
+        };
 
         if let Some(osv) = &self.osv
             && let Err(e) = scan_vulnerabilities(osv, ecosystem, &mut results).await
@@ -622,7 +647,11 @@ impl Checker {
         // exactly like the vulnerability scan above: it degrades to a warning
         // rather than failing the check, because the version data is still
         // correct and useful without a license column.
+        // A registry-less ecosystem publishes no metadata endpoint either, so this
+        // would fail every time and say so in a warning about a feature the user
+        // never asked this ecosystem for.
         if self.licenses
+            && fetcher.is_some()
             && let Err(e) = self.attach_licenses(ecosystem, &mut results).await
         {
             warnings.push(format!("license collection skipped: {e}"));
@@ -835,6 +864,36 @@ fn deferred_versions(items: &[Item], kind: ManifestKind) -> Option<String> {
     ))
 }
 
+/// The verdict for an item nothing was ever going to fetch.
+fn unfetchable(item: &Item) -> CheckResult {
+    let status = match item.source {
+        PackageSource::Git => DependencyStatus::Git,
+        // An entry that defers its version elsewhere and found nothing there is
+        // a real package on a real registry whose version this run never read.
+        // `Local` would say the opposite — that there is no registry for it —
+        // which of `spring-boot-starter-web` is simply false, and is the wrong
+        // token for a CI consumer to read.
+        PackageSource::Inherited => DependencyStatus::Undetermined,
+        _ => DependencyStatus::Local,
+    };
+    CheckResult::new(item.clone(), status)
+}
+
+/// The verdict for one item in an ecosystem that publishes no registry.
+///
+/// A path or git dependency reports exactly what it always did — nothing was
+/// going to be fetched for it either way. Everything else is
+/// [`DependencyStatus::Undetermined`]: currency here is not merely unread but
+/// *unknowable*, and both `UpToDate` and `Error` would be claims this run has no
+/// basis for. `Local` would be worse still, since these are real published
+/// packages that simply have no registry behind them.
+fn without_a_registry(item: &Item) -> CheckResult {
+    if !item.is_checkable() {
+        return unfetchable(item);
+    }
+    CheckResult::new(item.clone(), DependencyStatus::Undetermined)
+}
+
 /// Evaluate one parsed item against the fetched version lists, applying the
 /// configured pre-release filter before classification.
 fn evaluate_item(
@@ -844,17 +903,7 @@ fn evaluate_item(
     unstable: UnstableFilter,
 ) -> CheckResult {
     if !item.is_checkable() {
-        let status = match item.source {
-            PackageSource::Git => DependencyStatus::Git,
-            // An entry that defers its version elsewhere and found nothing there is
-            // a real package on a real registry whose version this run never read.
-            // `Local` would say the opposite — that there is no registry for it —
-            // which of `spring-boot-starter-web` is simply false, and is the wrong
-            // token for a CI consumer to read.
-            PackageSource::Inherited => DependencyStatus::Undetermined,
-            _ => DependencyStatus::Local,
-        };
-        return CheckResult::new(item.clone(), status);
+        return unfetchable(item);
     }
     match fetched.get(&item.name) {
         Some(Ok(versions)) => {
@@ -1306,6 +1355,148 @@ mod tests {
 
     fn registry_item() -> Item {
         item("[dependencies]\ntime = \"0.2.7\"\n")
+    }
+
+    /// A `Package.resolved` v2 pin set, the only record of a Swift project's
+    /// dependencies.
+    const PACKAGE_RESOLVED: &str = r#"{
+  "pins" : [
+    {
+      "identity" : "swift-nio",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/apple/swift-nio.git",
+      "state" : { "revision" : "635b25", "version" : "2.65.0" }
+    },
+    {
+      "identity" : "helpers",
+      "kind" : "fileSystem",
+      "location" : "/Users/me/helpers",
+      "state" : { }
+    }
+  ],
+  "version" : 2
+}"#;
+
+    /// A checker wired the way the CLI wires one when an ecosystem is switched off
+    /// in config: no fetcher for it, and no network reachable if one were tried.
+    fn offline_checker() -> Checker {
+        Checker::builder()
+            .rust_registry("http://127.0.0.1:1".to_string(), None)
+            .vulnerabilities(false)
+            .disk_cache(false)
+            .build()
+            .expect("a checker builds without a network")
+    }
+
+    /// The feature this whole ecosystem rests on. Before `has_registry`, a manifest
+    /// whose ecosystem had no registered fetcher was dropped with
+    /// `UnsupportedEcosystem` *before* the OSV scan — so a registry-less ecosystem
+    /// was not degraded, it was absent.
+    #[tokio::test]
+    async fn an_ecosystem_with_no_registry_is_checked_rather_than_skipped() {
+        let check = offline_checker()
+            .check_manifest(ManifestKind::PackageSwift, "", Some(PACKAGE_RESOLVED))
+            .await
+            .expect("a registry-less ecosystem is not an unsupported one");
+
+        assert_eq!(check.ecosystem, Ecosystem::Swift);
+        let names: Vec<&str> = check.results.iter().map(|r| r.item.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["github.com/apple/swift-nio", "helpers"],
+            "the pin set is the dependency list; `Package.swift` supplied none"
+        );
+
+        let nio = &check.results[0];
+        assert_eq!(
+            nio.status,
+            DependencyStatus::Undetermined,
+            "no registry exists to compare against, so no currency claim is made"
+        );
+        assert_eq!(nio.item.locked_version.as_deref(), Some("2.65.0"));
+        assert_eq!(
+            nio.latest_available, None,
+            "nothing was fetched, so nothing is offered as newer"
+        );
+        // A local package reports what it always did — nothing was going to be
+        // fetched for it in any ecosystem.
+        assert_eq!(check.results[1].status, DependencyStatus::Local);
+    }
+
+    /// The discriminator. `has_registry()` is true for every ecosystem but Swift,
+    /// so an ecosystem the user switched off in config keeps the old path and the
+    /// CLI keeps printing `skipping … is not enabled or not yet supported`.
+    /// Collapsing the two would silently half-check every disabled ecosystem.
+    #[tokio::test]
+    async fn a_config_disabled_ecosystem_is_still_reported_unsupported() {
+        for (kind, manifest, ecosystem) in [
+            (
+                ManifestKind::PubspecYaml,
+                "dependencies:\n  http: ^1.1.0\n",
+                Ecosystem::Dart,
+            ),
+            (
+                ManifestKind::GoMod,
+                "require github.com/a/b v1.0.0\n",
+                Ecosystem::Go,
+            ),
+            (
+                ManifestKind::MixExs,
+                "defp deps do\n  [{:jason, \"~> 1.4\"}]\nend\n",
+                Ecosystem::Elixir,
+            ),
+        ] {
+            let outcome = offline_checker().check_manifest(kind, manifest, None).await;
+            assert!(
+                matches!(outcome, Err(CheckError::UnsupportedEcosystem(eco)) if eco == ecosystem),
+                "{ecosystem:?} has a registry and was switched off, so it must be skipped, not checked"
+            );
+        }
+    }
+
+    /// Two ways to have no fetcher, two different answers. This is the pair a
+    /// reviewer should attack first.
+    #[tokio::test]
+    async fn having_no_registry_and_being_switched_off_are_not_the_same_state() {
+        let checker = offline_checker();
+        assert!(
+            checker
+                .check_manifest(ManifestKind::PackageSwift, "", Some(PACKAGE_RESOLVED))
+                .await
+                .is_ok()
+        );
+        assert!(
+            checker
+                .check_manifest(
+                    ManifestKind::PubspecYaml,
+                    "dependencies:\n  http: ^1.1.0\n",
+                    None
+                )
+                .await
+                .is_err()
+        );
+    }
+
+    /// `apply_lockfile` never inserts, and five ecosystems depend on that. Only the
+    /// one lockfile that *is* the dependency list may supply items.
+    #[tokio::test]
+    async fn a_lockfile_that_is_not_a_dependency_source_still_only_annotates() {
+        let lock = "[[package]]\nname = \"serde\"\nversion = \"1.0.0\"\n\n\
+                    [[package]]\nname = \"transitive\"\nversion = \"9.9.9\"\n";
+        let check = offline_checker()
+            .check_manifest(
+                ManifestKind::CargoToml,
+                "[dependencies]\nserde = \"1\"\n",
+                Some(lock),
+            )
+            .await
+            .expect("rust is registered");
+        let names: Vec<&str> = check.results.iter().map(|r| r.item.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["serde"],
+            "a transitive lock entry is not a dependency"
+        );
     }
 
     #[test]
