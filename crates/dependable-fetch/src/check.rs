@@ -105,6 +105,16 @@ pub struct ManifestCheck {
     /// was found" and "nothing was looked for" alike, and a `--fail-on vulnerable` gate
     /// reading the first when the second is true reports a clean build it never checked.
     pub vulnerability_scan_failed: bool,
+    /// Whether any registry lookup failed for a reason other than the package not
+    /// existing.
+    ///
+    /// The difference a gate turns on. A 404 is a per-dependency fact — a private or
+    /// internal package, one served by a registry this run does not route to, a deleted
+    /// package — and it says nothing about the dependencies that *were* resolved. A
+    /// timeout, a refused connection, a 5xx, or an undecodable response is the registry
+    /// declining to answer, and a `--fail-on` promise cannot be kept from answers that
+    /// were never given.
+    pub registry_unreachable: bool,
     /// The manifest whose `[workspace.dependencies]` govern this one — itself, when it
     /// declares its own `[workspace]`, else the nearest ancestor that does.
     ///
@@ -198,7 +208,11 @@ struct FetchTask {
 }
 
 /// The result of one fetch task: `(name, cache_key, versions-or-error)`.
-type FetchOutcome = (String, String, Result<Vec<String>, String>);
+///
+/// The error is still typed here, and only stringified once
+/// [`Checker::fetch_all`] has read whether it was the registry answering "no such
+/// package" or the registry not answering at all.
+type FetchOutcome = (String, String, Result<Vec<String>, FetchError>);
 
 /// Fetched versions (or a per-package error message), keyed by `(cache_key, name)`.
 ///
@@ -615,7 +629,7 @@ impl Checker {
             }
         }
 
-        let fetched = self.fetch_all(tasks).await;
+        let (fetched, registry_unreachable) = self.fetch_all(tasks).await;
         let mut results: Vec<CheckResult> = parsed
             .items
             .iter()
@@ -649,6 +663,7 @@ impl Checker {
             results,
             warnings,
             vulnerability_scan_failed,
+            registry_unreachable,
             workspace_root: workspace.map(|(root, _)| root),
         };
 
@@ -723,7 +738,14 @@ impl Checker {
     /// request. The concurrency inside a single manifest is safe — its tasks are
     /// already deduplicated by `(cache_key, name)` before they get here. Anyone
     /// parallelising the *manifest* loop must add coalescing here first.
-    async fn fetch_all(&self, tasks: Vec<FetchTask>) -> FetchedMap {
+    /// Fetch every task's version list, returning the results and whether any lookup
+    /// failed for a reason other than the package not existing.
+    ///
+    /// A 404 is an answer: the package is private, internal, deleted, or served by a
+    /// registry this run does not route to. Anything else — a timeout, a refused
+    /// connection, a 5xx, a response that would not decode — is the registry declining
+    /// to answer, and a gate cannot be honoured from answers that were never given.
+    async fn fetch_all(&self, tasks: Vec<FetchTask>) -> (FetchedMap, bool) {
         let total = tasks.len();
         self.emit(ProgressEvent::Started { total });
 
@@ -756,8 +778,7 @@ impl Checker {
                     let result =
                         crate::retry::with_retry(|| task.fetcher.fetch_versions(&task.name))
                             .await
-                            .map(|fetched| fetched.versions)
-                            .map_err(|e| e.to_string());
+                            .map(|fetched| fetched.versions);
                     let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
                     if let Some(p) = &progress {
                         p(ProgressEvent::Advanced {
@@ -772,6 +793,7 @@ impl Checker {
             .collect()
             .await;
 
+        let mut registry_unreachable = false;
         for (name, cache_key, result) in fetched {
             if let Ok(versions) = &result {
                 self.versions_cache
@@ -781,11 +803,16 @@ impl Checker {
                     disk.put(&cache_key, &name, versions).await;
                 }
             }
-            out.insert((cache_key, name), result);
+            if let Err(e) = &result
+                && !matches!(e, FetchError::NotFound(_))
+            {
+                registry_unreachable = true;
+            }
+            out.insert((cache_key, name), result.map_err(|e| e.to_string()));
         }
 
         self.emit(ProgressEvent::Finished);
-        out
+        (out, registry_unreachable)
     }
 
     fn emit(&self, event: ProgressEvent) {

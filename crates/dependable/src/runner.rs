@@ -262,6 +262,7 @@ impl Engine {
                 }
                 let integrity = ScanIntegrity {
                     vulnerability_scan_failed: check.vulnerability_scan_failed,
+                    registry_unreachable: check.registry_unreachable,
                     unresolved: check
                         .results
                         .iter()
@@ -1370,8 +1371,18 @@ fn expand_env(content: &str) -> String {
 /// Whether a gate can be honoured from what this run actually established.
 ///
 /// `FailOn::None` gates on nothing, so nothing can be missing. Every other setting is a
-/// promise not to pass a build with a particular property, and a run that failed to look
-/// cannot keep it.
+/// promise not to pass a build with a particular property, and a run that failed to
+/// *look* cannot keep it.
+///
+/// The question is about the run, not about any one dependency. A registry that never
+/// answered, or an advisory scan that did not complete, leaves the whole result set
+/// unfounded — every dependency it covered is reported non-vulnerable because nothing
+/// was asked. A registry that answered "no such package" left nothing unfounded: that
+/// is a permanent, per-dependency fact about a private, internal, or deleted package,
+/// visible in the table and in `--format json`, and gating the whole build on it turned
+/// one unpublished internal package into a hard exit 2 for every repository that has
+/// one — including every consumer of the shipped Action, which defaults to
+/// `--fail-on vulnerable`.
 fn gate_is_answerable(reports: &[ManifestReport], fail_on: FailOn) -> Result<(), String> {
     if fail_on == FailOn::None {
         return Ok(());
@@ -1379,28 +1390,50 @@ fn gate_is_answerable(reports: &[ManifestReport], fail_on: FailOn) -> Result<(),
     let scan_failed = reports
         .iter()
         .any(|r| r.integrity.vulnerability_scan_failed);
-    // `FailOn::Any` already fails on `DependencyStatus::Error`, so an unresolved
-    // dependency is not a hole there — it is the gate working. The other settings match
-    // only specific statuses and skip errors entirely, which is where a run that
-    // resolved nothing could still report success.
-    let unresolved: usize = if fail_on == FailOn::Any {
-        0
-    } else {
-        reports.iter().map(|r| r.integrity.unresolved).sum()
-    };
-    match (scan_failed, unresolved) {
-        (false, 0) => Ok(()),
-        (true, 0) => Err("the vulnerability scan did not complete".to_owned()),
-        (false, n) => Err(format!(
-            "{n} dependenc{} could not be resolved against {} registry",
-            if n == 1 { "y" } else { "ies" },
-            if n == 1 { "its" } else { "their" }
-        )),
-        (true, n) => Err(format!(
-            "the vulnerability scan did not complete and {n} dependenc{} could not be resolved",
-            if n == 1 { "y" } else { "ies" }
-        )),
+    // `FailOn::Any` fails on `DependencyStatus::Error`, and a registry that did not
+    // answer produces exactly that for every dependency it was asked about — so there
+    // the promise is kept rather than missed, and the run exits 1 on the errors
+    // themselves. The other settings match specific statuses and skip errors entirely,
+    // which is where a registry that never answered could still be reported as clean.
+    let registry_unreachable =
+        fail_on != FailOn::Any && reports.iter().any(|r| r.integrity.registry_unreachable);
+    match (scan_failed, registry_unreachable) {
+        (false, false) => Ok(()),
+        (true, false) => Err("the vulnerability scan did not complete".to_owned()),
+        (false, true) => Err("the registry did not answer".to_owned()),
+        (true, true) => Err(
+            "the vulnerability scan did not complete and the registry did not answer".to_owned(),
+        ),
     }
+}
+
+/// Say on stderr how many dependencies the registry reported as non-existent.
+///
+/// Such a dependency has no status to gate on and the gate no longer stops for it, so
+/// the run says plainly that it was not covered — otherwise a passing
+/// `--fail-on vulnerable` reads as "every dependency here is clean" when one of them was
+/// never checked.
+///
+/// Silent for `FailOn::None` (nothing was gated on) and for `FailOn::Any` (which fails
+/// on these results, so they *were* gated on), and silent when the registry did not
+/// answer, because then the errors are a transport failure and calling them
+/// "not found" would misattribute them.
+fn note_unresolved(reports: &[ManifestReport], fail_on: FailOn) {
+    if matches!(fail_on, FailOn::None | FailOn::Any)
+        || reports.iter().any(|r| r.integrity.registry_unreachable)
+    {
+        return;
+    }
+    let unresolved: usize = reports.iter().map(|r| r.integrity.unresolved).sum();
+    if unresolved == 0 {
+        return;
+    }
+    eprintln!(
+        "note: {unresolved} dependenc{} not found in {} registry, so {} not gated on",
+        if unresolved == 1 { "y was" } else { "ies were" },
+        if unresolved == 1 { "its" } else { "their" },
+        if unresolved == 1 { "it is" } else { "they are" },
+    );
 }
 
 fn exit_code(reports: &[ManifestReport], fail_on: FailOn) -> ExitCode {
@@ -1413,6 +1446,7 @@ fn exit_code(reports: &[ManifestReport], fail_on: FailOn) -> ExitCode {
         eprintln!("       refusing to report a clean run that was never completed");
         return ExitCode::from(2);
     }
+    note_unresolved(reports, fail_on);
     let triggered = reports
         .iter()
         .flat_map(|report| &report.results)
@@ -1578,6 +1612,7 @@ mod tests {
         let reports = vec![report_with(
             ScanIntegrity {
                 vulnerability_scan_failed: true,
+                registry_unreachable: false,
                 unresolved: 0,
             },
             &[DependencyStatus::UpToDate],
@@ -1589,22 +1624,59 @@ mod tests {
         assert!(gate_is_answerable(&reports, FailOn::None).is_ok());
     }
 
-    /// A dependency the registry never answered for has no status to gate on. `Outdated`
-    /// and `Vulnerable` match specific statuses and skip errors entirely, so a run that
-    /// resolved nothing would otherwise report success.
+    /// A registry that never answered leaves every dependency it covered unfounded, so
+    /// the gate still cannot be honoured — the half of the guard that has to survive the
+    /// narrowing below.
     #[test]
-    fn unresolved_dependencies_cannot_pass_a_status_gate() {
+    fn an_unreachable_registry_cannot_pass_a_status_gate() {
         let reports = vec![report_with(
             ScanIntegrity {
                 vulnerability_scan_failed: false,
-                unresolved: 3,
+                registry_unreachable: true,
+                unresolved: 0,
             },
-            &[DependencyStatus::Error("offline".to_owned())],
+            &[DependencyStatus::Error("registry unreachable".to_owned())],
         )];
         assert!(gate_is_answerable(&reports, FailOn::Vulnerable).is_err());
         assert!(gate_is_answerable(&reports, FailOn::Outdated).is_err());
-        // `Any` already fails on `Error`, so this is the gate working, not a hole.
+        assert_eq!(exit_code(&reports, FailOn::Vulnerable), ExitCode::from(2));
+        // `Any` fails on the `Error` statuses an unanswering registry produces, so its
+        // promise is kept — that is the gate working, not a hole.
         assert!(gate_is_answerable(&reports, FailOn::Any).is_ok());
+        assert_eq!(exit_code(&reports, FailOn::Any), ExitCode::from(1));
+        // Nothing was gated on, so nothing can be missing.
+        assert!(gate_is_answerable(&reports, FailOn::None).is_ok());
+    }
+
+    /// A registry that answered "no such package" answered. A private or internal
+    /// package, one served by a registry this run does not route to, or a deleted one is
+    /// a permanent per-dependency fact: it is reported, and it does not turn every
+    /// `--fail-on` setting into exit 2 for the dependencies that *did* resolve.
+    ///
+    /// This corrects an assertion that pinned the opposite. `--fail-on vulnerable` is
+    /// the shipped Action's default, so under the old rule every repository containing
+    /// one unpublished internal package went from a passing step to a hard failure, with
+    /// no escape short of dropping the gate.
+    #[test]
+    fn a_package_the_registry_says_does_not_exist_does_not_break_the_gate() {
+        let reports = vec![report_with(
+            ScanIntegrity {
+                vulnerability_scan_failed: false,
+                registry_unreachable: false,
+                unresolved: 1,
+            },
+            &[
+                DependencyStatus::UpToDate,
+                DependencyStatus::Error("package `@acme/internal` not found".to_owned()),
+            ],
+        )];
+        assert!(gate_is_answerable(&reports, FailOn::Vulnerable).is_ok());
+        assert!(gate_is_answerable(&reports, FailOn::Outdated).is_ok());
+        assert!(gate_is_answerable(&reports, FailOn::Any).is_ok());
+        assert_eq!(exit_code(&reports, FailOn::Vulnerable), ExitCode::SUCCESS);
+        assert_eq!(exit_code(&reports, FailOn::Outdated), ExitCode::SUCCESS);
+        // `Any` still fails on the error itself — that is the gate working, and it is
+        // the setting that asks to hear about anything less than a clean answer.
         assert_eq!(exit_code(&reports, FailOn::Any), ExitCode::from(1));
     }
 
