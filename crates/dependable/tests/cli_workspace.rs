@@ -182,7 +182,15 @@ fn a_relative_path_never_adopts_the_current_directorys_workspace() {
         dependency["constraint"], "9.9.9",
         "took the constraint from a workspace that is not an ancestor: {dependency}"
     );
-    assert_eq!(dependency["inherited"], false, "{dependency}");
+    assert!(
+        dependency["constraint"].is_null(),
+        "no constraint was adopted, so none is reported: {dependency}"
+    );
+    // `inherited` says the entry defers its version elsewhere, which this one does
+    // — it says nothing about whether anything was found there. It agrees with
+    // `source` by construction, so the two can never contradict each other.
+    assert_eq!(dependency["source"], "inherited", "{dependency}");
+    assert_eq!(dependency["inherited"], true, "{dependency}");
 }
 
 /// `workspace_root` names the manifest that *governs* this one, whether or not anything
