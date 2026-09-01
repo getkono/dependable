@@ -517,3 +517,48 @@ fn a_group_this_file_cannot_resolve_is_still_listed() {
     }
     assert_eq!(doc["summary"]["undetermined"], 2, "{}", doc["summary"]);
 }
+
+/// The `system` scope survives a version this parser had to reconstruct.
+///
+/// A comment inside `<version>` costs the entry its byte-faithful span, and the
+/// span-less path used to overwrite the source with `Inherited` — which is
+/// checkable, so a jar with no registry at all was fetched from one and reported
+/// `ERROR`, failing `--fail-on any`. Same POM, same scope, two answers.
+#[test]
+fn a_system_scoped_jar_stays_local_when_its_version_is_reconstructed() {
+    let dir = pom_dir(
+        "maven_system_scope_reconstructed",
+        "  <dependencies>\n    \
+         <dependency>\n      \
+         <groupId>org.example</groupId>\n      \
+         <artifactId>plainsys</artifactId>\n      \
+         <version>1.0.0</version>\n      \
+         <scope>system</scope>\n      \
+         <systemPath>/opt/plain.jar</systemPath>\n    \
+         </dependency>\n    \
+         <dependency>\n      \
+         <groupId>org.example</groupId>\n      \
+         <artifactId>cmtsys</artifactId>\n      \
+         <version>1.0<!--x-->.0</version>\n      \
+         <scope>system</scope>\n      \
+         <systemPath>/opt/cmt.jar</systemPath>\n    \
+         </dependency>\n  \
+         </dependencies>\n",
+    );
+
+    let doc = check_json(&dir, &[]);
+    for artifact in ["plainsys", "cmtsys"] {
+        let result = status_of(&doc, &format!("org.example:{artifact}"));
+        assert_eq!(
+            result["status"], "LOCAL",
+            "a system jar has no registry however its version is spelled: {result}"
+        );
+    }
+
+    let output = run(&dir, &["check", ".", "--fail-on", "any"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

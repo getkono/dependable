@@ -497,11 +497,20 @@ fn item(entry: &Declared, version: &Located, starts: &[usize]) -> Item {
 
 /// An item whose version is known but whose line is not this dependency's to
 /// rewrite — a `<properties>` entry several dependencies share.
+///
+/// The entry's own source survives when it says something
+/// [`Inherited`](PackageSource::Inherited) would contradict: a `<scope>system</scope>`
+/// jar is [`Local`](PackageSource::Local) — there is no registry that has heard of
+/// it — whether or not its version happened to need reconstructing. Only a registry
+/// entry becomes `Inherited`, which is the case the variant describes.
 fn inherited(entry: &Declared, version: &str) -> Item {
     Item {
         name: entry.name.clone(),
         version_constraint: version.to_owned(),
-        source: PackageSource::Inherited,
+        source: match entry.source {
+            PackageSource::Registry => PackageSource::Inherited,
+            other => other,
+        },
         version_line: 0,
         version_col_start: 0,
         version_col_end: 0,
@@ -860,6 +869,27 @@ mod tests {
         assert_eq!(names, vec![":orphan"]);
         assert_eq!(m.items[0].version_constraint, "");
         assert!(!m.items[0].is_checkable());
+    }
+
+    /// A `system` jar is a file on this machine whatever shape its version takes.
+    /// Reconstructing the version — here around a comment — must not relabel the
+    /// entry as one a registry could answer for: `Inherited` is checkable, and the
+    /// run would go and ask crates of a jar no registry has ever published.
+    #[test]
+    fn a_system_scoped_jar_stays_local_when_its_version_is_reconstructed() {
+        let content = pom("  <dependencies>\n\
+             \x20   <dependency>\n\
+             \x20     <groupId>g</groupId>\n\
+             \x20     <artifactId>cmtsys</artifactId>\n\
+             \x20     <version>1.0<!--x-->.0</version>\n\
+             \x20     <scope>system</scope>\n\
+             \x20   </dependency>\n\
+             \x20 </dependencies>\n");
+        let m = parse(&content);
+        let item = find(&m, "g:cmtsys");
+        assert_eq!(item.version_constraint, "1.0.0");
+        assert_eq!(item.source, PackageSource::Local);
+        assert!(!item.is_checkable(), "a system jar has no registry to ask");
     }
 
     /// Whitespace around a version is formatting, not part of it, and the span has
