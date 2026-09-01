@@ -661,6 +661,30 @@ mod tests {
         assert_eq!(sliced(&content, item), "1.2.3");
     }
 
+    /// An `<exclusions>` block names packages that must **not** be pulled in. Its
+    /// coordinates are nested, and reading only direct children is what keeps them
+    /// from being mistaken for the dependency's own.
+    #[test]
+    fn an_exclusion_is_not_a_dependency() {
+        let content = pom("  <dependencies>\n\
+             \x20   <dependency>\n\
+             \x20     <groupId>org.example</groupId>\n\
+             \x20     <artifactId>app</artifactId>\n\
+             \x20     <version>1.0.0</version>\n\
+             \x20     <exclusions>\n\
+             \x20       <exclusion>\n\
+             \x20         <groupId>commons-logging</groupId>\n\
+             \x20         <artifactId>commons-logging</artifactId>\n\
+             \x20       </exclusion>\n\
+             \x20     </exclusions>\n\
+             \x20   </dependency>\n\
+             \x20 </dependencies>\n");
+        let m = parse(&content);
+        let names: Vec<&str> = m.items.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, vec!["org.example:app"]);
+        assert_eq!(sliced(&content, &m.items[0]), "1.0.0");
+    }
+
     #[test]
     fn malformed_xml_is_a_structural_error() {
         assert!(PomXmlParser.parse("<project><dependencies>").is_err());
