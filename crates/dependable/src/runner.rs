@@ -659,9 +659,8 @@ pub async fn run_list(args: ListArgs) -> anyhow::Result<ExitCode> {
                 resolve_workspace_inheritance(&mut parsed.items, &declarations)
             })
             .unwrap_or_default();
-        let lockfile = (!args.no_lock_file)
-            .then(|| apply_nearest_lockfile(manifest, kind, &root, &mut parsed.items))
-            .flatten();
+        let lockfile =
+            apply_nearest_lockfile(manifest, kind, &root, !args.no_lock_file, &mut parsed.items);
         let meta = parse_project(kind, &content);
         let (version, version_inherited) = resolve_version(manifest, kind, &meta);
 
@@ -702,10 +701,22 @@ pub async fn run_list(args: ListArgs) -> anyhow::Result<ExitCode> {
 /// found by walking up. The walk stops at the repository root (the first ancestor
 /// holding a `.git`) so a stray lockfile outside the project is never read, and the
 /// path that was used is reported rather than assumed.
+///
+/// # `annotations`
+/// `--no-lock-file` clears this, and it governs **only** the annotating half. The flag
+/// is documented as "ignore sibling lockfiles (do not report locked versions)": it
+/// suppresses the `locked_at` column, which is an annotation on a list the manifest
+/// already produced. A `Package.resolved` is not that — it *is* the list, because a
+/// `Package.swift` is a program this tool declines to read. Honouring the flag there
+/// would not withhold a version column, it would report a Swift project as depending
+/// on nothing at all, which is the inversion this ecosystem's support exists to
+/// prevent. So a dependency-source lockfile is read regardless, and the flag keeps
+/// exactly the meaning its help text claims.
 fn apply_nearest_lockfile(
     manifest: &Path,
     kind: ManifestKind,
     root: &Path,
+    annotations: bool,
     items: &mut Vec<Item>,
 ) -> Option<PathBuf> {
     // One lockfile *is* the dependency list rather than an annotation on one: a
@@ -718,6 +729,9 @@ fn apply_nearest_lockfile(
         let content = std::fs::read_to_string(&path).ok()?;
         items.extend(lockfile_items(lock_kind, &content)?);
         return Some(relative_to(root, &path));
+    }
+    if !annotations {
+        return None;
     }
     let (path, resolved) = dependable_fetch::find_lockfile(manifest, kind)?;
     apply_lockfile(items, &resolved);

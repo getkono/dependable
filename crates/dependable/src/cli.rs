@@ -138,7 +138,9 @@ pub struct ListArgs {
     /// How many directories deep to search.
     #[arg(long, default_value_t = 3)]
     pub depth: usize,
-    /// Ignore sibling lockfiles (do not report locked versions).
+    /// Ignore sibling lockfiles (do not report locked versions). A lockfile that
+    /// *is* the dependency list rather than an annotation on one — SwiftPM's
+    /// `Package.resolved` — is still read, or the project would list nothing.
     #[arg(long)]
     pub no_lock_file: bool,
     /// Show each crate's available feature flags (Rust only; fetches the
