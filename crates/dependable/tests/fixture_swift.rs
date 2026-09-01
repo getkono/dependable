@@ -697,10 +697,10 @@ fn json_distinguishes_an_unread_dependency_list_from_an_empty_one() {
 /// empty `results` array it has earned.
 #[test]
 fn sarif_reports_an_unread_dependency_list_as_a_finding() {
-    let unread = scratch("swift_sarif_unread");
+    let unread_dir = scratch("swift_sarif_unread");
     std::fs::copy(
         fixture("sample-swift/Package.swift"),
-        unread.join("Package.swift"),
+        unread_dir.join("Package.swift"),
     )
     .unwrap();
 
@@ -726,7 +726,7 @@ fn sarif_reports_an_unread_dependency_list_as_a_finding() {
         log["runs"][0]["results"].as_array().cloned().unwrap()
     };
 
-    let unread = results(&unread);
+    let unread = results(&unread_dir);
     let empty = results(&empty);
 
     assert_eq!(
@@ -751,10 +751,47 @@ fn sarif_reports_an_unread_dependency_list_as_a_finding() {
     // No package was read, so none is named — and `region` is absent because the
     // missing information is a file that is not there, not a line in this one.
     assert!(unread[0]["properties"].get("package").is_none());
-    assert_eq!(unread[0]["properties"]["status"], "unread");
     assert!(
         unread[0]["locations"][0]["physicalLocation"]
             .get("region")
             .is_none()
     );
+
+    // `properties.status` otherwise always holds a `DependencyStatus` token, so a
+    // consumer switching on it exhaustively is doing the one safe thing with the
+    // key. DEP003 must not put a word there that no status can produce; the fact
+    // is about the manifest and gets its own key.
+    assert!(
+        unread[0]["properties"].get("status").is_none(),
+        "DEP003 names no dependency, so it claims no dependency status: {unread:?}"
+    );
+    assert_eq!(unread[0]["properties"]["dependencyListUnread"], true);
+
+    // The strings a Code Scanning alert renders verbatim. Wrapped string literals
+    // without `\` continuations carried runs of 14-18 literal spaces into them.
+    let text = |value: &serde_json::Value| value.as_str().expect("a string").to_owned();
+    let rule = {
+        let output = run(&[
+            "check",
+            "--manifest",
+            unread_dir.join("Package.swift").to_str().unwrap(),
+            "--no-vuln",
+            "--format",
+            "sarif",
+        ]);
+        let log: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("a SARIF document");
+        log["runs"][0]["tool"]["driver"]["rules"][2].clone()
+    };
+    assert_eq!(rule["id"], "DEP003");
+    for rendered in [
+        text(&unread[0]["message"]["text"]),
+        text(&rule["fullDescription"]["text"]),
+        text(&rule["help"]["text"]),
+    ] {
+        assert!(
+            !rendered.contains("  "),
+            "a run of spaces renders verbatim in the alert: {rendered:?}"
+        );
+    }
 }
