@@ -230,9 +230,15 @@ fn strip_leading_zeros(token: &str) -> &str {
 /// not a version: nothing in the `android` line is an upgrade of anything in the
 /// `jre` line, so the two are never ranked against each other.
 ///
-/// A version flavours on its **final** token, when that token is not numeric and is
-/// not one of Maven's own qualifier words ([`qualifier_alias`] recognizes those, so
-/// `6.4.4.Final`, `1.0-rc1`, and `1.0-SNAPSHOT` all flavour as `None`).
+/// A version flavours on its **whole trailing run of non-numeric tokens**, when
+/// every token in that run is a word Maven's own order does not rank
+/// ([`qualifier_alias`] recognizes those, so `6.4.4.Final`, `1.0-rc1`, and
+/// `1.0-SNAPSHOT` all flavour as `None`). The run and not its last token, because
+/// `com.google.inject:guice` publishes `2.0` beside `2.0-no_aop`: reading only
+/// `aop` would name a word no artifact is spelled with, and — worse — would leave
+/// the word this returns and the release key [`partitioning_flavours`] groups by
+/// disagreeing, so the flavour could never be found to partition anything and the
+/// filter built on it would go inert. The two must be read off the same slice.
 ///
 /// This is a question about one string, and one string cannot answer it: `-android`
 /// and `-incubating` tokenize identically, and only the first names a variant. So
@@ -254,14 +260,32 @@ pub fn flavour(version: &str) -> Option<String> {
 
 /// [`flavour`] for a version that is already tokenized.
 fn flavour_of(tokens: &[String]) -> Option<String> {
-    let last = tokens.last()?;
-    if is_numeric(last) {
+    let words = &tokens[release_len(tokens)..];
+    if words.is_empty() {
         return None;
     }
     // A word Maven itself ranks is a qualifier, not a variant; `ga`/`final`/
-    // `release` (which alias to `None`) are the release itself.
-    (qualifier_alias(last) == Some(last.as_str()) && !KNOWN_QUALIFIERS.contains(&last.as_str()))
-        .then(|| last.clone())
+    // `release` (which alias to `None`) are the release itself. One such word
+    // anywhere in the run makes the whole run a qualifier: `1.0-jre-SNAPSHOT` is a
+    // snapshot, not a flavour anybody upgrades within.
+    words
+        .iter()
+        .all(|word| {
+            qualifier_alias(word) == Some(word.as_str())
+                && !KNOWN_QUALIFIERS.contains(&word.as_str())
+        })
+        .then(|| words.join("."))
+}
+
+/// How many leading tokens are the release, i.e. everything before the trailing run
+/// of non-numeric tokens a flavour is spelled with.
+///
+/// This is the boundary [`flavour_of`] reads its word from and the one
+/// [`partitioning_flavours`] cuts its release key at, which is why it is one
+/// function: a key that kept part of the flavour would put `2.0-no_aop` in a group
+/// of its own and no flavour would ever be found to partition anything.
+fn release_len(tokens: &[String]) -> usize {
+    tokens.len() - tokens.iter().rev().take_while(|t| !is_numeric(t)).count()
 }
 
 /// The flavour words a published version list is actually *partitioned* by.
@@ -280,7 +304,10 @@ fn flavour_of(tokens: &[String]) -> Option<String> {
 /// side of that split would be told it is up to date forever.
 ///
 /// Releases are grouped by their [`maven_to_semver`] translation, so `1.0` and
-/// `1.0.0` — one version in Maven's order — are one release here too.
+/// `1.0.0` — one version in Maven's order — are one release here too. The flavour
+/// is cut off that key by the same [`release_len`] boundary [`flavour_of`] reads
+/// the word from, so a multi-word flavour (`2.0-no_aop`) groups with the plain
+/// release it is a variant of rather than sitting alone in a group of one.
 #[must_use]
 pub fn partitioning_flavours<'a>(versions: impl IntoIterator<Item = &'a str>) -> BTreeSet<String> {
     let mut spellings: BTreeMap<String, BTreeSet<Option<String>>> = BTreeMap::new();
@@ -288,7 +315,7 @@ pub fn partitioning_flavours<'a>(versions: impl IntoIterator<Item = &'a str>) ->
         let tokens = tokenize(version);
         let flavour = flavour_of(&tokens);
         let release = if flavour.is_some() {
-            &tokens[..tokens.len() - 1]
+            &tokens[..release_len(&tokens)]
         } else {
             &tokens[..]
         };
@@ -593,6 +620,37 @@ mod tests {
     fn a_release_is_grouped_by_its_translation_not_its_spelling() {
         let found = partitioning_flavours(["1.0.0", "1.0-jre"]);
         assert!(found.contains("jre"), "{found:?}");
+    }
+
+    /// `com.google.inject:guice` publishes `2.0` and `2.0-no_aop` — one release,
+    /// two builds, the second without the AOP support that pulls in cglib/ASM.
+    ///
+    /// The flavour is spelled with two tokens, so reading only the last one made
+    /// the word (`aop`) and the release key (`2.0.no` → `2.0.0-no`) disagree: the
+    /// variant landed in a group of its own, `no_aop` partitioned nothing, and the
+    /// filter built on this went inert and offered the no-AOP project the AOP jar.
+    #[test]
+    fn a_flavour_spelled_with_two_words_still_groups_with_its_plain_release() {
+        let found = partitioning_flavours(["7.0.0", "7.0.0-no_aop", "2.0", "2.0-no_aop"]);
+        assert_eq!(
+            found.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["no.aop"],
+            "{found:?}"
+        );
+        // The word the filter restricts on is read off the same slice as the key,
+        // which is the invariant that went missing.
+        assert_eq!(flavour("2.0-no_aop").as_deref(), Some("no.aop"));
+        assert!(found.contains(&flavour("2.0-no_aop").expect("a flavour")));
+    }
+
+    /// A trailing run holding one of Maven's own qualifier words is a qualifier,
+    /// not a variant: nobody upgrades *within* `-jre-SNAPSHOT`.
+    #[test]
+    fn a_run_containing_a_qualifier_word_is_not_a_flavour() {
+        assert_eq!(flavour("1.0-jre-SNAPSHOT"), None);
+        assert_eq!(flavour("1.0.0.Final"), None);
+        assert_eq!(flavour("9.4.51.v20230217"), None);
+        assert_eq!(flavour("33.7.1-jre").as_deref(), Some("jre"));
     }
 
     /// Maven writes a qualifier with a dot as readily as with a hyphen, so the
