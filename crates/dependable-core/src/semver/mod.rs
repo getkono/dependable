@@ -2,6 +2,7 @@
 
 pub mod checker;
 pub mod elixir;
+pub mod maven;
 pub mod normalize;
 pub mod nuget;
 pub mod python;
