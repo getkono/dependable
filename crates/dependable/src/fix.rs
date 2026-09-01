@@ -114,10 +114,11 @@ fn plan_fixes(content: &str, results: &[CheckResult], all: bool) -> (String, Vec
 }
 
 /// Build a new constraint from `original`, preserving its leading operator/`v`
-/// prefix and substituting `new_version`. Returns `None` for compound forms that
+/// prefix and substituting `new_version`. Returns `None` for the forms that
 /// can't be rewritten to a single version without changing their meaning: a
 /// comma-separated range (Cargo `>=1.0, <2.0`), a space-separated range
-/// (npm/pubspec `>=1.0.0 <2.0.0`), or a `||` alternation (`^1 || ^2`).
+/// (npm/pubspec `>=1.0.0 <2.0.0`), a `||` alternation (`^1 || ^2`), a dist-tag
+/// (`latest`), or a wildcard (`*`, `1.x`, `1.*`).
 fn rewrite_constraint(original: &str, new_version: &str) -> Option<String> {
     let trimmed = original.trim();
     if trimmed.contains(',') {
@@ -140,7 +141,23 @@ fn rewrite_constraint(original: &str, new_version: &str) -> Option<String> {
     if rest.starts_with(|c: char| c.is_ascii_alphabetic()) {
         return None;
     }
+    // A wildcard (`*`, `1.x`, `1.*`, Gradle's `1.+`) is a range the author chose,
+    // not a version — substituting a concrete release narrows it to a pin (#87).
+    // Widening it instead (`1.x` → `2.x`) would need to know how this ecosystem
+    // spells a wildcard, which this layer cannot see, and would be wrong for NuGet
+    // anyway, where a bare version is an inclusive minimum rather than a pin. So
+    // decline, exactly as a dist-tag is declined, and leave the author's range.
+    if is_wildcard(rest) {
+        return None;
+    }
     Some(format!("{prefix}{new_version}"))
+}
+
+/// Whether `rest` — a constraint with its leading operator prefix already
+/// stripped — floats over a range of versions rather than naming one.
+fn is_wildcard(rest: &str) -> bool {
+    rest.split('.')
+        .any(|segment| matches!(segment, "*" | "x" | "X" | "+"))
 }
 
 /// Apply byte-range edits to `content`, operating per line. Edits on the same
