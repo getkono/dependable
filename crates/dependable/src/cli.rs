@@ -75,7 +75,10 @@ pub struct CheckArgs {
     /// `include-if-current`. Overrides `[global] unstable`.
     #[arg(long, value_enum)]
     pub unstable: Option<UnstableFilter>,
-    /// Ignore `Cargo.lock`.
+    /// Ignore sibling lockfiles (do not report locked versions). A lockfile that
+    /// *is* the dependency list rather than an annotation on one — SwiftPM's
+    /// `Package.resolved` — is still read, or the project would be checked as
+    /// though it had no dependencies at all.
     #[arg(long)]
     pub no_lock_file: bool,
     /// Skip vulnerability scanning.

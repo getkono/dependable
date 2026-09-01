@@ -151,49 +151,72 @@ pub fn swift_package_name(location: &str) -> String {
         name = name[at + 1..].to_string();
     }
 
-    // git's SCP shorthand (`github.com:owner/repo`) writes a colon where a URL
-    // writes a slash. A port number is digits and is never this.
-    if scheme.is_none()
-        && let Some(colon) = name.find(':')
-        && !name[colon + 1..].starts_with(|c: char| c.is_ascii_digit())
-    {
-        name.replace_range(colon..=colon, "/");
-    }
-
     let name = name.trim_end_matches('/');
     let name = name.strip_suffix(".git").unwrap_or(name);
-    lowercase_host(name.trim_end_matches('/'))
+    normalize_host(name.trim_end_matches('/'), scheme.is_some())
 }
 
-/// Normalize the host component of an OSV `SwiftURL` name, leaving the path alone.
+/// Lowercase `name`'s host and join it to the path below it with a `/`, leaving
+/// that path exactly as written.
 ///
-/// Lowercased, for the reason [`swift_package_name`] gives, and stripped of any
-/// port: `ssh://git@github.com:22/apple/swift-nio.git` and
+/// The host is lowercased for the reason [`swift_package_name`] gives, and any port
+/// is dropped: `ssh://git@github.com:22/apple/swift-nio.git` and
 /// `https://github.com/apple/swift-nio.git` address the same repository, but only
 /// the second spells the key OSV holds. A port is transport, not identity, and
 /// leaving it on is the same silent false negative a mis-cased host is — the query
 /// matches nothing and the package is reported clean.
-fn lowercase_host(name: &str) -> String {
-    match name.split_once('/') {
-        Some((host, path)) => format!("{}/{path}", strip_port(host).to_ascii_lowercase()),
-        None => strip_port(name).to_ascii_lowercase(),
+fn normalize_host(name: &str, has_scheme: bool) -> String {
+    match split_authority(name, has_scheme) {
+        (host, Some(path)) => format!("{}/{path}", host.to_ascii_lowercase()),
+        (host, None) => host.to_ascii_lowercase(),
     }
 }
 
-/// `host` without a trailing `:<digits>`.
+/// Split `name` into its host and the path beneath it, dropping the separator (and
+/// a port, where there is one).
 ///
-/// Only an all-digit suffix is a port, which is the same test the SCP-shorthand
-/// branch of [`swift_package_name`] already applies: `github.com:vapor` is a path
-/// and keeps its colon here too. An IPv6 literal is unharmed — `[::1]` ends in `]`,
-/// not a digit — while `[::1]:22` loses only the port.
-fn strip_port(host: &str) -> &str {
-    match host.rsplit_once(':') {
-        Some((rest, port))
-            if !rest.is_empty() && !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) =>
-        {
-            rest
-        }
-        _ => host,
+/// # A colon is a port or a path separator, and only the form of the location says which
+/// `github.com:22/apple/swift-nio` and `github.com:42/pkg` are the same string
+/// shape and mean opposite things, so no test applied to the colon's *neighbours*
+/// can tell them apart. Guessing from whether the segment is numeric got both
+/// wrong: an owner beginning with a digit (`1024jp/GzipSwift`, `0xOpenBytes`,
+/// `4np`) kept a colon that OSV never matches, and an all-digit owner (`42/pkg`)
+/// silently lost its segment, producing a well-formed key naming a *different*
+/// package — the worse of the two, because nothing about it looks wrong.
+///
+/// What actually distinguishes them is the form: a port is URL syntax and only ever
+/// follows a scheme, while git's SCP shorthand (`git@github.com:owner/repo`) has no
+/// scheme by definition and writes a colon exactly where a URL writes a slash. So
+/// `has_scheme` decides it, and the digits are never consulted.
+///
+/// An IPv6 literal is bracketed and full of colons that are neither, so the scan for
+/// a separator begins after the closing `]`.
+fn split_authority(name: &str, has_scheme: bool) -> (&str, Option<&str>) {
+    let after_host = if name.starts_with('[') {
+        name.find(']').map_or(0, |close| close + 1)
+    } else {
+        0
+    };
+    let find = |needle: char| name[after_host..].find(needle).map(|i| i + after_host);
+    let slash = find('/');
+    let colon = find(':');
+    let split_at = |i: usize| (&name[..i], Some(&name[i + 1..]));
+
+    if has_scheme {
+        // URL syntax: the authority runs to the first `/`, and a `:` inside it is a
+        // port.
+        let (authority, path) = slash.map_or((name, None), split_at);
+        let host = colon
+            .filter(|i| *i < authority.len())
+            .map_or(authority, |i| &authority[..i]);
+        (host, path)
+    } else {
+        // No scheme, so no port: the first colon — if it comes before any slash — is
+        // SCP shorthand's path separator.
+        colon
+            .filter(|colon| slash.is_none_or(|slash| *colon < slash))
+            .or(slash)
+            .map_or((name, None), split_at)
     }
 }
 
@@ -208,9 +231,13 @@ fn strip_port(host: &str) -> &str {
 /// answers for the package it was asked about or not at all.
 ///
 /// Empty when the name is already lowercase, which is the overwhelming majority.
+///
+/// The fold is **ASCII**, matching the host's: OSV's `SwiftURL` keys and the
+/// hostnames in them are ASCII, and Unicode lowercasing can change a string's byte
+/// length, which would hand OSV a key for a repository nobody wrote.
 #[must_use]
 pub fn swift_package_name_variants(name: &str) -> Vec<String> {
-    let lowered = name.to_lowercase();
+    let lowered = name.to_ascii_lowercase();
     if lowered == name {
         Vec::new()
     } else {
@@ -542,12 +569,6 @@ mod tests {
                 "git://GitHub.com:9418/apple/swift-nio",
                 "github.com/apple/swift-nio",
             ),
-            // No scheme: `:22` is read as a port by the SCP-shorthand branch, so
-            // the path starts after it.
-            (
-                "github.com:22/apple/swift-nio.git",
-                "github.com/apple/swift-nio",
-            ),
             // The port is transport only; a mixed-case path still survives it.
             (
                 "ssh://git@github.com:22/weichsel/ZIPFoundation.git",
@@ -559,19 +580,57 @@ mod tests {
         }
     }
 
-    /// The strip is an all-digit suffix and nothing else, so a colon that is part of
-    /// a name — SCP shorthand, an IPv6 literal — keeps it.
+    /// The colon in git's SCP shorthand is a path separator, whatever the segment
+    /// after it happens to look like. Reading it as a port when the segment was
+    /// numeric produced two silent false negatives at once: `1024jp/GzipSwift` — a
+    /// real, widely used package, as are `0xOpenBytes/*` and `4np/*` — kept a colon
+    /// that OSV can never match, and `42/pkg` lost its owner entirely, yielding a
+    /// well-formed key for a *different* repository, which no reader can spot as
+    /// garbage and which could collide with a real advisory key.
     #[test]
-    fn a_colon_that_is_not_a_port_survives() {
+    fn an_scp_shorthand_colon_is_a_path_separator_whatever_follows_it() {
         let cases = [
-            // SCP shorthand: the colon becomes the path separator, not a port.
+            // The owner begins with a digit. Nothing distinguishes this from a port
+            // but the absence of a scheme.
+            (
+                "git@github.com:1024jp/GzipSwift.git",
+                "github.com/1024jp/GzipSwift",
+            ),
+            // The owner is *all* digits — the case the old heuristic deleted.
+            ("git@github.com:42/pkg.git", "github.com/42/pkg"),
             ("git@github.com:vapor/vapor.git", "github.com/vapor/vapor"),
-            // An IPv6 literal ends in `]`, never a digit.
+            // A scheme is present, so here the same shape really is a port.
+            (
+                "ssh://git@github.com:22/apple/swift-nio.git",
+                "github.com/apple/swift-nio",
+            ),
+            (
+                "https://github.com:443/apple/swift-nio.git",
+                "github.com/apple/swift-nio",
+            ),
+        ];
+        for (location, expected) in cases {
+            assert_eq!(swift_package_name(location), expected, "{location}");
+        }
+    }
+
+    /// An IPv6 literal is bracketed and full of colons that separate nothing, so the
+    /// search for a port or a path separator starts after the `]`.
+    #[test]
+    fn an_ipv6_literal_keeps_its_colons() {
+        let cases = [
             ("https://[::1]/apple/swift-nio.git", "[::1]/apple/swift-nio"),
+            // A scheme, so `:22` is a port.
             (
                 "ssh://git@[::1]:22/apple/swift-nio",
                 "[::1]/apple/swift-nio",
             ),
+            // No scheme, so by the same rule as every other SCP location the colon
+            // separates the host from the path — degenerate, but consistent, and it
+            // does not mangle the address.
+            ("[::1]:22", "[::1]/22"),
+            // No separator at all: the whole literal is the host.
+            ("[2001:db8::1]", "[2001:db8::1]"),
         ];
         for (location, expected) in cases {
             assert_eq!(swift_package_name(location), expected, "{location}");

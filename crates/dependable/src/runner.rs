@@ -416,11 +416,17 @@ pub async fn run_check(args: CheckArgs) -> anyhow::Result<ExitCode> {
 fn build_report(root: PathBuf, reports: &[ManifestReport]) -> dependable_report::Report {
     let mut report = dependable_report::Report::new(root);
     for manifest in reports {
-        report.push(dependable_report::ManifestResults::new(
-            manifest.path.clone(),
-            manifest.ecosystem,
-            manifest.results.clone(),
-        ));
+        report.push(
+            dependable_report::ManifestResults::new(
+                manifest.path.clone(),
+                manifest.ecosystem,
+                manifest.results.clone(),
+            )
+            // A policy rule counts rows. A manifest whose dependency list went
+            // unread contributes none, and a rule that passes over no rows has
+            // established nothing — so the model has to carry the difference.
+            .with_dependencies_unread(manifest.dependencies_unread),
+        );
     }
     report
 }
@@ -1148,11 +1154,17 @@ pub async fn run_report(args: crate::cli::ReportArgs) -> anyhow::Result<ExitCode
             notes.push(notice);
         }
         match engine.check_manifest(manifest).await? {
-            Some(checked) => report.push(dependable_report::ManifestResults::new(
-                relative_to(&root, &checked.path),
-                checked.ecosystem,
-                checked.results,
-            )),
+            Some(checked) => report.push(
+                dependable_report::ManifestResults::new(
+                    relative_to(&root, &checked.path),
+                    checked.ecosystem,
+                    checked.results,
+                )
+                // Structural, not a note: `--quiet` suppresses the notes below, and
+                // a caveat about what the report does not cover is not chatter. A
+                // report that omits it is indistinguishable from a clean one.
+                .with_dependencies_unread(checked.dependencies_unread),
+            ),
             None => notes.push(format!(
                 "Skipped {}: its ecosystem is not enabled or not yet supported.",
                 relative_to(&root, manifest).display()

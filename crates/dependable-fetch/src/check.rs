@@ -554,15 +554,26 @@ impl Checker {
     /// directory first, then each ancestor, stopping at a repository boundary —
     /// so a workspace member picks up the lockfile at the workspace root rather
     /// than reporting no locked versions.
+    ///
+    /// # `read_lockfiles` governs annotations only
+    /// [`CheckerBuilder::read_lockfiles`] is the `--no-lock-file` switch, and that
+    /// flag suppresses *locked-version annotations* on a list the manifest already
+    /// produced. A `Package.resolved` is not that: it **is** the list, because a
+    /// `Package.swift` is a program this crate declines to read
+    /// ([`LockfileKind::is_dependency_source`]). Honouring the switch there does
+    /// not withhold a column, it reports a Swift project as depending on nothing —
+    /// and since the OSV scan then runs over an empty item list, a project with a
+    /// vulnerable pin comes back clean. So the file is located first and the switch
+    /// is applied only to a lockfile that annotates.
     async fn read_lockfile(
         &self,
         path: &Path,
         kind: ManifestKind,
     ) -> Option<(LockfileKind, String)> {
-        if !self.read_lockfiles {
+        let (lock_path, lock_kind) = crate::discover::locate_lockfile(path, kind)?;
+        if !self.read_lockfiles && !lock_kind.is_dependency_source() {
             return None;
         }
-        let (lock_path, lock_kind) = crate::discover::locate_lockfile(path, kind)?;
         let content = tokio::fs::read_to_string(&lock_path).await.ok()?;
         Some((lock_kind, content))
     }
@@ -1481,7 +1492,13 @@ impl CheckerBuilder {
         self
     }
 
-    /// Whether [`Checker::check_path`] reads the sibling lockfile (default: true).
+    /// Whether [`Checker::check_path`] reads an **annotating** sibling lockfile
+    /// (default: true).
+    ///
+    /// A lockfile that *is* the dependency list rather than an annotation on one —
+    /// SwiftPM's `Package.resolved`, see [`LockfileKind::is_dependency_source`] —
+    /// is read regardless: switching it off would report the project as depending
+    /// on nothing rather than as having no locked versions.
     pub fn read_lockfiles(mut self, enabled: bool) -> Self {
         self.read_lockfiles = enabled;
         self
@@ -1675,6 +1692,85 @@ mod tests {
         // A local package reports what it always did — nothing was going to be
         // fetched for it in any ecosystem.
         assert_eq!(check.results[1].status, DependencyStatus::Local);
+    }
+
+    /// `--no-lock-file` suppresses locked-version *annotations*. A
+    /// `Package.resolved` is not one — it is the whole dependency list a Swift
+    /// project has — so honouring the switch there did not withhold a column, it
+    /// handed the OSV scan an empty item list and reported a project with a
+    /// vulnerable pin as clean.
+    #[tokio::test]
+    async fn lockfiles_off_still_reads_the_lockfile_that_is_the_dependency_list() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("Package.swift"), "// a program\n").unwrap();
+        std::fs::write(dir.path().join("Package.resolved"), PACKAGE_RESOLVED).unwrap();
+
+        let checker = Checker::builder()
+            .rust_registry("http://127.0.0.1:1".to_string(), None)
+            .registryless(Ecosystem::Swift)
+            .vulnerabilities(false)
+            .disk_cache(false)
+            .read_lockfiles(false)
+            .build()
+            .expect("a checker builds without a network");
+
+        let check = checker
+            .check_path(dir.path().join("Package.swift"))
+            .await
+            .expect("checked");
+        let names: Vec<&str> = check.results.iter().map(|r| r.item.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["github.com/apple/swift-nio", "helpers"],
+            "with the list suppressed there is nothing to scan and nothing to report"
+        );
+    }
+
+    /// The other half of the same switch: a lockfile that only *annotates* a list
+    /// the manifest already produced must still be ignored. Reading a dependency
+    /// source regardless must not become reading everything regardless.
+    #[tokio::test]
+    async fn lockfiles_off_still_suppresses_an_annotating_lockfile() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"sample\"\n\n[dependencies]\ntime = \"0.2.7\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.lock"),
+            "[[package]]\nname = \"time\"\nversion = \"0.2.7\"\n",
+        )
+        .unwrap();
+
+        async fn locked(manifest: &std::path::Path, read_lockfiles: bool) -> Option<String> {
+            let checker = Checker::builder()
+                .rust_registry("http://127.0.0.1:1".to_string(), None)
+                .vulnerabilities(false)
+                .disk_cache(false)
+                .read_lockfiles(read_lockfiles)
+                .build()
+                .expect("a checker builds without a network");
+            checker
+                .check_path(manifest)
+                .await
+                .expect("checked")
+                .results
+                .first()
+                .and_then(|r| r.item.locked_version.clone())
+        }
+
+        let manifest = dir.path().join("Cargo.toml");
+        assert_eq!(
+            locked(&manifest, true).await.as_deref(),
+            Some("0.2.7"),
+            "the fixture must have an annotation to suppress"
+        );
+        assert_eq!(
+            locked(&manifest, false).await,
+            None,
+            "`--no-lock-file` must still drop an annotating lockfile"
+        );
     }
 
     /// The discriminator. `has_registry()` is true for every ecosystem but Swift,

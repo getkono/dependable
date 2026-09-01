@@ -328,6 +328,70 @@ fn no_lock_file_does_not_empty_a_swift_dependency_list() {
     );
 }
 
+/// The same flag on the command that decides the exit code. `list` was taught that a
+/// `Package.resolved` is the dependency list rather than an annotation on one; `check`
+/// was not, so `--no-lock-file` handed the OSV scan an empty item list. A Swift project
+/// with a known-vulnerable pin then reported clean and exited 0 — a silent security
+/// false negative, and the exact inversion the flag's own help text disclaims.
+#[test]
+fn no_lock_file_does_not_empty_what_check_scans() {
+    let manifest = fixture("sample-swift/Package.swift");
+    let output = run(&[
+        "check",
+        "--manifest",
+        manifest.to_str().unwrap(),
+        "--no-lock-file",
+        "--no-vuln",
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        stdout.contains("github.com/apple/swift-nio"),
+        "the pins are what `check` has to scan; stdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("(0 dependencies)") && !stdout.contains("nothing to check"),
+        "an empty scan of a resolved project is a false clean bill; stdout: {stdout}"
+    );
+    assert!(
+        !stderr.contains("no dependency with a version to check was found here at all"),
+        "there are four; stderr: {stderr}"
+    );
+
+    // The exit code is what a CI job acts on, and it was the part that silently
+    // inverted: nothing scanned means nothing found means success.
+    let gated = run(&[
+        "check",
+        "--manifest",
+        manifest.to_str().unwrap(),
+        "--no-lock-file",
+        "--no-vuln",
+        "--fail-on",
+        "any",
+    ]);
+    assert_eq!(
+        gated.status.code(),
+        Some(1),
+        "`--fail-on any` over four undetermined pins must fail exactly as it does without the flag"
+    );
+
+    // …and `--format json` must publish the same list, not a summary of nothing.
+    let json = run(&[
+        "check",
+        "--manifest",
+        manifest.to_str().unwrap(),
+        "--no-lock-file",
+        "--no-vuln",
+        "--format",
+        "json",
+    ]);
+    let doc: serde_json::Value =
+        serde_json::from_slice(&json.stdout).expect("`check --format json` emits JSON");
+    assert_eq!(doc["summary"]["total"], 6, "{doc}");
+    assert_eq!(doc["summary"]["undetermined"], 4, "{doc}");
+}
+
 /// The other half of the same flag: for a lockfile that only *annotates* a list the
 /// manifest already produced, `--no-lock-file` must still suppress it. Fixing Swift
 /// by ignoring the flag everywhere would have taken this with it.
@@ -692,10 +756,10 @@ fn json_distinguishes_an_unread_dependency_list_from_an_empty_one() {
 /// empty `results` array it has earned.
 #[test]
 fn sarif_reports_an_unread_dependency_list_as_a_finding() {
-    let unread = scratch("swift_sarif_unread");
+    let unread_dir = scratch("swift_sarif_unread");
     std::fs::copy(
         fixture("sample-swift/Package.swift"),
-        unread.join("Package.swift"),
+        unread_dir.join("Package.swift"),
     )
     .unwrap();
 
@@ -721,7 +785,7 @@ fn sarif_reports_an_unread_dependency_list_as_a_finding() {
         log["runs"][0]["results"].as_array().cloned().unwrap()
     };
 
-    let unread = results(&unread);
+    let unread = results(&unread_dir);
     let empty = results(&empty);
 
     assert_eq!(
@@ -746,10 +810,126 @@ fn sarif_reports_an_unread_dependency_list_as_a_finding() {
     // No package was read, so none is named — and `region` is absent because the
     // missing information is a file that is not there, not a line in this one.
     assert!(unread[0]["properties"].get("package").is_none());
-    assert_eq!(unread[0]["properties"]["status"], "unread");
     assert!(
         unread[0]["locations"][0]["physicalLocation"]
             .get("region")
             .is_none()
     );
+
+    // `properties.status` otherwise always holds a `DependencyStatus` token, so a
+    // consumer switching on it exhaustively is doing the one safe thing with the
+    // key. DEP003 must not put a word there that no status can produce; the fact
+    // is about the manifest and gets its own key.
+    assert!(
+        unread[0]["properties"].get("status").is_none(),
+        "DEP003 names no dependency, so it claims no dependency status: {unread:?}"
+    );
+    assert_eq!(unread[0]["properties"]["dependencyListUnread"], true);
+
+    // The strings a Code Scanning alert renders verbatim. Wrapped string literals
+    // without `\` continuations carried runs of 14-18 literal spaces into them.
+    let text = |value: &serde_json::Value| value.as_str().expect("a string").to_owned();
+    let rule = {
+        let output = run(&[
+            "check",
+            "--manifest",
+            unread_dir.join("Package.swift").to_str().unwrap(),
+            "--no-vuln",
+            "--format",
+            "sarif",
+        ]);
+        let log: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("a SARIF document");
+        log["runs"][0]["tool"]["driver"]["rules"][2].clone()
+    };
+    assert_eq!(rule["id"], "DEP003");
+    for rendered in [
+        text(&unread[0]["message"]["text"]),
+        text(&rule["fullDescription"]["text"]),
+        text(&rule["help"]["text"]),
+    ] {
+        assert!(
+            !rendered.contains("  "),
+            "a run of spaces renders verbatim in the alert: {rendered:?}"
+        );
+    }
+}
+
+/// An HTML report is frequently the only artifact a reviewer ever sees, so the fact
+/// that a project's dependency list went unread has to be *in the document*.
+///
+/// It used to reach the page only as a run note, and `report --quiet` drops notes —
+/// so the quiet artifact for a Swift project with no `Package.resolved` was
+/// byte-for-byte the shape of a resolved, clean one, right down to §3 asserting
+/// "This manifest declares no dependencies", which nothing had established.
+#[test]
+fn a_quiet_html_report_still_says_the_dependency_list_went_unread() {
+    let unread_dir = scratch("swift_html_unread");
+    std::fs::copy(
+        fixture("sample-swift/Package.swift"),
+        unread_dir.join("Package.swift"),
+    )
+    .unwrap();
+
+    let empty_dir = scratch("swift_html_empty");
+    std::fs::copy(
+        fixture("sample-swift/Package.swift"),
+        empty_dir.join("Package.swift"),
+    )
+    .unwrap();
+    std::fs::write(
+        empty_dir.join("Package.resolved"),
+        r#"{"pins":[],"version":2}"#,
+    )
+    .unwrap();
+
+    let render = |dir: &Path| {
+        let out = dir.join("report.html");
+        let output = run(&[
+            "report",
+            "--manifest",
+            dir.join("Package.swift").to_str().unwrap(),
+            "--no-vuln",
+            "--quiet",
+            "--output",
+            out.to_str().unwrap(),
+        ]);
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // The templates wrap their prose, so the rendered document carries newlines
+        // inside sentences. Collapse them, or an assertion about a phrase would be
+        // an assertion about where a template happens to break its lines.
+        std::fs::read_to_string(&out)
+            .expect("the report was written")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+
+    let unread = render(&unread_dir);
+    let empty = render(&empty_dir);
+
+    assert!(
+        unread.contains("no readable dependency list"),
+        "the summary must carry the caveat structurally, not as a suppressible note"
+    );
+    assert!(
+        unread.contains("could not be read"),
+        "and the manifest's own section must say which project it is about"
+    );
+    assert!(
+        !unread.contains("This manifest declares no dependencies"),
+        "nothing established that; the file that would have said so was never read"
+    );
+
+    // The other half: a project that really is resolved and really has no pins is
+    // still reported exactly as before, with no caveat it has not earned.
+    assert!(
+        !empty.contains("no readable dependency list") && !empty.contains("could not be read"),
+        "a resolved project with no pins has nothing to caveat"
+    );
+    assert!(empty.contains("This manifest declares no dependencies"));
 }

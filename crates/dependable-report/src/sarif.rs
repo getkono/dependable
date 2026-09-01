@@ -271,7 +271,8 @@ fn vulnerable_finding(
             ecosystem,
             current_version: Some(current),
             latest_version: latest_version(result),
-            status: result.status.token(),
+            status: Some(result.status.token()),
+            dependency_list_unread: None,
             advisory_id: Some(id.to_string()),
             cvss_score: advisory.and_then(|a| a.severity.score),
             severity: advisory.and_then(|a| a.severity.band).map(|b| b.token()),
@@ -324,7 +325,8 @@ fn outdated_finding(
             ecosystem,
             current_version: Some(current),
             latest_version: latest,
-            status: result.status.token(),
+            status: Some(result.status.token()),
+            dependency_list_unread: None,
             advisory_id: None,
             cvss_score: None,
             severity: None,
@@ -353,7 +355,9 @@ fn unread_finding(ecosystem: &'static str, uri: &str) -> Finding {
         rule_index: 2,
         level: Level::Warning,
         message: format!(
-            "The dependency list for `{uri}` could not be read, so no dependency in it was              checked. An empty result set for this manifest means nothing was looked at, not              that nothing is wrong."
+            "The dependency list for `{uri}` could not be read, so no dependency in it was \
+             checked. An empty result set for this manifest means nothing was looked at, \
+             not that nothing is wrong."
         ),
         uri: uri.to_string(),
         start_line: None,
@@ -365,9 +369,10 @@ fn unread_finding(ecosystem: &'static str, uri: &str) -> Finding {
             ecosystem,
             current_version: None,
             latest_version: None,
-            // Not a `DependencyStatus` token — no dependency has this status,
-            // because no dependency was read. The manifest does.
-            status: "unread",
+            // No dependency has a status here, because no dependency was read.
+            // The fact belongs to the manifest, and to its own key.
+            status: None,
+            dependency_list_unread: Some(true),
             advisory_id: None,
             cvss_score: None,
             severity: None,
@@ -610,10 +615,14 @@ fn rules() -> [ReportingDescriptor; 3] {
             name: "UnreadDependencyList",
             short_description: Text::new("The project's dependency list could not be read."),
             full_description: Text::new(
-                "The file that is this project's dependency list — a SwiftPM                  `Package.resolved` — is missing or unreadable, and its manifest declares no                  dependencies of its own. No dependency was checked, so the absence of other                  findings for this manifest says nothing about the project.",
+                "The file that is this project's dependency list — a SwiftPM \
+                 `Package.resolved` — is missing or unreadable, and its manifest declares \
+                 no dependencies of its own. No dependency was checked, so the absence of \
+                 other findings for this manifest says nothing about the project.",
             ),
             help: Text::new(
-                "Resolve the project (`swift package resolve`) and commit the resulting                  `Package.resolved`, or repair the existing one.",
+                "Resolve the project (`swift package resolve`) and commit the resulting \
+                 `Package.resolved`, or repair the existing one.",
             ),
             help_uri: INFORMATION_URI,
             default_configuration: RuleConfig {
@@ -817,7 +826,21 @@ struct ResultProperties {
     current_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     latest_version: Option<String>,
-    status: &'static str,
+    /// A [`DependencyStatus::token`] — and nothing else, ever.
+    ///
+    /// Absent for [`DEP003`], which is about the manifest rather than a dependency
+    /// in it. Overloading this key with a word no `DependencyStatus` produces would
+    /// break the one thing a consumer can safely do with it: switch on it
+    /// exhaustively. [`ResultProperties::dependency_list_unread`] carries that fact
+    /// instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<&'static str>,
+    /// [`DEP003`] only: the file that *is* this project's dependency list went
+    /// unread, so an empty result set for the manifest means nothing was looked at.
+    /// Its own key rather than a value of [`ResultProperties::status`], because it
+    /// is a fact about the manifest and not a status any dependency can hold.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dependency_list_unread: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     advisory_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
