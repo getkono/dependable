@@ -68,5 +68,5 @@ description = "Check that commits on this branch follow Conventional Commits"
 run = "convco check master..HEAD"
 
 [tasks.ci]
-description = "Run the full local CI gate: format check, lint, and tests"
-depends = ["fmt:check", "lint", "test"]
+description = "Run the full local CI gate: format check, lint, and tests (both color modes)"
+depends = ["fmt:check", "lint", "test", "test:color"]
