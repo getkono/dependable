@@ -180,6 +180,15 @@ pub enum PackageSource {
     /// does need IO, and is [`resolve_workspace_inheritance`](crate::resolve_workspace_inheritance)
     /// applied by the caller that has the root in hand.
     Inherited,
+    /// A real registry package whose declared version this manifest does not, on its
+    /// own, resolve to a range: an npm `"$name"` override naming a dependency the
+    /// manifest never declares.
+    ///
+    /// Not [`Local`](Self::Local) — the package is published and the entry is real —
+    /// and not a parse error: the manifest is valid, its intent simply cannot be read
+    /// from what is written. Nothing is fetched for it, and the checker reports it as
+    /// [`DependencyStatus::Undetermined`](crate::result::DependencyStatus::Undetermined).
+    Unresolved,
 }
 
 #[cfg(test)]

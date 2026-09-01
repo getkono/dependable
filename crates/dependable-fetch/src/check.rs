@@ -855,6 +855,10 @@ fn evaluate_item(
     if !item.is_checkable() {
         let status = match item.source {
             PackageSource::Git => DependencyStatus::Git,
+            // A real package whose declared version could not be read from the
+            // manifest. Nothing to fetch, and nothing that would justify calling it
+            // current.
+            PackageSource::Unresolved => DependencyStatus::Undetermined,
             _ => DependencyStatus::Local,
         };
         return CheckResult::new(item.clone(), status);
