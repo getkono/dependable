@@ -108,13 +108,25 @@ fn is_override_section(section: &str) -> bool {
 /// package is therefore the *last* `>`-separated segment; reading the first named an
 /// unrelated package, which `--fix` then rewrote the pin to that package's latest
 /// version.
+///
+/// Both pnpm and Yarn also allow a **range** in the key, and a range can contain `>`
+/// (`"lodash@>=1.0.0"`). Splitting on every `>` read that comparator as a parent
+/// separator and renamed the package to a fragment of its own range — `=1.0.0` — so the
+/// split is bounded by [`is_parent_separator`].
 fn override_name(key: &str) -> Option<&str> {
     if key == "." {
         return None;
     }
-    // The parent selectors in front of the last `>` scope the override; only the segment
-    // after it names the package being overridden.
-    let key = key.rsplit('>').next().unwrap_or(key).trim();
+    let key = key.trim();
+    // The parent selectors in front of the last *separating* `>` scope the override;
+    // only the segment after it names the package being overridden.
+    let key = match key
+        .char_indices()
+        .rfind(|&(at, c)| c == '>' && is_parent_separator(key, at))
+    {
+        Some((at, _)) => key[at + 1..].trim(),
+        None => key,
+    };
     // Segment first, then strip the version. Doing it the other way round cut `**/@scope/pkg`
     // at the scope's own `@`, because that `@` is not at the start of the *key*.
     //
@@ -139,6 +151,26 @@ fn override_name(key: &str) -> Option<&str> {
         _ => name,
     };
     (!name.is_empty() && name != "*" && name != "**").then_some(name)
+}
+
+/// Whether the `>` at byte offset `at` joins a parent selector to the package it scopes,
+/// rather than being a comparator inside a version range.
+///
+/// A comparator **opens** a clause, so it follows what can open one: the `@` that
+/// introduces the range, a clause delimiter, or another operator character (`>=`, `||>`).
+/// A separator follows the end of a name or of a version, which none of those can be.
+/// That is the whole distinction between `"lodash@>=1.0.0"` (one package, a range) and
+/// `"quux@1>bar"` (a parent and the package it scopes).
+fn is_parent_separator(key: &str, at: usize) -> bool {
+    let Some(prev) = key[..at].chars().next_back() else {
+        // A leading `>` opens a range that names no parent at all.
+        return false;
+    };
+    !prev.is_whitespace()
+        && !matches!(
+            prev,
+            '@' | ',' | '|' | '(' | '[' | '<' | '>' | '=' | '!' | '~' | '^'
+        )
 }
 
 /// An npm override value that references one of this manifest's own direct
@@ -543,5 +575,47 @@ mod tests {
         let names: Vec<&str> = m.items.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(names, vec!["bar"], "got {names:?}");
         assert_eq!(find(&m, "bar").kind, DependencyKind::Override);
+    }
+    /// pnpm and Yarn both allow a range in the override key, and a range contains `>`.
+    /// Splitting on every `>` cut the key inside its own range: `lodash@>=1.0.0` was
+    /// read as a package called `=1.0.0`, which no registry has, so the entry reported
+    /// as a 404 — and once a 404 stopped failing the gate, silently.
+    #[test]
+    fn a_range_in_an_override_key_is_not_a_parent_separator() {
+        assert_eq!(override_name("lodash@>=1.0.0"), Some("lodash"));
+        assert_eq!(override_name("foo>bar@>=1"), Some("bar"));
+        assert_eq!(override_name("foo@>1.0.0"), Some("foo"));
+        assert_eq!(override_name("a@>b"), Some("a"));
+        assert_eq!(override_name("lodash@>=1.0.0,>=1.1"), Some("lodash"));
+        assert_eq!(override_name("@scope/pkg@>=1.0.0"), Some("@scope/pkg"));
+        assert_eq!(override_name("**/lodash@>=1.0.0"), Some("lodash"));
+        // A separator still separates when a range sits on either side of it.
+        assert_eq!(override_name("quux@1>bar@^2.1.0"), Some("bar"));
+        assert_eq!(override_name("foo@>=1.0.0>bar"), Some("bar"));
+        assert_eq!(
+            override_name("@scope/pkg@1>@scope/other"),
+            Some("@scope/other")
+        );
+    }
+
+    /// The whole reported key list, read through the parser: every one of these named a
+    /// fragment of its own range before, so the manifest was checked against four
+    /// packages that do not exist.
+    #[test]
+    fn override_keys_carrying_ranges_name_their_own_packages() {
+        let content = r#"{ "overrides": {
+            "lodash@>=1.0.0": "4.17.21",
+            "foo>bar@>=1": "2.0.0",
+            "foo@>1.0.0": "1.0.0",
+            "a@>b": "1.0.0",
+            "quux@1>baz@^2.1.0": "2.0.0"
+        } }"#;
+        let m = parse(content);
+        let names: Vec<&str> = m.items.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["lodash", "bar", "foo", "a", "baz"],
+            "got {names:?}"
+        );
     }
 }

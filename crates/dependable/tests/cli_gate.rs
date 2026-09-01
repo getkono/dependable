@@ -26,6 +26,10 @@ fn workdir(name: &str) -> PathBuf {
 /// One canned response: status code, `Content-Type`, body.
 type Response = (u16, &'static str, String);
 
+fn json(body: impl Into<String>) -> Response {
+    (200, "application/json", body.into())
+}
+
 fn text(body: impl Into<String>) -> Response {
     (200, "text/plain", body.into())
 }
@@ -92,6 +96,19 @@ fn registry(routes: Vec<(String, Response)>) -> String {
         }
     });
     format!("http://{addr}")
+}
+
+/// An npm abbreviated packument: the version keys and the `latest` dist-tag are all the
+/// version checker reads.
+fn packument(name: &str, versions: &[&str], latest: &str) -> Response {
+    let entries: Vec<String> = versions
+        .iter()
+        .map(|v| format!("\"{v}\":{{\"name\":\"{name}\",\"version\":\"{v}\"}}"))
+        .collect();
+    json(format!(
+        "{{\"name\":\"{name}\",\"dist-tags\":{{\"latest\":\"{latest}\"}},\"versions\":{{{}}}}}",
+        entries.join(",")
+    ))
 }
 
 /// Point every ecosystem fetcher at `base` and switch OSV off, so a run touches nothing
@@ -184,6 +201,51 @@ fn a_go_module_the_proxy_answers_410_for_does_not_break_the_gate() {
     );
     // The module that *did* resolve is still evaluated.
     assert!(stdout.contains("update available"), "stdout: {stdout}");
+}
+
+// ---------------------------------------------------------------------------
+// A `>` inside an override key's range
+// ---------------------------------------------------------------------------
+
+/// pnpm and Yarn both allow a range in an override key, and a range contains `>`.
+/// Splitting on every `>` cut each key inside its own range, so the run asked the
+/// registry for `=1.0.0`, `=1`, `1.0.0` and `b` — and, with a 404 no longer failing the
+/// gate, said nothing about it.
+#[test]
+fn an_override_key_carrying_a_range_is_checked_as_its_own_package() {
+    let dir = workdir("gate_override_range");
+    let base = registry(vec![
+        (
+            "/lodash".to_string(),
+            packument("lodash", &["4.17.21"], "4.17.21"),
+        ),
+        ("/bar".to_string(), packument("bar", &["2.0.0"], "2.0.0")),
+        ("/foo".to_string(), packument("foo", &["1.0.0"], "1.0.0")),
+        ("/a".to_string(), packument("a", &["1.0.0"], "1.0.0")),
+    ]);
+    let config = write_config(&dir, &base);
+    fs::write(
+        dir.join("package.json"),
+        "{\"name\":\"app\",\"overrides\":{\"lodash@>=1.0.0\":\"4.17.21\",\"foo>bar@>=1\":\
+         \"2.0.0\",\"foo@>1.0.0\":\"1.0.0\",\"a@>b\":\"1.0.0\",\"quux@1>bar@^2.1.0\":\"2.0.0\"}}\n",
+    )
+    .unwrap();
+
+    let output = check(&dir, &config, &["--fail-on", "vulnerable"]);
+    let (stdout, stderr, code) = outcome(&output);
+
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    for fragment in ["=1.0.0", "not found"] {
+        assert!(
+            !stdout.contains(fragment),
+            "a range fragment was read as a package name:\n{stdout}"
+        );
+    }
+    assert!(
+        stdout.contains("lodash") && stdout.contains("bar") && stdout.contains("foo"),
+        "stdout: {stdout}"
+    );
+    assert!(stdout.contains("5 up to date"), "stdout: {stdout}");
 }
 
 // ---------------------------------------------------------------------------
