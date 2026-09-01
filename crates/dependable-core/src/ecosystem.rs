@@ -4,8 +4,10 @@ use serde::{Deserialize, Serialize};
 
 /// A package ecosystem.
 ///
-/// Every variant is wired end-to-end: a parser, a registry fetcher, and an OSV
-/// mapping. Which languages that adds up to is a wider question than this enum —
+/// Most variants are wired end-to-end: a parser, a registry fetcher, and an OSV
+/// mapping. [`Ecosystem::has_registry`] names the exception — an ecosystem that
+/// publishes no registry has an OSV mapping and nothing to compare a version
+/// against. Which languages that adds up to is a wider question than this enum —
 /// `deno.json` and `pnpm-workspace.yaml` are both [`Ecosystem::Npm`] — so the
 /// **Supported languages** table in `README.md` is authoritative for status, and
 /// `docs/ECOSYSTEM-CANDIDATES.md` records what a new variant has to clear.
@@ -21,6 +23,15 @@ pub enum Ecosystem {
     CSharp,
     Elixir,
     Jvm,
+    /// Swift packages, identified by their git URL.
+    ///
+    /// The one ecosystem here with no registry: SwiftPM discovers versions by
+    /// enumerating a repository's git tags, and while SE-0292 defines a registry
+    /// API, no dominant public instance operates one. [`Ecosystem::has_registry`]
+    /// is `false`, and a check reports currency as
+    /// [`Undetermined`](crate::result::DependencyStatus::Undetermined) rather than
+    /// guessing.
+    Swift,
 }
 
 impl Ecosystem {
@@ -37,7 +48,30 @@ impl Ecosystem {
             Ecosystem::CSharp => "NuGet",
             Ecosystem::Elixir => "Hex",
             Ecosystem::Jvm => "Maven",
+            // OSV keys its Swift advisories by repository URL, not by a package
+            // name any registry issued — which is why the name we send is the URL
+            // with its scheme stripped (`dependable_core::swift_package_name`).
+            Ecosystem::Swift => "SwiftURL",
         }
+    }
+
+    /// Whether this ecosystem publishes a registry a version can be compared
+    /// against.
+    ///
+    /// `false` for exactly one ecosystem, [`Swift`](Self::Swift), and it is a fact
+    /// about the ecosystem rather than about this tool's configuration — which is
+    /// the whole reason it is a method here and not the absence of a fetcher. A
+    /// caller with no fetcher registered for an ecosystem cannot otherwise tell "the
+    /// user turned this off" from "there is nothing to turn on", and the two want
+    /// opposite behaviour: the first should skip the manifest, the second should
+    /// carry on and scan it for vulnerabilities.
+    ///
+    /// A `false` here means [`default_registry`](Self::default_registry) is empty and
+    /// nothing will ever be fetched, so currency is unknowable rather than merely
+    /// unread.
+    #[must_use]
+    pub fn has_registry(self) -> bool {
+        !matches!(self, Ecosystem::Swift)
     }
 
     /// A human-readable name for display.
@@ -53,10 +87,17 @@ impl Ecosystem {
             Ecosystem::CSharp => "C#",
             Ecosystem::Elixir => "Elixir",
             Ecosystem::Jvm => "JVM",
+            Ecosystem::Swift => "Swift",
         }
     }
 
-    /// The default registry base URL for the ecosystem.
+    /// The default registry base URL for the ecosystem, or `""` for an ecosystem
+    /// that has none.
+    ///
+    /// Empty is the honest answer for Swift and the only one: inventing a URL here
+    /// would hand a fetcher somewhere to send requests that cannot be answered.
+    /// [`has_registry`](Self::has_registry) is the predicate to branch on; this is
+    /// the value to configure a fetcher with once it says `true`.
     #[must_use]
     pub fn default_registry(self) -> &'static str {
         match self {
@@ -69,6 +110,7 @@ impl Ecosystem {
             Ecosystem::CSharp => "https://api.nuget.org",
             Ecosystem::Elixir => "https://hex.pm",
             Ecosystem::Jvm => "https://repo1.maven.org/maven2",
+            Ecosystem::Swift => "",
         }
     }
 
@@ -103,6 +145,11 @@ impl Ecosystem {
                 "https://central.sonatype.com/artifact/{}",
                 name.replace(':', "/")
             ),
+            // A Swift package name *is* its repository URL with the scheme taken
+            // off, so the page is that URL put back together. There is no registry
+            // page to link to instead, and inventing one would send the reader to a
+            // site that has never heard of this package.
+            Ecosystem::Swift => format!("https://{name}"),
         }
     }
 
@@ -130,6 +177,10 @@ impl Ecosystem {
             ),
             // Packagist renders every version on the package page itself.
             Ecosystem::Php => self.package_url(name),
+            // A Swift version is a git tag, and the tag's spelling is not derivable
+            // from the version: `2.65.0` and `v2.65.0` are both common, and a link
+            // to the wrong one 404s. The repository is what we can name truthfully.
+            Ecosystem::Swift => self.package_url(name),
         }
     }
 
@@ -160,7 +211,7 @@ mod tests {
 
     /// Every variant, so a new ecosystem cannot be added without being given
     /// its pages.
-    const ALL: [Ecosystem; 9] = [
+    const ALL: [Ecosystem; 10] = [
         Ecosystem::Rust,
         Ecosystem::Go,
         Ecosystem::Npm,
@@ -170,7 +221,45 @@ mod tests {
         Ecosystem::CSharp,
         Ecosystem::Elixir,
         Ecosystem::Jvm,
+        Ecosystem::Swift,
     ];
+
+    /// Exactly one ecosystem has no registry, and the rest must not drift into
+    /// claiming they have none — a `false` here routes a manifest past the
+    /// registry entirely.
+    #[test]
+    fn swift_is_the_only_ecosystem_without_a_registry() {
+        for ecosystem in ALL {
+            let expected = ecosystem != Ecosystem::Swift;
+            assert_eq!(ecosystem.has_registry(), expected, "{ecosystem:?}");
+            assert_eq!(
+                !ecosystem.default_registry().is_empty(),
+                expected,
+                "{ecosystem:?}: a registry URL and `has_registry` must agree"
+            );
+        }
+    }
+
+    /// The OSV ecosystem strings are what a query is keyed on; a wrong one matches
+    /// nothing and reports a vulnerable package as clean.
+    #[test]
+    fn swift_advisories_are_keyed_by_repository_url() {
+        assert_eq!(Ecosystem::Swift.osv_name(), "SwiftURL");
+        assert_eq!(
+            Ecosystem::Swift.package_url("github.com/vapor/vapor"),
+            "https://github.com/vapor/vapor"
+        );
+        // No per-version page: a git tag's spelling is not derivable from the
+        // version, so the repository is all that can be named truthfully.
+        assert_eq!(
+            Ecosystem::Swift.version_url("github.com/vapor/vapor", "4.92.1"),
+            Ecosystem::Swift.package_url("github.com/vapor/vapor")
+        );
+        assert_eq!(
+            Ecosystem::Swift.docs_url("github.com/vapor/vapor", "4.92.1"),
+            None
+        );
+    }
 
     #[test]
     fn every_ecosystem_can_name_a_page_for_a_package() {

@@ -37,10 +37,10 @@ pub use npmrc::{NpmrcConfig, parse_npmrc};
 pub use parsers::{
     AutoTargets, CargoPackageManifest, CargoTarget, CargoTargetKind, CargoTomlParser,
     CfgDependencyTable, ComposerJsonParser, CsprojParser, DenoJsonParser, DependencySection,
-    GoModParser, GradleCatalogParser, MixExsParser, PackageField, PackageJsonParser, Parser,
-    PnpmWorkspaceParser, PomXmlParser, ProjectMeta, ProjectRole, PubspecYamlParser,
-    PyprojectTomlParser, RequirementsTxtParser, WorkspaceDecl, parse, parse_cargo_config,
-    parse_package_manifest, parse_package_name, parse_project, parse_workspace,
+    GoModParser, GradleCatalogParser, MixExsParser, PackageField, PackageJsonParser,
+    PackageSwiftParser, Parser, PnpmWorkspaceParser, PomXmlParser, ProjectMeta, ProjectRole,
+    PubspecYamlParser, PyprojectTomlParser, RequirementsTxtParser, WorkspaceDecl, parse,
+    parse_cargo_config, parse_package_manifest, parse_package_name, parse_project, parse_workspace,
     resolve_workspace_inheritance,
 };
 pub use result::{CheckResult, DependencyStatus};

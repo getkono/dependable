@@ -61,6 +61,13 @@ pub enum ManifestKind {
     Csproj,
     GradleVersionCatalog,
     PomXml,
+    /// SwiftPM's `Package.swift`.
+    ///
+    /// Its parser reads no dependencies at all, deliberately — the file is a Swift
+    /// program, not data. The dependency list comes from its `Package.resolved`,
+    /// which [`LockfileKind::is_dependency_source`] marks as a source of items
+    /// rather than an annotation on them.
+    PackageSwift,
 }
 
 impl ManifestKind {
@@ -79,6 +86,7 @@ impl ManifestKind {
             ManifestKind::MixExs => Ecosystem::Elixir,
             ManifestKind::Csproj => Ecosystem::CSharp,
             ManifestKind::GradleVersionCatalog | ManifestKind::PomXml => Ecosystem::Jvm,
+            ManifestKind::PackageSwift => Ecosystem::Swift,
         }
     }
 
@@ -99,6 +107,9 @@ impl ManifestKind {
             ManifestKind::ComposerJson => &[LockfileKind::ComposerLock],
             ManifestKind::PubspecYaml => &[LockfileKind::PubspecLock],
             ManifestKind::MixExs => &[LockfileKind::MixLock],
+            // The only entry here that is not merely a source of resolved versions:
+            // without it a Swift project has no dependency list at all.
+            ManifestKind::PackageSwift => &[LockfileKind::PackageResolved],
             _ => &[],
         }
     }
@@ -193,6 +204,7 @@ impl ManifestKind {
             "mix.exs" => ManifestKind::MixExs,
             "Directory.Packages.props" => ManifestKind::Csproj,
             "pom.xml" => ManifestKind::PomXml,
+            "Package.swift" => ManifestKind::PackageSwift,
             // Gradle reads every `*.versions.toml` under `gradle/` as a catalog;
             // `libs` is only the conventional name of the default one.
             _ if name.ends_with(".versions.toml") => ManifestKind::GradleVersionCatalog,
@@ -446,6 +458,7 @@ mod tests {
                 ManifestKind::GradleVersionCatalog,
             ),
             ("services/api/pom.xml", ManifestKind::PomXml),
+            ("app/Package.swift", ManifestKind::PackageSwift),
         ];
         for (path, expected) in cases {
             assert_eq!(
@@ -481,6 +494,7 @@ mod tests {
         assert_eq!(names(ManifestKind::ComposerJson), ["composer.lock"]);
         assert_eq!(names(ManifestKind::PubspecYaml), ["pubspec.lock"]);
         assert_eq!(names(ManifestKind::MixExs), ["mix.lock"]);
+        assert_eq!(names(ManifestKind::PackageSwift), ["Package.resolved"]);
         assert!(names(ManifestKind::GoMod).is_empty());
         assert!(!ManifestKind::GoMod.has_lockfile_support());
     }
@@ -509,6 +523,7 @@ mod tests {
             ManifestKind::Csproj,
             ManifestKind::GradleVersionCatalog,
             ManifestKind::PomXml,
+            ManifestKind::PackageSwift,
         ] {
             assert!(kind.workspace_roots().is_none(), "{kind:?}");
             assert!(
@@ -561,6 +576,29 @@ mod tests {
         // A `pom.xml` is data and reads fine; what it cannot resolve is reported
         // entry by entry, so there is nothing here to declare unreadable.
         assert!(ManifestKind::PomXml.unreadable_manifests().is_empty());
+        // A `Package.swift` is a program too, and is not listed here on purpose: an
+        // unreadable manifest is one whose dependencies went unread, and Swift's are
+        // read in full from `Package.resolved` beside it. What a Swift run cannot
+        // establish is currency, which is a different statement and is made per check.
+        assert!(ManifestKind::PackageSwift.unreadable_manifests().is_empty());
+    }
+
+    /// Exactly one lockfile supplies the dependency list; the rest annotate one the
+    /// manifest already produced, and a drift here would silently insert transitive
+    /// packages into five other ecosystems' results.
+    #[test]
+    fn only_package_resolved_is_a_source_of_dependencies() {
+        assert!(LockfileKind::PackageResolved.is_dependency_source());
+        for kind in [
+            LockfileKind::CargoLock,
+            LockfileKind::PackageLockJson,
+            LockfileKind::BunLock,
+            LockfileKind::ComposerLock,
+            LockfileKind::PubspecLock,
+            LockfileKind::MixLock,
+        ] {
+            assert!(!kind.is_dependency_source(), "{kind:?}");
+        }
     }
 
     #[test]
@@ -591,6 +629,7 @@ mod tests {
             ManifestKind::ComposerJson,
             ManifestKind::PubspecYaml,
             ManifestKind::MixExs,
+            ManifestKind::PackageSwift,
         ] {
             for lockfile in kind.lockfiles() {
                 assert_eq!(
