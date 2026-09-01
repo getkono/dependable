@@ -405,9 +405,14 @@ dependable tree --format json      # nodes + edges, for tooling / IDEs
 dependable tree --format dot | dot -Tsvg > deps.svg   # visual graph
 ```
 
-In `--format json`, a node's `version` is `null` when no version was read for it
-— which is what a shallow tree, built from manifests with no `Cargo.lock` to
-resolve against, produces for every node. It is never the empty string.
+In `--format json`, a node's `version` is `null` when no version was read for it,
+and the `ascii` and `dot` renderers drop the `vX.Y.Z` suffix for the same node.
+A shallow tree — built from manifests, with no `Cargo.lock` to resolve against —
+still reports each **workspace member's** declared version, because a member is
+not resolved against anything and what its manifest declares is what the crate
+is; its **dependencies** are `null`, because a manifest declares a constraint
+rather than a resolution. A version is never the empty string: a blank one in a
+lockfile is read as no version at all.
 
 ```
 my-app v0.1.0 (workspace)
