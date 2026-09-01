@@ -1,0 +1,3 @@
+# A project that has switched the JVM off. Used by the CLI tests.
+[jvm]
+enabled = false

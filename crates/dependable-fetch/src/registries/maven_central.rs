@@ -143,12 +143,17 @@ fn parse_metadata(body: &str, package: &str) -> Result<FetchedVersions, FetchErr
 }
 
 /// Sort raw Maven versions newest-first by their semver interpretation.
+///
+/// The comparison is **total**: versions that compare equal are ordered by their
+/// own strings, so a list built in a nondeterministic order (a `HashMap`'s
+/// iteration, pages appended as their fetches complete) cannot come out of here in
+/// a nondeterministic one.
 fn sort_desc(versions: &mut [String]) {
     versions.sort_by(|a, b| {
         let va = maven_to_semver(a).and_then(|s| Version::parse(&s).ok());
         let vb = maven_to_semver(b).and_then(|s| Version::parse(&s).ok());
         match (va, vb) {
-            (Some(va), Some(vb)) => vb.cmp(&va),
+            (Some(va), Some(vb)) => vb.cmp(&va).then_with(|| b.cmp(a)),
             _ => b.cmp(a),
         }
     });

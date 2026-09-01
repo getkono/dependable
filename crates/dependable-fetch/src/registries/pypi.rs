@@ -405,13 +405,65 @@ impl RegistryFetcher for PyPiFetcher {
 }
 
 /// Sort raw PEP 440 versions newest-first by their semver interpretation.
+///
+/// The comparison is **total**: versions that compare equal are ordered by their
+/// own strings, so a list built in a nondeterministic order (a `HashMap`'s
+/// iteration, pages appended as their fetches complete) cannot come out of here in
+/// a nondeterministic one.
 fn sort_desc(versions: &mut [String]) {
     versions.sort_by(|a, b| {
         let va = pep440_to_semver(a).and_then(|s| Version::parse(&s).ok());
         let vb = pep440_to_semver(b).and_then(|s| Version::parse(&s).ok());
         match (va, vb) {
-            (Some(va), Some(vb)) => vb.cmp(&va),
+            (Some(va), Some(vb)) => vb.cmp(&va).then_with(|| b.cmp(a)),
             _ => b.cmp(a),
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// PyPI's `releases` object is read into a `HashMap`, whose iteration order is
+    /// randomized per process — so the list handed to the sort has no order of its
+    /// own, and `psycopg2-binary` really does publish both `2.7.6` and `2.7.6.1`.
+    ///
+    /// The sort compares translations, and two versions can translate alike, so a
+    /// stable sort left every tie group in the order it arrived in. Breaking the tie
+    /// on the version string makes the order **total**, so one input set has exactly
+    /// one sorted form however it was assembled.
+    #[test]
+    fn sorting_is_total_so_the_arrival_order_cannot_survive_it() {
+        let published = ["2.7.6.1", "2.7.6", "2.7.5"];
+        let expected = {
+            let mut first: Vec<String> = published.iter().map(|v| (*v).to_string()).collect();
+            sort_desc(&mut first);
+            first
+        };
+        // Every ordering of the same set, so nothing positional can survive.
+        let mut order: Vec<usize> = (0..published.len()).collect();
+        let mut seen = 0;
+        loop {
+            let mut shuffled: Vec<String> =
+                order.iter().map(|i| published[*i].to_string()).collect();
+            sort_desc(&mut shuffled);
+            assert_eq!(shuffled, expected, "arrived as {order:?}");
+            seen += 1;
+            // Next permutation, in place.
+            let Some(pivot) = (0..order.len() - 1)
+                .rev()
+                .find(|i| order[*i] < order[i + 1])
+            else {
+                break;
+            };
+            let swap = (pivot + 1..order.len())
+                .rev()
+                .find(|i| order[*i] > order[pivot])
+                .expect("a successor above the pivot");
+            order.swap(pivot, swap);
+            order[pivot + 1..].reverse();
+        }
+        assert_eq!(seen, 6, "every ordering was tried");
+    }
 }

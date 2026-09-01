@@ -472,3 +472,93 @@ fn a_pom_whose_dependencies_are_all_in_profiles_says_so() {
         String::from_utf8_lossy(&checked.stderr)
     );
 }
+
+/// `${project.groupId}` is the standard way a multi-module build names a sibling
+/// module, and this file cannot resolve it — Maven's built-ins are not
+/// `<properties>` entries. Dropping the entry made `list` report a POM declaring
+/// three dependencies as having one, with nothing on stderr: the same silent
+/// omission a parent-supplied `<version>` used to cause, reached through the
+/// coordinate instead of the version.
+#[test]
+fn a_group_this_file_cannot_resolve_is_still_listed() {
+    let dir = pom_dir(
+        "maven_unresolvable_group",
+        "  <dependencies>\n    \
+         <dependency>\n      \
+         <groupId>${project.groupId}</groupId>\n      \
+         <artifactId>app-core</artifactId>\n      \
+         <version>${project.version}</version>\n    \
+         </dependency>\n    \
+         <dependency>\n      \
+         <groupId>${project.groupId}</groupId>\n      \
+         <artifactId>app-web</artifactId>\n      \
+         <version>${project.version}</version>\n    \
+         </dependency>\n    \
+         <dependency>\n      \
+         <groupId>org.slf4j</groupId>\n      \
+         <artifactId>slf4j-api</artifactId>\n      \
+         <version>2.0.13</version>\n    \
+         </dependency>\n  \
+         </dependencies>\n",
+    );
+
+    let listed = run(&dir, &["list", "."]);
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    assert!(stdout.contains("3 dependencies"), "{stdout}");
+    for artifact in ["app-core", "app-web", "slf4j-api"] {
+        assert!(stdout.contains(artifact), "{artifact} is missing: {stdout}");
+    }
+
+    // And `check` classifies the two as undetermined rather than omitting them.
+    let doc = check_json(&dir, &[]);
+    assert_eq!(doc["summary"]["total"], 3, "{}", doc["summary"]);
+    for name in ["${project.groupId}:app-core", "${project.groupId}:app-web"] {
+        assert_eq!(status_of(&doc, name)["status"], "UNDETERMINED", "{name}");
+    }
+    assert_eq!(doc["summary"]["undetermined"], 2, "{}", doc["summary"]);
+}
+
+/// The `system` scope survives a version this parser had to reconstruct.
+///
+/// A comment inside `<version>` costs the entry its byte-faithful span, and the
+/// span-less path used to overwrite the source with `Inherited` — which is
+/// checkable, so a jar with no registry at all was fetched from one and reported
+/// `ERROR`, failing `--fail-on any`. Same POM, same scope, two answers.
+#[test]
+fn a_system_scoped_jar_stays_local_when_its_version_is_reconstructed() {
+    let dir = pom_dir(
+        "maven_system_scope_reconstructed",
+        "  <dependencies>\n    \
+         <dependency>\n      \
+         <groupId>org.example</groupId>\n      \
+         <artifactId>plainsys</artifactId>\n      \
+         <version>1.0.0</version>\n      \
+         <scope>system</scope>\n      \
+         <systemPath>/opt/plain.jar</systemPath>\n    \
+         </dependency>\n    \
+         <dependency>\n      \
+         <groupId>org.example</groupId>\n      \
+         <artifactId>cmtsys</artifactId>\n      \
+         <version>1.0<!--x-->.0</version>\n      \
+         <scope>system</scope>\n      \
+         <systemPath>/opt/cmt.jar</systemPath>\n    \
+         </dependency>\n  \
+         </dependencies>\n",
+    );
+
+    let doc = check_json(&dir, &[]);
+    for artifact in ["plainsys", "cmtsys"] {
+        let result = status_of(&doc, &format!("org.example:{artifact}"));
+        assert_eq!(
+            result["status"], "LOCAL",
+            "a system jar has no registry however its version is spelled: {result}"
+        );
+    }
+
+    let output = run(&dir, &["check", ".", "--fail-on", "any"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

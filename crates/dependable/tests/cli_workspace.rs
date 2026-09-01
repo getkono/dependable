@@ -220,3 +220,55 @@ fn a_constraint_the_root_never_declared_is_attributed_to_nobody() {
         "the root declares no tokio: {tokio}"
     );
 }
+
+/// A package that inherits from a workspace root there is none of.
+///
+/// The status is `UNDETERMINED`, which `--fail-on any` fails the run for — so the
+/// exit code alone tells a reader nothing, and stderr saying nothing at all leaves a
+/// CI job red with no explanation anywhere. Reporting an unread version as
+/// undetermined rather than local is the right call; doing it silently is not.
+#[test]
+fn a_package_inheriting_from_no_workspace_at_all_says_so() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("workspace_detached_member");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(dir.join(".git")).unwrap();
+    // A package, not a workspace: nothing above it declares `serde`, and the `.git`
+    // marker stops the walk before it reaches this repository's own root.
+    fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"detached\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde.workspace = true\n",
+    )
+    .unwrap();
+    fs::write(dir.join("dependable.toml"), CONFIG).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_dependable"))
+        .args([
+            "check",
+            dir.to_str().unwrap(),
+            "--config",
+            dir.join("dependable.toml").to_str().unwrap(),
+            "--fail-on",
+            "any",
+            "--format",
+            "json",
+            "--no-vuln",
+            "--no-cache",
+        ])
+        .output()
+        .expect("run dependable");
+
+    let doc: Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
+    let serde = result(&doc, "Cargo.toml", "serde");
+    assert_eq!(serde["status"], "UNDETERMINED", "{serde}");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "`--fail-on any` fails on an undetermined dependency"
+    );
+    assert!(
+        stderr.contains("serde") && stderr.contains("no workspace root was found"),
+        "an undetermined dependency that fails the run has to say why: {stderr:?}"
+    );
+}

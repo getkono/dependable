@@ -597,13 +597,17 @@ fn warn_policy_ignored(config: &Path) {
 /// sibling lockfile applied. Only `--features` touches the network.
 pub async fn run_list(args: ListArgs) -> anyhow::Result<ExitCode> {
     let root = args.path.clone().unwrap_or_else(|| PathBuf::from("."));
+    // `list` needs no configuration to do its own work, but the unread-manifest
+    // warnings discovery emits are advice to *enable* something — and telling
+    // someone to enable an ecosystem they switched off is noise `check`, `fix`, and
+    // `report` already know not to make.
+    let cfg = load_config(&args.config);
     let manifests = collect_manifests(
         args.manifest.as_deref(),
         args.path.as_deref(),
         args.depth,
         &args.manifest_glob,
-        // `list` reads no config file, so every ecosystem is on.
-        &|_| true,
+        &|ecosystem| cfg.ecosystem_enabled(ecosystem),
     )?;
     if manifests.is_empty() {
         eprintln!("No supported manifests found.");

@@ -164,7 +164,7 @@ a.ext { color: var(--accent); }
 </ul>
 </div>
 <ul class="stats">
-<li><span class="n">7</span><span class="k">dependencies</span></li>
+<li><span class="n">8</span><span class="k">dependencies</span></li>
 <li><span class="n">2</span><span class="k">manifests</span></li>
 <li><span class="n">16.7%</span><span class="k">of 6 checkable up to date</span></li>
 <li class="bad"><span class="n">2</span><span class="k">vulnerable</span></li>
@@ -191,6 +191,7 @@ a.ext { color: var(--accent); }
 <tr><th scope="row">Errored</th><td class="num">1</td></tr>
 <tr><th scope="row">Path (local)</th><td class="num">1</td></tr>
 <tr><th scope="row">Git</th><td class="num">0</td></tr>
+<tr><th scope="row">Undetermined</th><td class="num">1</td></tr>
 </tbody>
 </table>
 <p class="prose">
@@ -284,7 +285,7 @@ and Markdown permits raw HTML inside it.
 <section id="dependencies" class="card">
 <h2>3. Dependency status</h2>
 <details class="manifest" open>
-<summary><code>Cargo.toml</code> — Rust (5 dependencies)</summary>
+<summary><code>Cargo.toml</code> — Rust (6 dependencies)</summary>
 <table class="grid wide">
 <thead>
 <tr>
@@ -347,6 +348,16 @@ and Markdown permits raw HTML inside it.
 <td>
 <span class="chip st-ERROR">error</span>
 <div class="muted">502 Bad Gateway from the index</div>
+</td>
+</tr>
+<tr>
+<th scope="row">helper</th>
+<td><code></code></td>
+<td><code class="ver"></code></td>
+<td><code class="ver">—</code></td>
+<td><code class="ver">—</code></td>
+<td>
+<span class="chip st-UNDETERMINED">undetermined</span>
 </td>
 </tr>
 </tbody>
@@ -453,26 +464,26 @@ publisher never dated are listed last.
 <div class="chart">
 <svg class="pie" viewBox="0 0 220 220" width="220" height="220" role="img" aria-labelledby="pie-title pie-desc">
 <title id="pie-title">Dependencies by ecosystem</title>
-<desc id="pie-desc">A pie chart of 7 dependencies split across 2 ecosystem(s). The same figures are in the table beneath it.</desc>
-<path d="M 110.0000 110.0000 L 110.0000 10.0000 A 100.0000 100.0000 0 1 1 12.5072 132.2521 Z" fill="#b7410e"></path>
-<path d="M 110.0000 110.0000 L 12.5072 132.2521 A 100.0000 100.0000 0 0 1 110.0000 10.0000 Z" fill="#cb3837"></path>
+<desc id="pie-desc">A pie chart of 8 dependencies split across 2 ecosystem(s). The same figures are in the table beneath it.</desc>
+<path d="M 110.0000 110.0000 L 110.0000 10.0000 A 100.0000 100.0000 0 1 1 10.0000 110.0000 Z" fill="#b7410e"></path>
+<path d="M 110.0000 110.0000 L 10.0000 110.0000 A 100.0000 100.0000 0 0 1 110.0000 10.0000 Z" fill="#cb3837"></path>
 </svg>
 <ul class="legend">
 <li>
 <svg class="swatch" viewBox="0 0 10 10" width="10" height="10" aria-hidden="true"><rect width="10" height="10" fill="#b7410e"></rect></svg>
 <span class="legend-name">Rust</span>
-<span class="legend-count">5 (71.4%)</span>
-<svg class="bar" viewBox="0 0 120 8" width="120" height="8" role="img" aria-label="Rust health: 1 up to date, 1 outdated, 1 vulnerable, 2 not checkable">
-<rect x="0.0000" y="0" width="24.0000" height="8" class="bar-ok"><title>up to date: 1</title></rect>
-<rect x="24.0000" y="0" width="24.0000" height="8" class="bar-outdated"><title>outdated: 1</title></rect>
-<rect x="48.0000" y="0" width="24.0000" height="8" class="bar-vulnerable"><title>vulnerable: 1</title></rect>
-<rect x="72.0000" y="0" width="48.0000" height="8" class="bar-other"><title>not checkable: 2</title></rect>
+<span class="legend-count">6 (75.0%)</span>
+<svg class="bar" viewBox="0 0 120 8" width="120" height="8" role="img" aria-label="Rust health: 1 up to date, 1 outdated, 1 vulnerable, 3 not checkable">
+<rect x="0.0000" y="0" width="20.0000" height="8" class="bar-ok"><title>up to date: 1</title></rect>
+<rect x="20.0000" y="0" width="20.0000" height="8" class="bar-outdated"><title>outdated: 1</title></rect>
+<rect x="40.0000" y="0" width="20.0000" height="8" class="bar-vulnerable"><title>vulnerable: 1</title></rect>
+<rect x="60.0000" y="0" width="60.0000" height="8" class="bar-other"><title>not checkable: 3</title></rect>
 </svg>
 </li>
 <li>
 <svg class="swatch" viewBox="0 0 10 10" width="10" height="10" aria-hidden="true"><rect width="10" height="10" fill="#cb3837"></rect></svg>
 <span class="legend-name">npm</span>
-<span class="legend-count">2 (28.6%)</span>
+<span class="legend-count">2 (25.0%)</span>
 <svg class="bar" viewBox="0 0 120 8" width="120" height="8" role="img" aria-label="npm health: 0 up to date, 1 outdated, 1 vulnerable, 0 not checkable">
 <rect x="0.0000" y="0" width="60.0000" height="8" class="bar-outdated"><title>outdated: 1</title></rect>
 <rect x="60.0000" y="0" width="60.0000" height="8" class="bar-vulnerable"><title>vulnerable: 1</title></rect>
@@ -496,17 +507,17 @@ publisher never dated are listed last.
 <tbody>
 <tr>
 <th scope="row">Rust</th>
-<td class="num">5</td>
-<td class="num">71.4%</td>
+<td class="num">6</td>
+<td class="num">75.0%</td>
 <td class="num">1</td>
 <td class="num">1</td>
 <td class="num">1</td>
-<td class="num">2</td>
+<td class="num">3</td>
 </tr>
 <tr>
 <th scope="row">npm</th>
 <td class="num">2</td>
-<td class="num">28.6%</td>
+<td class="num">25.0%</td>
 <td class="num">0</td>
 <td class="num">1</td>
 <td class="num">1</td>

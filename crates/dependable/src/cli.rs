@@ -126,6 +126,11 @@ pub struct ListArgs {
     /// any pattern is kept. `*` and `?` do not cross `/`, `**` does.
     #[arg(long, conflicts_with = "manifest")]
     pub manifest_glob: Vec<String>,
+    /// Config file path. `list` reads only the per-ecosystem `enabled` flags from
+    /// it, so that an ecosystem you have switched off is not warned about; it does
+    /// not read registry or network settings.
+    #[arg(long, default_value = ".dependable.toml")]
+    pub config: PathBuf,
     /// Output format: `table` for reading, `json` for the full inventory, `text` for
     /// one tab-separated line per dependency.
     #[arg(long, value_enum, default_value_t = Format::Table)]
@@ -143,7 +148,7 @@ pub struct ListArgs {
     /// Show each dependency's registry-declared license (fetches package
     /// metadata, so this makes `list` hit the network). Available for crates.io,
     /// npm, PyPI, Packagist, and Hex; Go, JSR, NuGet, and pub.dev publish none.
-    /// Uses the default registry URLs — `list` reads no config file.
+    /// Uses the default registry URLs — `list` reads no registry configuration.
     #[arg(long)]
     pub licenses: bool,
     #[arg(short, long)]
