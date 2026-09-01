@@ -13,9 +13,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use dependable_core::{
-    CheckResult, DependencyStatus, Ecosystem, Evaluation, Item, LockfileKind, ManifestKind,
-    PackageSource, UnstableFilter, apply_lockfile, check_version_for, parse, parse_lockfile_kind,
-    resolve_workspace_inheritance,
+    CheckResult, DependencyStatus, Ecosystem, ErrorOrigin, Evaluation, Item, LockfileKind,
+    ManifestKind, PackageSource, UnstableFilter, apply_lockfile, check_version_for, parse,
+    parse_lockfile_kind, resolve_workspace_inheritance,
 };
 use futures::stream::{self, StreamExt};
 use semver::Version as SemverVersion;
@@ -214,7 +214,37 @@ struct FetchTask {
 /// package" or the registry not answering at all.
 type FetchOutcome = (String, String, Result<Vec<String>, FetchError>);
 
-/// Fetched versions (or a per-package error message), keyed by `(cache_key, name)`.
+/// One fetch that produced no versions, with the provenance a gate turns on kept
+/// beside the message.
+///
+/// The message alone cannot answer "did a registry say this package does not exist?",
+/// and the answer is not cosmetic: a 404 is a permanent per-dependency fact that must
+/// not fail a whole build, while an unanswered request leaves every dependency it
+/// covered unfounded. Re-deriving either from prose is how they got merged.
+#[derive(Debug, Clone)]
+pub(crate) struct FetchFailure {
+    /// Where the failure came from.
+    pub(crate) origin: ErrorOrigin,
+    /// What to show the user.
+    pub(crate) message: String,
+}
+
+impl From<&FetchError> for FetchFailure {
+    fn from(error: &FetchError) -> Self {
+        Self {
+            origin: match error {
+                FetchError::NotFound(_) => ErrorOrigin::NotFound,
+                // Everything else is a request that produced no usable answer: a
+                // timeout, a refused connection, a 5xx, an undecodable body, a document
+                // listing no versions at all.
+                _ => ErrorOrigin::Unanswered,
+            },
+            message: error.to_string(),
+        }
+    }
+}
+
+/// Fetched versions (or a per-package failure), keyed by `(cache_key, name)`.
 ///
 /// Keyed by the same pair the fetch tasks are deduplicated by, and for the same reason:
 /// a name alone is not unique within a manifest. A `Cargo.toml` naming one crate from
@@ -222,7 +252,7 @@ type FetchOutcome = (String, String, Result<Vec<String>, FetchError>);
 /// importing both `jsr:foo` and `npm:foo`, issues two tasks — and a name-keyed map
 /// collapsed them into one slot, so whichever request finished last silently answered
 /// for both.
-type FetchedMap = HashMap<(String, String), Result<Vec<String>, String>>;
+type FetchedMap = HashMap<(String, String), Result<Vec<String>, FetchFailure>>;
 
 impl Checker {
     /// Start configuring a checker.
@@ -808,7 +838,10 @@ impl Checker {
             {
                 registry_unreachable = true;
             }
-            out.insert((cache_key, name), result.map_err(|e| e.to_string()));
+            out.insert(
+                (cache_key, name),
+                result.map_err(|e| FetchFailure::from(&e)),
+            );
         }
 
         self.emit(ProgressEvent::Finished);
@@ -923,11 +956,12 @@ fn evaluate_item(
                 in_native_versions(eval, &translated, ecosystem),
             )
         }
-        Some(Err(e)) => CheckResult::new(item.clone(), DependencyStatus::Error(e.clone())),
-        None => CheckResult::new(
-            item.clone(),
-            DependencyStatus::Error("not fetched".to_string()),
-        ),
+        Some(Err(failure)) => {
+            CheckResult::errored(item.clone(), failure.message.clone(), failure.origin)
+        }
+        // No entry at all: the task was never issued, or its result never arrived. No
+        // registry answered anything here.
+        None => CheckResult::errored(item.clone(), "not fetched", ErrorOrigin::Local),
     }
 }
 
