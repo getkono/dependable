@@ -565,10 +565,13 @@ impl Checker {
         // `PackageSource::Inherited`, which is what keeps `--fix` off a span that means
         // nothing in this file.
         let mut warnings = Vec::new();
+        warnings.extend(std::mem::take(&mut parsed.notices));
         if let Some((root, declarations)) = &workspace {
             // The resolved names are the caller's business; the annotated items are ours.
             let _ = resolve_workspace_inheritance(&mut parsed.items, declarations);
             warnings.extend(undeclared_inheritance(&parsed.items, root));
+        } else {
+            warnings.extend(detached_inheritance(&parsed.items, kind));
         }
 
         // Apply the lockfile to annotate locked versions, dispatching on the file
@@ -580,6 +583,10 @@ impl Checker {
             && let Ok(data) = parse_lockfile_kind(lock_kind, lock)
         {
             apply_lockfile(&mut parsed.items, &data);
+        }
+
+        if let Some(warning) = deferred_versions(&parsed.items, kind) {
+            warnings.push(warning);
         }
 
         // Build the fetch task list, routing each checkable item to a fetcher:
@@ -789,6 +796,79 @@ fn undeclared_inheritance(items: &[Item], root: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Name every entry that says it inherits when no governing root was found at all.
+///
+/// The sibling of [`undeclared_inheritance`], for the case where the walk upwards ran
+/// out before it found a root rather than finding one that declares the wrong things.
+/// A detached member — a `Cargo.toml` with `serde = { workspace = true }` and nothing
+/// above it — reports every such entry as [`DependencyStatus::Undetermined`], which
+/// `--fail-on any` treats as a failure; without this the run exits non-zero with
+/// nothing on stderr to say why.
+///
+/// Only Cargo, because `workspace = true` is the only spelling that promises a root:
+/// a POM deferring to its `<parent>` has no root to be missing and is
+/// [`deferred_versions`]' story to tell.
+fn detached_inheritance(items: &[Item], kind: ManifestKind) -> Vec<String> {
+    if kind != ManifestKind::CargoToml {
+        return Vec::new();
+    }
+    let mut seen = HashSet::new();
+    items
+        .iter()
+        .filter(|item| {
+            item.source == PackageSource::Inherited && item.version_constraint.is_empty()
+        })
+        .filter(|item| seen.insert(item.name.as_str()))
+        .map(|item| {
+            format!(
+                "`{}` is declared `workspace = true`, but no workspace root was found above this manifest, so no version was read for it and nothing was checked",
+                item.name,
+            )
+        })
+        .collect()
+}
+
+/// Say, once per manifest, that some of its entries state no version this file can
+/// resolve — and therefore that nothing was checked for them.
+///
+/// Without it the run is silent: those entries report as
+/// [`DependencyStatus::Undetermined`] in a table a reader may not be reading, and
+/// stderr says nothing at all. `undeclared_inheritance` above is the Cargo
+/// equivalent and stays separate, because a Cargo member inheriting a name its root
+/// never declared is a *broken* manifest, while a POM deferring to its `<parent>` is
+/// an ordinary, valid, extremely common one — the same status, two different things
+/// to tell the reader.
+fn deferred_versions(items: &[Item], kind: ManifestKind) -> Option<String> {
+    let source = match kind {
+        ManifestKind::PomXml => {
+            "a `<parent>`, `<dependencyManagement>`, or a property this file does not declare"
+        }
+        _ => return None,
+    };
+    let mut names: Vec<&str> = items
+        .iter()
+        .filter(|item| {
+            item.source == PackageSource::Inherited && item.version_constraint.is_empty()
+        })
+        .map(|item| item.name.as_str())
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    if names.is_empty() {
+        return None;
+    }
+    let (subject, verb, object) = if names.len() == 1 {
+        ("dependency", "takes its version", "it")
+    } else {
+        ("dependencies", "take their version", "them")
+    };
+    Some(format!(
+        "{} {subject} {verb} from {source}, so no version was read for {object} and nothing was checked: {}",
+        names.len(),
+        names.join(", ")
+    ))
+}
+
 /// Evaluate one parsed item against the fetched version lists, applying the
 /// configured pre-release filter before classification.
 fn evaluate_item(
@@ -800,6 +880,12 @@ fn evaluate_item(
     if !item.is_checkable() {
         let status = match item.source {
             PackageSource::Git => DependencyStatus::Git,
+            // An entry that defers its version elsewhere and found nothing there is
+            // a real package on a real registry whose version this run never read.
+            // `Local` would say the opposite — that there is no registry for it —
+            // which of `spring-boot-starter-web` is simply false, and is the wrong
+            // token for a CI consumer to read.
+            PackageSource::Inherited => DependencyStatus::Undetermined,
             _ => DependencyStatus::Local,
         };
         return CheckResult::new(item.clone(), status);

@@ -184,7 +184,11 @@ fn findings(report: &Report) -> Vec<Finding> {
                 // Security tab drowning in notes.
                 // `UpToDate`, `Local` and `Git` have nothing to report, and
                 // `Error` is a tool failure rather than a finding about the code
-                // — the CLI already puts it on stderr.
+                // — the CLI already puts it on stderr. `Undetermined` is the same
+                // shape as `Error`: nothing was learned, so there is no finding to
+                // pin to a line — and it has no line to pin one to, since a
+                // dependency deferring its version elsewhere records no span. The
+                // CLI's manifest-level warning is where that belongs.
                 _ => {}
             }
         }

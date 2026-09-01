@@ -64,6 +64,7 @@ impl Parser for PnpmWorkspaceParser {
             kind: ManifestKind::PnpmWorkspaceYaml,
             items,
             alternate_registries: Vec::new(),
+            notices: Vec::new(),
         })
     }
 }

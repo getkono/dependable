@@ -305,9 +305,15 @@ pub enum TreeFormat {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FailOn {
+    /// Never fail: report and exit 0.
     None,
+    /// Fail on a dependency behind its latest release, or vulnerable.
     Outdated,
+    /// Fail only on a known advisory.
     Vulnerable,
+    /// Fail unless every dependency was checked and is current. A dependency
+    /// whose version could not be read counts against this: nothing was
+    /// established about it, so exiting 0 would claim more than the run knows.
     Any,
 }
 

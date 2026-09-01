@@ -40,9 +40,13 @@ impl Item {
     /// sources are skipped.
     ///
     /// An [`Inherited`](PackageSource::Inherited) item is checkable only once
-    /// [`resolve_workspace_inheritance`](crate::resolve_workspace_inheritance) has
-    /// supplied the workspace root's constraint. Unresolved, the manifest states no
-    /// version at all, and there is nothing to ask a registry for.
+    /// something has supplied the constraint declared elsewhere — the workspace root
+    /// via [`resolve_workspace_inheritance`](crate::resolve_workspace_inheritance) for
+    /// Cargo, the `[versions]` table for a Gradle catalog, the `<properties>` table
+    /// for a POM. Without one the manifest states no version at all, and there is
+    /// nothing to ask a registry for; a check reports such an item as
+    /// [`Undetermined`](crate::result::DependencyStatus::Undetermined) rather than
+    /// claiming it has no registry.
     #[must_use]
     pub fn is_checkable(&self) -> bool {
         match self.source {
@@ -60,7 +64,9 @@ impl Item {
     /// parser that declines to record a span also gives the item a source nothing would
     /// fetch, so [`is_checkable`](Self::is_checkable) covers all of them but one: a
     /// resolved [`Inherited`](PackageSource::Inherited) item is worth checking and still
-    /// has no home here, because its version string is in the workspace root.
+    /// has no home here, because the version string it was resolved from belongs to
+    /// another entry — a workspace root's table, a catalog `[versions]` alias, a shared
+    /// POM `<properties>` value.
     #[must_use]
     pub fn has_position(&self) -> bool {
         self.is_checkable() && self.source != PackageSource::Inherited
@@ -153,14 +159,33 @@ pub enum PackageSource {
     Local,
     /// A git dependency — skipped for version checks.
     Git,
-    /// A Cargo `dep.workspace = true`: the manifest opts into a version declared in
-    /// the workspace root's `[workspace.dependencies]` and states none of its own.
+    /// The dependency's version is declared somewhere other than this entry, so
+    /// there is no version string here to check against or to rewrite.
     ///
-    /// Reading `workspace = true` needs no filesystem, so the IO-free parser records it
-    /// — which is what keeps it distinct from a [`Local`](Self::Local) `path` entry that
-    /// happens to share a name with a root declaration. Resolving it against the root
-    /// does need IO, and is [`resolve_workspace_inheritance`](crate::resolve_workspace_inheritance)
-    /// applied by the caller that has the root in hand.
+    /// Three parsers emit it, for the same reason and with the same consequences:
+    ///
+    /// - Cargo's `dep.workspace = true` — the version is in the workspace root's
+    ///   `[workspace.dependencies]`. Reading `workspace = true` needs no
+    ///   filesystem, so the IO-free parser records the fact; *resolving* it does
+    ///   need IO, and is
+    ///   [`resolve_workspace_inheritance`](crate::resolve_workspace_inheritance)
+    ///   applied by the caller that has the root in hand.
+    /// - A Gradle version catalog entry whose `version.ref` names a `[versions]`
+    ///   alias several entries share.
+    /// - A Maven POM entry whose version comes from a `<properties>` value several
+    ///   dependencies share, or from a `<parent>` / `<dependencyManagement>` /
+    ///   undeclared property this file does not state.
+    ///
+    /// What keeps it distinct from [`Local`](Self::Local) is that the package is a
+    /// real registry package — an entry that merely shares a name with a root
+    /// `path` declaration is `Local`, and a POM `<scope>system</scope>` jar is
+    /// `Local`, because neither has a registry at all.
+    ///
+    /// The constraint tells the two halves apart. Filled in, the version was found
+    /// elsewhere and the item is checkable — never rewritable, since the string it
+    /// would rewrite is not this dependency's own. Empty, no version was found at
+    /// all, and a check reports
+    /// [`DependencyStatus::Undetermined`](crate::result::DependencyStatus::Undetermined).
     Inherited,
 }
 
