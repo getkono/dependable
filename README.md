@@ -416,8 +416,13 @@ such: `version_inherited` for a Cargo `version.workspace = true`, `inherited` fo
 constraint taken from `[workspace.dependencies]`, and `lockfile` for the lockfile that
 supplied the locked versions — a workspace keeps one at its root, above its members.
 
-A dependency's `source` is `registry`, `jsr`, `git`, `local` (a `path` entry),
-`inherited`, or `locked`. `inherited` means the version is declared elsewhere in a
+A dependency's `source` is today `registry`, `jsr`, `git`, `local` (a `path` entry),
+`inherited`, or `locked`, plus `unknown` for anything this list does not name. That
+list is open, not closed: a new ecosystem may add a token to it within
+`dependable.list/v1`, which pins the document's *shape* — which fields exist and what
+type each holds — and not the token sets inside those fields. Match the ones you care
+about and let the rest fall through to a default; `unknown` is why exhaustive matching
+on `source` was never safe. `inherited` means the version is declared elsewhere in a
 manifest — a Cargo `dep.workspace = true` resolved against the workspace root, a
 Gradle `[versions]` alias, a shared Maven `<properties>` value — and such a dependency
 is checked wherever it is used and rewritten only where it is declared; see

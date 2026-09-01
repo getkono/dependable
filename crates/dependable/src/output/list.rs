@@ -22,6 +22,7 @@ use crate::output::posix;
 /// `"unknown"` for a variant this function does not name, so a consumer that matched
 /// exhaustively on them was never safe. Adding a token (`"locked"`) therefore stays
 /// within `v1`; removing a field, renaming one, or changing one's type would not.
+/// The README states the same policy for readers who never open this file.
 const SCHEMA: &str = "dependable.list/v1";
 
 /// One discovered manifest: its identity and the dependencies it declares.

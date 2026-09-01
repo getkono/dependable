@@ -231,6 +231,15 @@ pub enum PackageSource {
     /// Distinct from a [`Registry`](Self::Registry) item that merely carries a
     /// [`locked_version`](Item::locked_version): that one was declared, was read from
     /// a manifest, and has a span. This one has no declaration behind it at all.
+    ///
+    /// The test is the *declaration*, never the provenance of the version string:
+    /// `Locked` means no manifest anywhere in the repository declares this dependency,
+    /// so there is nothing to point at. A `Cargo.toml` entry whose exact version came
+    /// out of `Cargo.lock` is still `Registry` — it was declared, and `--fix` rewrites
+    /// the declaration. A lockfile-first reader added later — a `Gemfile.lock`, a
+    /// `poetry.lock` — inherits that boundary: pins the project's own manifest also
+    /// declares stay with the source of that declaration and keep their span, and only
+    /// the pins no manifest mentions are `Locked`.
     Locked,
 }
 

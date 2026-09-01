@@ -245,12 +245,14 @@ fn shallow_graph(
                 // inherited entry has already taken its root declaration's source above,
                 // so a centrally-declared `path` crate lands on the `Local` arm and a
                 // centrally-declared registry crate does not. Only Cargo manifests reach
-                // here, so `Locked` cannot; were it ever to, `registry+` is the right
-                // answer for it anyway — a lockfile pin is a registry package.
-
+                // here, so `Locked` cannot; `registry+` is the right answer for it
+                // anyway — a lockfile pin is a registry package — and it is written as
+                // its own arm rather than left to the wildcard so the claim is in the
+                // code, not only in this comment.
                 let source = match item.source {
                     PackageSource::Git => Some("git+".to_owned()),
                     PackageSource::Local => None,
+                    PackageSource::Locked => Some("registry+".to_owned()),
                     _ => Some("registry+".to_owned()),
                 };
                 external_pkgs.push(LockedPackage::new(
