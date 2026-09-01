@@ -30,6 +30,10 @@ fn text(body: impl Into<String>) -> Response {
     (200, "text/plain", body.into())
 }
 
+fn xml(body: impl Into<String>) -> Response {
+    (200, "application/xml", body.into())
+}
+
 /// A status with no body — the shape a proxy's `404`/`410` takes.
 fn status(code: u16) -> Response {
     (code, "text/plain", String::new())
@@ -180,4 +184,45 @@ fn a_go_module_the_proxy_answers_410_for_does_not_break_the_gate() {
     );
     // The module that *did* resolve is still evaluated.
     assert!(stdout.contains("update available"), "stdout: {stdout}");
+}
+
+// ---------------------------------------------------------------------------
+// A 200 that lists no versions
+// ---------------------------------------------------------------------------
+
+/// A `maven-metadata.xml` that parses but names no version is not an authoritative "this
+/// artifact does not exist" — a Nexus or Artifactory group repository whose upstream
+/// proxy is down serves exactly such a locally-merged document. Reporting it as a 404
+/// exempted it from the gate, certifying a build against a dependency nothing was ever
+/// known about.
+#[test]
+fn a_metadata_document_listing_no_versions_is_not_exempt_from_the_gate() {
+    let dir = workdir("gate_empty_metadata");
+    let base = registry(vec![(
+        "/com/acme/thing/maven-metadata.xml".to_string(),
+        xml(
+            "<metadata><groupId>com.acme</groupId><artifactId>thing</artifactId><versioning>\
+             <versions></versions></versioning></metadata>",
+        ),
+    )]);
+    let config = write_config(&dir, &base);
+    fs::create_dir_all(dir.join("gradle")).unwrap();
+    fs::write(
+        dir.join("gradle/libs.versions.toml"),
+        "[libraries]\nthing = { module = \"com.acme:thing\", version = \"1.0.0\" }\n",
+    )
+    .unwrap();
+
+    let output = check(&dir, &config, &["--fail-on", "vulnerable"]);
+    let (stdout, stderr, code) = outcome(&output);
+
+    assert_eq!(code, 2, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stderr.contains("error: cannot honour --fail-on: the registry did not answer"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("not found in its registry"),
+        "an answered-but-empty document was reported as a 404:\n{stderr}"
+    );
 }

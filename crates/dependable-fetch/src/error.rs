@@ -17,6 +17,17 @@ pub enum FetchError {
     #[error("registry returned status {code} for `{package}`")]
     Status { code: u16, package: String },
 
+    /// A successful response that carried no versions at all.
+    ///
+    /// Distinct from [`NotFound`](Self::NotFound), which is the registry saying the
+    /// package does not exist. A `200` with an empty version list is not that answer: a
+    /// Nexus or Artifactory group repository whose upstream proxy is down serves exactly
+    /// such a locally-merged document for a package that certainly does exist. Treating
+    /// it as a 404 exempted it from a `--fail-on` gate, certifying a build against a
+    /// dependency nothing was ever known about.
+    #[error("registry listed no versions for `{package}`")]
+    EmptyVersionList { package: String },
+
     #[error("failed to decode response for `{package}`: {detail}")]
     Decode { package: String, detail: String },
 
@@ -41,7 +52,14 @@ impl FetchError {
                 *code == 429 || (500..600).contains(code)
             }
             Self::Http(error) => error.is_timeout() || error.is_connect(),
-            Self::NotFound(_) | Self::Decode { .. } | Self::Osv(_) => false,
+            // An empty-but-well-formed document parses the same way next time, so a
+            // retry only spends the user's time reaching the same conclusion — the same
+            // reasoning as a decode failure. It is still not a 404, so the gate refuses
+            // to certify through it.
+            Self::NotFound(_)
+            | Self::EmptyVersionList { .. }
+            | Self::Decode { .. }
+            | Self::Osv(_) => false,
         }
     }
 }
