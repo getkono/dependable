@@ -273,6 +273,14 @@ fn a_package_the_registry_answers_404_for_does_not_break_the_gate() {
         stderr.contains("note: 1 dependency was not found in its registry, so it is not gated on"),
         "stderr: {stderr}"
     );
+    // `--quiet` says "Only print errors"; a note about what was skipped is not one.
+    let quiet = check(&dir, &config, &["--fail-on", "vulnerable", "-q"]);
+    let (_, quiet_stderr, quiet_code) = outcome(&quiet);
+    assert_eq!(quiet_code, 0);
+    assert!(
+        !quiet_stderr.contains("not found in its registry"),
+        "`-q` still printed the note: {quiet_stderr}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -350,6 +358,57 @@ fn a_poetry_wildcard_resolves_instead_of_going_undetermined() {
     assert!(
         stdout.contains("up to date") && !stdout.contains("undetermined"),
         "stdout: {stdout}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `Undetermined` says so
+// ---------------------------------------------------------------------------
+
+/// `Undetermined` was gated on by nothing and noted by nothing, so a run that could not
+/// read two constraints printed a clean `--fail-on outdated` and said nothing at all
+/// about them. The status stays out of the gate — `--fail-on any` already fails on it —
+/// but the run now says what it could not evaluate.
+#[test]
+fn a_dependency_whose_version_could_not_be_read_is_noted() {
+    let dir = workdir("gate_undetermined_note");
+    let base = registry(vec![(
+        "/express".to_string(),
+        packument("express", &["4.19.2"], "4.19.2"),
+    )]);
+    let config = write_config(&dir, &base);
+    fs::write(
+        dir.join("package.json"),
+        "{\"name\":\"app\",\"dependencies\":{\"express\":\"^4.19.0\"},\"overrides\":\
+         {\"lodash\":\"$nope\",\"minimist\":\"$\"}}\n",
+    )
+    .unwrap();
+
+    let output = check(&dir, &config, &["--fail-on", "outdated"]);
+    let (stdout, stderr, code) = outcome(&output);
+
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    // `"$"` names nothing, and used to reach the checker as a literal constraint and
+    // hard-fail on the `$`.
+    assert!(
+        !stdout.contains("unparseable constraint"),
+        "a dangling reference was read as a constraint:\n{stdout}"
+    );
+    assert!(stdout.contains("2 undetermined"), "stdout: {stdout}");
+    assert!(
+        stderr.contains(
+            "note: 2 dependencies have a declared version this run could not read, so they are \
+             not gated on"
+        ),
+        "stderr: {stderr}"
+    );
+
+    let quiet = check(&dir, &config, &["--fail-on", "outdated", "-q"]);
+    let (_, quiet_stderr, quiet_code) = outcome(&quiet);
+    assert_eq!(quiet_code, 0);
+    assert!(
+        !quiet_stderr.contains("could not read"),
+        "`-q` still printed the note: {quiet_stderr}"
     );
 }
 

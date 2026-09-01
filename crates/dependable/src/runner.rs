@@ -427,7 +427,7 @@ pub async fn run_check(args: CheckArgs) -> anyhow::Result<ExitCode> {
             return Ok(ExitCode::from(1));
         }
     }
-    Ok(exit_code(&reports, fail_on))
+    Ok(exit_code(&reports, fail_on, args.quiet))
 }
 
 /// Assemble the neutral report model the policy engine consumes from the CLI's
@@ -1447,13 +1447,14 @@ fn join_reasons(reasons: &[String]) -> String {
 /// never checked.
 ///
 /// Silent for `FailOn::None` (nothing was gated on) and for `FailOn::Any` (which fails
-/// on these results, so they *were* gated on).
+/// on these results, so they *were* gated on), and silent under `--quiet`, whose help
+/// says "Only print errors" — a note about what was skipped is not one.
 ///
 /// Counted from the registry's own answer ([`ScanIntegrity::unresolved`]), never from
 /// every `Error`: an unreadable constraint reached no registry, and saying it was "not
 /// found in its registry" reported a cause that never happened.
-fn note_unresolved(reports: &[ManifestReport], fail_on: FailOn) {
-    if matches!(fail_on, FailOn::None | FailOn::Any) {
+fn note_unresolved(reports: &[ManifestReport], fail_on: FailOn, quiet: bool) {
+    if quiet || matches!(fail_on, FailOn::None | FailOn::Any) {
         return;
     }
     let unresolved: usize = reports.iter().map(|r| r.integrity.unresolved).sum();
@@ -1468,7 +1469,45 @@ fn note_unresolved(reports: &[ManifestReport], fail_on: FailOn) {
     );
 }
 
-fn exit_code(reports: &[ManifestReport], fail_on: FailOn) -> ExitCode {
+/// Say on stderr how many dependencies this run could not read a version out of.
+///
+/// `Undetermined` is a real package whose declared constraint this run could not
+/// translate, and the status was made honest without saying so anywhere: it trips no
+/// `--fail-on outdated` gate, produces no SARIF result, and left a passing run reading
+/// as "everything here is current" when a dependency had never been evaluated.
+///
+/// Mirrors [`note_unresolved`] exactly — same silences, same shape. Deliberately *not* a
+/// gate: adding `Undetermined` to `--fail-on outdated` would change what that setting
+/// promises, and `--fail-on any` already fails on it.
+fn note_undetermined(reports: &[ManifestReport], fail_on: FailOn, quiet: bool) {
+    if quiet || matches!(fail_on, FailOn::None | FailOn::Any) {
+        return;
+    }
+    let undetermined = reports
+        .iter()
+        .flat_map(|report| &report.results)
+        .filter(|result| matches!(result.status, DependencyStatus::Undetermined))
+        .count();
+    if undetermined == 0 {
+        return;
+    }
+    eprintln!(
+        "note: {undetermined} dependenc{} a declared version this run could not read, so {} not \
+         gated on",
+        if undetermined == 1 {
+            "y has"
+        } else {
+            "ies have"
+        },
+        if undetermined == 1 {
+            "it is"
+        } else {
+            "they are"
+        },
+    );
+}
+
+fn exit_code(reports: &[ManifestReport], fail_on: FailOn, quiet: bool) -> ExitCode {
     // A gate whose inputs are missing must fail, not pass. `--fail-on vulnerable` with an
     // unreachable OSV used to exit 0 while printing the errors that explain why it could
     // not know — a green build that had never been checked, which is the one outcome a
@@ -1478,7 +1517,8 @@ fn exit_code(reports: &[ManifestReport], fail_on: FailOn) -> ExitCode {
         eprintln!("       refusing to report a clean run that was never completed");
         return ExitCode::from(2);
     }
-    note_unresolved(reports, fail_on);
+    note_unresolved(reports, fail_on, quiet);
+    note_undetermined(reports, fail_on, quiet);
     let triggered = reports
         .iter()
         .flat_map(|report| &report.results)
@@ -1695,11 +1735,14 @@ mod tests {
         )];
         assert!(gate_is_answerable(&reports, FailOn::Vulnerable).is_err());
         assert!(gate_is_answerable(&reports, FailOn::Outdated).is_err());
-        assert_eq!(exit_code(&reports, FailOn::Vulnerable), ExitCode::from(2));
+        assert_eq!(
+            exit_code(&reports, FailOn::Vulnerable, false),
+            ExitCode::from(2)
+        );
         // `Any` fails on the `Error` statuses an unanswering registry produces, so its
         // promise is kept — that is the gate working, not a hole.
         assert!(gate_is_answerable(&reports, FailOn::Any).is_ok());
-        assert_eq!(exit_code(&reports, FailOn::Any), ExitCode::from(1));
+        assert_eq!(exit_code(&reports, FailOn::Any, false), ExitCode::from(1));
         // Nothing was gated on, so nothing can be missing.
         assert!(gate_is_answerable(&reports, FailOn::None).is_ok());
     }
@@ -1736,11 +1779,17 @@ mod tests {
         assert!(gate_is_answerable(&reports, FailOn::Vulnerable).is_ok());
         assert!(gate_is_answerable(&reports, FailOn::Outdated).is_ok());
         assert!(gate_is_answerable(&reports, FailOn::Any).is_ok());
-        assert_eq!(exit_code(&reports, FailOn::Vulnerable), ExitCode::SUCCESS);
-        assert_eq!(exit_code(&reports, FailOn::Outdated), ExitCode::SUCCESS);
+        assert_eq!(
+            exit_code(&reports, FailOn::Vulnerable, false),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            exit_code(&reports, FailOn::Outdated, false),
+            ExitCode::SUCCESS
+        );
         // `Any` still fails on the error itself — that is the gate working, and it is
         // the setting that asks to hear about anything less than a clean answer.
-        assert_eq!(exit_code(&reports, FailOn::Any), ExitCode::from(1));
+        assert_eq!(exit_code(&reports, FailOn::Any, false), ExitCode::from(1));
     }
 
     /// The other half of the same distinction, and the regression the carve-out
@@ -1776,10 +1825,13 @@ mod tests {
             "1 dependency could not be evaluated"
         );
         assert!(gate_is_answerable(&reports, FailOn::Outdated).is_err());
-        assert_eq!(exit_code(&reports, FailOn::Vulnerable), ExitCode::from(2));
+        assert_eq!(
+            exit_code(&reports, FailOn::Vulnerable, false),
+            ExitCode::from(2)
+        );
         // `Any` fails on the `Error` itself, so its promise is kept.
         assert!(gate_is_answerable(&reports, FailOn::Any).is_ok());
-        assert_eq!(exit_code(&reports, FailOn::Any), ExitCode::from(1));
+        assert_eq!(exit_code(&reports, FailOn::Any, false), ExitCode::from(1));
         // Nothing was gated on, so nothing can be missing.
         assert!(gate_is_answerable(&reports, FailOn::None).is_ok());
     }
@@ -1813,14 +1865,17 @@ mod tests {
             &[DependencyStatus::UpToDate],
         )];
         assert!(gate_is_answerable(&clean, FailOn::Vulnerable).is_ok());
-        assert_eq!(exit_code(&clean, FailOn::Vulnerable), ExitCode::SUCCESS);
+        assert_eq!(
+            exit_code(&clean, FailOn::Vulnerable, false),
+            ExitCode::SUCCESS
+        );
 
         let vulnerable = vec![report_with(
             ScanIntegrity::default(),
             &[DependencyStatus::Vulnerable],
         )];
         assert_eq!(
-            exit_code(&vulnerable, FailOn::Vulnerable),
+            exit_code(&vulnerable, FailOn::Vulnerable, false),
             ExitCode::from(1)
         );
     }
