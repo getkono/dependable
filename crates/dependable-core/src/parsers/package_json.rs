@@ -82,10 +82,19 @@ fn is_override_section(section: &str) -> bool {
 ///
 /// Yarn `resolutions` keys carry a path (`parent/child`, `**/lodash`) and npm's nested
 /// form uses `"."` to mean "the parent entry itself", which names no new package.
+///
+/// pnpm scopes an override to the parent that pulls the package in by joining the two
+/// with `>`: `"foo@2>bar"` forces a version onto **bar**, not onto `foo`. The overridden
+/// package is therefore the *last* `>`-separated segment; reading the first named an
+/// unrelated package, which `--fix` then rewrote the pin to that package's latest
+/// version.
 fn override_name(key: &str) -> Option<&str> {
     if key == "." {
         return None;
     }
+    // The parent selectors in front of the last `>` scope the override; only the segment
+    // after it names the package being overridden.
+    let key = key.rsplit('>').next().unwrap_or(key).trim();
     // Segment first, then strip the version. Doing it the other way round cut `**/@scope/pkg`
     // at the scope's own `@`, because that `@` is not at the start of the *key*.
     //
@@ -387,5 +396,33 @@ mod tests {
         assert_eq!(override_name("parent/@scope/pkg"), Some("@scope/pkg"));
         assert_eq!(override_name("@scope/pkg@^1"), Some("@scope/pkg"));
         assert_eq!(override_name("."), None);
+    }
+
+    /// A pnpm override key scoped to a parent (`foo@2>bar`) pins **bar**. Reading the
+    /// first segment named `foo`, so the entry was checked against an unrelated
+    /// package's version list — and `fix --all` would then have rewritten a pin on `bar`
+    /// to whatever `foo`'s newest release happened to be.
+    #[test]
+    fn a_scoped_override_key_names_the_package_after_the_last_arrow() {
+        assert_eq!(override_name("foo@2>bar"), Some("bar"));
+        assert_eq!(override_name("foo>bar"), Some("bar"));
+        assert_eq!(override_name("a>b>c"), Some("c"));
+        assert_eq!(
+            override_name("@scope/pkg@1>@scope/other"),
+            Some("@scope/other")
+        );
+        assert_eq!(override_name("foo"), Some("foo"));
+    }
+
+    /// The same key read end to end through the parser, so the defect is falsified where
+    /// it was observed rather than only at the helper.
+    #[test]
+    fn a_scoped_pnpm_override_is_checked_as_the_package_it_pins() {
+        let content =
+            r#"{ "pnpm": { "overrides": { "foo@2>bar": "3.0.0" } } }"#;
+        let m = parse(content);
+        let names: Vec<&str> = m.items.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, vec!["bar"], "got {names:?}");
+        assert_eq!(find(&m, "bar").kind, DependencyKind::Override);
     }
 }
