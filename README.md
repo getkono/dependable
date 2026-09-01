@@ -72,7 +72,27 @@ is where every Swift dependency comes from: the one lockfile here that is the de
 list rather than an annotation on one. SwiftPM records the *flattened* resolution there
 and does not mark which pins are direct, so a Swift project lists its transitive
 dependencies alongside its direct ones — which is more than every other ecosystem shows,
-not less.
+not less. Because the file cannot say which is which, no pin is reported as a direct
+dependency: `list` marks every one `(indirect)`, and `--format json` gives it
+`"direct": false`.
+
+Being the dependency list rather than an annotation on one has two more consequences.
+A `Package.resolved` counts only in the manifest's own directory — a nested package in
+a monorepo never adopts the root's pins, which would report the root's dependencies,
+and the root's advisories, against a package that has neither. And a `Package.swift`
+with no readable `Package.resolved` beside it — a missing one (Apple advises library
+packages not to commit theirs) or a malformed one — is reported as *unknown*, never as
+zero dependencies: a warning names the cause, and `--fail-on any` exits non-zero,
+because nothing was established about that project at all.
+
+One limitation remains, and it is worth stating. OSV matches its `SwiftURL` keys
+case-sensitively while a git forge does not, and real keys are mixed-case
+(`github.com/weichsel/ZIPFoundation`). `dependable` lowercases the host, keeps the
+repository path exactly as `Package.resolved` wrote it, and additionally queries the
+all-lowercase spelling. That covers every direction but one: a `Package.resolved`
+recording a lowercase spelling of a repository whose advisory is keyed under mixed case
+matches nothing, and the package reports clean. Recovering the canonical casing needs
+the forge, not the file.
 
 ### Lockfiles
 
