@@ -581,7 +581,7 @@ fn a_registry_namesake_of_a_member_still_expands_in_the_tree() {
     app.apply(Action::Expand); // a -> the registry `b`
 
     let namesake = &app.rows()[2];
-    assert_eq!(namesake.version, "9.0.0");
+    assert_eq!(namesake.version.as_deref(), Some("9.0.0"));
     assert!(
         namesake.redirect.is_none(),
         "the registry crate has no top-level entry of its own"

@@ -119,18 +119,22 @@ fn package_lines(app: &App, row: &crate::rows::Row, width: u16) -> Content {
     let published = row.node_kind == Some(NodeKind::Registry);
 
     content.push(heading(&row.name));
-    if row.version.is_empty() {
-        // A shallow graph resolves no versions, so there is nothing to look up.
-        content.push(dim("version not resolved — no lockfile for this project"));
+    let Some(version) = row.version.as_deref() else {
+        // Nothing read a version for this dependency, so nothing here may be
+        // looked up or claimed. Why it could not be read is the project row's
+        // caveat to explain, not this pane's.
+        content.push(dim(
+            "version not resolved — nothing read a version for this",
+        ));
         return content;
-    }
+    };
     if published {
         // The version the project uses, not the newest one: the package page
         // describes a release this project may be years behind.
-        let url = ecosystem.version_url(&row.name, &row.version);
-        linked_field(&mut content, "resolved", &row.version, &url);
+        let url = ecosystem.version_url(&row.name, version);
+        linked_field(&mut content, "resolved", version, &url);
     } else {
-        content.push(field("resolved", &row.version));
+        content.push(field("resolved", version));
     }
     content.push(Line::raw(""));
 
@@ -165,7 +169,7 @@ fn package_lines(app: &App, row: &crate::rows::Row, width: u16) -> Content {
             content.push(dim("press r to try again"));
         }
         Some(PackageData::Ready(facts)) => {
-            facts_lines(&mut content, facts, row, ecosystem, width);
+            facts_lines(&mut content, facts, row, version, ecosystem, width);
         }
     }
     content
@@ -173,12 +177,15 @@ fn package_lines(app: &App, row: &crate::rows::Row, width: u16) -> Content {
 
 /// Render a completed lookup.
 ///
-/// `row` carries the version the project actually uses, which is what the
-/// publish date must describe and which version's pages to link.
+/// `resolved` is the version the project actually uses, which is what the
+/// publish date must describe and which version's pages to link. It is passed in
+/// rather than read back off `row` because reaching here at all means it is
+/// known — a row without one never gets this far.
 fn facts_lines(
     content: &mut Content,
     facts: &PackageFacts,
     row: &crate::rows::Row,
+    resolved: &str,
     ecosystem: Ecosystem,
     width: u16,
 ) {
@@ -218,12 +225,12 @@ fn facts_lines(
             content.push(dim("this registry publishes no package metadata"));
             // Derived from the name, so it survives a registry that publishes
             // nothing at all — which is the case pub.dev and NuGet are in.
-            if let Some(url) = ecosystem.docs_url(&row.name, &row.version) {
+            if let Some(url) = ecosystem.docs_url(&row.name, resolved) {
                 content.push(Line::raw(""));
                 link_field(content, "docs", &url);
             }
         }
-        Some(meta) => metadata_lines(content, meta, row, ecosystem, width),
+        Some(meta) => metadata_lines(content, meta, row, resolved, ecosystem, width),
     }
 
     for warning in &facts.warnings {
@@ -241,10 +248,10 @@ fn metadata_lines(
     content: &mut Content,
     meta: &PackageMetadata,
     row: &crate::rows::Row,
+    resolved: &str,
     ecosystem: Ecosystem,
     width: u16,
 ) {
-    let resolved = row.version.as_str();
     if let Some(description) = &meta.description {
         // Registry descriptions are often hard-wrapped; the embedded newlines
         // would run words together, and the pane no longer wraps for us.

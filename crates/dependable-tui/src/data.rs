@@ -82,11 +82,9 @@ fn dedupe_workspaces(projects: &mut Vec<Project>) {
             .iter()
             .map(|&i| {
                 let node = &project.graph.nodes()[i];
-                format!(
-                    "{} {}",
-                    node.name,
-                    node.version.as_deref().unwrap_or_default()
-                )
+                // An unresolved version is its own fingerprint value: two roots
+                // that both have one are as alike as two that share a version.
+                format!("{} {}", node.name, node.version.as_deref().unwrap_or("?"))
             })
             .collect();
         fingerprint.sort();

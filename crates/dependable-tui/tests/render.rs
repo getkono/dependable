@@ -1026,3 +1026,128 @@ fn a_pointer_keeps_the_columns_aligned() {
         assert_eq!(column, version, "a version is out of its column: {screen}");
     }
 }
+
+/// A project whose graph came from manifests alone: a registry dependency is
+/// named, but nothing ever read a version for it. This is what every Gradle,
+/// `pom.xml`, `*.csproj`, and `mix.exs` project produces, and every Cargo
+/// workspace with no `Cargo.lock`.
+fn version_less_project() -> Project {
+    let packages = vec![
+        LockedPackage::new("app".into(), None, None, vec!["serde".into()]),
+        LockedPackage::new(
+            "serde".into(),
+            None,
+            Some("registry+https://example.com".into()),
+            Vec::new(),
+        ),
+    ];
+    let resolved = ResolvedLockfile::from_packages(packages);
+    let names = std::iter::once("app".to_owned()).collect();
+    Project {
+        manifest: PathBuf::from("build.gradle.kts"),
+        label: "build.gradle.kts".to_owned(),
+        ecosystem: Ecosystem::Rust,
+        graph: DependencyGraph::from_resolved(&resolved, &names, &["app".to_owned()]),
+        source: GraphSource::Unsupported,
+    }
+}
+
+/// The STATUS cell of the row naming `package`, as the user reads it.
+///
+/// Read out of the column rather than searched for anywhere on screen, so that
+/// a word appearing in a caveat or the detail pane cannot stand in for a badge.
+fn status_cell_of(screen: &str, package: &str) -> String {
+    let heading = screen
+        .lines()
+        .find(|line| line.contains("NAME"))
+        .expect("a column heading row");
+    let start = column_of(heading, "STATUS").expect("STATUS");
+    // The detail pane sits to the right and names the selected package too, so
+    // rows are matched within the tree pane's own share of each line, which ends
+    // at the pane's right border.
+    let pane = |line: &str| -> String {
+        line.chars()
+            .skip(1)
+            .take_while(|c| *c != '\u{2502}')
+            .collect()
+    };
+    let row = screen
+        .lines()
+        .map(pane)
+        .find(|line| line.contains(package))
+        .unwrap_or_else(|| panic!("a tree row for {package}: {screen}"));
+    // `pane` dropped the left border, so the heading's own offset drops with it.
+    row.chars()
+        .skip(start - 1)
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
+/// Select the `serde` row of [`version_less_project`].
+fn on_the_version_less_dependency() -> App {
+    let mut app = App::new(vec![version_less_project()]);
+    app.apply(Action::Move(1)); // the `app` root
+    app.apply(Action::Expand);
+    app.apply(Action::Move(1)); // `serde`
+    app
+}
+
+#[test]
+fn a_dependency_with_no_known_version_says_unknown() {
+    // The status column is where the tree makes its claim about a package. A
+    // blank one reads as "nothing to report"; the truth is that we never learned
+    // what version is declared, and the row has to say so.
+    let mut app = on_the_version_less_dependency();
+    assert_eq!(app.selected().map(|r| r.name.as_str()), Some("serde"));
+    let screen = render(&mut app);
+    assert_eq!(
+        status_cell_of(&screen, "serde"),
+        "unknown",
+        "the status column must report the version as unknown: {screen}"
+    );
+}
+
+#[test]
+fn a_dependency_with_no_known_version_is_never_looked_up() {
+    // Every answer a registry gives is about a particular version. With none to
+    // ask about, there is no lookup to make and nothing to report from one.
+    let app = on_the_version_less_dependency();
+    assert_eq!(
+        app.selected_key(),
+        None,
+        "a package with no version is not a lookup"
+    );
+}
+
+#[test]
+fn a_freshness_verdict_never_attaches_to_a_version_we_did_not_read() {
+    // The bug this guards: an unread version was carried as `""`, which
+    // `check_version` treats as "no locked version" and answers `UpToDate` for —
+    // so the tree showed a green `ok` beside a package it knew nothing about.
+    // Facts stored against the empty version are forced in here to prove the row
+    // cannot be driven by them, whatever put them in the store.
+    let mut app = App::new(vec![version_less_project()]);
+    app.set_data(
+        key(Ecosystem::Rust, "serde", ""),
+        PackageData::Ready(Box::new(PackageFacts {
+            latest: Some("2.0.0".to_owned()),
+            status: Some(DependencyStatus::UpToDate),
+            ..PackageFacts::default()
+        })),
+    );
+    app.apply(Action::Move(1));
+    app.apply(Action::Expand);
+    app.apply(Action::Move(1));
+
+    let screen = render(&mut app);
+    assert_eq!(
+        status_cell_of(&screen, "serde"),
+        "unknown",
+        "no freshness verdict may be claimed for an unread version: {screen}"
+    );
+    assert!(
+        !screen.contains("2.0.0"),
+        "nor a latest version to compare it against: {screen}"
+    );
+}
