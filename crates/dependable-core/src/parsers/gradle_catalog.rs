@@ -7,9 +7,11 @@
 //! which is how a project whose dependencies live in `build.gradle.kts` is told that
 //! they were not read rather than reported as none.
 //!
-//! Only `[versions]` and `[libraries]` are read. `[bundles]` names groups of
-//! libraries already declared here, and `[plugins]` resolves against the Gradle
-//! Plugin Portal rather than a Maven repository.
+//! Only `[versions]` and `[libraries]` become dependencies. `[bundles]` names groups
+//! of libraries already declared here, and `[plugins]` resolves against the Gradle
+//! Plugin Portal rather than a Maven repository — but a plugin's `version.ref` is
+//! still *counted*, because it is one more thing a `[versions]` line governs and so
+//! one more reason that line is not any single library's to rewrite.
 //!
 //! A `[libraries]` entry is reported as a [`DependencyKind::Normal`] dependency and
 //! not as a central [`DependencyKind::Workspace`] declaration, which is what its
@@ -39,11 +41,12 @@
 //!
 //! Because the `[versions]` literal is in this same file, a library that is the
 //! **only** user of its alias also carries that literal's span, so `--fix` rewrites
-//! the `[versions]` line — the line that governs it. An alias shared by several
-//! libraries carries no span on any of them: one line cannot be rewritten to two
-//! different versions, and the same reasoning is why a Cargo member is never
-//! rewritten in place either. Such a library is [`PackageSource::Inherited`]:
-//! checked and scanned for advisories, never written to.
+//! the `[versions]` line — the line that governs it. An alias used more than once —
+//! by another library, or by a plugin — carries no span on any of them: one line
+//! cannot be rewritten to two different versions, and the same reasoning is why a
+//! Cargo member is never rewritten in place either. Such a library is
+//! [`PackageSource::Inherited`]: checked and scanned for advisories, never written
+//! to.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -85,13 +88,12 @@ impl Parser for GradleCatalogParser {
         let versions = read_versions(root);
         let declared = read_libraries(root);
 
-        // An alias used by exactly one library is that library's own line to fix.
-        let mut uses: HashMap<&str, usize> = HashMap::new();
-        for entry in &declared {
-            if let Some(alias) = &entry.reference {
-                *uses.entry(alias.as_str()).or_default() += 1;
-            }
-        }
+        // An alias used by exactly one thing in the whole document is that one
+        // thing's own line to fix. Counted over the document and not over
+        // `declared`, because `[plugins]` reference `[versions]` too and are not
+        // in it — see `count_version_refs`.
+        let mut uses: HashMap<String, usize> = HashMap::new();
+        count_version_refs(root, &mut uses);
 
         let mut items = Vec::new();
         for entry in &declared {
@@ -135,6 +137,35 @@ fn read_versions(root: &dyn TableLike) -> HashMap<String, Located> {
         }
     }
     out
+}
+
+/// Count every `version.ref` in the document, by the alias it names.
+///
+/// The whole document, because sole ownership of a `[versions]` line is a fact
+/// about that line and not about `[libraries]`. The most ordinary Gradle catalog
+/// there is shares one `kotlin` alias between the `kotlin-stdlib` library and the
+/// `kotlin-jvm` plugin; counting only libraries makes the library the sole user, so
+/// `--fix` rewrites the `[versions]` line and silently moves the **Kotlin Gradle
+/// plugin** with it — a different artifact, resolved against a different repository,
+/// never checked here, and not named in the fix record.
+///
+/// `[bundles]` needs no counting: a bundle is an array of *library* aliases and
+/// names no version alias at all.
+fn count_version_refs(table: &dyn TableLike, uses: &mut HashMap<String, usize>) {
+    for (key, item) in table.iter() {
+        if key == "version"
+            && let Some(alias) = item
+                .as_table_like()
+                .and_then(|version| version.get("ref"))
+                .and_then(TomlItem::as_str)
+        {
+            *uses.entry(alias.to_owned()).or_default() += 1;
+            continue;
+        }
+        if let Some(inner) = item.as_table_like() {
+            count_version_refs(inner, uses);
+        }
+    }
 }
 
 /// Read `[libraries]` into one record per entry, in source order.
@@ -398,6 +429,53 @@ testing = ["junit-jupiter"]
              dangling = { module = \"org.example:other\", version.ref = \"absent\" }\n",
         );
         assert!(parsed.is_empty());
+    }
+
+    /// The most ordinary Gradle catalog there is: one alias, one library, one
+    /// plugin. Counting only `[libraries]` made the library the alias's sole user,
+    /// so `--fix` rewrote the `[versions]` line — and silently moved the **Kotlin
+    /// Gradle plugin** with it. A different artifact, resolved against the Plugin
+    /// Portal, never checked here, and not named in the fix record.
+    #[test]
+    fn an_alias_shared_with_a_plugin_belongs_to_neither() {
+        let parsed = items(
+            "[versions]\n\
+             kotlin = \"1.9.24\"\n\
+             \n\
+             [libraries]\n\
+             kotlin-stdlib = { module = \"org.jetbrains.kotlin:kotlin-stdlib\", version.ref = \"kotlin\" }\n\
+             \n\
+             [plugins]\n\
+             kotlin-jvm = { id = \"org.jetbrains.kotlin.jvm\", version.ref = \"kotlin\" }\n",
+        );
+        let stdlib = find(&parsed, "org.jetbrains.kotlin:kotlin-stdlib");
+        assert_eq!(stdlib.version_constraint, "1.9.24", "still checked");
+        assert!(stdlib.is_checkable());
+        assert_eq!(stdlib.source, PackageSource::Inherited);
+        assert!(
+            !stdlib.is_rewritable(),
+            "rewriting this line would move the Gradle plugin too"
+        );
+        assert!(!stdlib.has_position());
+    }
+
+    /// The rule is sole ownership, not "no plugin anywhere": an alias no plugin
+    /// touches is still its one library's line to fix.
+    #[test]
+    fn a_plugins_own_alias_does_not_freeze_an_unrelated_library() {
+        let content = "[versions]\n\
+                       ktlint = \"1.2.1\"\n\
+                       okhttp = \"4.12.0\"\n\
+                       \n\
+                       [libraries]\n\
+                       okhttp = { module = \"com.squareup.okhttp3:okhttp\", version.ref = \"okhttp\" }\n\
+                       \n\
+                       [plugins]\n\
+                       ktlint = { id = \"org.jlleitschuh.gradle.ktlint\", version.ref = \"ktlint\" }\n";
+        let parsed = items(content);
+        let okhttp = find(&parsed, "com.squareup.okhttp3:okhttp");
+        assert!(okhttp.is_rewritable());
+        assert_eq!(slice(content, okhttp), "4.12.0");
     }
 
     #[test]
