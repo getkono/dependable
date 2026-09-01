@@ -69,7 +69,10 @@ honestly — dependencies are routinely assembled in loops, behind conditionals,
 variables, so a text-level reader returns a *wrong* list rather than a short one. It is
 never read. `Package.resolved` is plain JSON carrying the full flattened pin set, and it
 is where every Swift dependency comes from: the one lockfile here that is the dependency
-list rather than an annotation on one.
+list rather than an annotation on one. SwiftPM records the *flattened* resolution there
+and does not mark which pins are direct, so a Swift project lists its transitive
+dependencies alongside its direct ones — which is more than every other ecosystem shows,
+not less.
 
 ### Lockfiles
 

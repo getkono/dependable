@@ -41,6 +41,10 @@ type ProgressSink = Arc<dyn Fn(ProgressEvent) + Send + Sync>;
 /// Each [`Checker::check_manifest`]/[`Checker::check_path`] call emits one
 /// `Started` → `Advanced`* → `Finished` cycle, letting a UI manage a per-manifest
 /// progress bar. `#[non_exhaustive]` so new phases can be added later.
+///
+/// A manifest whose ecosystem publishes no registry fetches nothing and emits no
+/// cycle at all — never a `Started` without its `Finished`, so a bar is never left
+/// running.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum ProgressEvent {
@@ -587,11 +591,12 @@ impl Checker {
             warnings.extend(undeclared_inheritance(&parsed.items, root));
         }
 
-        // Apply the lockfile to annotate locked versions, dispatching on the file
-        // that was found rather than on the manifest beside it. An unparseable
-        // lockfile is ignored — the dependency is simply checked without a locked
-        // version. `apply_lockfile` only annotates existing items, never inserts,
-        // so transitive deps are never introduced.
+        // Apply the lockfile, dispatching on the file that was found rather than on
+        // the manifest beside it. An unparseable lockfile is ignored — the
+        // dependency is simply checked without a locked version. `apply_lockfile`
+        // only annotates existing items, never inserts, so transitive deps are never
+        // introduced; the one lockfile that *is* the dependency list takes the other
+        // branch, and its ecosystem has no manifest-declared items to add to.
         if let Some((lock_kind, lock)) = lockfile {
             if let Some(pins) = lockfile_items(lock_kind, lock) {
                 // The one lockfile that *is* the dependency list. Its manifest is a
