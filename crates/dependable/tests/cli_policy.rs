@@ -1,6 +1,13 @@
 //! End-to-end: the `[policy]` block of `.dependable.toml` gates `dependable
 //! check`'s exit code.
 //!
+//! Every case here asserts *enforcement*, which is what the `report` feature builds,
+//! so the file states that requirement rather than failing a `--no-default-features`
+//! run for the absence of a subcommand it never compiled. That a `[policy]` block
+//! still **loads** without the feature is asserted in `config::schema_tests`, which
+//! runs in both builds.
+#![cfg(feature = "report")]
+//!
 //! Hermetic. The fixture declares nothing but path dependencies, so no registry
 //! fetch task and no OSV query is built — yet every declared dependency still
 //! yields a result for the policy engine to judge.

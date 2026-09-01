@@ -598,7 +598,7 @@ fn env_override<T>(
 fn warn_policy_ignored(config: &Path) {
     if crate::config::has_policy_table(config) {
         eprintln!(
-            "warning: {} declares `[policy]`, but this build has no `report` feature;              the policy is not enforced",
+            "warning: {} declares `[policy]`, but this build has no `report` feature; the policy is not enforced",
             config.display()
         );
     }
