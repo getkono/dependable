@@ -582,6 +582,7 @@ dependencies = [
  "futures",
  "moka",
  "reqwest",
+ "roxmltree",
  "semver",
  "serde",
  "serde_json",

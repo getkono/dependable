@@ -29,17 +29,17 @@ pub use lockfiles::{
     parse_mix_lock, parse_mix_lock_graph, parse_package_lock, parse_package_lock_graph,
 };
 pub use manifest::{
-    AlternateRegistryDecl, LockfileKind, ManifestKind, ParsedManifest, UnreadableLockfile,
-    WorkspaceRoots,
+    AlternateRegistryDecl, LockfileKind, ManifestKind, ParsedManifest, UNREADABLE_MANIFESTS,
+    UnreadableLockfile, UnreadableManifest, WorkspaceRoots,
 };
 pub use npmrc::{NpmrcConfig, parse_npmrc};
 pub use parsers::{
     AutoTargets, CargoPackageManifest, CargoTarget, CargoTargetKind, CargoTomlParser,
     CfgDependencyTable, ComposerJsonParser, CsprojParser, DenoJsonParser, DependencySection,
-    GoModParser, MixExsParser, PackageField, PackageJsonParser, Parser, PnpmWorkspaceParser,
-    ProjectMeta, ProjectRole, PubspecYamlParser, PyprojectTomlParser, RequirementsTxtParser,
-    WorkspaceDecl, parse, parse_cargo_config, parse_package_manifest, parse_package_name,
-    parse_project, parse_workspace, resolve_workspace_inheritance,
+    GoModParser, GradleCatalogParser, MixExsParser, PackageField, PackageJsonParser, Parser,
+    PnpmWorkspaceParser, ProjectMeta, ProjectRole, PubspecYamlParser, PyprojectTomlParser,
+    RequirementsTxtParser, WorkspaceDecl, parse, parse_cargo_config, parse_package_manifest,
+    parse_package_name, parse_project, parse_workspace, resolve_workspace_inheritance,
 };
 pub use result::{CheckResult, DependencyStatus};
 pub use semver::{Evaluation, UnstableFilter, check_version, is_prerelease, to_semver_constraint};

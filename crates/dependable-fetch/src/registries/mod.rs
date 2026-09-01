@@ -18,6 +18,7 @@ pub mod crates_io;
 pub mod go_proxy;
 pub mod hex;
 pub mod jsr;
+pub mod maven_central;
 pub mod npm;
 pub mod nuget;
 pub mod packagist;
@@ -28,6 +29,7 @@ pub use crates_io::CratesIoFetcher;
 pub use go_proxy::GoProxyFetcher;
 pub use hex::HexFetcher;
 pub use jsr::JsrFetcher;
+pub use maven_central::MavenCentralFetcher;
 pub use npm::NpmFetcher;
 pub use nuget::NuGetFetcher;
 pub use packagist::PackagistFetcher;
@@ -313,8 +315,8 @@ pub async fn fetch_features(
 
 /// Whether `ecosystem`'s registry publishes package metadata at all.
 ///
-/// Four of the nine registries implement no metadata endpoint this crate can
-/// read — the Go module proxy, JSR, NuGet, and pub.dev — so for those the honest
+/// Five of the ten registries implement no metadata endpoint this crate can read —
+/// the Go module proxy, JSR, NuGet, pub.dev, and Maven Central — so for those the honest
 /// answer to "what license is this?" is "we cannot ask", not "none". A caller
 /// showing license data uses this to say so rather than rendering a blank column.
 #[must_use]

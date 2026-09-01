@@ -114,6 +114,7 @@ fn ecosystem_color(ecosystem: Ecosystem) -> &'static str {
         Ecosystem::Dart => "#00b4ab",
         Ecosystem::CSharp => "#178600",
         Ecosystem::Elixir => "#6e4a7e",
+        Ecosystem::Jvm => "#b07219",
         _ => "#6b7280",
     }
 }

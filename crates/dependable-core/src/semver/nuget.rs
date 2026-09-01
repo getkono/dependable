@@ -113,6 +113,29 @@ fn floating_range(c: &str) -> Option<String> {
     Some(format!(">={lower}, <{upper}"))
 }
 
+/// What [`nuget_to_semver`] threw away, as a comparison key.
+///
+/// The translation drops the 4th and later revision segments, so `8.0.32` and
+/// `8.0.32.1` — both published `MySql.Data` releases — translate alike and compare
+/// equal. Which of them is the newer is decided by exactly what was dropped, and
+/// this is it: `8.0.32.1` outranks `8.0.32`, which has no revision segment at all.
+///
+/// A caller that has to name one published artifact out of a group translating
+/// alike orders them by this rather than by their position in a list. NuGet's
+/// registration pages arrive in whatever order their fetches complete, so the
+/// position carries no information — and `AWSSDK.Core`'s `4.0.7` group straddles a
+/// page boundary, which is a stale revision reported as newest whenever the later
+/// page lands first.
+#[must_use]
+pub fn discarded_precision(version: &str) -> Vec<u64> {
+    let v = version.trim();
+    let core = v.split(['-', '+']).next().unwrap_or(v);
+    core.split('.')
+        .skip(3)
+        .map(|segment| segment.parse().unwrap_or(0))
+        .collect()
+}
+
 /// Split on the first occurrence of `sep`, returning the head and an optional tail.
 fn split_once(s: &str, sep: char) -> (&str, Option<&str>) {
     match s.split_once(sep) {
@@ -153,6 +176,26 @@ mod tests {
             Some("13.0.1-beta1")
         );
         assert_eq!(nuget_to_semver("$(Version)"), None);
+    }
+
+    /// A revision segment is the whole difference between naming the newest
+    /// published `MySql.Data` and naming a superseded one, and the translation drops
+    /// it — so the group it collapses needs an order that does not come from a list
+    /// position.
+    #[test]
+    fn a_dropped_revision_still_ranks_two_versions_that_translate_alike() {
+        assert_eq!(nuget_to_semver("8.0.32").as_deref(), Some("8.0.32"));
+        assert_eq!(nuget_to_semver("8.0.32.1").as_deref(), Some("8.0.32"));
+        assert!(discarded_precision("8.0.32") < discarded_precision("8.0.32.1"));
+        assert!(discarded_precision("4.0.7.1") < discarded_precision("4.0.7.2"));
+        assert!(discarded_precision("4.0.7.9") < discarded_precision("4.0.7.10"));
+        assert_eq!(discarded_precision("8.0.32"), discarded_precision("8.0.32"));
+        // A pre-release or build suffix is kept by the translation, so it is not
+        // part of what this ranks.
+        assert_eq!(
+            discarded_precision("1.0.0.4-beta1"),
+            discarded_precision("1.0.0.4")
+        );
     }
 
     #[test]

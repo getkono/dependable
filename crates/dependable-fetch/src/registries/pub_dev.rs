@@ -90,9 +90,15 @@ impl RegistryFetcher for PubDevFetcher {
     }
 }
 
+/// Sort raw versions newest-first.
+///
+/// The comparison is **total**: versions that compare equal are ordered by their
+/// own strings, so a list built in a nondeterministic order (a `HashMap`'s
+/// iteration, pages appended as their fetches complete) cannot come out of here in
+/// a nondeterministic one.
 fn sort_desc(versions: &mut [String]) {
     versions.sort_by(|a, b| match (Version::parse(a), Version::parse(b)) {
-        (Ok(va), Ok(vb)) => vb.cmp(&va),
+        (Ok(va), Ok(vb)) => vb.cmp(&va).then_with(|| b.cmp(a)),
         _ => b.cmp(a),
     });
 }

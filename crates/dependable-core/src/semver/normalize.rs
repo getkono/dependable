@@ -87,22 +87,34 @@ const PYTHON_PRERELEASE: &[&str] = &[
 /// Whether `version` looks like a pre-release / unstable version for `ecosystem`.
 ///
 /// Uses a case-insensitive substring match against a marker set, plus Python's
-/// implicit forms (`1.0a1`, `1.0b2`, `1.0rc1`).
+/// implicit forms (`1.0a1`, `1.0b2`, `1.0rc1`) and the JVM's, which no substring
+/// list can cover.
+///
+/// The marker list is hyphen-prefixed, which is the spelling every ecosystem that
+/// publishes semver uses. Maven does not: it separates a qualifier with a dot as
+/// readily as with a hyphen (`6.0.0.M1`, `8.0.0.Beta1`, `5.3.0.RC1`) and
+/// abbreviates the word (`2.0-M1`, `2.0-CR1`, `2.0-a1`). `-SNAPSHOT` is the one
+/// form the universal list happens to catch, so before
+/// [`maven::is_prerelease`](crate::semver::maven::is_prerelease) was consulted the
+/// default `Exclude` filter offered a beta as the latest stable release.
 #[must_use]
 pub fn is_prerelease(version: &str, ecosystem: Ecosystem) -> bool {
     let lower = version.to_ascii_lowercase();
     if UNIVERSAL_PRERELEASE.iter().any(|m| lower.contains(m)) {
         return true;
     }
-    if ecosystem == Ecosystem::Python {
-        if PYTHON_PRERELEASE.iter().any(|m| lower.contains(m)) {
-            return true;
+    match ecosystem {
+        Ecosystem::Python => {
+            PYTHON_PRERELEASE.iter().any(|m| lower.contains(m))
+                || python_implicit_prerelease(&lower)
         }
-        if python_implicit_prerelease(&lower) {
-            return true;
-        }
+        // Maven's qualifiers are tokens, not suffixes, so they are recognized by
+        // the tokenizer that already models Maven's order rather than by substring
+        // — which would read `9.4.51.v20230217` (a dated build of a release) or
+        // `32.1.3-android` (a build variant) as unstable.
+        Ecosystem::Jvm => crate::semver::maven::is_prerelease(version),
+        _ => false,
     }
-    false
 }
 
 /// Detect PEP 440 implicit pre-release segments: `a`/`b` followed by a digit, or
@@ -151,6 +163,7 @@ pub fn to_semver_constraint(constraint: &str, ecosystem: Ecosystem) -> String {
         Ecosystem::Python => crate::semver::python::pep440_constraint_to_semver(constraint),
         Ecosystem::CSharp => crate::semver::nuget::nuget_constraint_to_semver(constraint),
         Ecosystem::Elixir => crate::semver::elixir::hex_constraint_to_semver(constraint),
+        Ecosystem::Jvm => crate::semver::maven::maven_constraint_to_semver(constraint),
         _ => normalize_constraint(constraint),
     }
 }
@@ -223,6 +236,40 @@ mod tests {
         assert!(!is_prerelease("1.0a1", Ecosystem::Rust));
         // A bare stable version is never a pre-release.
         assert!(!is_prerelease("1.0.0", Ecosystem::Python));
+    }
+
+    /// The marker list is hyphen-prefixed; Maven's qualifiers are not. Under the
+    /// default `Exclude` filter this offered `8.0.0.Beta1` as Hibernate's latest
+    /// release and `7.1.0.M1` as Spring's.
+    #[test]
+    fn jvm_specific_prereleases() {
+        for v in ["6.0.0.M1", "8.0.0.Beta1", "5.3.0.RC1", "2.0-M1", "2.0-a1"] {
+            assert!(is_prerelease(v, Ecosystem::Jvm), "{v}");
+            // Nothing in the universal list matches these, which is the defect.
+            assert!(!is_prerelease(v, Ecosystem::Rust), "{v}");
+        }
+        // `-SNAPSHOT` is the one form the universal list already covered.
+        assert!(is_prerelease("1.0-SNAPSHOT", Ecosystem::Jvm));
+        for v in [
+            "6.4.4.Final",
+            "5.3.9.RELEASE",
+            "9.4.51.v20230217",
+            "32.1.3-android",
+        ] {
+            assert!(!is_prerelease(v, Ecosystem::Jvm), "{v}");
+        }
+    }
+
+    /// Under the default filter, the newest *release* is what a JVM project is
+    /// offered — the whole list is not thrown away just because a beta tops it.
+    #[test]
+    fn the_default_filter_keeps_a_jvm_release_over_a_beta() {
+        let out = UnstableFilter::Exclude.filter(
+            &vers(&["8.0.0.Beta1", "6.6.0.Final", "6.4.4.Final"]),
+            Some("6.4.4.Final"),
+            Ecosystem::Jvm,
+        );
+        assert_eq!(out, vers(&["6.6.0.Final", "6.4.4.Final"]));
     }
 
     #[test]

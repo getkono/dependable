@@ -47,6 +47,7 @@ pub enum ManifestKind {
     PubspecYaml,
     MixExs,
     Csproj,
+    GradleVersionCatalog,
 }
 
 impl ManifestKind {
@@ -64,6 +65,7 @@ impl ManifestKind {
             ManifestKind::PubspecYaml => Ecosystem::Dart,
             ManifestKind::MixExs => Ecosystem::Elixir,
             ManifestKind::Csproj => Ecosystem::CSharp,
+            ManifestKind::GradleVersionCatalog => Ecosystem::Jvm,
         }
     }
 
@@ -100,6 +102,22 @@ impl ManifestKind {
                 reason: "Bun's legacy binary lockfile, which cannot be read as text. \
                          Run `bun install --save-text-lockfile` to migrate it to bun.lock.",
             }],
+            _ => &[],
+        }
+    }
+
+    /// Manifest formats this ecosystem produces that we recognise but cannot read.
+    ///
+    /// The sibling of [`ManifestKind::unreadable_lockfiles`], for the same reason and
+    /// with more at stake: an unread *lockfile* costs the resolved versions, while an
+    /// unread *manifest* costs the dependencies themselves. A Gradle project whose
+    /// dependencies are declared in `build.gradle.kts` and reported as three catalog
+    /// entries has been told something false, and being told nothing was read is the
+    /// only honest alternative.
+    #[must_use]
+    pub fn unreadable_manifests(self) -> &'static [UnreadableManifest] {
+        match self {
+            ManifestKind::GradleVersionCatalog => GRADLE_BUILD_SCRIPTS,
             _ => &[],
         }
     }
@@ -161,6 +179,9 @@ impl ManifestKind {
             "pubspec.yaml" => ManifestKind::PubspecYaml,
             "mix.exs" => ManifestKind::MixExs,
             "Directory.Packages.props" => ManifestKind::Csproj,
+            // Gradle reads every `*.versions.toml` under `gradle/` as a catalog;
+            // `libs` is only the conventional name of the default one.
+            _ if name.ends_with(".versions.toml") => ManifestKind::GradleVersionCatalog,
             _ if is_requirements_file(name) => ManifestKind::RequirementsTxt,
             _ if name.ends_with(".csproj") => ManifestKind::Csproj,
             _ => return None,
@@ -209,6 +230,108 @@ pub struct UnreadableLockfile {
     pub file_name: &'static str,
     /// Why it cannot be read, phrased for the person who has to fix it.
     pub reason: &'static str,
+}
+
+/// Where a Gradle build declares its subprojects.
+///
+/// This is the file that makes a directory below it *part of this build* rather
+/// than a separate one, which is what lets a build root's catalog speak for a
+/// subdirectory that has no catalog of its own.
+const GRADLE_SETTINGS: &[&str] = &["settings.gradle.kts", "settings.gradle"];
+
+/// Where a Gradle build root announces itself.
+///
+/// [`GRADLE_SETTINGS`] is the definition, and a catalog is included because a
+/// single-project build has a catalog and often no settings file at all — it is
+/// still a build root, and the walk out of a subdirectory must not cross it.
+const GRADLE_BUILD_ROOTS: &[&str] = &[
+    "settings.gradle.kts",
+    "settings.gradle",
+    "gradle/libs.versions.toml",
+];
+
+/// Gradle's build scripts, which are programs rather than data.
+///
+/// Both spellings, because a project may use either and neither is readable. The
+/// catalog that supersedes them sits in a subdirectory, which is why supersession is
+/// a relative path rather than a sibling name — and it sits in the **build root's**
+/// subdirectory, which is why supersession is resolved by walking up to
+/// `build_root_markers` rather than by looking beside the script.
+const GRADLE_BUILD_SCRIPTS: &[UnreadableManifest] = &[
+    UnreadableManifest {
+        file_name: "build.gradle.kts",
+        reason: "a Gradle build script, which cannot be read without executing it. \
+                 Declare dependencies in `gradle/libs.versions.toml` to have them checked.",
+        superseded_by: &["gradle/libs.versions.toml"],
+        build_root_markers: GRADLE_BUILD_ROOTS,
+        subproject_markers: GRADLE_SETTINGS,
+        ecosystem: Ecosystem::Jvm,
+    },
+    UnreadableManifest {
+        file_name: "build.gradle",
+        reason: "a Gradle build script, which cannot be read without executing it. \
+                 Declare dependencies in `gradle/libs.versions.toml` to have them checked.",
+        superseded_by: &["gradle/libs.versions.toml"],
+        build_root_markers: GRADLE_BUILD_ROOTS,
+        subproject_markers: GRADLE_SETTINGS,
+        ecosystem: Ecosystem::Jvm,
+    },
+];
+
+/// Every manifest format recognised but unreadable, whichever ecosystem produces it.
+///
+/// What a directory scan looks for, since it is asking about files on disk rather
+/// than about a manifest kind it has already identified. A kind's own entries are
+/// reachable through [`ManifestKind::unreadable_manifests`]; a second ecosystem
+/// adding a group here must add it to both.
+pub const UNREADABLE_MANIFESTS: &[UnreadableManifest] = GRADLE_BUILD_SCRIPTS;
+
+/// A manifest format we recognise but cannot read, and what to do about it.
+///
+/// The manifest-level counterpart of [`UnreadableLockfile`], with one field it does
+/// not need: an unreadable manifest may have a readable *alternative* elsewhere in
+/// the project, and where that alternative is present nothing was missed and there
+/// is nothing to report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct UnreadableManifest {
+    /// The file name to look for.
+    pub file_name: &'static str,
+    /// Why it cannot be read, phrased for the person who has to fix it.
+    pub reason: &'static str,
+    /// Paths whose presence means the dependencies are declared somewhere readable
+    /// after all, relative to the **build root** — not to the directory holding the
+    /// unreadable file.
+    ///
+    /// The two are the same directory only in a single-module project. A Gradle
+    /// catalog is build-root scoped: one `<root>/gradle/libs.versions.toml` serves
+    /// every subproject, and a subproject has no `gradle/` directory of its own. A
+    /// directory-local test therefore calls every module of a *correctly* configured
+    /// multi-module build unread, and tells each of them to declare its dependencies
+    /// in a catalog that already holds them.
+    pub superseded_by: &'static [&'static str],
+    /// File names that mark the build root `superseded_by` resolves against, tried
+    /// in each directory on the way up from the unreadable file.
+    ///
+    /// The walk stops at the first directory holding one of these (or at the
+    /// repository boundary), so supersession never resolves against an unrelated
+    /// build further up the tree.
+    pub build_root_markers: &'static [&'static str],
+    /// File names an **ancestor** must hold for its readable alternative to cover
+    /// this directory as well.
+    ///
+    /// A build root's catalog serves the subprojects that build root declares, and
+    /// `settings.gradle*` is where they are declared. Without this test a
+    /// single-project build at the repository root — a catalog, no settings file —
+    /// silently absorbs any other build script anywhere beneath it, and the one
+    /// script whose dependencies really are unread is the one nobody is told about.
+    /// A readable alternative sitting *beside* the unreadable file needs no such
+    /// evidence: it is the same directory.
+    pub subproject_markers: &'static [&'static str],
+    /// The ecosystem this manifest belongs to, so a scan can stay quiet about an
+    /// ecosystem the user has turned off — a warning about an unread manifest is
+    /// advice to enable something, and it is noise for someone who disabled it.
+    pub ecosystem: Ecosystem,
 }
 
 /// A lockfile format we can read.
@@ -298,6 +421,14 @@ mod tests {
             ("mix.exs", ManifestKind::MixExs),
             ("App.csproj", ManifestKind::Csproj),
             ("Directory.Packages.props", ManifestKind::Csproj),
+            (
+                "gradle/libs.versions.toml",
+                ManifestKind::GradleVersionCatalog,
+            ),
+            (
+                "gradle/deps.versions.toml",
+                ManifestKind::GradleVersionCatalog,
+            ),
         ];
         for (path, expected) in cases {
             assert_eq!(
@@ -359,6 +490,7 @@ mod tests {
             ManifestKind::PubspecYaml,
             ManifestKind::MixExs,
             ManifestKind::Csproj,
+            ManifestKind::GradleVersionCatalog,
         ] {
             assert!(kind.workspace_roots().is_none(), "{kind:?}");
             assert!(
@@ -387,6 +519,27 @@ mod tests {
                 "{content:?}"
             );
         }
+    }
+
+    /// A Gradle build script is a program: the catalog beside it is the only part of
+    /// the build that is data, so the script has to be reported unread.
+    #[test]
+    fn a_gradle_build_script_is_recognised_but_unreadable() {
+        let scripts = ManifestKind::GradleVersionCatalog.unreadable_manifests();
+        let names: Vec<&str> = scripts.iter().map(|m| m.file_name).collect();
+        assert_eq!(names, ["build.gradle.kts", "build.gradle"]);
+        for script in scripts {
+            assert_eq!(script.superseded_by, ["gradle/libs.versions.toml"]);
+            assert!(script.reason.contains("libs.versions.toml"), "{script:?}");
+        }
+        // Every kind's entries have to be findable by a scan that has only a path.
+        for script in scripts {
+            assert!(
+                UNREADABLE_MANIFESTS.contains(script),
+                "{script:?} is unreachable from a directory scan"
+            );
+        }
+        assert!(ManifestKind::CargoToml.unreadable_manifests().is_empty());
     }
 
     #[test]
