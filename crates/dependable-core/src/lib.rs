@@ -30,6 +30,7 @@ pub use lockfiles::{
 };
 pub use manifest::{
     AlternateRegistryDecl, LockfileKind, ManifestKind, ParsedManifest, UnreadableLockfile,
+    WorkspaceRoots,
 };
 pub use npmrc::{NpmrcConfig, parse_npmrc};
 pub use parsers::{
