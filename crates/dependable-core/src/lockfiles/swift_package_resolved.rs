@@ -187,7 +187,19 @@ fn normalize_host(name: &str, has_scheme: bool) -> String {
 /// What actually distinguishes them is the form: a port is URL syntax and only ever
 /// follows a scheme, while git's SCP shorthand (`git@github.com:owner/repo`) has no
 /// scheme by definition and writes a colon exactly where a URL writes a slash. So
-/// `has_scheme` decides it, and the digits are never consulted.
+/// `has_scheme` decides *whether a port is even possible*, and it is the only thing
+/// consulted where there is no scheme.
+///
+/// Where there is one, the digits get a second, narrower job: a port is digits, so a
+/// non-numeric segment after the colon is not one and the colon stays where it was
+/// written. Without that guard `ssh://git@github.com:vapor/vapor.git` — a scheme in
+/// front of SCP shorthand, which only a hand-edited or generated file contains —
+/// loses `vapor` and yields `github.com/vapor`: a well-formed key naming a
+/// *different* repository, the same silent, unspottable false negative the old
+/// numeric heuristic produced for `42/pkg`. Keeping the colon instead yields a key
+/// that matches nothing, which is a miss anyone can see rather than a wrong answer
+/// nobody can. The guard is only ever reached behind a scheme, so no SCP location
+/// is judged by its digits.
 ///
 /// An IPv6 literal is bracketed and full of colons that are neither, so the scan for
 /// a separator begins after the closing `]`.
@@ -203,11 +215,12 @@ fn split_authority(name: &str, has_scheme: bool) -> (&str, Option<&str>) {
     let split_at = |i: usize| (&name[..i], Some(&name[i + 1..]));
 
     if has_scheme {
-        // URL syntax: the authority runs to the first `/`, and a `:` inside it is a
-        // port.
+        // URL syntax: the authority runs to the first `/`, and a `:` inside it may be
+        // a port — it is one only where what follows is digits.
         let (authority, path) = slash.map_or((name, None), split_at);
         let host = colon
             .filter(|i| *i < authority.len())
+            .filter(|i| authority[i + 1..].bytes().all(|b| b.is_ascii_digit()))
             .map_or(authority, |i| &authority[..i]);
         (host, path)
     } else {
@@ -608,6 +621,40 @@ mod tests {
         }
     }
 
+    /// A scheme says a colon in the authority *may* be a port; it does not say the
+    /// segment after it is one. `ssh://git@github.com:vapor/vapor.git` is a scheme
+    /// written in front of SCP shorthand — invalid URL syntax that only a hand-edited
+    /// or generated `Package.resolved` contains — and dropping `vapor` as if it were
+    /// a port yields `github.com/vapor`: a well-formed OSV key naming a *different*
+    /// repository, so the scan answers about a package nobody asked about and the
+    /// real one reports clean. A port is digits; anything else is left where it was
+    /// written, which yields a key that matches nothing — a visible miss instead of a
+    /// silent wrong answer.
+    #[test]
+    fn a_non_numeric_segment_after_a_scheme_is_not_a_port() {
+        let cases = [
+            // A scheme in front of SCP shorthand: `vapor` is not a port, so the colon
+            // stays and the owner is never dropped.
+            (
+                "ssh://git@github.com:vapor/vapor.git",
+                "github.com:vapor/vapor",
+            ),
+            ("https://host:notaport/x/y", "host:notaport/x/y"),
+            // Still ports, and still stripped.
+            (
+                "ssh://git@github.com:22/apple/swift-nio.git",
+                "github.com/apple/swift-nio",
+            ),
+            (
+                "https://github.com:443/apple/swift-nio.git",
+                "github.com/apple/swift-nio",
+            ),
+        ];
+        for (location, expected) in cases {
+            assert_eq!(swift_package_name(location), expected, "{location}");
+        }
+    }
+
     /// An IPv6 literal is bracketed and full of colons that separate nothing, so the
     /// search for a port or a path separator starts after the `]`.
     #[test]
@@ -623,6 +670,12 @@ mod tests {
             // separates the host from the path — degenerate, but consistent, and it
             // does not mangle the address.
             ("[::1]:22", "[::1]/22"),
+            // A zone id puts `%` and letters inside the brackets; the port after the
+            // `]` is still digits and still goes.
+            (
+                "ssh://git@[fe80::1%25eth0]:22/apple/swift-nio",
+                "[fe80::1%25eth0]/apple/swift-nio",
+            ),
             // No separator at all: the whole literal is the host.
             ("[2001:db8::1]", "[2001:db8::1]"),
         ];
