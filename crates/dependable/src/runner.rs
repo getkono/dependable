@@ -19,7 +19,7 @@ use dependable_fetch::{
     Item, JsrFetcher, ManifestKind, MavenCentralFetcher, NpmFetcher, NuGetFetcher, PackageSource,
     PackagistFetcher, ParseError, ProgressEvent, PubDevFetcher, PyPiFetcher, ScopedRegistry,
     TreeOptions, UnstableFilter, WorkspaceGraphOptions, build_client, build_workspace_graph,
-    nearest_workspace_root, workspace_source,
+    workspace_root_of, workspace_source,
 };
 use dependable_tui::TuiOptions;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
@@ -639,7 +639,7 @@ pub async fn run_list(args: ListArgs) -> anyhow::Result<ExitCode> {
             .then(|| apply_nearest_lockfile(manifest, kind, &root, &mut parsed.items))
             .flatten();
         let meta = parse_project(kind, &content);
-        let (version, version_inherited) = resolve_version(manifest, kind, &meta);
+        let (version, version_inherited) = resolve_version(manifest, kind, &content, &meta);
 
         reports.push(ProjectReport {
             relative: relative_to(&root, manifest),
@@ -690,18 +690,19 @@ fn apply_nearest_lockfile(
 }
 
 /// The manifest's version, resolving a Cargo `version.workspace = true` against the
-/// nearest ancestor `[workspace.package]` table. Returns the version and whether it was
-/// inherited.
+/// `[workspace.package]` table governing it — its own, when the manifest is itself the
+/// root. Returns the version and whether it was inherited.
 fn resolve_version(
     manifest: &Path,
     kind: ManifestKind,
+    content: &str,
     meta: &ProjectMeta,
 ) -> (Option<String>, bool) {
     match &meta.version {
         None => (None, false),
         Some(PackageField::Literal(version)) => (Some(version.clone()), false),
         Some(PackageField::Workspace) => {
-            let inherited = workspace_package_defaults(manifest, kind)
+            let inherited = workspace_package_defaults(manifest, kind, content)
                 .and_then(|defaults| defaults.get("version").cloned());
             (inherited, true)
         }
@@ -710,7 +711,14 @@ fn resolve_version(
     }
 }
 
-/// `[workspace.package]` from the nearest ancestor `Cargo.toml` declaring a workspace.
+/// `[workspace.package]` from the `Cargo.toml` governing `manifest`.
+///
+/// [`workspace_root_of`] rather than `nearest_workspace_root`, because a Cargo root that
+/// is also a package inherits from its **own** table: a single `Cargo.toml` holding both
+/// `[workspace.package] version` and `[package] version.workspace = true` is legal, and a
+/// walk that excludes the asking manifest never finds the table sitting in it. That is
+/// already how the dependency inheritance a few lines up resolves, via `workspace_source`;
+/// the scalar axis had no reason to disagree.
 ///
 /// Reading the located root as a Cargo `[workspace]` table is this function's own
 /// business: scalar inheritance (`version.workspace = true`) is a different axis from the
@@ -718,11 +726,12 @@ fn resolve_version(
 fn workspace_package_defaults(
     manifest: &Path,
     kind: ManifestKind,
+    content: &str,
 ) -> Option<BTreeMap<String, String>> {
     if kind != ManifestKind::CargoToml {
         return None;
     }
-    let (_, root_kind, content) = nearest_workspace_root(manifest, kind)?;
+    let (_, root_kind, content) = workspace_root_of(manifest, kind, content)?;
     // Checked rather than assumed. Cargo's descriptor names one candidate today, so
     // this always holds — but pairing a kind with each candidate name is precisely
     // what makes a second candidate of another kind possible, and reading someone
