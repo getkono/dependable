@@ -60,7 +60,7 @@
 //! lands a line short of the version it points at.
 
 use std::collections::BTreeMap;
-use std::path::{Component, Path};
+use std::path::{Component, Path, Prefix};
 
 use dependable_core::result::{Advisory, Severity};
 use dependable_core::{CheckResult, DependencyStatus, Item};
@@ -437,23 +437,39 @@ fn fingerprint(
 /// instead, where a drive prefix is legal and keeps its colon. A *relative* path outside
 /// the root stays relative — it is already the form a consumer can resolve.
 ///
+/// "Outside the root" is decided by [`Path::has_root`] and not [`Path::is_absolute`],
+/// which on Windows are not the same question: `/elsewhere/Cargo.toml` is rooted but
+/// carries no drive, so `is_absolute` is false there and the same input produced a
+/// `file:` URI on Unix and a bare path-absolute string on Windows. A rooted path is
+/// exactly as unresolvable without a base on one platform as on the other, and a SARIF
+/// log should not describe the same manifest differently for the machine that rendered
+/// it. A drive-relative path (`C:foo`) is rooted by neither test and stays relative.
+///
 /// No filesystem access: nothing here canonicalizes or probes.
 fn uri_for(root: &Path, path: &Path) -> String {
     if let Ok(relative) = path.strip_prefix(root) {
         return encode_uri(&join_components(relative));
     }
-    if path.is_absolute() {
+    if path.has_root() {
         return absolute_file_uri(path);
     }
     encode_uri(&join_components(path))
 }
 
-/// `/`-join a path's components, dropping `.` and any root or prefix.
+/// `/`-join a path's components, dropping `.` and any root — but **keeping** a prefix.
+///
+/// A drive-relative path (`C:foo`) is rooted by neither [`Path::has_root`] nor
+/// [`Path::is_absolute`], so it arrives here, and dropping its prefix turned
+/// `C:crates\app` into `crates/app` — the same URI a path on any other drive produces.
+/// The prefix is emitted as an ordinary segment and percent-encoded with the rest
+/// (`C%3A/crates/app`), because outside a `file:` URI's leading position a bare colon
+/// is not the drive separator it is there.
 fn join_components(path: &Path) -> String {
     let parts: Vec<String> = path
         .components()
         .filter_map(|component| match component {
-            Component::Prefix(_) | Component::RootDir | Component::CurDir => None,
+            Component::RootDir | Component::CurDir => None,
+            Component::Prefix(p) => Some(p.as_os_str().to_string_lossy().into_owned()),
             Component::ParentDir => Some("..".to_string()),
             Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
         })
@@ -461,27 +477,57 @@ fn join_components(path: &Path) -> String {
     parts.join("/")
 }
 
+/// How one Windows path prefix is spelled in a `file:` URI: an authority, and a leading
+/// path segment.
+///
+/// Split out from [`absolute_file_uri`] because the four prefix forms are the whole
+/// difficulty and this is the only way to test them off Windows — [`Path`] parses a
+/// prefix only there, while [`Prefix`] itself is spellable everywhere.
+///
+/// - A drive (`C:`, and the verbatim `\\?\C:` that [`std::fs::canonicalize`] hands
+///   back) is a path segment. The colon is legal in a `file:` URI path and encoding it
+///   yields `C%3A`, which resolves to nothing.
+/// - A UNC share (`\\server\share`, and its verbatim spelling) has a real authority:
+///   `file://server/share/...`. Emitting it as a path produced `file://///server/...`,
+///   which names a different thing.
+/// - The verbatim and device namespaces (`\\?\Volume{…}`, `\\.\COM1`) name no
+///   authority, so they stay path segments — encoded, because `?` unencoded opens a URI
+///   query and truncated the path at `file:////`.
+fn prefix_uri_parts(prefix: Prefix<'_>) -> (Option<String>, Option<String>) {
+    let drive = |letter: u8| Some(format!("{}:", letter.to_ascii_uppercase() as char));
+    match prefix {
+        Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => (None, drive(letter)),
+        Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => (
+            Some(encode_uri(&server.to_string_lossy())),
+            Some(encode_uri(&share.to_string_lossy())),
+        ),
+        Prefix::Verbatim(name) | Prefix::DeviceNS(name) => {
+            (None, Some(encode_uri(&name.to_string_lossy())))
+        }
+    }
+}
+
 /// An absolute path as a `file:` URI, with each segment percent-encoded.
 fn absolute_file_uri(path: &Path) -> String {
-    let mut prefix: Option<String> = None;
+    let mut authority = String::new();
     let mut parts: Vec<String> = Vec::new();
     for component in path.components() {
         match component {
-            // `C:` — the colon is legal in a `file:` URI path and encoding it yields
-            // `C%3A`, which resolves to nothing.
             Component::Prefix(p) => {
-                prefix = Some(p.as_os_str().to_string_lossy().replace('\\', "/"));
+                let (server, segment) = prefix_uri_parts(p.kind());
+                if let Some(server) = server {
+                    authority = server;
+                }
+                if let Some(segment) = segment {
+                    parts.push(segment);
+                }
             }
             Component::RootDir | Component::CurDir => {}
             Component::ParentDir => parts.push("..".to_string()),
             Component::Normal(part) => parts.push(encode_uri(&part.to_string_lossy())),
         }
     }
-    let joined = parts.join("/");
-    match prefix {
-        Some(prefix) => format!("file:///{prefix}/{joined}"),
-        None => format!("file:///{joined}"),
-    }
+    format!("file://{authority}/{}", parts.join("/"))
 }
 
 /// Percent-encode every byte outside the URI-safe set, leaving `/` as the path
@@ -1339,6 +1385,100 @@ mod tests {
         );
         assert!(!uri.contains("%3A"), "the drive colon was encoded: {uri}");
         assert_eq!(uri, "file:///C:/Users/dev/my%20project/Cargo.toml");
+
+        // A rooted path carrying no drive is `is_absolute() == false` on Windows and
+        // true everywhere else. It is unresolvable without a base on both, so it takes
+        // the same `file:` form on both — a log must not describe one manifest two ways
+        // depending on the machine that rendered it.
+        assert_eq!(
+            uri_for(Path::new(r"D:\repo"), Path::new("/elsewhere/Cargo.toml")),
+            "file:///elsewhere/Cargo.toml"
+        );
+
+        // A drive-relative path (`C:foo`) is rooted by neither test: it resolves against
+        // that drive's working directory, so it stays relative — but it keeps naming its
+        // drive. This assertion used to read `crates/app/Cargo.toml`, which is the URI a
+        // path on *any* drive produces: the correction restores information the renderer
+        // was dropping, it does not relax the check.
+        assert_eq!(
+            uri_for(Path::new(r"D:\repo"), Path::new(r"C:crates\app\Cargo.toml")),
+            "C%3A/crates/app/Cargo.toml"
+        );
+
+        // A UNC share has a real authority. Rendering it as a path produced
+        // `file://///server/share/...`, which names a different thing.
+        assert_eq!(
+            uri_for(
+                Path::new(r"D:\repo"),
+                Path::new(r"\\server\share\repo\Cargo.toml")
+            ),
+            "file://server/share/repo/Cargo.toml"
+        );
+
+        // The verbatim form `std::fs::canonicalize` returns, and which `discover.rs`
+        // deliberately preserves. Emitting the prefix unencoded left `file:////?/C:/...`,
+        // where the `?` opens a URI query and truncates the path at `file:////`.
+        assert_eq!(
+            uri_for(Path::new(r"D:\repo"), Path::new(r"\\?\C:\repo\Cargo.toml")),
+            "file:///C:/repo/Cargo.toml"
+        );
+        assert_eq!(
+            uri_for(
+                Path::new(r"D:\repo"),
+                Path::new(r"\\?\UNC\server\share\repo\Cargo.toml")
+            ),
+            "file://server/share/repo/Cargo.toml"
+        );
+    }
+
+    /// The prefix forms, off Windows.
+    ///
+    /// [`Path`] parses a prefix only on Windows, so the end-to-end assertions above run
+    /// on one platform in the CI matrix — which is how the UNC and verbatim spellings
+    /// went unnoticed. [`Prefix`] itself is spellable everywhere, so the decision each
+    /// form drives is checked on every platform the suite runs on.
+    #[test]
+    fn every_windows_prefix_form_has_a_uri_spelling() {
+        use std::ffi::OsStr;
+
+        // A drive is a path segment, and its colon must survive: `C%3A` in the leading
+        // position of a `file:` URI resolves to nothing.
+        assert_eq!(
+            prefix_uri_parts(Prefix::Disk(b'C')),
+            (None, Some("C:".to_owned()))
+        );
+        // `\?\C:\...` is what `std::fs::canonicalize` returns and what `simplified()`
+        // preserves; it names the same drive.
+        assert_eq!(
+            prefix_uri_parts(Prefix::VerbatimDisk(b'C')),
+            (None, Some("C:".to_owned()))
+        );
+
+        // A UNC share is an authority plus a first segment, not four extra slashes.
+        assert_eq!(
+            prefix_uri_parts(Prefix::UNC(OsStr::new("server"), OsStr::new("share"))),
+            (Some("server".to_owned()), Some("share".to_owned()))
+        );
+        assert_eq!(
+            prefix_uri_parts(Prefix::VerbatimUNC(
+                OsStr::new("server"),
+                OsStr::new("share")
+            )),
+            (Some("server".to_owned()), Some("share".to_owned()))
+        );
+
+        // The verbatim and device namespaces name no authority, and every byte of them
+        // is encoded — an unencoded `?` opens a URI query and truncates the path.
+        let (authority, segment) = prefix_uri_parts(Prefix::Verbatim(OsStr::new("Volume{1}")));
+        assert_eq!(authority, None);
+        let segment = segment.expect("a verbatim namespace names a segment");
+        assert!(!segment.contains('{'), "{segment}");
+        assert!(!segment.contains('}'), "{segment}");
+
+        assert_eq!(
+            prefix_uri_parts(Prefix::DeviceNS(OsStr::new("COM1"))),
+            (None, Some("COM1".to_owned()))
+        );
     }
 
     /// A space in a directory name still has to be encoded, in both forms.

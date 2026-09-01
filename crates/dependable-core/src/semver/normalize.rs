@@ -180,6 +180,32 @@ pub fn to_semver_constraint(constraint: &str, ecosystem: Ecosystem) -> String {
     }
 }
 
+/// Convert a constraint for `semver`, or `None` when the ecosystem's dialect could
+/// not be expressed as a `semver::VersionReq`.
+///
+/// Three of the four translators signal failure by dropping everything they could
+/// not read: [`maven_constraint_to_semver`](crate::semver::maven::maven_constraint_to_semver)
+/// and [`nuget_constraint_to_semver`](crate::semver::nuget::nuget_constraint_to_semver)
+/// return an empty string for an unreadable version or a malformed interval, and
+/// [`pep440_constraint_to_semver`](crate::semver::python::pep440_constraint_to_semver)
+/// does the same once every clause has been dropped. An empty result is therefore
+/// ambiguous on its own: it means "the author declared no constraint" *and* "we
+/// could not read the constraint the author declared", and the checker treating the
+/// second as the first turned it into `*` — which resolves to the newest release and
+/// reports `up to date`, the one answer a constraint that was never understood must
+/// not give.
+///
+/// The two are told apart by what went in: an empty result from a **non-empty**
+/// input is a failed translation, and nothing else produces one.
+#[must_use]
+pub fn try_to_semver_constraint(constraint: &str, ecosystem: Ecosystem) -> Option<String> {
+    let translated = to_semver_constraint(constraint, ecosystem);
+    if translated.trim().is_empty() && !constraint.trim().is_empty() {
+        return None;
+    }
+    Some(translated)
+}
+
 /// Normalize a concrete version string: strip a leading `v`/`V` and pad partial
 /// versions (`1` → `1.0.0`, `1.2` → `1.2.0`) so they parse as `semver::Version`.
 #[must_use]

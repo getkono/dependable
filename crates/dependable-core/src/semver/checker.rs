@@ -2,7 +2,8 @@
 
 use ::semver::{Version, VersionReq};
 
-use super::normalize::normalize_constraint;
+use super::normalize::{normalize_constraint, try_to_semver_constraint};
+use crate::ecosystem::Ecosystem;
 use crate::result::DependencyStatus;
 
 /// The outcome of evaluating one constraint against a set of available versions.
@@ -31,6 +32,37 @@ pub fn to_version_req(constraint: &str) -> Result<VersionReq, ::semver::Error> {
 /// (currently just `latest`) rather than a version range.
 fn is_latest_tag(constraint: &str) -> bool {
     constraint.trim() == "latest"
+}
+
+/// Classify a dependency whose constraint is written in `ecosystem`'s dialect.
+///
+/// The wrapper [`check_version`] cannot see the difference between an author who
+/// declared no constraint and a constraint this crate failed to translate, because
+/// the failing translators hand it the same empty string for both — so an
+/// untranslatable range became `*`, resolved to the newest release, and reported
+/// `up to date`. Translating here keeps that distinction: a failed translation is
+/// [`DependencyStatus::Undetermined`], which claims nothing about currency.
+#[must_use]
+pub fn check_version_for(
+    constraint: &str,
+    ecosystem: Ecosystem,
+    versions: &[String],
+    locked_at: Option<&str>,
+) -> Evaluation {
+    match try_to_semver_constraint(constraint, ecosystem) {
+        Some(translated) => check_version(&translated, versions, locked_at),
+        None => Evaluation {
+            status: DependencyStatus::Undetermined,
+            latest_compatible: None,
+            latest_available: newest(versions).map(|v| v.to_string()),
+            patch_available: false,
+        },
+    }
+}
+
+/// The newest parseable version in `versions`, if any.
+fn newest(versions: &[String]) -> Option<Version> {
+    versions.iter().filter_map(|v| Version::parse(v).ok()).max()
 }
 
 /// Classify a dependency.
@@ -137,6 +169,84 @@ mod tests {
 
     fn vers(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// A constraint whose dialect did not translate must not be reported as current.
+    ///
+    /// Maven, NuGet, and PEP 440 all signal a failed translation by returning the empty
+    /// string, which the checker read as "no constraint declared" and turned into `*` —
+    /// so `latest_compatible` became the newest release and the status became
+    /// `UpToDate`, disarming `--fail-on outdated` at every ecosystem that translates.
+    /// One case per affected ecosystem, each taken from a manifest that parses.
+    #[test]
+    fn an_untranslatable_constraint_is_undetermined_not_up_to_date() {
+        // A Gradle version catalog with an unclosed Maven interval.
+        let jvm = check_version_for(
+            "[4.0,4.9",
+            Ecosystem::Jvm,
+            &vers(&["4.0.0", "4.9.0", "5.5.0"]),
+            None,
+        );
+        assert_eq!(jvm.status, DependencyStatus::Undetermined, "{jvm:?}");
+        assert_eq!(jvm.latest_compatible, None);
+        assert_eq!(jvm.latest_available.as_deref(), Some("5.5.0"));
+
+        // Maven's `LATEST` keyword, which is a version *selector*, not a range.
+        let latest_keyword =
+            check_version_for("LATEST", Ecosystem::Jvm, &vers(&["2.10.0", "2.14.0"]), None);
+        assert_eq!(latest_keyword.status, DependencyStatus::Undetermined);
+
+        // A NuGet interval missing its closing bracket. The newest release is *outside*
+        // the range the author meant, so `UpToDate` here was actively wrong.
+        let nuget = check_version_for(
+            "[12.0.0,13.0.0",
+            Ecosystem::CSharp,
+            &vers(&["12.0.3", "13.0.4"]),
+            None,
+        );
+        assert_eq!(nuget.status, DependencyStatus::Undetermined, "{nuget:?}");
+
+        // PEP 440 `!=`, which has no `semver::VersionReq` spelling, so every clause is
+        // dropped and nothing is left to compare against.
+        let python = check_version_for(
+            "!=2.31.0",
+            Ecosystem::Python,
+            &vers(&["2.31.0", "2.34.2"]),
+            None,
+        );
+        assert_eq!(python.status, DependencyStatus::Undetermined, "{python:?}");
+    }
+
+    /// The other half of the same distinction: an author who declared *no* constraint
+    /// still means "any version", and must keep evaluating as `*` rather than becoming
+    /// undetermined.
+    #[test]
+    fn an_absent_constraint_still_means_any_version() {
+        for ecosystem in [
+            Ecosystem::Python,
+            Ecosystem::CSharp,
+            Ecosystem::Jvm,
+            Ecosystem::Elixir,
+            Ecosystem::Rust,
+        ] {
+            let e = check_version_for("", ecosystem, &vers(&["1.0.0", "2.0.0"]), Some("2.0.0"));
+            assert_eq!(e.status, DependencyStatus::UpToDate, "{ecosystem:?}: {e:?}");
+            assert_eq!(e.latest_compatible.as_deref(), Some("2.0.0"));
+        }
+    }
+
+    /// A constraint the ecosystem *can* translate keeps its real evaluation, so the
+    /// guard above is not simply refusing to answer.
+    #[test]
+    fn a_translatable_constraint_is_still_evaluated() {
+        let e = check_version_for(
+            "[1.0,2.0)",
+            Ecosystem::Jvm,
+            &vers(&["1.0.0", "1.9.0", "2.5.0"]),
+            None,
+        );
+        assert_eq!(e.status, DependencyStatus::UpdateAvailable, "{e:?}");
+        assert_eq!(e.latest_compatible.as_deref(), Some("1.9.0"));
     }
 
     #[test]
