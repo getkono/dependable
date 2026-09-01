@@ -25,6 +25,15 @@ pub struct ManifestReport {
     /// The manifest whose `[workspace.dependencies]` supplied any inherited constraint.
     /// `None` outside a workspace.
     pub workspace_root: Option<PathBuf>,
+    /// Whether the file that *is* this project's dependency list went unread, so
+    /// [`Self::results`] being empty says nothing about the project.
+    ///
+    /// Only a SwiftPM project can set this: a `Package.swift` is a program this
+    /// tool declines to read, so with no readable `Package.resolved` beside it
+    /// there is no dependency list at all. `--fail-on any` reads it, because
+    /// "nothing was found wrong" and "nothing was looked at" must not share an
+    /// exit code.
+    pub dependencies_unread: bool,
 }
 
 /// Aggregate status counts across one or more reports.
@@ -185,6 +194,7 @@ mod tests {
                 })
                 .collect(),
             workspace_root: None,
+            dependencies_unread: false,
         }
     }
 

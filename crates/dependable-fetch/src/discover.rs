@@ -110,6 +110,7 @@ fn walk(
             found.notices.push(LockfileNotice {
                 path,
                 reason: unreadable.reason.to_owned(),
+                dependency_list_unread: false,
             });
         }
     }
@@ -168,23 +169,46 @@ fn is_superseded(dir: &Path, unreadable: &UnreadableManifest) -> bool {
     }
 }
 
+/// Whether `lockfile` may be adopted from `dir`, given the manifest sits in `own_dir`.
+///
+/// The upward walk is safe while a lockfile *annotates* items a manifest already
+/// produced: a workspace member's `Cargo.lock` at the root pins the very crates the
+/// member declared, and a pin for a crate it does not declare simply goes unused.
+///
+/// It is not safe when the lockfile **is** the item list. A nested SwiftPM package
+/// with no `Package.resolved` of its own would adopt its ancestor's, and report the
+/// ancestor's dependencies as its own — attributing advisories to a package that
+/// does not have the dependency, which is a false positive on the one verdict Swift
+/// can give. In a monorepo that is every not-yet-resolved package. So a dependency
+/// source counts only in the manifest's own directory.
+fn adoptable_from(lockfile: LockfileKind, dir: &Path, own_dir: &Path) -> bool {
+    !lockfile.is_dependency_source() || dir == own_dir
+}
+
 /// Locate the lockfile governing `manifest` without reading it.
 ///
 /// Same upward walk as [`find_lockfile`] — the manifest's own directory first, then
 /// each ancestor, stopping at a `.git` boundary — but it answers only "where is it",
 /// which is what callers that need a different parse of the same file want.
+///
+/// A lockfile that is a dependency source rather than an annotation is accepted only
+/// from the manifest's own directory; see [`adoptable_from`].
 #[must_use]
 pub fn locate_lockfile(manifest: &Path, kind: ManifestKind) -> Option<(PathBuf, LockfileKind)> {
     let candidates = kind.lockfiles();
     if candidates.is_empty() {
         return None;
     }
-    let mut dir = manifest.parent()?;
+    let own_dir = manifest.parent()?;
+    let mut dir = own_dir;
     loop {
         // A directory is searched for every candidate before moving up, so a
         // lockfile beside the manifest always beats one further away whichever
         // package manager wrote it.
         for lockfile in candidates {
+            if !adoptable_from(*lockfile, dir, own_dir) {
+                continue;
+            }
             let candidate = dir.join(lockfile.file_name());
             if candidate.is_file() {
                 return Some((candidate, *lockfile));
@@ -207,15 +231,22 @@ pub fn locate_lockfile(manifest: &Path, kind: ManifestKind) -> Option<(PathBuf, 
 ///
 /// Returns the path and the parsed data, or `None` for manifest kinds that have no
 /// lockfile ([`ManifestKind::lockfiles`]) and when none is found.
+///
+/// A lockfile that is a dependency source rather than an annotation is accepted only
+/// from the manifest's own directory; see [`adoptable_from`].
 #[must_use]
 pub fn find_lockfile(manifest: &Path, kind: ManifestKind) -> Option<(PathBuf, LockfileData)> {
     let candidates = kind.lockfiles();
     if candidates.is_empty() {
         return None;
     }
-    let mut dir = manifest.parent()?;
+    let own_dir = manifest.parent()?;
+    let mut dir = own_dir;
     loop {
         for lockfile in candidates {
+            if !adoptable_from(*lockfile, dir, own_dir) {
+                continue;
+            }
             let candidate = dir.join(lockfile.file_name());
             if let Ok(content) = std::fs::read_to_string(&candidate)
                 && let Ok(parsed) = parse_lockfile_kind(*lockfile, &content)
@@ -392,6 +423,16 @@ pub struct LockfileNotice {
     pub path: PathBuf,
     /// What is wrong with it, phrased for the person who has to fix it.
     pub reason: String,
+    /// Whether this file *is* the project's dependency list rather than an
+    /// annotation on one, so that failing to read it leaves the dependency list
+    /// itself unknown — not merely unannotated.
+    ///
+    /// Only SwiftPM's `Package.resolved` can set this today
+    /// ([`LockfileKind::is_dependency_source`]). A caller that gates an exit code
+    /// on "is everything here checked and current" has to treat it as a failure:
+    /// with the list unread there is nothing to check, and reporting nothing
+    /// wrong would assert exactly what was never established.
+    pub dependency_list_unread: bool,
 }
 
 impl std::fmt::Display for LockfileNotice {
@@ -419,26 +460,55 @@ pub fn lockfile_notices(manifest: &Path, kind: ManifestKind) -> Vec<LockfileNoti
             notices.push(LockfileNotice {
                 path,
                 reason: unreadable.reason.to_owned(),
+                dependency_list_unread: false,
             });
         }
     }
 
     for lockfile in kind.lockfiles() {
+        let source = lockfile.is_dependency_source();
         let path = dir.join(lockfile.file_name());
         if !path.is_file() {
+            // A missing annotation is nothing to report — the manifest still says
+            // what the project depends on. A missing *source* is: the manifest
+            // beside it is a program this tool declines to read, so with the file
+            // absent the dependency list is not short, it is unknown, and a run
+            // that reports no findings has established nothing whatsoever.
+            if source {
+                notices.push(LockfileNotice {
+                    reason: format!(
+                        "is not here, and {} is a program rather than a list of \
+                         dependencies, so no dependency of this project could be \
+                         determined: a run that reports nothing has not established that \
+                         there is nothing to report. `swift package resolve` writes one.",
+                        manifest
+                            .file_name()
+                            .map_or_else(|| "the manifest".into(), |n| n.to_string_lossy())
+                    ),
+                    path,
+                    dependency_list_unread: true,
+                });
+            }
             continue;
         }
-        let reason = match std::fs::read_to_string(&path) {
-            Err(error) => format!("could not be read: {error}"),
+        let (reason, unread) = match std::fs::read_to_string(&path) {
+            Err(error) => (format!("could not be read: {error}"), source),
             Ok(content) => match parse_lockfile_kind(*lockfile, &content) {
-                Err(error) => format!("could not be parsed: {error}"),
+                Err(error) => (format!("could not be parsed: {error}"), source),
+                // The file read: it simply pins nothing with a version. The
+                // dependency list is as complete as it was ever going to be, so
+                // this is not the unread case even for a dependency source.
                 Ok(data) if data.versions.is_empty() => {
-                    "was read but records no versions".to_owned()
+                    ("was read but records no versions".to_owned(), false)
                 }
                 Ok(_) => continue,
             },
         };
-        notices.push(LockfileNotice { path, reason });
+        notices.push(LockfileNotice {
+            path,
+            reason,
+            dependency_list_unread: unread,
+        });
     }
 
     notices
@@ -596,6 +666,128 @@ mod tests {
         let (path, _) =
             locate_lockfile(&nested.join("package.json"), ManifestKind::PackageJson).unwrap();
         assert_eq!(path, nested.join("package-lock.json"));
+    }
+
+    /// Restricting the walk to the manifest's own directory is right for the one
+    /// lockfile that *is* the dependency list, and wrong for every other. All five
+    /// annotating formats keep the ancestor walk they have always had: each one
+    /// here sits at a workspace root with the manifest a directory below, which is
+    /// how a monorepo is actually laid out.
+    #[test]
+    fn an_annotating_lockfile_is_still_adopted_from_an_ancestor() {
+        let cases = [
+            (
+                ManifestKind::CargoToml,
+                "Cargo.toml",
+                LockfileKind::CargoLock,
+                "[package]\nname = \"member\"\n",
+                "[[package]]\nname = \"serde\"\nversion = \"1.0.1\"\n",
+            ),
+            (
+                ManifestKind::PackageJson,
+                "package.json",
+                LockfileKind::PackageLockJson,
+                "{}",
+                r#"{"packages":{"node_modules/left-pad":{"version":"1.3.0"}}}"#,
+            ),
+            (
+                ManifestKind::PackageJson,
+                "package.json",
+                LockfileKind::BunLock,
+                "{}",
+                r#"{"packages":{"left-pad":["left-pad@1.3.0","",{},""]}}"#,
+            ),
+            (
+                ManifestKind::ComposerJson,
+                "composer.json",
+                LockfileKind::ComposerLock,
+                "{}",
+                r#"{"packages":[{"name":"monolog/monolog","version":"2.9.1"}]}"#,
+            ),
+            (
+                ManifestKind::MixExs,
+                "mix.exs",
+                LockfileKind::MixLock,
+                "defmodule M do\nend\n",
+                "%{\n  \"jason\": {:hex, :jason, \"1.4.1\", \"abc\", [:mix], [], \"hexpm\", \"def\"},\n}\n",
+            ),
+        ];
+
+        for (manifest_kind, manifest_name, lock_kind, manifest_body, lock_body) in cases {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let root = dir.path();
+            std::fs::create_dir_all(root.join(".git")).expect("mkdir .git");
+            write(&root.join(lock_kind.file_name()), lock_body);
+            let manifest = root.join("packages/app").join(manifest_name);
+            write(&manifest, manifest_body);
+
+            let located = locate_lockfile(&manifest, manifest_kind);
+            assert_eq!(
+                located,
+                Some((root.join(lock_kind.file_name()), lock_kind)),
+                "{lock_kind:?} must still be found in an ancestor"
+            );
+
+            let (path, data) = find_lockfile(&manifest, manifest_kind)
+                .unwrap_or_else(|| panic!("{lock_kind:?} must still be read from an ancestor"));
+            assert_eq!(path, root.join(lock_kind.file_name()));
+            assert!(!data.versions.is_empty(), "{lock_kind:?}: {data:?}");
+        }
+    }
+
+    /// The one lockfile that *is* the dependency list is accepted only beside its
+    /// own manifest. A nested SwiftPM package that adopted the root's would report
+    /// the root's dependencies as its own — and, with scanning on, the root's
+    /// advisories against a package that does not have the dependency.
+    #[test]
+    fn a_dependency_source_lockfile_is_never_adopted_from_an_ancestor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".git")).expect("mkdir .git");
+        let resolved = r#"{"pins":[{"identity":"vapor","kind":"remoteSourceControl",
+            "location":"https://github.com/vapor/vapor.git",
+            "state":{"revision":"abc","version":"4.83.0"}}],"version":2}"#;
+        write(&root.join("Package.resolved"), resolved);
+        write(&root.join("Package.swift"), "// swift-tools-version:5.9\n");
+
+        let nested = root.join("Examples/Demo/Package.swift");
+        write(&nested, "// swift-tools-version:5.9\n");
+
+        assert_eq!(
+            locate_lockfile(&nested, ManifestKind::PackageSwift),
+            None,
+            "the ancestor's pins are not this package's dependencies"
+        );
+        assert!(find_lockfile(&nested, ManifestKind::PackageSwift).is_none());
+
+        // Beside its own manifest it is read exactly as before.
+        assert_eq!(
+            locate_lockfile(&root.join("Package.swift"), ManifestKind::PackageSwift),
+            Some((root.join("Package.resolved"), LockfileKind::PackageResolved))
+        );
+    }
+
+    /// The nested package's own `Package.resolved` is missing, not merely
+    /// unannotated, and that has to reach the reader — nothing else distinguishes
+    /// it from a package that genuinely depends on nothing.
+    #[test]
+    fn a_missing_dependency_source_is_a_notice_of_its_own() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        write(&root.join("Package.swift"), "// swift-tools-version:5.9\n");
+
+        let notices = lockfile_notices(&root.join("Package.swift"), ManifestKind::PackageSwift);
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert_eq!(notices[0].path, root.join("Package.resolved"));
+        assert!(notices[0].dependency_list_unread);
+
+        // A missing *annotating* lockfile is not a notice: the manifest still says
+        // what the project depends on.
+        write(&root.join("Cargo.toml"), "[package]\nname = \"x\"\n");
+        assert!(
+            lockfile_notices(&root.join("Cargo.toml"), ManifestKind::CargoToml).is_empty(),
+            "a missing Cargo.lock costs a locked version, not a dependency list"
+        );
     }
 
     #[test]

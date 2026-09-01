@@ -355,6 +355,111 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
+/// A nested SwiftPM package must never adopt an ancestor's `Package.resolved`.
+///
+/// The upward walk is right for the five lockfiles that *annotate* a list some
+/// manifest declared — an unused pin costs nothing. It is wrong for the one that
+/// **is** the list: the nested package here declares neither of the root's
+/// dependencies, and adopting them reports the root's packages as its own. With
+/// scanning on that attributes the root's advisories to a project that does not
+/// have the dependency — a false positive on the one verdict Swift can give — and
+/// in a SwiftPM monorepo it happens to every package not yet resolved.
+#[test]
+fn a_nested_package_does_not_adopt_an_ancestors_package_resolved() {
+    let root = scratch("swift_monorepo");
+    let nested = root.join("Examples/Demo");
+    std::fs::create_dir_all(&nested).unwrap();
+    let manifest = std::fs::read_to_string(fixture("sample-swift/Package.swift")).unwrap();
+    std::fs::write(root.join("Package.swift"), &manifest).unwrap();
+    std::fs::copy(
+        fixture("sample-swift/Package.resolved"),
+        root.join("Package.resolved"),
+    )
+    .unwrap();
+    std::fs::write(nested.join("Package.swift"), &manifest).unwrap();
+
+    let output = run(&[
+        "check",
+        "--manifest",
+        nested.join("Package.swift").to_str().unwrap(),
+        "--no-vuln",
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stdout.contains("github.com/apple/swift-nio"),
+        "the nested package declares none of the root's dependencies; stdout: {stdout}"
+    );
+    assert!(
+        stderr.contains("Package.resolved") && stderr.contains("is not here"),
+        "and it must say the list is unknown rather than empty; stderr: {stderr}"
+    );
+
+    // The root itself is unaffected: its own Package.resolved sits beside it.
+    let output = run(&[
+        "check",
+        "--manifest",
+        root.join("Package.swift").to_str().unwrap(),
+        "--no-vuln",
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("github.com/apple/swift-nio"),
+        "stdout: {stdout}"
+    );
+}
+
+/// Apple advises library packages *not* to commit `Package.resolved`, so a Swift
+/// project with none is the common state rather than an edge. Nothing about it may
+/// read as "this project has no dependencies": `Package.swift` is a program this
+/// tool declines to read, so the list was never seen, and `--fail-on any` — which
+/// asks whether everything here is checked and current — must not answer yes.
+#[test]
+fn a_swift_project_with_no_package_resolved_says_so_and_fails_a_strict_gate() {
+    let dir = scratch("swift_no_resolved");
+    std::fs::copy(
+        fixture("sample-swift/Package.swift"),
+        dir.join("Package.swift"),
+    )
+    .unwrap();
+    let manifest = dir.join("Package.swift");
+
+    let output = run(&[
+        "check",
+        "--manifest",
+        manifest.to_str().unwrap(),
+        "--no-vuln",
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("is not here") && stderr.contains("`swift package resolve`"),
+        "the cause must be named; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("0 dependencies here"),
+        "\"we could not look\" must not be phrased as a count of what is here; \
+         stderr: {stderr}"
+    );
+    assert!(
+        output.status.success(),
+        "no gate was asked for; stderr: {stderr}"
+    );
+
+    let strict = run(&[
+        "check",
+        "--manifest",
+        manifest.to_str().unwrap(),
+        "--no-vuln",
+        "--fail-on",
+        "any",
+    ]);
+    assert!(
+        !strict.status.success(),
+        "exit 0 would assert that a list nobody read is clean; stdout: {}",
+        String::from_utf8_lossy(&strict.stdout)
+    );
+}
+
 /// A half-written `Package.resolved` used to crash the process outright, and the
 /// degradation waiting behind that crash was worse: a *prefix* of the pins,
 /// presented as the whole dependency list, with the packages past the cut never

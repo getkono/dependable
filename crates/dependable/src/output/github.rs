@@ -815,6 +815,7 @@ mod tests {
             ecosystem: Ecosystem::Rust,
             results,
             workspace_root: None,
+            dependencies_unread: false,
         }
     }
 

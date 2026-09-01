@@ -84,6 +84,7 @@ mod tests {
             ecosystem: Ecosystem::Rust,
             results: Vec::new(),
             workspace_root: None,
+            dependencies_unread: false,
         }
     }
 

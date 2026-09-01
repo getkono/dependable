@@ -258,7 +258,7 @@ impl Engine {
     /// has no registered checker or no parser yet — so a polyglot repo with a
     /// not-yet-supported manifest does not abort the whole run.
     async fn check_manifest(&self, path: &Path) -> anyhow::Result<Option<ManifestReport>> {
-        report_lockfile_notices(path);
+        let dependencies_unread = report_lockfile_notices(path);
         match self.checker.check_path(path).await {
             Ok(check) => {
                 for warning in &check.warnings {
@@ -269,6 +269,7 @@ impl Engine {
                     ecosystem: check.ecosystem,
                     results: check.results,
                     workspace_root: check.workspace_root,
+                    dependencies_unread,
                 }))
             }
             Err(CheckError::UnsupportedEcosystem(eco)) => {
@@ -292,18 +293,26 @@ impl Engine {
     }
 }
 
-/// Warn about lockfiles that are present beside `manifest` but cannot be used.
+/// Warn about lockfiles that are present beside `manifest` but cannot be used —
+/// or, for the one format that *is* the dependency list, absent altogether.
 ///
 /// Without this a `bun.lockb` is silently skipped and every dependency is
 /// reported unlocked, with nothing to tell the user that a lockfile they can
 /// migrate is the reason.
-fn report_lockfile_notices(manifest: &Path) {
+///
+/// Returns whether any notice means the project's dependency list itself went
+/// unread, which the caller has to carry into the exit code: a run that knows
+/// nothing about a project must not report it clean.
+fn report_lockfile_notices(manifest: &Path) -> bool {
     let Some(kind) = ManifestKind::detect(manifest) else {
-        return;
+        return false;
     };
+    let mut unread = false;
     for notice in dependable_fetch::lockfile_notices(manifest, kind) {
         eprintln!("warning: {notice}");
+        unread |= notice.dependency_list_unread;
     }
+    unread
 }
 
 /// A progress sink that drives a per-manifest indicatif bar. Each manifest's
@@ -605,7 +614,7 @@ pub async fn run_list(args: ListArgs) -> anyhow::Result<ExitCode> {
         let Some(kind) = ManifestKind::detect(manifest) else {
             continue;
         };
-        report_lockfile_notices(manifest);
+        let _ = report_lockfile_notices(manifest);
         let content = std::fs::read_to_string(manifest)
             .with_context(|| format!("reading {}", manifest.display()))?;
         let mut parsed = match parse(kind, &content) {
@@ -1398,7 +1407,13 @@ fn exit_code(reports: &[ManifestReport], fail_on: FailOn) -> ExitCode {
                 DependencyStatus::UpToDate | DependencyStatus::Local | DependencyStatus::Git
             ),
         });
-    if triggered {
+    // A manifest whose dependency list was never read has no results to inspect,
+    // so the loop above sees an empty list and finds nothing wrong with it. That
+    // is the inversion in its purest form: zero rows read as a clean project. Only
+    // `--fail-on any` asks the question this answers — `vulnerable` and `outdated`
+    // ask about findings, and there are none to have.
+    let unread = fail_on == FailOn::Any && reports.iter().any(|r| r.dependencies_unread);
+    if triggered || unread {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
