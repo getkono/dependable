@@ -199,7 +199,9 @@ mod tests {
             rewrite_constraint("=1.2.0", "1.5.0").as_deref(),
             Some("=1.5.0")
         );
-        assert_eq!(rewrite_constraint("*", "1.5.0").as_deref(), Some("1.5.0"));
+        // The bare wildcard `*` is a range, not a version — see
+        // `rewrite_never_narrows_a_wildcard_to_a_pin`.
+        assert_eq!(rewrite_constraint("*", "1.5.0"), None);
     }
 
     #[test]
@@ -214,8 +216,29 @@ mod tests {
         assert_eq!(rewrite_constraint("latest", "2.3.0"), None);
         assert_eq!(rewrite_constraint("next", "2.3.0"), None);
         assert_eq!(rewrite_constraint("beta", "2.3.0"), None);
-        // The wildcard `*` is still rewritten (it resolves to a concrete version).
-        assert_eq!(rewrite_constraint("*", "2.3.0").as_deref(), Some("2.3.0"));
+        // The wildcard `*` is declined for the same reason: it is a range the
+        // author chose, and pinning it would narrow their manifest (issue #87).
+        assert_eq!(rewrite_constraint("*", "2.3.0"), None);
+    }
+
+    /// Issue #87: a wildcard is a range, not a version. Rewriting `1.x` to a
+    /// concrete release narrows what the author wrote into a pin — in npm a bare
+    /// version is an exact match, so the floating constraint is destroyed. None of
+    /// the three existing guards sees a wildcard: there is no comma, no space or
+    /// `|` after the (empty) operator prefix, and `1.x` starts with a digit so the
+    /// dist-tag guard passes it through.
+    #[test]
+    fn rewrite_never_narrows_a_wildcard_to_a_pin() {
+        assert_eq!(rewrite_constraint("1.x", "2.0.0"), None);
+        assert_eq!(rewrite_constraint("1.*", "2.0.0"), None);
+        assert_eq!(rewrite_constraint("1.X", "2.0.0"), None);
+        // Gradle's dynamic version has the same shape (issue #87), and NuGet's
+        // floating `1.*` resolves differently from a bare `2.0.0`.
+        assert_eq!(rewrite_constraint("1.+", "2.0.0"), None);
+        assert_eq!(rewrite_constraint("^1.x", "2.0.0"), None);
+        assert_eq!(rewrite_constraint("1.2.x", "2.0.0"), None);
+        // The bare wildcard is the same kind of thing.
+        assert_eq!(rewrite_constraint("*", "2.0.0"), None);
     }
 
     #[test]
@@ -455,5 +478,34 @@ mod tests {
 
         assert_eq!(records.len(), 1, "{records:?}");
         assert_eq!(updated, "[workspace.dependencies]\nserde = \"1.0.219\"\n");
+    }
+
+    /// The end-to-end shape of issue #87, with no flags and no lockfile.
+    ///
+    /// `1.x` matches `1.0.0` and `1.9.0` but not `2.0.0`, so `check_version` reports
+    /// `UpdateAvailable` with `latest_compatible == 1.9.0` (see
+    /// `wildcard_constraint_is_reported_as_upgradable` in the core checker). Default
+    /// `fix` therefore reaches `rewrite_constraint` with a live wildcard, and used to
+    /// write `"lodash": "1.9.0"` — an exact pin in npm, where the author had asked for
+    /// every `1.x` release.
+    #[test]
+    fn a_wildcard_dependency_is_left_untouched_by_fix() {
+        let content = r#"{
+  "dependencies": {
+    "lodash": "1.x"
+  }
+}
+"#;
+        let results = results_for(ManifestKind::PackageJson, content, &[("lodash", "1.9.0")]);
+        assert_eq!(
+            results.len(),
+            1,
+            "the fixture must produce a checkable item"
+        );
+
+        let (updated, records) = plan_fixes(content, &results, false);
+
+        assert!(records.is_empty(), "{records:?}");
+        assert_eq!(updated, content, "the manifest must be byte-identical");
     }
 }

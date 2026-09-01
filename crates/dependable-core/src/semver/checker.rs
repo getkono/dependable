@@ -178,4 +178,16 @@ mod tests {
         let e = check_version("latest", &vers(&["not-a-version"]), None);
         assert!(matches!(e.status, DependencyStatus::Error(_)));
     }
+
+    /// The reachability witness for issue #87: a wildcard constraint really does
+    /// reach the fix layer as an upgradable dependency, so the guard there is not
+    /// dead code. `1.x` allows `1.9.0` but not `2.0.0`, so the newest release sits
+    /// outside the range and the item is reported as an available update.
+    #[test]
+    fn wildcard_constraint_is_reported_as_upgradable() {
+        let e = check_version("1.x", &vers(&["1.0.0", "1.9.0", "2.0.0"]), None);
+        assert_eq!(e.status, DependencyStatus::UpdateAvailable);
+        assert_eq!(e.latest_compatible.as_deref(), Some("1.9.0"));
+        assert_eq!(e.latest_available.as_deref(), Some("2.0.0"));
+    }
 }
