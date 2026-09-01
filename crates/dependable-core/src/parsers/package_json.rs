@@ -182,7 +182,13 @@ fn is_parent_separator(key: &str, at: usize) -> bool {
 /// `unparseable constraint: unexpected character '$'` on a perfectly valid manifest —
 /// the same shape `csproj.rs` already declines to read as a version in `$(MSBuildProp)`.
 ///
-/// Returns the referenced package name.
+/// Returns the referenced package name, or `None` when the value is a reference that
+/// names nothing usable — a bare `"$"`, or `"$a b"`. Those are still references and are
+/// still not constraints: handing them to the checker produced the same
+/// `unparseable constraint: unexpected character '$'` hard failure, so
+/// [`build_item`] routes every `$`-prefixed override value that does not resolve to
+/// [`PackageSource::Unresolved`], exactly as a `$name` naming an undeclared dependency
+/// already was.
 fn override_reference(value: &str) -> Option<&str> {
     let name = value.strip_prefix('$')?;
     (!name.is_empty() && !name.contains(char::is_whitespace)).then_some(name)
@@ -197,14 +203,15 @@ fn build_item(
     starts: &[usize],
     declared: &HashMap<&str, &str>,
 ) -> Item {
-    if kind == DependencyKind::Override
-        && let Some(referenced) = override_reference(&entry.value)
-    {
+    // Every `$`-prefixed override value is a reference, including the ones that name
+    // nothing (`"$"`, `"$a b"`). Guarding on a *well-formed* reference let those two fall
+    // through to the checker as literal constraints and hard-fail on the `$`.
+    if kind == DependencyKind::Override && entry.value.starts_with('$') {
         // Resolved, the reference *is* the referenced dependency's constraint, so the
         // entry is checked against exactly the version the manifest forces. Unresolved,
         // the manifest names a dependency it does not declare: real package, unreadable
         // version, and nothing to ask a registry for.
-        return match declared.get(referenced) {
+        return match override_reference(&entry.value).and_then(|r| declared.get(r)) {
             Some(constraint) => {
                 let (line, col) = offset_to_line_col(starts, entry.content_start);
                 Item {
@@ -550,6 +557,26 @@ mod tests {
         assert_eq!(find(&m, "weird").version_constraint, "$semver");
     }
 
+    /// A reference that names nothing usable is still a reference. `"$"` and `"$a b"`
+    /// failed the well-formedness guard and fell through to the checker as literal
+    /// constraints, which hard-failed on the `$` — the exact failure the reference form
+    /// exists to prevent.
+    #[test]
+    fn a_reference_naming_nothing_is_unresolved_rather_than_a_constraint() {
+        let content = r#"{ "overrides": { "minimist": "$", "foo": "$a b", "bar": "$nope" } }"#;
+        let m = parse(content);
+        for name in ["minimist", "foo", "bar"] {
+            let item = find(&m, name);
+            assert_eq!(item.source, PackageSource::Unresolved, "{name}");
+            assert!(
+                item.version_constraint.is_empty(),
+                "{name} kept `{}` as a constraint",
+                item.version_constraint
+            );
+            assert!(!item.is_checkable(), "{name} was sent to a registry");
+        }
+    }
+
     /// A pnpm override key scoped to a parent (`foo@2>bar`) pins **bar**. Reading the
     /// first segment named `foo`, so the entry was checked against an unrelated
     /// package's version list — and `fix --all` would then have rewritten a pin on `bar`
@@ -576,6 +603,7 @@ mod tests {
         assert_eq!(names, vec!["bar"], "got {names:?}");
         assert_eq!(find(&m, "bar").kind, DependencyKind::Override);
     }
+
     /// pnpm and Yarn both allow a range in the override key, and a range contains `>`.
     /// Splitting on every `>` cut the key inside its own range: `lodash@>=1.0.0` was
     /// read as a package called `=1.0.0`, which no registry has, so the entry reported
