@@ -15,11 +15,11 @@ use dependable_fetch::core::{
     parse_cargo_config, parse_npmrc, parse_project, parse_workspace, resolve_workspace_inheritance,
 };
 use dependable_fetch::{
-    CheckError, Checker, DependencyStatus, Ecosystem, GoProxyFetcher, GraphSource, HexFetcher,
-    Item, JsrFetcher, ManifestKind, MavenCentralFetcher, NpmFetcher, NuGetFetcher, PackageSource,
-    PackagistFetcher, ParseError, ProgressEvent, PubDevFetcher, PyPiFetcher, ScopedRegistry,
-    TreeOptions, UnstableFilter, WorkspaceGraphOptions, build_client, build_workspace_graph,
-    nearest_workspace_root, workspace_source,
+    CheckError, Checker, DependencyStatus, Ecosystem, ErrorOrigin, GoProxyFetcher, GraphSource,
+    HexFetcher, Item, JsrFetcher, ManifestKind, MavenCentralFetcher, NpmFetcher, NuGetFetcher,
+    PackageSource, PackagistFetcher, ParseError, ProgressEvent, PubDevFetcher, PyPiFetcher,
+    ScopedRegistry, TreeOptions, UnstableFilter, WorkspaceGraphOptions, build_client,
+    build_workspace_graph, nearest_workspace_root, workspace_source,
 };
 use dependable_tui::TuiOptions;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
@@ -260,14 +260,21 @@ impl Engine {
                 for warning in &check.warnings {
                     eprintln!("warning: {} — {warning}", path.display());
                 }
+                // Split by provenance, not by status: a 404 is the registry answering,
+                // and anything else that produced an `Error` is this run failing to
+                // evaluate the dependency. Only the first is exempt from the gate.
+                let count = |origin| {
+                    check
+                        .results
+                        .iter()
+                        .filter(|r| r.error_origin == origin)
+                        .count()
+                };
                 let integrity = ScanIntegrity {
                     vulnerability_scan_failed: check.vulnerability_scan_failed,
                     registry_unreachable: check.registry_unreachable,
-                    unresolved: check
-                        .results
-                        .iter()
-                        .filter(|r| matches!(r.status, DependencyStatus::Error(_)))
-                        .count(),
+                    unresolved: count(ErrorOrigin::NotFound),
+                    unevaluated: count(ErrorOrigin::Local),
                 };
                 Ok(Some(ManifestReport {
                     path: path.to_path_buf(),
@@ -1383,27 +1390,52 @@ fn expand_env(content: &str) -> String {
 /// one unpublished internal package into a hard exit 2 for every repository that has
 /// one — including every consumer of the shipped Action, which defaults to
 /// `--fail-on vulnerable`.
+///
+/// The carve-out is for that answer alone. A dependency this run failed to evaluate by
+/// itself — a constraint written in a dialect that did not parse — reached no registry,
+/// so there is no fact standing in for its status and the gate is as unanswerable as it
+/// ever was. Exempting those too let `{"lodash": "^^^bogus"}` pass
+/// `--fail-on vulnerable` under a note blaming a registry that was never asked.
 fn gate_is_answerable(reports: &[ManifestReport], fail_on: FailOn) -> Result<(), String> {
     if fail_on == FailOn::None {
         return Ok(());
     }
-    let scan_failed = reports
+    let mut reasons: Vec<String> = Vec::new();
+    if reports
         .iter()
-        .any(|r| r.integrity.vulnerability_scan_failed);
-    // `FailOn::Any` fails on `DependencyStatus::Error`, and a registry that did not
-    // answer produces exactly that for every dependency it was asked about — so there
-    // the promise is kept rather than missed, and the run exits 1 on the errors
-    // themselves. The other settings match specific statuses and skip errors entirely,
-    // which is where a registry that never answered could still be reported as clean.
-    let registry_unreachable =
-        fail_on != FailOn::Any && reports.iter().any(|r| r.integrity.registry_unreachable);
-    match (scan_failed, registry_unreachable) {
-        (false, false) => Ok(()),
-        (true, false) => Err("the vulnerability scan did not complete".to_owned()),
-        (false, true) => Err("the registry did not answer".to_owned()),
-        (true, true) => Err(
-            "the vulnerability scan did not complete and the registry did not answer".to_owned(),
-        ),
+        .any(|r| r.integrity.vulnerability_scan_failed)
+    {
+        reasons.push("the vulnerability scan did not complete".to_owned());
+    }
+    // `FailOn::Any` fails on `DependencyStatus::Error`, and both an unanswering registry
+    // and an unreadable constraint produce exactly that — so there the promise is kept
+    // rather than missed, and the run exits 1 on the errors themselves. The other
+    // settings match specific statuses and skip errors entirely, which is where a run
+    // that established nothing could still be reported as clean.
+    if fail_on != FailOn::Any {
+        if reports.iter().any(|r| r.integrity.registry_unreachable) {
+            reasons.push("the registry did not answer".to_owned());
+        }
+        let unevaluated: usize = reports.iter().map(|r| r.integrity.unevaluated).sum();
+        if unevaluated > 0 {
+            reasons.push(format!(
+                "{unevaluated} dependenc{} could not be evaluated",
+                if unevaluated == 1 { "y" } else { "ies" }
+            ));
+        }
+    }
+    if reasons.is_empty() {
+        return Ok(());
+    }
+    Err(join_reasons(&reasons))
+}
+
+/// `a`, `a and b`, `a, b and c` — the gate's reasons read as a sentence.
+fn join_reasons(reasons: &[String]) -> String {
+    match reasons {
+        [] => String::new(),
+        [only] => only.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
     }
 }
 
@@ -1415,13 +1447,13 @@ fn gate_is_answerable(reports: &[ManifestReport], fail_on: FailOn) -> Result<(),
 /// never checked.
 ///
 /// Silent for `FailOn::None` (nothing was gated on) and for `FailOn::Any` (which fails
-/// on these results, so they *were* gated on), and silent when the registry did not
-/// answer, because then the errors are a transport failure and calling them
-/// "not found" would misattribute them.
+/// on these results, so they *were* gated on).
+///
+/// Counted from the registry's own answer ([`ScanIntegrity::unresolved`]), never from
+/// every `Error`: an unreadable constraint reached no registry, and saying it was "not
+/// found in its registry" reported a cause that never happened.
 fn note_unresolved(reports: &[ManifestReport], fail_on: FailOn) {
-    if matches!(fail_on, FailOn::None | FailOn::Any)
-        || reports.iter().any(|r| r.integrity.registry_unreachable)
-    {
+    if matches!(fail_on, FailOn::None | FailOn::Any) {
         return;
     }
     let unresolved: usize = reports.iter().map(|r| r.integrity.unresolved).sum();
@@ -1580,28 +1612,50 @@ mod tests {
         assert_eq!(expand_env("a=${OPEN"), "a=${OPEN");
     }
 
-    fn report_with(integrity: ScanIntegrity, statuses: &[DependencyStatus]) -> ManifestReport {
+    fn fixture_item() -> dependable_fetch::Item {
+        dependable_fetch::core::parse(
+            dependable_fetch::ManifestKind::CargoToml,
+            "[dependencies]\nserde = \"1\"\n",
+        )
+        .expect("fixture manifest")
+        .items
+        .into_iter()
+        .next()
+        .expect("one dependency")
+    }
+
+    /// A result the **registry** produced by name: no such package. Built through
+    /// [`CheckResult::not_found`] rather than by hand, because the provenance — not the
+    /// wording of the message — is what the gate reads.
+    fn not_found_result() -> dependable_fetch::CheckResult {
+        dependable_fetch::CheckResult::errored(
+            fixture_item(),
+            "package `@acme/internal` not found",
+            ErrorOrigin::NotFound,
+        )
+    }
+
+    fn report_of(
+        integrity: ScanIntegrity,
+        results: Vec<dependable_fetch::CheckResult>,
+    ) -> ManifestReport {
         ManifestReport {
             path: PathBuf::from("Cargo.toml"),
             ecosystem: dependable_fetch::Ecosystem::Rust,
-            results: statuses
-                .iter()
-                .map(|s| {
-                    let item = dependable_fetch::core::parse(
-                        dependable_fetch::ManifestKind::CargoToml,
-                        "[dependencies]\nserde = \"1\"\n",
-                    )
-                    .expect("fixture manifest")
-                    .items
-                    .into_iter()
-                    .next()
-                    .expect("one dependency");
-                    dependable_fetch::CheckResult::new(item, s.clone())
-                })
-                .collect(),
+            results,
             workspace_root: None,
             integrity,
         }
+    }
+
+    fn report_with(integrity: ScanIntegrity, statuses: &[DependencyStatus]) -> ManifestReport {
+        report_of(
+            integrity,
+            statuses
+                .iter()
+                .map(|s| dependable_fetch::CheckResult::new(fixture_item(), s.clone()))
+                .collect(),
+        )
     }
 
     /// The defect this exists to prevent: OSV unreachable, `--fail-on vulnerable` armed,
@@ -1614,6 +1668,7 @@ mod tests {
                 vulnerability_scan_failed: true,
                 registry_unreachable: false,
                 unresolved: 0,
+                unevaluated: 0,
             },
             &[DependencyStatus::UpToDate],
         )];
@@ -1634,6 +1689,7 @@ mod tests {
                 vulnerability_scan_failed: false,
                 registry_unreachable: true,
                 unresolved: 0,
+                unevaluated: 0,
             },
             &[DependencyStatus::Error("registry unreachable".to_owned())],
         )];
@@ -1659,15 +1715,22 @@ mod tests {
     /// no escape short of dropping the gate.
     #[test]
     fn a_package_the_registry_says_does_not_exist_does_not_break_the_gate() {
-        let reports = vec![report_with(
+        let not_found = not_found_result();
+        assert_eq!(
+            not_found.error_origin,
+            ErrorOrigin::NotFound,
+            "the carve-out has to be reached through the provenance, not through the message"
+        );
+        let reports = vec![report_of(
             ScanIntegrity {
                 vulnerability_scan_failed: false,
                 registry_unreachable: false,
                 unresolved: 1,
+                unevaluated: 0,
             },
-            &[
-                DependencyStatus::UpToDate,
-                DependencyStatus::Error("package `@acme/internal` not found".to_owned()),
+            vec![
+                dependable_fetch::CheckResult::new(fixture_item(), DependencyStatus::UpToDate),
+                not_found,
             ],
         )];
         assert!(gate_is_answerable(&reports, FailOn::Vulnerable).is_ok());
@@ -1678,6 +1741,67 @@ mod tests {
         // `Any` still fails on the error itself — that is the gate working, and it is
         // the setting that asks to hear about anything less than a clean answer.
         assert_eq!(exit_code(&reports, FailOn::Any), ExitCode::from(1));
+    }
+
+    /// The other half of the same distinction, and the regression the carve-out
+    /// introduced: an unparseable constraint never reaches a registry, so nothing was
+    /// established about the dependency at all. Exempting it alongside the 404s let
+    /// `{"lodash": "^^^bogus"}` pass `--fail-on vulnerable` under a note saying the
+    /// registry had not found it — a gate certifying a build it had not evaluated.
+    #[test]
+    fn a_dependency_this_run_could_not_evaluate_still_breaks_the_gate() {
+        let error = dependable_fetch::CheckResult::new(
+            fixture_item(),
+            DependencyStatus::Error("unparseable constraint: unexpected character '^'".to_owned()),
+        );
+        assert_eq!(
+            error.error_origin,
+            ErrorOrigin::Local,
+            "no registry was ever asked about this dependency"
+        );
+        let reports = vec![report_of(
+            ScanIntegrity {
+                vulnerability_scan_failed: false,
+                registry_unreachable: false,
+                unresolved: 0,
+                unevaluated: 1,
+            },
+            vec![
+                dependable_fetch::CheckResult::new(fixture_item(), DependencyStatus::UpToDate),
+                error,
+            ],
+        )];
+        assert_eq!(
+            gate_is_answerable(&reports, FailOn::Vulnerable).unwrap_err(),
+            "1 dependency could not be evaluated"
+        );
+        assert!(gate_is_answerable(&reports, FailOn::Outdated).is_err());
+        assert_eq!(exit_code(&reports, FailOn::Vulnerable), ExitCode::from(2));
+        // `Any` fails on the `Error` itself, so its promise is kept.
+        assert!(gate_is_answerable(&reports, FailOn::Any).is_ok());
+        assert_eq!(exit_code(&reports, FailOn::Any), ExitCode::from(1));
+        // Nothing was gated on, so nothing can be missing.
+        assert!(gate_is_answerable(&reports, FailOn::None).is_ok());
+    }
+
+    /// Every unanswerable reason at once, read as one sentence rather than as a
+    /// hand-written combination per pair.
+    #[test]
+    fn the_gate_names_every_reason_it_could_not_be_honoured() {
+        let reports = vec![report_of(
+            ScanIntegrity {
+                vulnerability_scan_failed: true,
+                registry_unreachable: true,
+                unresolved: 0,
+                unevaluated: 2,
+            },
+            vec![],
+        )];
+        assert_eq!(
+            gate_is_answerable(&reports, FailOn::Vulnerable).unwrap_err(),
+            "the vulnerability scan did not complete, the registry did not answer and 2 \
+             dependencies could not be evaluated"
+        );
     }
 
     /// A complete run still gates on what it found, and still passes when it finds

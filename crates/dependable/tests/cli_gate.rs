@@ -204,6 +204,78 @@ fn a_go_module_the_proxy_answers_410_for_does_not_break_the_gate() {
 }
 
 // ---------------------------------------------------------------------------
+// The 404 carve-out covers a 404, and nothing else
+// ---------------------------------------------------------------------------
+
+/// The regression the carve-out introduced. An unparseable constraint never reaches a
+/// registry, so nothing is established about the dependency at all — but it produced the
+/// same `DependencyStatus::Error` as a 404 and was exempted with them. Two dependencies
+/// were left unevaluated, the note blamed a registry that was never asked, and
+/// `--fail-on vulnerable` certified the build.
+#[test]
+fn an_unreadable_constraint_still_refuses_to_certify_the_build() {
+    let dir = workdir("gate_unreadable_constraint");
+    let base = registry(vec![
+        (
+            "/lodash".to_string(),
+            packument("lodash", &["4.17.20", "4.17.21"], "4.17.21"),
+        ),
+        (
+            "/express".to_string(),
+            packument("express", &["4.19.2"], "4.19.2"),
+        ),
+    ]);
+    let config = write_config(&dir, &base);
+    fs::write(
+        dir.join("package.json"),
+        "{\"name\":\"app\",\"dependencies\":{\"lodash\":\"^^^bogus\",\"express\":\"^4.19.0\"}}\n",
+    )
+    .unwrap();
+
+    let output = check(&dir, &config, &["--fail-on", "vulnerable"]);
+    let (stdout, stderr, code) = outcome(&output);
+
+    assert_eq!(code, 2, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stderr.contains("error: cannot honour --fail-on: 1 dependency could not be evaluated"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("not found in its registry"),
+        "the note blamed a registry that was never asked:\n{stderr}"
+    );
+}
+
+/// The other half, which must survive the repair: a registry that answers `404` answered.
+/// A private or internal package is a permanent per-dependency fact, reported and not
+/// gated on, and it must not turn `--fail-on vulnerable` into exit 2 for the
+/// dependencies that did resolve.
+#[test]
+fn a_package_the_registry_answers_404_for_does_not_break_the_gate() {
+    let dir = workdir("gate_404_carve_out");
+    let base = registry(vec![(
+        "/express".to_string(),
+        packument("express", &["4.19.2"], "4.19.2"),
+    )]);
+    let config = write_config(&dir, &base);
+    fs::write(
+        dir.join("package.json"),
+        "{\"name\":\"app\",\"dependencies\":{\"@acme/internal\":\"^1.0.0\",\"express\":\
+         \"^4.19.0\"}}\n",
+    )
+    .unwrap();
+
+    let output = check(&dir, &config, &["--fail-on", "vulnerable"]);
+    let (stdout, stderr, code) = outcome(&output);
+
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stderr.contains("note: 1 dependency was not found in its registry, so it is not gated on"),
+        "stderr: {stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // A `>` inside an override key's range
 // ---------------------------------------------------------------------------
 

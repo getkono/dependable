@@ -78,10 +78,10 @@ pub use registries::{
 // parsers, `check_version`, ...).
 pub use dependable_core as core;
 pub use dependable_core::{
-    CheckResult, DependencyGraph, DependencyKind, DependencyStatus, Ecosystem, Evaluation, Item,
-    LockfileKind, ManifestKind, Node, NodeKind, PackageSource, ParseError, ParsedManifest,
-    PathPredicate, Placement, Tree, TreeNode, TreeOptions, UnstableFilter, Visit, Visitor,
-    WalkOptions, WalkStats, WorkspaceDecl, resolve_workspace_inheritance,
+    CheckResult, DependencyGraph, DependencyKind, DependencyStatus, Ecosystem, ErrorOrigin,
+    Evaluation, Item, LockfileKind, ManifestKind, Node, NodeKind, PackageSource, ParseError,
+    ParsedManifest, PathPredicate, Placement, Tree, TreeNode, TreeOptions, UnstableFilter, Visit,
+    Visitor, WalkOptions, WalkStats, WorkspaceDecl, resolve_workspace_inheritance,
 };
 
 /// One-import convenience for consumers: `use dependable_fetch::prelude::*;`.

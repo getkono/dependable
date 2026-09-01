@@ -41,7 +41,7 @@ pub use parsers::{
     RequirementsTxtParser, WorkspaceDecl, parse, parse_cargo_config, parse_package_manifest,
     parse_package_name, parse_project, parse_workspace, resolve_workspace_inheritance,
 };
-pub use result::{CheckResult, DependencyStatus};
+pub use result::{CheckResult, DependencyStatus, ErrorOrigin};
 pub use semver::{
     Evaluation, UnstableFilter, check_version, check_version_for, is_prerelease,
     to_semver_constraint, try_to_semver_constraint,
