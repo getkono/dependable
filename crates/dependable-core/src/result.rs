@@ -120,6 +120,15 @@ pub enum DependencyStatus {
     Outdated,
     Vulnerable,
     Error(String),
+    /// A real package whose declared version this run could not read: the
+    /// constraint is written in a dialect that did not translate, or it refers to
+    /// something the manifest never declares.
+    ///
+    /// Distinct from [`Self::Error`], which is the registry or the fetch failing,
+    /// and deliberately distinct from [`Self::UpToDate`]: an unreadable constraint
+    /// is not evidence that a dependency is current, and reporting it as current
+    /// is what disarms `--fail-on outdated`.
+    Undetermined,
     Local,
     Git,
 }
@@ -135,6 +144,7 @@ impl DependencyStatus {
             DependencyStatus::Outdated => "outdated",
             DependencyStatus::Vulnerable => "vulnerable",
             DependencyStatus::Error(_) => "error",
+            DependencyStatus::Undetermined => "undetermined",
             DependencyStatus::Local => "local",
             DependencyStatus::Git => "git",
         }
@@ -150,6 +160,7 @@ impl DependencyStatus {
             DependencyStatus::Outdated => "OUTDATED",
             DependencyStatus::Vulnerable => "VULN",
             DependencyStatus::Error(_) => "ERROR",
+            DependencyStatus::Undetermined => "UNDETERMINED",
             DependencyStatus::Local => "LOCAL",
             DependencyStatus::Git => "GIT",
         }

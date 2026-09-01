@@ -418,8 +418,7 @@ mod tests {
     /// it was observed rather than only at the helper.
     #[test]
     fn a_scoped_pnpm_override_is_checked_as_the_package_it_pins() {
-        let content =
-            r#"{ "pnpm": { "overrides": { "foo@2>bar": "3.0.0" } } }"#;
+        let content = r#"{ "pnpm": { "overrides": { "foo@2>bar": "3.0.0" } } }"#;
         let m = parse(content);
         let names: Vec<&str> = m.items.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(names, vec!["bar"], "got {names:?}");

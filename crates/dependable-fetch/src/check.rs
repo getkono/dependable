@@ -14,8 +14,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use dependable_core::{
     CheckResult, DependencyStatus, Ecosystem, Evaluation, Item, LockfileKind, ManifestKind,
-    PackageSource, UnstableFilter, apply_lockfile, check_version, parse, parse_lockfile_kind,
-    resolve_workspace_inheritance, to_semver_constraint,
+    PackageSource, UnstableFilter, apply_lockfile, check_version_for, parse, parse_lockfile_kind,
+    resolve_workspace_inheritance,
 };
 use futures::stream::{self, StreamExt};
 use semver::Version as SemverVersion;
@@ -877,8 +877,16 @@ fn evaluate_item(
                 .iter()
                 .map(|(semver, _)| semver.clone())
                 .collect();
-            let constraint = to_semver_constraint(&item.version_constraint, ecosystem);
-            let eval = check_version(&constraint, &candidates, item.locked_version.as_deref());
+            // Translation happens inside `check_version_for`, which is what keeps a
+            // dialect this crate could not read (`[4.0,4.9`, `LATEST`, `!=2.31.0`)
+            // apart from a manifest that declared no constraint at all. The first is
+            // `Undetermined`; only the second is `*`.
+            let eval = check_version_for(
+                &item.version_constraint,
+                ecosystem,
+                &candidates,
+                item.locked_version.as_deref(),
+            );
             CheckResult::from_evaluation(
                 item.clone(),
                 in_native_versions(eval, &translated, ecosystem),

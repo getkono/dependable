@@ -72,6 +72,9 @@ pub struct Summary {
     pub outdated: usize,
     pub vulnerable: usize,
     pub error: usize,
+    /// Real packages whose declared version this run could not read — an
+    /// untranslatable constraint, or a reference to something never declared.
+    pub undetermined: usize,
     pub local: usize,
     pub git: usize,
 }
@@ -95,6 +98,7 @@ impl Summary {
                     DependencyStatus::Outdated => s.outdated += 1,
                     DependencyStatus::Vulnerable => s.vulnerable += 1,
                     DependencyStatus::Error(_) => s.error += 1,
+                    DependencyStatus::Undetermined => s.undetermined += 1,
                     DependencyStatus::Local => s.local += 1,
                     DependencyStatus::Git => s.git += 1,
                     _ => {}
