@@ -16,9 +16,9 @@ use dependable_fetch::core::{
 };
 use dependable_fetch::{
     CheckError, Checker, DependencyStatus, Ecosystem, GoProxyFetcher, GraphSource, HexFetcher,
-    Item, JsrFetcher, ManifestKind, NpmFetcher, NuGetFetcher, PackageSource, PackagistFetcher,
-    ParseError, ProgressEvent, PubDevFetcher, PyPiFetcher, ScopedRegistry, TreeOptions,
-    UnstableFilter, WorkspaceGraphOptions, build_client, build_workspace_graph,
+    Item, JsrFetcher, ManifestKind, MavenCentralFetcher, NpmFetcher, NuGetFetcher, PackageSource,
+    PackagistFetcher, ParseError, ProgressEvent, PubDevFetcher, PyPiFetcher, ScopedRegistry,
+    TreeOptions, UnstableFilter, WorkspaceGraphOptions, build_client, build_workspace_graph,
     nearest_workspace_root, workspace_source,
 };
 use dependable_tui::TuiOptions;
@@ -228,6 +228,15 @@ impl Engine {
                 Arc::new(HexFetcher::with_registry(
                     client.clone(),
                     cfg.elixir.registry.clone(),
+                )),
+            );
+        }
+        if cfg.jvm.enabled {
+            builder = builder.registry(
+                Ecosystem::Jvm,
+                Arc::new(MavenCentralFetcher::with_registry(
+                    client.clone(),
+                    cfg.jvm.registry.clone(),
                 )),
             );
         }

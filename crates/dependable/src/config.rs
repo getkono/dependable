@@ -36,6 +36,8 @@ pub struct Config {
     #[serde(default)]
     pub elixir: ElixirConfig,
     #[serde(default)]
+    pub jvm: JvmConfig,
+    #[serde(default)]
     pub vulnerability: VulnConfig,
     /// CI gating rules. Empty by default, so policy gates nothing until a
     /// `[policy]` block is written.
@@ -197,6 +199,24 @@ impl Default for ElixirConfig {
         Self {
             enabled: true,
             registry: "https://hex.pm".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct JvmConfig {
+    pub enabled: bool,
+    pub registry: String,
+}
+
+impl Default for JvmConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            // Any Maven repository serving the same `maven-metadata.xml` layout works
+            // here: an Artifactory or Nexus mirror is the usual reason to change it.
+            registry: "https://repo1.maven.org/maven2".to_string(),
         }
     }
 }

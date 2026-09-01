@@ -38,6 +38,13 @@ Or download a prebuilt binary for your platform from the
 | Dart / Flutter | `pubspec.yaml` | pub.dev | `pubspec.lock` | 🧪 Experimental |
 | C# / .NET | `*.csproj`, `Directory.Packages.props` | NuGet | — | 🧪 Experimental |
 | Elixir | `mix.exs` | Hex | `mix.lock` | 🧪 Experimental |
+| Kotlin / Java | `gradle/libs.versions.toml` | Maven Central | — | 🧪 Experimental |
+
+Kotlin / Java coverage is the **declarative** half of a Gradle build: the version
+catalog. A build script (`build.gradle`, `build.gradle.kts`) is a program, and reading
+one means running your build — so a build script found without a catalog beside it is
+reported as unread rather than silently skipped, and a handful of catalog entries never
+gets presented as a whole dependency list.
 
 ### Lockfiles
 
@@ -80,11 +87,11 @@ V2 reporting features and other deferred work are tracked as GitHub issues; see
 Three languages come up often enough to answer here. Each is absent for a different
 reason, and one of them is closer than it looks:
 
-- **Kotlin / Java / Scala** — the registry side is ready (Maven Central publishes
-  complete version lists, and `Maven` is the largest language ecosystem in OSV that
-  `dependable` does not yet cover). Gradle build scripts are programs, not manifests, so
-  only the declarative parts — `gradle/libs.versions.toml` version catalogs, and
-  `pom.xml` with literal versions — can be read without executing your build.
+- **Gradle build scripts and `pom.xml`** — the JVM's declarative half ships (see the
+  table above); the rest does not. A `build.gradle.kts` is a program, and its ground
+  truth needs `./gradlew dependencies` — a JVM daemon executing your build. `pom.xml` is
+  data and is readable in principle, but its versions are frequently `${properties}`
+  inherited through a parent chain, which is a resolution step of its own.
 - **Swift** — SwiftPM has no canonical registry: packages are git URLs and versions are
   git tags, and `Package.swift` is executable Swift. `Package.resolved` is readable, so
   locked versions and vulnerability scanning are feasible, but "outdated" is not.
