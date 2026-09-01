@@ -143,10 +143,12 @@ fn rewrite_constraint(original: &str, new_version: &str) -> Option<String> {
     }
     // A wildcard (`*`, `1.x`, `1.*`, Gradle's `1.+`) is a range the author chose,
     // not a version — substituting a concrete release narrows it to a pin (#87).
-    // Widening it instead (`1.x` → `2.x`) would need to know how this ecosystem
-    // spells a wildcard, which this layer cannot see, and would be wrong for NuGet
-    // anyway, where a bare version is an inclusive minimum rather than a pin. So
-    // decline, exactly as a dist-tag is declined, and leave the author's range.
+    // The decline is deliberately blanket rather than per-ecosystem: substituting
+    // is safe where a bare version is a caret or an inclusive minimum (Cargo, Go,
+    // Dart) and unsafe where it is an exact pin (npm, Composer, Hex), and this
+    // signature carries no `Ecosystem` to tell them apart. `apply_fixes` does hold
+    // the manifest path and could supply one — #92 tracks narrowing the decline to
+    // the ecosystems that need it. Until then, decline as a dist-tag is declined.
     if is_wildcard(rest) {
         return None;
     }
