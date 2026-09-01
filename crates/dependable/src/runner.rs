@@ -997,6 +997,11 @@ fn resolve_report_settings(args: &crate::cli::ReportArgs, cfg: &Config) -> Setti
 /// silently left alone by `fix`, because the version string is in the workspace root and
 /// there is no line here to rewrite. Without this the two commands appear to contradict
 /// each other, and nothing points at the file that can actually be changed.
+///
+/// `PackageSource::Inherited` and not merely "has no position": a
+/// [`PackageSource::Locked`] entry is also skipped by `fix`, but there is no root
+/// holding its version, so this note has no file to send the reader to. Swift is told
+/// so once per project instead, by the check itself.
 fn report_inherited_skips(manifest: &Path, report: &ManifestReport) {
     let Some(root) = &report.workspace_root else {
         return;

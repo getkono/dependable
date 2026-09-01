@@ -325,23 +325,32 @@ fn pin_item(pin: &Pin) -> Option<Item> {
             .or_else(|| pin.identity.clone())
     }?;
 
+    // An empty string is not a version. SwiftPM writes `null` for a pin with no
+    // version, but a hand-edited or third-party-generated file can write `""`, and
+    // that must not be mistaken for a resolved one — the name path above filters
+    // emptiness for the same reason. Filtering here is what makes `Locked` with an
+    // empty constraint unrepresentable: the degenerate pin falls through to the
+    // branch/revision state and the `Git` arm, exactly as a versionless pin does.
+    let version = pin.version.clone().filter(|version| !version.is_empty());
+
     // What the pin resolved to, in descending order of usefulness to a reader.
-    let state = pin
-        .version
+    let state = version
         .clone()
         .or_else(|| pin.branch.clone())
         .or_else(|| pin.revision.clone())
         .unwrap_or_default();
 
-    // `Inherited`, not `Registry`: the version was written somewhere other than
-    // this entry — in `Package.resolved`, never in the manifest — so there is no
-    // span in `Package.swift` to report or to rewrite, which is exactly what
-    // `Item::has_position` reads the source to decide. A branch pin has no
-    // version at all and is the git dependency it looks like.
+    // `Locked`, not `Registry`: the version was written in `Package.resolved` and
+    // never in a manifest, so there is no span in `Package.swift` to report or to
+    // rewrite, which is exactly what `Item::has_position` reads the source to
+    // decide. Not `Inherited` either — nothing was inherited, because nothing
+    // declared it; a consumer told "inherited" would go looking for a central
+    // declaration that does not exist. A branch pin has no version at all and is
+    // the git dependency it looks like.
     let (source, constraint, locked) = if local {
         (PackageSource::Local, state, None)
-    } else if let Some(version) = pin.version.clone() {
-        (PackageSource::Inherited, version.clone(), Some(version))
+    } else if let Some(version) = version {
+        (PackageSource::Locked, version.clone(), Some(version))
     } else {
         (PackageSource::Git, state, None)
     };
@@ -427,7 +436,11 @@ mod tests {
         let nio = find(&items, "github.com/apple/swift-nio");
         assert_eq!(nio.locked_version.as_deref(), Some("2.65.0"));
         assert_eq!(nio.version_constraint, "2.65.0");
-        assert_eq!(nio.source, PackageSource::Inherited);
+        assert_eq!(
+            nio.source,
+            PackageSource::Locked,
+            "the version came from this file, not from a declaration anywhere"
+        );
     }
 
     /// The pin set is the only record of what the project depends on, so a pin has
@@ -509,6 +522,90 @@ mod tests {
         assert_eq!(items[0].version_constraint, "main");
         assert_eq!(items[0].locked_version, None);
         assert!(!items[0].is_checkable());
+    }
+
+    /// An empty version string states nothing, so it may not produce a `Locked`
+    /// item: `Locked` is the claim that a lockfile supplied the resolved version,
+    /// and the renderers act on that claim. `dependable list` gives a `Locked` pin
+    /// no annotation precisely because it always states a version, so an empty
+    /// constraint would print a bare `—` — the very output the `Inherited`
+    /// `(unresolved)` arm exists to prevent. Filtering it at the producer makes
+    /// `Locked` with an empty constraint unrepresentable rather than merely
+    /// unrendered.
+    #[test]
+    fn an_empty_version_is_not_a_locked_pin() {
+        let lock = r#"{
+  "pins": [
+    {
+      "identity": "swift-nio",
+      "kind": "remoteSourceControl",
+      "location": "https://github.com/apple/swift-nio.git",
+      "state": { "revision": "635b25", "version": "" }
+    }
+  ],
+  "version": 2
+}"#;
+        let items = items(lock);
+        assert_eq!(items[0].name, "github.com/apple/swift-nio");
+        assert_ne!(
+            items[0].source,
+            PackageSource::Locked,
+            "an empty string is not a resolved version"
+        );
+        assert_eq!(items[0].source, PackageSource::Git);
+        assert_eq!(items[0].locked_version, None);
+        assert_eq!(
+            items[0].version_constraint, "635b25",
+            "with no version the pin states what it does have: the revision"
+        );
+        assert!(!items[0].is_checkable());
+    }
+
+    /// The invariant the filter buys, asserted over every pin shape that reaches
+    /// `pin_item`: nothing that calls itself `Locked` may state an empty version.
+    #[test]
+    fn a_locked_pin_always_states_a_version() {
+        let lock = r#"{
+  "pins": [
+    { "identity": "a", "kind": "remoteSourceControl", "location": "https://github.com/acme/a.git",
+      "state": { "revision": "1111", "version": "1.0.0" } },
+    { "identity": "b", "kind": "remoteSourceControl", "location": "https://github.com/acme/b.git",
+      "state": { "revision": "2222", "version": "" } },
+    { "identity": "c", "kind": "remoteSourceControl", "location": "https://github.com/acme/c.git",
+      "state": { "branch": "main", "revision": "3333", "version": "" } },
+    { "identity": "d", "kind": "fileSystem", "location": "/Users/me/d", "state": { "version": "" } }
+  ],
+  "version": 2
+}"#;
+        let items = items(lock);
+        assert_eq!(items.len(), 4);
+        for item in &items {
+            if item.source == PackageSource::Locked {
+                assert!(
+                    !item.version_constraint.is_empty(),
+                    "{} is Locked with no version",
+                    item.name
+                );
+                assert!(
+                    item.locked_version
+                        .as_deref()
+                        .is_some_and(|v| !v.is_empty()),
+                    "{} is Locked with no locked version",
+                    item.name
+                );
+            }
+        }
+        let sources: Vec<PackageSource> = items.iter().map(|item| item.source).collect();
+        assert_eq!(
+            sources,
+            [
+                PackageSource::Locked,
+                PackageSource::Git,
+                PackageSource::Git,
+                PackageSource::Local,
+            ]
+        );
+        assert_eq!(find(&items, "github.com/acme/c").version_constraint, "main");
     }
 
     #[test]
