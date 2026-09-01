@@ -31,6 +31,16 @@ struct SummaryDto {
     /// its `<parent>`, an unresolved workspace inheritance. Additive, and
     /// deliberately not folded into `error`: nothing failed, nothing was asked.
     undetermined: usize,
+    /// How many manifests had their dependency list go unread — a `Package.swift`
+    /// with no readable `Package.resolved` beside it.
+    ///
+    /// The key that separates "read nothing" from "genuinely empty". Every other
+    /// count here tallies rows that were read, so a manifest nothing was read from
+    /// contributes zero to all of them and its document is otherwise identical to a
+    /// clean one's. Additive, like `manifests` and `unique_packages`: a consumer
+    /// pinned to the documented shape is unaffected, and one that wants the
+    /// distinction gates on `manifests_unread > 0`.
+    manifests_unread: usize,
 }
 
 #[derive(Serialize)]
@@ -99,6 +109,7 @@ pub fn render(reports: &[ManifestReport]) -> anyhow::Result<()> {
             vulnerable: summary.vulnerable,
             error: summary.error,
             undetermined: summary.undetermined,
+            manifests_unread: summary.manifests_unread,
         },
         results,
     };

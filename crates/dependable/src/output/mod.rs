@@ -69,6 +69,15 @@ pub struct Summary {
     /// [`git`](Self::git), which are deliberately skipped and therefore clean,
     /// because these were not skipped on purpose — nothing was learned about them.
     pub undetermined: usize,
+    /// How many of the [`manifests`](Self::manifests) had their dependency list go
+    /// unread — [`ManifestReport::dependencies_unread`].
+    ///
+    /// The counter that stops a machine-readable report saying "clean" about a
+    /// project nothing was read from. Every status count above is a tally of rows
+    /// that *were* read, so all of them are zero for such a manifest and the
+    /// document is byte-identical to a genuinely empty one. Non-zero here is the
+    /// only thing in the summary that separates the two.
+    pub manifests_unread: usize,
 }
 
 impl Summary {
@@ -98,6 +107,7 @@ impl Summary {
             }
         }
         s.manifests = reports.len();
+        s.manifests_unread = reports.iter().filter(|r| r.dependencies_unread).count();
         s.unique_packages = unique.len();
         s
     }

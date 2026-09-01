@@ -19,11 +19,17 @@ use super::ManifestReport;
 pub fn render(reports: &[ManifestReport]) -> anyhow::Result<()> {
     let mut report = Report::new(scan_root(reports));
     for manifest in reports {
-        report.push(ManifestResults::new(
-            manifest.path.clone(),
-            manifest.ecosystem,
-            manifest.results.clone(),
-        ));
+        report.push(
+            ManifestResults::new(
+                manifest.path.clone(),
+                manifest.ecosystem,
+                manifest.results.clone(),
+            )
+            // Without this the one manifest whose empty result set means "nothing was
+            // read" is indistinguishable from every manifest whose empty result set
+            // means "nothing is wrong".
+            .with_dependencies_unread(manifest.dependencies_unread),
+        );
     }
     println!("{}", dependable_report::sarif::render(&report)?);
     Ok(())

@@ -6,7 +6,7 @@
 //!
 //! # Public surface
 //!
-//! [`render`], [`DEP001`] and [`DEP002`]. Everything else in this module is
+//! [`render`], [`DEP001`], [`DEP002`] and [`DEP003`]. Everything else in this module is
 //! private on purpose: the SARIF document shape is an output artifact, not an
 //! API, and publishing the structs would freeze the JSON layout as semver
 //! surface.
@@ -17,10 +17,13 @@
 //! | --- | --- | --- |
 //! | [`DEP001`] | a newer version of the dependency is available | `warning` |
 //! | [`DEP002`] | the version in use is affected by a known advisory | `error` |
+//! | [`DEP003`] | the project's dependency list could not be read | `warning` |
 //!
 //! One result is emitted **per advisory ID**, so each CVE becomes its own alert
 //! carrying its own `properties.cvssScore`, and one result per dependency for
-//! [`DEP001`]. `DEP003` onwards are unused and free for later rules.
+//! [`DEP001`]. [`DEP003`] is per *manifest*, not per dependency — it is emitted
+//! precisely because there are no dependencies to emit one against. `DEP004`
+//! onwards are unused and free for later rules.
 //!
 //! # Purity and determinism
 //!
@@ -74,6 +77,14 @@ pub const DEP001: &str = "DEP001";
 
 /// The rule ID for a dependency affected by a known advisory.
 pub const DEP002: &str = "DEP002";
+
+/// The rule ID for a manifest whose dependency list could not be read.
+///
+/// Unlike [`DEP001`] and [`DEP002`] this describes the *manifest*, not a
+/// dependency in it: an empty `results` array is what a clean project and an
+/// unread one otherwise share, so the finding that distinguishes them cannot
+/// itself be a per-dependency one.
+pub const DEP003: &str = "DEP003";
 
 /// The SARIF schema this renderer targets.
 const SCHEMA: &str = "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json";
@@ -149,6 +160,12 @@ fn findings(report: &Report) -> Vec<Finding> {
     for manifest in &report.manifests {
         let uri = uri_for(&report.root, &manifest.path);
         let ecosystem = manifest.ecosystem;
+        // First, and unconditional on there being results — it is emitted precisely
+        // because there are none, and a consumer scanning the array in order meets
+        // the caveat before the rows it qualifies.
+        if manifest.dependencies_unread {
+            findings.push(unread_finding(ecosystem.osv_name(), &uri));
+        }
         for result in &manifest.results {
             let line = start_line(&result.item);
             match result.status {
@@ -250,9 +267,9 @@ fn vulnerable_finding(
         start_line,
         fingerprint: fingerprint(DEP002, ecosystem, &result.item.name, id, uri),
         properties: ResultProperties {
-            package: result.item.name.clone(),
+            package: Some(result.item.name.clone()),
             ecosystem,
-            current_version: current,
+            current_version: Some(current),
             latest_version: latest_version(result),
             status: result.status.token(),
             advisory_id: Some(id.to_string()),
@@ -303,11 +320,54 @@ fn outdated_finding(
             uri,
         ),
         properties: ResultProperties {
-            package: result.item.name.clone(),
+            package: Some(result.item.name.clone()),
             ecosystem,
-            current_version: current,
+            current_version: Some(current),
             latest_version: latest,
             status: result.status.token(),
+            advisory_id: None,
+            cvss_score: None,
+            severity: None,
+            severity_label: None,
+            cvss_vector: None,
+            fixed_versions: Vec::new(),
+            aliases: Vec::new(),
+            cwe_ids: Vec::new(),
+            advisory_url: None,
+        },
+    }
+}
+
+/// A [`DEP003`] finding for one manifest whose dependency list went unread.
+///
+/// Level `warning` rather than `error`: nothing is known to be wrong, which is
+/// exactly the point — the run established nothing about this project, and a
+/// consumer must not read the absence of findings as their absence in fact.
+///
+/// No `region`: the missing information is a *file that is not there*, so there is
+/// no line in the manifest to point at. The `artifactLocation` still names the
+/// manifest, which SARIF permits — see [`start_line`].
+fn unread_finding(ecosystem: &'static str, uri: &str) -> Finding {
+    Finding {
+        rule_id: DEP003,
+        rule_index: 2,
+        level: Level::Warning,
+        message: format!(
+            "The dependency list for `{uri}` could not be read, so no dependency in it was              checked. An empty result set for this manifest means nothing was looked at, not              that nothing is wrong."
+        ),
+        uri: uri.to_string(),
+        start_line: None,
+        // No package to key on, so the manifest is the identity: one alert per
+        // manifest, reopened only if the same manifest goes unread again.
+        fingerprint: format!("{DEP003}:{ecosystem}:{uri}"),
+        properties: ResultProperties {
+            package: None,
+            ecosystem,
+            current_version: None,
+            latest_version: None,
+            // Not a `DependencyStatus` token — no dependency has this status,
+            // because no dependency was read. The manifest does.
+            status: "unread",
             advisory_id: None,
             cvss_score: None,
             severity: None,
@@ -499,7 +559,7 @@ fn build(findings: &[Finding]) -> SarifLog {
 
 /// The full rule catalogue, always emitted whether or not a rule fired — a
 /// consumer reading `tool.driver.rules` learns what this tool can report.
-fn rules() -> [ReportingDescriptor; 2] {
+fn rules() -> [ReportingDescriptor; 3] {
     [
         ReportingDescriptor {
             id: DEP001,
@@ -543,6 +603,25 @@ fn rules() -> [ReportingDescriptor; 2] {
             properties: RuleProperties {
                 tags: &["security", "dependencies", "vulnerability"],
                 security_severity: Some(DEP002_SECURITY_SEVERITY),
+            },
+        },
+        ReportingDescriptor {
+            id: DEP003,
+            name: "UnreadDependencyList",
+            short_description: Text::new("The project's dependency list could not be read."),
+            full_description: Text::new(
+                "The file that is this project's dependency list — a SwiftPM                  `Package.resolved` — is missing or unreadable, and its manifest declares no                  dependencies of its own. No dependency was checked, so the absence of other                  findings for this manifest says nothing about the project.",
+            ),
+            help: Text::new(
+                "Resolve the project (`swift package resolve`) and commit the resulting                  `Package.resolved`, or repair the existing one.",
+            ),
+            help_uri: INFORMATION_URI,
+            default_configuration: RuleConfig {
+                level: Level::Warning,
+            },
+            properties: RuleProperties {
+                tags: &["dependencies", "coverage"],
+                security_severity: None,
             },
         },
     ]
@@ -592,7 +671,7 @@ struct ToolComponent {
     version: &'static str,
     semantic_version: &'static str,
     information_uri: &'static str,
-    rules: [ReportingDescriptor; 2],
+    rules: [ReportingDescriptor; 3],
 }
 
 /// One rule in the catalogue.
@@ -727,10 +806,15 @@ enum Level {
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct ResultProperties {
-    package: String,
+    /// Absent only for [`DEP003`], which is about the manifest rather than any one
+    /// dependency in it. Every other finding names its package.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    package: Option<String>,
     /// The OSV ecosystem name (`crates.io`, `npm`, …), the machine-readable form.
     ecosystem: &'static str,
-    current_version: String,
+    /// Absent for [`DEP003`], for the same reason `package` is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     latest_version: Option<String>,
     status: &'static str,
@@ -848,11 +932,13 @@ mod tests {
         assert_eq!(driver["informationUri"], INFORMATION_URI);
 
         let rules = driver["rules"].as_array().expect("rules");
-        assert_eq!(rules.len(), 2);
+        assert_eq!(rules.len(), 3);
         assert_eq!(rules[0]["id"], DEP001);
         assert_eq!(rules[1]["id"], DEP002);
+        assert_eq!(rules[2]["id"], DEP003);
         assert_eq!(rules[0]["defaultConfiguration"]["level"], "warning");
         assert_eq!(rules[1]["defaultConfiguration"]["level"], "error");
+        assert_eq!(rules[2]["defaultConfiguration"]["level"], "warning");
         assert_eq!(rules[1]["properties"]["security-severity"], "7.0");
 
         // Present and empty: an *absent* `results` would mean the run failed.
