@@ -38,6 +38,10 @@
 {%- endfor %}
 </tbody>
 </table>
+{%- elif manifest.dependencies_unread %}
+<p class="empty">The file that is this project's dependency list could not be read, so no dependency
+of it was checked. This is not a project with no dependencies: it is a project nothing here was
+established about.</p>
 {%- else %}
 <p class="empty">This manifest declares no dependencies.</p>
 {%- endif %}

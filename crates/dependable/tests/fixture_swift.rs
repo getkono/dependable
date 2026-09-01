@@ -795,3 +795,82 @@ fn sarif_reports_an_unread_dependency_list_as_a_finding() {
         );
     }
 }
+
+/// An HTML report is frequently the only artifact a reviewer ever sees, so the fact
+/// that a project's dependency list went unread has to be *in the document*.
+///
+/// It used to reach the page only as a run note, and `report --quiet` drops notes —
+/// so the quiet artifact for a Swift project with no `Package.resolved` was
+/// byte-for-byte the shape of a resolved, clean one, right down to §3 asserting
+/// "This manifest declares no dependencies", which nothing had established.
+#[test]
+fn a_quiet_html_report_still_says_the_dependency_list_went_unread() {
+    let unread_dir = scratch("swift_html_unread");
+    std::fs::copy(
+        fixture("sample-swift/Package.swift"),
+        unread_dir.join("Package.swift"),
+    )
+    .unwrap();
+
+    let empty_dir = scratch("swift_html_empty");
+    std::fs::copy(
+        fixture("sample-swift/Package.swift"),
+        empty_dir.join("Package.swift"),
+    )
+    .unwrap();
+    std::fs::write(
+        empty_dir.join("Package.resolved"),
+        r#"{"pins":[],"version":2}"#,
+    )
+    .unwrap();
+
+    let render = |dir: &Path| {
+        let out = dir.join("report.html");
+        let output = run(&[
+            "report",
+            "--manifest",
+            dir.join("Package.swift").to_str().unwrap(),
+            "--no-vuln",
+            "--quiet",
+            "--output",
+            out.to_str().unwrap(),
+        ]);
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // The templates wrap their prose, so the rendered document carries newlines
+        // inside sentences. Collapse them, or an assertion about a phrase would be
+        // an assertion about where a template happens to break its lines.
+        std::fs::read_to_string(&out)
+            .expect("the report was written")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+
+    let unread = render(&unread_dir);
+    let empty = render(&empty_dir);
+
+    assert!(
+        unread.contains("no readable dependency list"),
+        "the summary must carry the caveat structurally, not as a suppressible note"
+    );
+    assert!(
+        unread.contains("could not be read"),
+        "and the manifest's own section must say which project it is about"
+    );
+    assert!(
+        !unread.contains("This manifest declares no dependencies"),
+        "nothing established that; the file that would have said so was never read"
+    );
+
+    // The other half: a project that really is resolved and really has no pins is
+    // still reported exactly as before, with no caveat it has not earned.
+    assert!(
+        !empty.contains("no readable dependency list") && !empty.contains("could not be read"),
+        "a resolved project with no pins has nothing to caveat"
+    );
+    assert!(empty.contains("This manifest declares no dependencies"));
+}
