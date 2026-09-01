@@ -62,8 +62,13 @@ use crate::error::ParseError;
 use crate::item::{DependencyKind, Item, PackageSource};
 use crate::manifest::{ManifestKind, ParsedManifest};
 
-/// How far a `${a}` → `${b}` → literal chain is followed before giving up, which
-/// also bounds a property that (illegally) refers to itself.
+/// How many `${a}` → `${b}` **hops** a property chain may take before it is given
+/// up on, which also bounds a property that (illegally) refers to itself.
+///
+/// A hop is a step from one property to the next, so the longest chain that still
+/// resolves is `MAX_PROPERTY_HOPS + 1` properties long: eight hops from `${p0}`
+/// reach `p8`, and `p8` is read. [`terminal`] loops one more time than this number
+/// for exactly that reason — the first read is not a hop.
 const MAX_PROPERTY_HOPS: usize = 8;
 
 /// Parses `pom.xml`.
@@ -248,7 +253,9 @@ fn version_source(node: roxmltree::Node<'_, '_>, properties: &HashMap<String, Lo
 /// `None` when the chain leaves this file, states nothing, or does not terminate.
 fn terminal<'a>(start: &str, properties: &'a HashMap<String, Located>) -> Option<&'a str> {
     let mut name = start;
-    for _ in 0..MAX_PROPERTY_HOPS {
+    // Inclusive: `MAX_PROPERTY_HOPS` hops means one more property read than hops
+    // taken, since arriving at the first property costs no hop.
+    for _ in 0..=MAX_PROPERTY_HOPS {
         let (key, located) = properties.get_key_value(name)?;
         match interpolation(&located.value) {
             Some(next) => name = next,
@@ -688,6 +695,34 @@ mod tests {
     #[test]
     fn malformed_xml_is_a_structural_error() {
         assert!(PomXmlParser.parse("<project><dependencies>").is_err());
+    }
+
+    /// Eight hops is what the constant says, so eight hops has to resolve.
+    #[test]
+    fn a_chain_resolves_up_to_the_documented_number_of_hops() {
+        let chain = |hops: usize| {
+            let mut properties = String::from("  <properties>\n");
+            for hop in 0..hops {
+                properties.push_str(&format!("    <p{hop}>${{p{}}}</p{hop}>\n", hop + 1));
+            }
+            properties.push_str(&format!("    <p{hops}>9.9.9</p{hops}>\n  </properties>\n"));
+            let content = pom(&format!(
+                "{properties}  <dependencies>\n\
+                 \x20   <dependency>\n\
+                 \x20     <groupId>g</groupId>\n\
+                 \x20     <artifactId>a</artifactId>\n\
+                 \x20     <version>${{p0}}</version>\n\
+                 \x20   </dependency>\n\
+                 \x20 </dependencies>\n"
+            ));
+            parse(&content).items[0].version_constraint.clone()
+        };
+        assert_eq!(chain(MAX_PROPERTY_HOPS), "9.9.9", "the documented limit");
+        assert_eq!(
+            chain(MAX_PROPERTY_HOPS + 1),
+            "",
+            "one hop past it states nothing, rather than spinning"
+        );
     }
 
     #[test]
