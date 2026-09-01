@@ -194,7 +194,11 @@ struct GraphDto<'a> {
 struct NodeDto<'a> {
     id: usize,
     name: &'a str,
-    version: &'a str,
+    /// `null` when no version was ever read for this node — a graph built from
+    /// manifests alone resolves none. Emitted rather than omitted so every node
+    /// has the same shape and a consumer never has to tell an absent key from an
+    /// absent version.
+    version: Option<&'a str>,
     kind: &'static str,
 }
 
@@ -215,7 +219,7 @@ fn json(graph: &DependencyGraph, opts: &TreeOptions) -> anyhow::Result<String> {
             NodeDto {
                 id,
                 name: &n.name,
-                version: n.version.as_deref().unwrap_or_default(),
+                version: n.version.as_deref(),
                 kind: kind_str(n.kind),
             }
         })
@@ -265,7 +269,7 @@ fn dot(graph: &DependencyGraph, opts: &TreeOptions) -> String {
 mod tests {
     use super::*;
     use dependable_fetch::DependencyGraph;
-    use dependable_fetch::core::parse_cargo_lock_graph;
+    use dependable_fetch::core::{LockedPackage, ResolvedLockfile, parse_cargo_lock_graph};
 
     /// app (workspace) -> serde (registry) -> serde_derive; and app -> serde too,
     /// so serde is deduped on its second appearance.
@@ -374,6 +378,30 @@ source = "registry+https://x"
         assert!(out.contains("\"kind\": \"workspace\""));
         assert!(out.contains("\"kind\": \"registry\""));
         assert!(out.contains("\"from\""));
+        assert!(out.contains("\"version\": \"1.0.0\""));
+    }
+
+    /// A graph built from manifests alone resolves no versions. Emitting `""`
+    /// there tells a consumer the package is at the empty version; `null` tells
+    /// it the truth, which is that nobody read one.
+    #[test]
+    fn json_reports_an_unread_version_as_null() {
+        let packages = vec![
+            LockedPackage::new("app".to_owned(), None, None, vec!["serde".to_owned()]),
+            LockedPackage::new(
+                "serde".to_owned(),
+                None,
+                Some("registry+".to_owned()),
+                Vec::new(),
+            ),
+        ];
+        let resolved = ResolvedLockfile::from_packages(packages);
+        let names = ["app".to_owned()].into_iter().collect();
+        let graph = DependencyGraph::from_resolved(&resolved, &names, &["app".to_owned()]);
+
+        let out = json(&graph, &TreeOptions::default()).unwrap();
+        assert!(out.contains("\"version\": null"), "{out}");
+        assert!(!out.contains("\"version\": \"\""), "{out}");
     }
 
     #[test]
