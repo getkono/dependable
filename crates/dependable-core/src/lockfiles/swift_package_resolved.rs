@@ -165,11 +165,35 @@ pub fn swift_package_name(location: &str) -> String {
     lowercase_host(name.trim_end_matches('/'))
 }
 
-/// Lowercase the host component of an OSV `SwiftURL` name, leaving the path alone.
+/// Normalize the host component of an OSV `SwiftURL` name, leaving the path alone.
+///
+/// Lowercased, for the reason [`swift_package_name`] gives, and stripped of any
+/// port: `ssh://git@github.com:22/apple/swift-nio.git` and
+/// `https://github.com/apple/swift-nio.git` address the same repository, but only
+/// the second spells the key OSV holds. A port is transport, not identity, and
+/// leaving it on is the same silent false negative a mis-cased host is — the query
+/// matches nothing and the package is reported clean.
 fn lowercase_host(name: &str) -> String {
     match name.split_once('/') {
-        Some((host, path)) => format!("{}/{path}", host.to_ascii_lowercase()),
-        None => name.to_ascii_lowercase(),
+        Some((host, path)) => format!("{}/{path}", strip_port(host).to_ascii_lowercase()),
+        None => strip_port(name).to_ascii_lowercase(),
+    }
+}
+
+/// `host` without a trailing `:<digits>`.
+///
+/// Only an all-digit suffix is a port, which is the same test the SCP-shorthand
+/// branch of [`swift_package_name`] already applies: `github.com:vapor` is a path
+/// and keeps its colon here too. An IPv6 literal is unharmed — `[::1]` ends in `]`,
+/// not a digit — while `[::1]:22` loses only the port.
+fn strip_port(host: &str) -> &str {
+    match host.rsplit_once(':') {
+        Some((rest, port))
+            if !rest.is_empty() && !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            rest
+        }
+        _ => host,
     }
 }
 
@@ -485,6 +509,62 @@ mod tests {
             (
                 "git+https://github.com/vapor/vapor.git",
                 "github.com/vapor/vapor",
+            ),
+        ];
+        for (location, expected) in cases {
+            assert_eq!(swift_package_name(location), expected, "{location}");
+        }
+    }
+
+    /// A port addresses the transport, not the package. OSV keys
+    /// `github.com/apple/swift-nio`, so a pin written `ssh://git@github.com:22/…`
+    /// would otherwise ask about `github.com:22/apple/swift-nio` — a key OSV has
+    /// never heard of — and the same repository at the same version would come back
+    /// clean through one URL and vulnerable through another.
+    #[test]
+    fn a_port_is_stripped_from_the_host() {
+        let cases = [
+            (
+                "ssh://git@github.com:22/apple/swift-nio.git",
+                "github.com/apple/swift-nio",
+            ),
+            (
+                "https://github.com:443/apple/swift-nio.git",
+                "github.com/apple/swift-nio",
+            ),
+            (
+                "git://GitHub.com:9418/apple/swift-nio",
+                "github.com/apple/swift-nio",
+            ),
+            // No scheme: `:22` is read as a port by the SCP-shorthand branch, so
+            // the path starts after it.
+            (
+                "github.com:22/apple/swift-nio.git",
+                "github.com/apple/swift-nio",
+            ),
+            // The port is transport only; a mixed-case path still survives it.
+            (
+                "ssh://git@github.com:22/weichsel/ZIPFoundation.git",
+                "github.com/weichsel/ZIPFoundation",
+            ),
+        ];
+        for (location, expected) in cases {
+            assert_eq!(swift_package_name(location), expected, "{location}");
+        }
+    }
+
+    /// The strip is an all-digit suffix and nothing else, so a colon that is part of
+    /// a name — SCP shorthand, an IPv6 literal — keeps it.
+    #[test]
+    fn a_colon_that_is_not_a_port_survives() {
+        let cases = [
+            // SCP shorthand: the colon becomes the path separator, not a port.
+            ("git@github.com:vapor/vapor.git", "github.com/vapor/vapor"),
+            // An IPv6 literal ends in `]`, never a digit.
+            ("https://[::1]/apple/swift-nio.git", "[::1]/apple/swift-nio"),
+            (
+                "ssh://git@[::1]:22/apple/swift-nio",
+                "[::1]/apple/swift-nio",
             ),
         ];
         for (location, expected) in cases {
