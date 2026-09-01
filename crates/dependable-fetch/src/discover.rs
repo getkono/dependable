@@ -20,7 +20,8 @@
 use std::path::{Path, PathBuf};
 
 use dependable_core::{
-    DependencyKind, Item, LockfileData, LockfileKind, ManifestKind, parse, parse_lockfile_kind,
+    DependencyKind, Item, LockfileData, LockfileKind, ManifestKind, UNREADABLE_MANIFESTS, parse,
+    parse_lockfile_kind,
 };
 
 /// Directories never descended into during discovery: build output, vendored
@@ -274,13 +275,16 @@ fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// A lockfile beside a manifest that exists but yields nothing.
+/// A file discovery found that exists but yields nothing — a lockfile it cannot
+/// read, or a manifest it cannot read.
 ///
 /// Every such case used to be a silent drop — an unreadable candidate was
 /// discarded by `if let Ok(...)` and the walk carried on, so a project with a
 /// lockfile it could not use was indistinguishable from one with none. That is
 /// the state a user is most able to act on, and the one they were never told
-/// about.
+/// about. The same reasoning covers a manifest that is a build script: reporting
+/// a short dependency list is worse than reporting none, because only one of the
+/// two looks wrong.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct LockfileNotice {
@@ -338,6 +342,65 @@ pub fn lockfile_notices(manifest: &Path, kind: ManifestKind) -> Vec<LockfileNoti
     }
 
     notices
+}
+
+/// Report manifests under `root` that are recognised but cannot be read.
+///
+/// The companion to [`lockfile_notices`], and a directory scan rather than a
+/// per-manifest check for the reason the notice exists at all: a Gradle project
+/// with no version catalog produces **no** manifest for discovery to hand over, so
+/// there is nothing to hang the question on. The walk mirrors [`find_manifests`] —
+/// same depth bound, same skipped directories — so the two see one tree.
+///
+/// A file whose readable alternative is present is not reported: a
+/// `build.gradle.kts` beside a `gradle/libs.versions.toml` had its dependencies
+/// read from the catalog, and warning about it would be noise.
+#[must_use]
+pub fn manifest_notices(root: &Path, max_depth: usize) -> Vec<LockfileNotice> {
+    let mut out = Vec::new();
+    scan_unreadable(root, max_depth, &mut out);
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    out
+}
+
+fn scan_unreadable(dir: &Path, depth_left: usize, out: &mut Vec<LockfileNotice>) {
+    for unreadable in UNREADABLE_MANIFESTS {
+        let path = dir.join(unreadable.file_name);
+        if !path.is_file() {
+            continue;
+        }
+        if unreadable
+            .superseded_by
+            .iter()
+            .any(|relative| dir.join(relative).is_file())
+        {
+            continue;
+        }
+        out.push(LockfileNotice {
+            path,
+            reason: unreadable.reason.to_owned(),
+        });
+    }
+    if depth_left == 0 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(is_skipped_dir)
+        {
+            continue;
+        }
+        scan_unreadable(&path, depth_left - 1, out);
+    }
 }
 
 #[cfg(test)]
@@ -658,5 +721,65 @@ mod tests {
         write(&manifest, "requests==2.0.0\n");
 
         assert!(find_lockfile(&manifest, ManifestKind::RequirementsTxt).is_none());
+    }
+
+    /// The failure this prevents: a Gradle project reporting nothing, or a handful
+    /// of catalog entries, as though that were the whole dependency list.
+    #[test]
+    fn a_gradle_build_script_with_no_catalog_is_reported_unread() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        write(&root.join("app/build.gradle.kts"), "dependencies {}\n");
+
+        let notices = manifest_notices(root, 3);
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert_eq!(notices[0].path, root.join("app/build.gradle.kts"));
+        assert!(
+            notices[0].reason.contains("libs.versions.toml"),
+            "{}",
+            notices[0].reason
+        );
+    }
+
+    /// A build script beside a catalog had its dependencies read from the catalog,
+    /// so there is nothing missing to report.
+    #[test]
+    fn a_build_script_beside_a_catalog_is_not_reported() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        write(&root.join("build.gradle.kts"), "dependencies {}\n");
+        write(
+            &root.join("gradle/libs.versions.toml"),
+            "[versions]\nkotlin = \"1.9.24\"\n",
+        );
+
+        assert!(manifest_notices(root, 3).is_empty());
+    }
+
+    /// The same tree `find_manifests` sees: build output and vendored code are not
+    /// somebody's project, and the depth bound is the one the user asked for.
+    #[test]
+    fn the_scan_skips_what_discovery_skips_and_stops_where_it_stops() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        write(&root.join("build/tmp/build.gradle"), "\n");
+        write(&root.join(".git/hooks/build.gradle"), "\n");
+        write(&root.join("node_modules/x/build.gradle"), "\n");
+        write(&root.join("a/b/c/build.gradle"), "\n");
+
+        // `build/` is not in SKIP_DIRS, so only the dotted and vendored ones go.
+        let deep = manifest_notices(root, 9);
+        let paths: Vec<&Path> = deep.iter().map(|n| n.path.as_path()).collect();
+        assert!(paths.contains(&root.join("a/b/c/build.gradle").as_path()));
+        assert!(!paths.contains(&root.join(".git/hooks/build.gradle").as_path()));
+        assert!(!paths.contains(&root.join("node_modules/x/build.gradle").as_path()));
+
+        let shallow = manifest_notices(root, 2);
+        assert!(
+            !shallow
+                .iter()
+                .any(|n| n.path == root.join("a/b/c/build.gradle")),
+            "depth 2 cannot reach a/b/c"
+        );
     }
 }

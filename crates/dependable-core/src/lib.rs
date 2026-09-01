@@ -29,8 +29,8 @@ pub use lockfiles::{
     parse_mix_lock, parse_mix_lock_graph, parse_package_lock, parse_package_lock_graph,
 };
 pub use manifest::{
-    AlternateRegistryDecl, LockfileKind, ManifestKind, ParsedManifest, UnreadableLockfile,
-    WorkspaceRoots,
+    AlternateRegistryDecl, LockfileKind, ManifestKind, ParsedManifest, UNREADABLE_MANIFESTS,
+    UnreadableLockfile, UnreadableManifest, WorkspaceRoots,
 };
 pub use npmrc::{NpmrcConfig, parse_npmrc};
 pub use parsers::{

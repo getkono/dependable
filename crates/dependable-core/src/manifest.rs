@@ -106,6 +106,22 @@ impl ManifestKind {
         }
     }
 
+    /// Manifest formats this ecosystem produces that we recognise but cannot read.
+    ///
+    /// The sibling of [`ManifestKind::unreadable_lockfiles`], for the same reason and
+    /// with more at stake: an unread *lockfile* costs the resolved versions, while an
+    /// unread *manifest* costs the dependencies themselves. A Gradle project whose
+    /// dependencies are declared in `build.gradle.kts` and reported as three catalog
+    /// entries has been told something false, and being told nothing was read is the
+    /// only honest alternative.
+    #[must_use]
+    pub fn unreadable_manifests(self) -> &'static [UnreadableManifest] {
+        match self {
+            ManifestKind::GradleVersionCatalog => GRADLE_BUILD_SCRIPTS,
+            _ => &[],
+        }
+    }
+
     /// Whether a sibling lockfile is read for this manifest kind.
     #[must_use]
     pub fn has_lockfile_support(self) -> bool {
@@ -214,6 +230,52 @@ pub struct UnreadableLockfile {
     pub file_name: &'static str,
     /// Why it cannot be read, phrased for the person who has to fix it.
     pub reason: &'static str,
+}
+
+/// Gradle's build scripts, which are programs rather than data.
+///
+/// Both spellings, because a project may use either and neither is readable. The
+/// catalog that supersedes them sits in a subdirectory, which is why supersession is
+/// a relative path rather than a sibling name.
+const GRADLE_BUILD_SCRIPTS: &[UnreadableManifest] = &[
+    UnreadableManifest {
+        file_name: "build.gradle.kts",
+        reason: "a Gradle build script, which cannot be read without executing it. \
+                 Declare dependencies in `gradle/libs.versions.toml` to have them checked.",
+        superseded_by: &["gradle/libs.versions.toml"],
+    },
+    UnreadableManifest {
+        file_name: "build.gradle",
+        reason: "a Gradle build script, which cannot be read without executing it. \
+                 Declare dependencies in `gradle/libs.versions.toml` to have them checked.",
+        superseded_by: &["gradle/libs.versions.toml"],
+    },
+];
+
+/// Every manifest format recognised but unreadable, whichever ecosystem produces it.
+///
+/// What a directory scan looks for, since it is asking about files on disk rather
+/// than about a manifest kind it has already identified. A kind's own entries are
+/// reachable through [`ManifestKind::unreadable_manifests`]; a second ecosystem
+/// adding a group here must add it to both.
+pub const UNREADABLE_MANIFESTS: &[UnreadableManifest] = GRADLE_BUILD_SCRIPTS;
+
+/// A manifest format we recognise but cannot read, and what to do about it.
+///
+/// The manifest-level counterpart of [`UnreadableLockfile`], with one field it does
+/// not need: an unreadable manifest may have a readable *alternative* elsewhere in
+/// the project, and where that alternative is present nothing was missed and there
+/// is nothing to report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct UnreadableManifest {
+    /// The file name to look for.
+    pub file_name: &'static str,
+    /// Why it cannot be read, phrased for the person who has to fix it.
+    pub reason: &'static str,
+    /// Paths, relative to the directory holding it, whose presence means the
+    /// dependencies are declared somewhere readable after all.
+    pub superseded_by: &'static [&'static str],
 }
 
 /// A lockfile format we can read.
@@ -401,6 +463,27 @@ mod tests {
                 "{content:?}"
             );
         }
+    }
+
+    /// A Gradle build script is a program: the catalog beside it is the only part of
+    /// the build that is data, so the script has to be reported unread.
+    #[test]
+    fn a_gradle_build_script_is_recognised_but_unreadable() {
+        let scripts = ManifestKind::GradleVersionCatalog.unreadable_manifests();
+        let names: Vec<&str> = scripts.iter().map(|m| m.file_name).collect();
+        assert_eq!(names, ["build.gradle.kts", "build.gradle"]);
+        for script in scripts {
+            assert_eq!(script.superseded_by, ["gradle/libs.versions.toml"]);
+            assert!(script.reason.contains("libs.versions.toml"), "{script:?}");
+        }
+        // Every kind's entries have to be findable by a scan that has only a path.
+        for script in scripts {
+            assert!(
+                UNREADABLE_MANIFESTS.contains(script),
+                "{script:?} is unreachable from a directory scan"
+            );
+        }
+        assert!(ManifestKind::CargoToml.unreadable_manifests().is_empty());
     }
 
     #[test]

@@ -52,7 +52,8 @@ pub use check::{CheckError, Checker, CheckerBuilder, ManifestCheck, ProgressEven
 // Manifest discovery (filesystem; shared by every frontend).
 pub use discover::{
     LockfileNotice, find_lockfile, find_manifests, locate_lockfile, lockfile_notices,
-    nearest_workspace_root, workspace_declarations, workspace_root_of, workspace_source,
+    manifest_notices, nearest_workspace_root, workspace_declarations, workspace_root_of,
+    workspace_source,
 };
 
 // Workspace dependency graph (offline; reads Cargo.lock / manifests).

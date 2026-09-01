@@ -32,6 +32,12 @@ pub fn discover_projects(root: &Path, depth: usize) -> (Vec<Project>, Vec<String
     let mut projects = Vec::new();
     let mut notices = Vec::new();
 
+    // A manifest we cannot read yields no project, so nothing later in this loop
+    // could ever mention it.
+    for notice in dependable_fetch::manifest_notices(root, depth) {
+        notices.push(notice.to_string());
+    }
+
     for manifest in find_manifests(root, depth) {
         let Some(kind) = ManifestKind::detect(&manifest) else {
             continue;

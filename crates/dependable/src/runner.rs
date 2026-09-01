@@ -1133,6 +1133,11 @@ fn collect_manifests(
         return Ok(vec![manifest.to_path_buf()]);
     }
     let root = path.map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    // Manifests we recognise but cannot read produce nothing for the walk to return,
+    // so this is the only point at which their absence can be reported at all.
+    for notice in dependable_fetch::manifest_notices(&root, depth) {
+        eprintln!("warning: {notice}");
+    }
     let found = dependable_fetch::find_manifests(&root, depth);
     if globs.is_empty() {
         return Ok(found);
