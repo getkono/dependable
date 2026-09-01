@@ -108,7 +108,8 @@ pub fn build_workspace_graph(
 
     let excluded = excluded_dirs(&root_dir, &root_content);
     let members = collect_members(&root_dir, &excluded);
-    let workspace_names: HashSet<String> = members.iter().map(|(name, _)| name.clone()).collect();
+    let workspace_names: HashSet<String> =
+        members.iter().map(|member| member.name.clone()).collect();
 
     let roots: Vec<String> = match &opts.package {
         Some(pkg) => vec![pkg.clone()],
@@ -166,23 +167,51 @@ fn excluded_dirs(root_dir: &Path, root_content: &str) -> HashSet<PathBuf> {
         .unwrap_or_default()
 }
 
-/// Collect `(package name, manifest content)` for every crate under `root_dir`,
-/// deduplicated by name. A crate is treated as in-workspace iff its
-/// `[package] name` appears here — this sidesteps needing a glob engine.
-fn collect_members(root_dir: &Path, excluded: &HashSet<PathBuf>) -> Vec<(String, String)> {
+/// A crate manifest found under the scan root.
+struct Member {
+    /// The crate's `[package] name`.
+    name: String,
+    /// The manifest's text.
+    content: String,
+    /// Whether the scan root is this crate's **nearest** `[workspace]` ancestor,
+    /// and so whether the root's `[workspace.package]` table governs it.
+    ///
+    /// False for a crate inside a nested, independent workspace — a `fuzz/` or
+    /// `examples/` directory with its own `[workspace]` table. Cargo resolves
+    /// those against *their* root; the scan root has no authority over them.
+    governed_by_root: bool,
+}
+
+/// Collect a [`Member`] for every crate under `root_dir`, deduplicated by name.
+/// A crate is treated as in-workspace iff its `[package] name` appears here —
+/// this sidesteps needing a glob engine.
+fn collect_members(root_dir: &Path, excluded: &HashSet<PathBuf>) -> Vec<Member> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
-    walk_members(root_dir, excluded, &mut seen, &mut out, 64);
+    walk_members(root_dir, root_dir, excluded, &mut seen, &mut out, 64, true);
     out
+}
+
+/// Whether `dir` holds a `Cargo.toml` declaring a `[workspace]` table.
+fn declares_workspace(dir: &Path) -> bool {
+    std::fs::read_to_string(dir.join("Cargo.toml"))
+        .is_ok_and(|content| parse_workspace(&content).is_some())
 }
 
 fn walk_members(
     dir: &Path,
+    root_dir: &Path,
     excluded: &HashSet<PathBuf>,
     seen: &mut HashSet<String>,
-    out: &mut Vec<(String, String)>,
+    out: &mut Vec<Member>,
     depth_left: usize,
+    governed: bool,
 ) {
+    // A nested `[workspace]` is a workspace root in its own right. Cargo already
+    // ignores such a subtree, so nobody lists it in `[workspace] exclude`, and the
+    // walk still descends into it — but the scan root's `[workspace.package]` has
+    // no authority there, so nothing at or below this manifest may inherit from it.
+    let governed = governed && (dir == root_dir || !declares_workspace(dir));
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -197,13 +226,25 @@ fn walk_members(
             {
                 continue;
             }
-            walk_members(&path, excluded, seen, out, depth_left - 1);
+            walk_members(
+                &path,
+                root_dir,
+                excluded,
+                seen,
+                out,
+                depth_left - 1,
+                governed,
+            );
         } else if path.file_name().and_then(|n| n.to_str()) == Some("Cargo.toml")
             && let Ok(content) = std::fs::read_to_string(&path)
             && let Some(name) = parse_package_name(&content)
             && seen.insert(name.clone())
         {
-            out.push((name, content));
+            out.push(Member {
+                name,
+                content,
+                governed_by_root: governed,
+            });
         }
     }
 }
@@ -216,8 +257,13 @@ fn walk_members(
 /// version, whether or not a lockfile exists. Its dependencies are a different
 /// matter: a manifest declares a constraint, not a resolution, so those stay
 /// unknown.
+///
+/// `version.workspace = true` is resolved against the root's `[workspace.package]`
+/// only for a member the root actually governs (see [`Member::governed_by_root`]).
+/// A crate in a nested, independent workspace keeps no version at all: reporting
+/// nothing is honest, where borrowing an unrelated root's number would not be.
 fn shallow_graph(
-    members: &[(String, String)],
+    members: &[Member],
     workspace_names: &HashSet<String>,
     roots: &[String],
     root_content: &str,
@@ -242,9 +288,9 @@ fn shallow_graph(
     let mut external_pkgs: Vec<LockedPackage> = Vec::new();
     let mut external_seen: HashSet<String> = HashSet::new();
 
-    for (name, content) in members {
+    for member in members {
         let mut items = CargoTomlParser
-            .parse(content)
+            .parse(&member.content)
             .map(|m| m.items)
             .unwrap_or_default();
         let _ = resolve_workspace_inheritance(&mut items, &declarations);
@@ -277,12 +323,20 @@ fn shallow_graph(
         // dependency's constraint this is not a range to resolve — it is what
         // this crate is — so leaving it unknown would understate what the
         // manifest already said.
-        let version = parse_project(ManifestKind::CargoToml, content)
+        let version = parse_project(ManifestKind::CargoToml, &member.content)
             .version
             .as_ref()
-            .and_then(|field| field.resolve(&package_defaults, "version"))
+            .and_then(|field| {
+                if member.governed_by_root {
+                    field.resolve(&package_defaults, "version")
+                } else {
+                    // Not this root's crate to resolve — take only what its own
+                    // manifest states outright.
+                    field.literal()
+                }
+            })
             .map(str::to_owned);
-        member_pkgs.push(LockedPackage::new(name.clone(), version, None, deps));
+        member_pkgs.push(LockedPackage::new(member.name.clone(), version, None, deps));
     }
 
     member_pkgs.append(&mut external_pkgs);

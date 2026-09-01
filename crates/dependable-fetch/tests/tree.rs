@@ -310,6 +310,93 @@ version.workspace = true
     assert_eq!(a.version.as_deref(), Some("3.1.4"));
 }
 
+/// The walk descends into a nested, **independent** workspace — a `cargo fuzz` or
+/// `examples/` tree with its own `[workspace]` — because Cargo already ignores such
+/// a subtree, so nobody lists it in `[workspace] exclude`. The outer root has no
+/// authority over those crates, so its `[workspace.package] version` must not be
+/// handed to them: that would turn "no version" into a confidently wrong one.
+/// A version the nested crate states outright is still its own, and still reported.
+#[test]
+fn a_nested_independent_workspace_does_not_inherit_the_outer_roots_version() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    fs::write(
+        dir.join("Cargo.toml"),
+        r#"
+[workspace]
+resolver = "2"
+members = ["crates/a"]
+
+[workspace.package]
+version = "1.0.0"
+"#,
+    )
+    .unwrap();
+    let member = dir.join("crates").join("a");
+    fs::create_dir_all(&member).unwrap();
+    fs::write(
+        member.join("Cargo.toml"),
+        r#"
+[package]
+name = "a"
+version.workspace = true
+"#,
+    )
+    .unwrap();
+    let fuzz = dir.join("fuzz");
+    fs::create_dir_all(&fuzz).unwrap();
+    fs::write(
+        fuzz.join("Cargo.toml"),
+        r#"
+[workspace]
+
+[workspace.package]
+version = "0.0.0"
+
+[package]
+name = "a-fuzz"
+version.workspace = true
+"#,
+    )
+    .unwrap();
+    // A crate below the nested root is out of reach too, however deep.
+    let inner = fuzz.join("crates").join("stated");
+    fs::create_dir_all(&inner).unwrap();
+    fs::write(
+        inner.join("Cargo.toml"),
+        r#"
+[package]
+name = "a-fuzz-stated"
+version = "7.7.7"
+"#,
+    )
+    .unwrap();
+
+    let built = build_workspace_graph(dir, &WorkspaceGraphOptions::default()).unwrap();
+    assert_eq!(built.source, GraphSource::Manifests);
+    let version_of = |name: &str| {
+        built
+            .graph
+            .nodes()
+            .iter()
+            .find(|n| n.name == name)
+            .unwrap_or_else(|| panic!("a node for {name}"))
+            .version
+            .clone()
+    };
+    assert_eq!(version_of("a").as_deref(), Some("1.0.0"));
+    assert_eq!(
+        version_of("a-fuzz"),
+        None,
+        "the outer root does not govern a nested workspace's crate"
+    );
+    assert_eq!(
+        version_of("a-fuzz-stated").as_deref(),
+        Some("7.7.7"),
+        "but a version the crate states outright is still its own"
+    );
+}
+
 /// Without a lockfile the graph is built from manifests alone, and a member's
 /// `dep.workspace = true` says nothing about what the crate *is*. The root's declaration
 /// does, and the root is already read here — so `centrally_declared` is classified from
