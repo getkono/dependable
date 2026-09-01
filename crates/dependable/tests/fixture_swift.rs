@@ -241,6 +241,68 @@ fn list_surfaces_the_pins_a_package_swift_never_declared() {
     assert!(stdout.contains("2.65.0"), "stdout: {stdout}");
 }
 
+/// `--no-lock-file` is documented as "do not report locked versions" — it suppresses
+/// an *annotation*. A `Package.resolved` is not an annotation: it is the only
+/// dependency list a Swift project has. Honouring the flag there turned
+/// `list --no-lock-file` into a silent assertion that the project depends on nothing,
+/// with no warning anywhere, which is the same inversion issue #85 exists to prevent.
+#[test]
+fn no_lock_file_does_not_empty_a_swift_dependency_list() {
+    let manifest = fixture("sample-swift/Package.swift");
+    let output = run(&[
+        "list",
+        "--manifest",
+        manifest.to_str().unwrap(),
+        "--no-lock-file",
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert!(
+        stdout.contains("github.com/apple/swift-nio"),
+        "the pins are the dependency list, not an annotation on one; stdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("(0 dependencies)"),
+        "a Swift project must never be listed as depending on nothing; stdout: {stdout}"
+    );
+}
+
+/// The other half of the same flag: for a lockfile that only *annotates* a list the
+/// manifest already produced, `--no-lock-file` must still suppress it. Fixing Swift
+/// by ignoring the flag everywhere would have taken this with it.
+#[test]
+fn no_lock_file_still_suppresses_an_annotating_lockfile() {
+    let manifest = fixture("sample-rust/Cargo.toml");
+    let with = run(&[
+        "list",
+        "--manifest",
+        manifest.to_str().unwrap(),
+        "--format",
+        "json",
+    ]);
+    let without = run(&[
+        "list",
+        "--manifest",
+        manifest.to_str().unwrap(),
+        "--format",
+        "json",
+        "--no-lock-file",
+    ]);
+    let with = String::from_utf8_lossy(&with.stdout).into_owned();
+    let without = String::from_utf8_lossy(&without.stdout).into_owned();
+
+    assert!(
+        with.contains("Cargo.lock") && with.contains("\"locked\": \"1.0.100\""),
+        "the fixture must have a lockfile to suppress; stdout: {with}"
+    );
+    assert!(
+        !without.contains("Cargo.lock") && !without.contains("\"locked\": \"1.0.100\""),
+        "`--no-lock-file` must still ignore an annotating lockfile; stdout: {without}"
+    );
+}
+
 /// Switching Swift off has to switch it off. Without the checker-level opt-in this
 /// key would parse, validate, and do nothing.
 #[test]
@@ -503,4 +565,132 @@ fn a_truncated_package_resolved_is_reported_unread_rather_than_read_short() {
             "{command:?}: and the file must be reported unread; stderr: {stderr}"
         );
     }
+}
+
+/// The machine-readable twin of the exit-code inversion, and the reason it matters:
+/// a CI job that parses `--format json` never sees an exit code per manifest.
+///
+/// Two Swift projects — one with no `Package.resolved` at all, one with a genuinely
+/// empty pin set — must not produce the same document. Every status count is a tally
+/// of rows that *were* read, so both are zero either way; `manifests_unread` is the
+/// only field that separates "we looked and there is nothing" from "we never looked".
+#[test]
+fn json_distinguishes_an_unread_dependency_list_from_an_empty_one() {
+    let unread = scratch("swift_json_unread");
+    std::fs::copy(
+        fixture("sample-swift/Package.swift"),
+        unread.join("Package.swift"),
+    )
+    .unwrap();
+
+    let empty = scratch("swift_json_empty");
+    std::fs::copy(
+        fixture("sample-swift/Package.swift"),
+        empty.join("Package.swift"),
+    )
+    .unwrap();
+    std::fs::write(empty.join("Package.resolved"), r#"{"pins":[],"version":2}"#).unwrap();
+
+    let document = |dir: &Path| {
+        let output = run(&[
+            "check",
+            "--manifest",
+            dir.join("Package.swift").to_str().unwrap(),
+            "--no-vuln",
+            "--format",
+            "json",
+        ]);
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).expect("a JSON document")
+    };
+
+    let unread = document(&unread);
+    let empty = document(&empty);
+
+    assert_ne!(
+        unread, empty,
+        "a project nothing was read from must not serialize as a clean one"
+    );
+    assert_eq!(unread["summary"]["manifests_unread"], 1);
+    assert_eq!(empty["summary"]["manifests_unread"], 0);
+    // The pinned shape is unchanged: every documented key keeps its name and value,
+    // so a consumer that does not know about the new one is unaffected.
+    for key in [
+        "total",
+        "vulnerable",
+        "error",
+        "undetermined",
+        "up_to_date",
+        "outdated",
+    ] {
+        assert_eq!(unread["summary"][key], 0, "{key}");
+        assert_eq!(empty["summary"][key], 0, "{key}");
+    }
+    assert_eq!(unread["results"].as_array().unwrap().len(), 0);
+}
+
+/// The same distinction in SARIF, which has no summary object to carry a counter:
+/// the unread manifest gets a `DEP003` result naming it, and the empty one gets the
+/// empty `results` array it has earned.
+#[test]
+fn sarif_reports_an_unread_dependency_list_as_a_finding() {
+    let unread = scratch("swift_sarif_unread");
+    std::fs::copy(
+        fixture("sample-swift/Package.swift"),
+        unread.join("Package.swift"),
+    )
+    .unwrap();
+
+    let empty = scratch("swift_sarif_empty");
+    std::fs::copy(
+        fixture("sample-swift/Package.swift"),
+        empty.join("Package.swift"),
+    )
+    .unwrap();
+    std::fs::write(empty.join("Package.resolved"), r#"{"pins":[],"version":2}"#).unwrap();
+
+    let results = |dir: &Path| {
+        let output = run(&[
+            "check",
+            "--manifest",
+            dir.join("Package.swift").to_str().unwrap(),
+            "--no-vuln",
+            "--format",
+            "sarif",
+        ]);
+        let log: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("a SARIF document");
+        log["runs"][0]["results"].as_array().cloned().unwrap()
+    };
+
+    let unread = results(&unread);
+    let empty = results(&empty);
+
+    assert_eq!(
+        empty.len(),
+        0,
+        "a resolved project with no pins genuinely has no findings"
+    );
+    assert_eq!(
+        unread.len(),
+        1,
+        "an unread dependency list is a finding of its own: {unread:?}"
+    );
+    assert_eq!(unread[0]["ruleId"], "DEP003");
+    assert_eq!(unread[0]["level"], "warning");
+    assert!(
+        unread[0]["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
+            .as_str()
+            .expect("a uri")
+            .ends_with("Package.swift"),
+        "the finding must name the manifest it is about: {unread:?}"
+    );
+    // No package was read, so none is named — and `region` is absent because the
+    // missing information is a file that is not there, not a line in this one.
+    assert!(unread[0]["properties"].get("package").is_none());
+    assert_eq!(unread[0]["properties"]["status"], "unread");
+    assert!(
+        unread[0]["locations"][0]["physicalLocation"]
+            .get("region")
+            .is_none()
+    );
 }
