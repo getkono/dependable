@@ -124,15 +124,7 @@ pub struct ManifestCheck {
 impl ManifestCheck {
     /// Results that represent an available upgrade (patch/update/outdated/vulnerable).
     pub fn outdated(&self) -> impl Iterator<Item = &CheckResult> {
-        self.results.iter().filter(|r| {
-            matches!(
-                r.status,
-                DependencyStatus::PatchAvailable
-                    | DependencyStatus::UpdateAvailable
-                    | DependencyStatus::Outdated
-                    | DependencyStatus::Vulnerable
-            )
-        })
+        self.results.iter().filter(|r| r.status.has_update())
     }
 
     /// Results with known advisories on the current version.

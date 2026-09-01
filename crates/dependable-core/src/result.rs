@@ -140,6 +140,24 @@ impl DependencyStatus {
         }
     }
 
+    /// Whether a newer release exists that this dependency could move to.
+    ///
+    /// The one predicate behind every "there is something to do here" decision:
+    /// which rows `fix` plans a rewrite for, and which of the rows it cannot
+    /// rewrite are worth saying so about. Those two answers must be the same set
+    /// or the two commands contradict each other, which is exactly the defect
+    /// this replaced three hand-written copies of the same `matches!` to prevent.
+    ///
+    /// [`Vulnerable`](Self::Vulnerable) counts: a vulnerable-but-current
+    /// dependency is the one most worth upgrading.
+    #[must_use]
+    pub fn has_update(&self) -> bool {
+        matches!(
+            self,
+            Self::PatchAvailable | Self::UpdateAvailable | Self::Outdated | Self::Vulnerable
+        )
+    }
+
     /// A stable uppercase token for machine-readable output.
     #[must_use]
     pub fn token(&self) -> &'static str {
