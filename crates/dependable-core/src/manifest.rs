@@ -48,6 +48,7 @@ pub enum ManifestKind {
     MixExs,
     Csproj,
     GradleVersionCatalog,
+    PomXml,
 }
 
 impl ManifestKind {
@@ -65,7 +66,7 @@ impl ManifestKind {
             ManifestKind::PubspecYaml => Ecosystem::Dart,
             ManifestKind::MixExs => Ecosystem::Elixir,
             ManifestKind::Csproj => Ecosystem::CSharp,
-            ManifestKind::GradleVersionCatalog => Ecosystem::Jvm,
+            ManifestKind::GradleVersionCatalog | ManifestKind::PomXml => Ecosystem::Jvm,
         }
     }
 
@@ -179,6 +180,7 @@ impl ManifestKind {
             "pubspec.yaml" => ManifestKind::PubspecYaml,
             "mix.exs" => ManifestKind::MixExs,
             "Directory.Packages.props" => ManifestKind::Csproj,
+            "pom.xml" => ManifestKind::PomXml,
             // Gradle reads every `*.versions.toml` under `gradle/` as a catalog;
             // `libs` is only the conventional name of the default one.
             _ if name.ends_with(".versions.toml") => ManifestKind::GradleVersionCatalog,
@@ -373,6 +375,7 @@ mod tests {
                 "gradle/deps.versions.toml",
                 ManifestKind::GradleVersionCatalog,
             ),
+            ("services/api/pom.xml", ManifestKind::PomXml),
         ];
         for (path, expected) in cases {
             assert_eq!(
@@ -435,6 +438,7 @@ mod tests {
             ManifestKind::MixExs,
             ManifestKind::Csproj,
             ManifestKind::GradleVersionCatalog,
+            ManifestKind::PomXml,
         ] {
             assert!(kind.workspace_roots().is_none(), "{kind:?}");
             assert!(
@@ -484,6 +488,9 @@ mod tests {
             );
         }
         assert!(ManifestKind::CargoToml.unreadable_manifests().is_empty());
+        // A `pom.xml` is data and reads fine; what it cannot resolve is reported
+        // entry by entry, so there is nothing here to declare unreadable.
+        assert!(ManifestKind::PomXml.unreadable_manifests().is_empty());
     }
 
     #[test]
