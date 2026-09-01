@@ -14,7 +14,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use dependable_core::{
     CheckResult, DependencyStatus, Ecosystem, Evaluation, Item, LockfileKind, ManifestKind,
     PackageSource, UnstableFilter, apply_lockfile, check_version, lockfile_items, parse,
-    parse_lockfile_kind, resolve_workspace_inheritance, to_semver_constraint,
+    parse_lockfile_kind, resolve_workspace_inheritance, swift_package_name_variants,
+    to_semver_constraint,
 };
 use futures::stream::{self, StreamExt};
 use semver::Version as SemverVersion;
@@ -362,7 +363,11 @@ impl Checker {
             .iter()
             .enumerate()
             .filter(|(_, result)| !result.current_vulnerabilities.is_empty())
-            .filter_map(|(i, result)| osv_query_for(result, ecosystem).map(|query| (i, query)))
+            .flat_map(|(i, result)| {
+                osv_queries_for(result, ecosystem)
+                    .into_iter()
+                    .map(move |query| (i, query))
+            })
             .collect();
         if pending.is_empty() {
             return Ok(());
@@ -380,7 +385,18 @@ impl Checker {
         let mut failure: Option<FetchError> = None;
         for (index, outcome) in fetched {
             match outcome {
-                Ok(advisories) => check.results[index].advisories = advisories,
+                // Appended and deduplicated by ID rather than assigned: a result
+                // asked about under two spellings of its name is enriched from
+                // both, and re-enriching a check that already holds its
+                // advisories stays a no-op.
+                Ok(advisories) => {
+                    let slot = &mut check.results[index].advisories;
+                    for advisory in advisories {
+                        if !slot.iter().any(|held| held.id == advisory.id) {
+                            slot.push(advisory);
+                        }
+                    }
+                }
                 Err(e) => failure = failure.or(Some(e)),
             }
         }
@@ -613,8 +629,12 @@ impl Checker {
         if let Some(warning) = deferred_versions(&parsed.items, kind) {
             warnings.push(warning);
         }
-        if let Some(warning) = currency_is_unknowable(ecosystem, &parsed.items, self.osv.is_some())
-        {
+        if let Some(warning) = currency_is_unknowable(
+            ecosystem,
+            &parsed.items,
+            self.osv.is_some(),
+            fetcher.is_some(),
+        ) {
             warnings.push(warning);
         }
 
@@ -880,15 +900,32 @@ fn deferred_versions(items: &[Item], kind: ManifestKind) -> Option<String> {
 /// Say, once per manifest, that this ecosystem publishes no registry — so nothing
 /// here was, or could be, compared against a newer version.
 ///
-/// Emitted for **every** manifest of such an ecosystem, including one that declares
-/// nothing, and deliberately conditioned on nothing else. The hazard is precise: a
+/// Emitted for **every** manifest of such an ecosystem that was in fact checked
+/// without a fetcher, including one that declares nothing. The hazard is precise: a
 /// Swift run that turns up no advisories looks exactly like a clean, up-to-date one,
 /// and a reader who is not told otherwise will read it that way.
 /// [`DependencyStatus::Undetermined`] says so per row, in a table nobody is obliged
 /// to read column by column; this says it in the same place, and as loudly as, the
 /// unreadable-lockfile notices.
-fn currency_is_unknowable(ecosystem: Ecosystem, items: &[Item], scanned: bool) -> Option<String> {
-    if ecosystem.has_registry() {
+///
+/// `has_fetcher` is the second half of the condition rather than a detail: a library
+/// consumer may register a fetcher for an ecosystem this build ships no registry for
+/// — an SE-0292 Swift registry is the obvious candidate — and that run produces real
+/// `UpToDate` rows. Telling its reader "nothing here can be checked" would then be
+/// the same kind of false statement in the other direction.
+///
+/// The count is of items that *exist*, and says nothing about whether the list they
+/// came from was ever read. Where it is zero the wording says only that nothing was
+/// found to check: "the 0 dependencies here" would turn "we could not look" into a
+/// claim about the project, which is the inversion this whole notice exists to
+/// prevent. The lockfile notice names the cause.
+fn currency_is_unknowable(
+    ecosystem: Ecosystem,
+    items: &[Item],
+    scanned: bool,
+    has_fetcher: bool,
+) -> Option<String> {
+    if ecosystem.has_registry() || has_fetcher {
         return None;
     }
     let name = ecosystem.display_name();
@@ -896,7 +933,9 @@ fn currency_is_unknowable(ecosystem: Ecosystem, items: &[Item], scanned: bool) -
     let plural = if count == 1 { "y" } else { "ies" };
     // With scanning off there is no verdict left at all, and saying "scanned for
     // vulnerabilities only" would name a check that did not run.
-    let outcome = if scanned {
+    let outcome = if count == 0 {
+        "no dependency with a version to check was found here at all".to_owned()
+    } else if scanned {
         format!(
             "{count} dependenc{plural} scanned for known vulnerabilities only. A run that \
              reports none is not a run that found them up to date"
@@ -1086,20 +1125,40 @@ fn same_flavour_only(
 /// actually install. Shared by the batch scan and the advisory-enrichment pass so
 /// the two produce identical cache keys, and so the advisories describe the exact
 /// version that was flagged.
-fn osv_query_for(result: &CheckResult, ecosystem: Ecosystem) -> Option<OsvQuery> {
+fn osv_queries_for(result: &CheckResult, ecosystem: Ecosystem) -> Vec<OsvQuery> {
     if !result.item.is_checkable() || matches!(result.status, DependencyStatus::Error(_)) {
-        return None;
+        return Vec::new();
     }
-    let version = result
+    let Some(version) = result
         .item
         .locked_version
         .clone()
-        .or_else(|| result.latest_compatible.clone())?;
-    Some(OsvQuery {
+        .or_else(|| result.latest_compatible.clone())
+    else {
+        return Vec::new();
+    };
+    let query = |name: String| OsvQuery {
         ecosystem: ecosystem.osv_name().to_string(),
-        name: result.item.name.clone(),
-        version,
-    })
+        name,
+        version: version.clone(),
+    };
+    let name = result.item.name.clone();
+    // Swift is the one ecosystem whose OSV key is a repository URL rather than a
+    // registry name. OSV matches those byte for byte while a git forge treats the
+    // path case-insensitively, so the same repository arrives under whichever
+    // spelling someone pasted into `Package.swift`, and a mismatch is silent — a
+    // vulnerable package simply reports clean. Asking the all-lowercase spelling
+    // too costs one batch entry, only for a name that is not already lowercase,
+    // and can add only a true match: OSV answers about the package it was asked
+    // about or not at all. Every other ecosystem asks exactly one question, as
+    // before.
+    let extra = match ecosystem {
+        Ecosystem::Swift => swift_package_name_variants(&name),
+        _ => Vec::new(),
+    };
+    std::iter::once(query(name))
+        .chain(extra.into_iter().map(query))
+        .collect()
 }
 
 /// Query OSV for the current version of each checkable dependency and flip its
@@ -1113,7 +1172,7 @@ async fn scan_vulnerabilities(
     let mut queries = Vec::new();
     let mut index_for = Vec::new();
     for (i, result) in results.iter().enumerate() {
-        if let Some(query) = osv_query_for(result, ecosystem) {
+        for query in osv_queries_for(result, ecosystem) {
             queries.push(query);
             index_for.push(i);
         }
@@ -1127,7 +1186,16 @@ async fn scan_vulnerabilities(
         if let Some(ids) = osv_results.get(query_idx)
             && !ids.is_empty()
         {
-            results[result_idx].current_vulnerabilities = ids.clone();
+            // Appended rather than assigned, because one result may have been
+            // asked about under more than one spelling of its name. Every
+            // ecosystem but Swift sends exactly one query per result, so this
+            // still ends up as that query's ID list, in its order.
+            let found = &mut results[result_idx].current_vulnerabilities;
+            for id in ids {
+                if !found.contains(id) {
+                    found.push(id.clone());
+                }
+            }
             results[result_idx].status = DependencyStatus::Vulnerable;
         }
     }
@@ -1603,6 +1671,62 @@ mod tests {
         );
     }
 
+    /// A fetcher registered for an ecosystem this build ships no registry for.
+    /// SE-0292 gives SwiftPM a package registry, so a library consumer wiring one
+    /// up is the plausible case, not a contrived one.
+    struct StubFetcher;
+
+    impl RegistryFetcher for StubFetcher {
+        fn fetch_versions<'a>(
+            &'a self,
+            _name: &'a str,
+        ) -> futures::future::BoxFuture<'a, Result<crate::registries::FetchedVersions, FetchError>>
+        {
+            use futures::FutureExt as _;
+            futures::future::ready(Ok(crate::registries::FetchedVersions::new(vec![
+                "2.65.0".to_string(),
+            ])))
+            .boxed()
+        }
+    }
+
+    /// The warning is about this run, not about the ecosystem in the abstract. A
+    /// caller that registered a fetcher for Swift gets real `UpToDate` rows, and
+    /// telling its reader "nothing here can be checked for a newer version" would
+    /// be the same false statement in the other direction — a claim about what the
+    /// run did, contradicted by the table beside it.
+    #[tokio::test]
+    async fn a_registryless_ecosystem_with_a_fetcher_is_not_told_it_cannot_be_checked() {
+        let checker = Checker::builder()
+            .rust_registry("http://127.0.0.1:1".to_string(), None)
+            .registry(Ecosystem::Swift, Arc::new(StubFetcher))
+            .vulnerabilities(false)
+            .disk_cache(false)
+            .build()
+            .expect("a checker builds without a network");
+
+        let check = checker
+            .check_manifest(ManifestKind::PackageSwift, "", Some(PACKAGE_RESOLVED))
+            .await
+            .expect("checked");
+        assert!(
+            !check
+                .warnings
+                .iter()
+                .any(|w| w.contains("no package registry")),
+            "a run that fetched must not say it could not: {:?}",
+            check.warnings
+        );
+        assert!(
+            check
+                .results
+                .iter()
+                .any(|r| matches!(r.status, DependencyStatus::UpToDate)),
+            "and it really did fetch: {:?}",
+            check.results
+        );
+    }
+
     /// Two ways to have no fetcher, two different answers. This is the pair a
     /// reviewer should attack first.
     #[tokio::test]
@@ -1648,6 +1772,45 @@ mod tests {
         );
     }
 
+    /// The one query every ecosystem but Swift ever asks.
+    fn only_query(result: &CheckResult, ecosystem: Ecosystem) -> OsvQuery {
+        let mut queries = osv_queries_for(result, ecosystem);
+        assert_eq!(queries.len(), 1, "one query per result");
+        queries.remove(0)
+    }
+
+    /// A Swift pin whose repository path is not lowercase is asked about under both
+    /// spellings: OSV matches its `SwiftURL` keys byte for byte while a git forge
+    /// does not, so the same repository circulates under either, and a miss here is
+    /// silent — a vulnerable package reported clean. Every other ecosystem, and a
+    /// name that is already lowercase, still asks exactly one question.
+    #[test]
+    fn a_mixed_case_swift_pin_is_asked_about_under_both_spellings() {
+        let mut pin = registry_item();
+        pin.name = "github.com/weichsel/ZIPFoundation".to_string();
+        pin.locked_version = Some("0.9.16".to_string());
+        let result = CheckResult::new(pin, DependencyStatus::Undetermined);
+
+        let names: Vec<String> = osv_queries_for(&result, Ecosystem::Swift)
+            .into_iter()
+            .map(|query| query.name)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "github.com/weichsel/ZIPFoundation",
+                "github.com/weichsel/zipfoundation"
+            ],
+            "the written spelling first, then the lowercase one"
+        );
+
+        let mut lower = registry_item();
+        lower.name = "github.com/vapor/vapor".to_string();
+        lower.locked_version = Some("4.83.0".to_string());
+        let lower = CheckResult::new(lower, DependencyStatus::Undetermined);
+        assert_eq!(osv_queries_for(&lower, Ecosystem::Swift).len(), 1);
+    }
+
     #[test]
     fn a_locked_version_outranks_the_best_compatible_one() {
         let mut declared = registry_item();
@@ -1655,7 +1818,7 @@ mod tests {
         let mut result = CheckResult::new(declared, DependencyStatus::UpToDate);
         result.latest_compatible = Some("0.2.9".to_string());
 
-        let query = osv_query_for(&result, Ecosystem::Rust).expect("a query");
+        let query = only_query(&result, Ecosystem::Rust);
         assert_eq!(query.ecosystem, "crates.io");
         assert_eq!(query.name, "time");
         assert_eq!(query.version, "0.2.7");
@@ -1665,14 +1828,14 @@ mod tests {
     fn an_unlocked_dependency_is_queried_at_its_best_compatible_version() {
         let mut result = CheckResult::new(registry_item(), DependencyStatus::UpToDate);
         result.latest_compatible = Some("0.2.9".to_string());
-        let query = osv_query_for(&result, Ecosystem::Rust).expect("a query");
+        let query = only_query(&result, Ecosystem::Rust);
         assert_eq!(query.version, "0.2.9");
     }
 
     #[test]
     fn nothing_is_queried_without_a_version() {
         let result = CheckResult::new(registry_item(), DependencyStatus::UpToDate);
-        assert!(osv_query_for(&result, Ecosystem::Rust).is_none());
+        assert!(osv_queries_for(&result, Ecosystem::Rust).is_empty());
     }
 
     #[test]
@@ -1680,7 +1843,7 @@ mod tests {
         let declared = item("[dependencies]\nlocal = { path = \"../local\" }\n");
         assert!(!declared.is_checkable());
         let result = CheckResult::new(declared, DependencyStatus::Local);
-        assert!(osv_query_for(&result, Ecosystem::Rust).is_none());
+        assert!(osv_queries_for(&result, Ecosystem::Rust).is_empty());
     }
 
     #[test]
@@ -1691,7 +1854,7 @@ mod tests {
             declared,
             DependencyStatus::Error("registry unreachable".to_string()),
         );
-        assert!(osv_query_for(&result, Ecosystem::Rust).is_none());
+        assert!(osv_queries_for(&result, Ecosystem::Rust).is_empty());
     }
 
     /// The single item declared by `manifest`, parsed as `kind`.
