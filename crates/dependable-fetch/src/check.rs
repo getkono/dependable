@@ -12,11 +12,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use dependable_core::{
-    CheckResult, DependencyStatus, Ecosystem, Item, LockfileKind, ManifestKind, PackageSource,
-    UnstableFilter, apply_lockfile, check_version, parse, parse_lockfile_kind,
+    CheckResult, DependencyStatus, Ecosystem, Evaluation, Item, LockfileKind, ManifestKind,
+    PackageSource, UnstableFilter, apply_lockfile, check_version, parse, parse_lockfile_kind,
     resolve_workspace_inheritance, to_semver_constraint,
 };
 use futures::stream::{self, StreamExt};
+use semver::Version as SemverVersion;
 
 use crate::build_client;
 use crate::cache::{
@@ -815,10 +816,15 @@ fn evaluate_item(
             // Filter on the raw (registry-native) version strings so pre-release
             // detection sees real markers, then translate to semver for comparison.
             let filtered = unstable.filter(versions, current, ecosystem);
-            let candidates = to_semver_versions(&filtered, ecosystem);
+            let filtered = same_flavour_only(&filtered, current, ecosystem);
+            let translated = to_semver_versions(&filtered, ecosystem);
+            let candidates: Vec<String> = translated
+                .iter()
+                .map(|(semver, _)| semver.clone())
+                .collect();
             let constraint = to_semver_constraint(&item.version_constraint, ecosystem);
             let eval = check_version(&constraint, &candidates, item.locked_version.as_deref());
-            CheckResult::from_evaluation(item.clone(), eval)
+            CheckResult::from_evaluation(item.clone(), in_native_versions(eval, &translated))
         }
         Some(Err(e)) => CheckResult::new(item.clone(), DependencyStatus::Error(e.clone())),
         None => CheckResult::new(
@@ -828,24 +834,98 @@ fn evaluate_item(
     }
 }
 
-/// Translate registry-native version strings into semver for comparison. Python
-/// (PEP 440), C# (NuGet), and the JVM (Maven) need conversion; other ecosystems
-/// already use semver.
-fn to_semver_versions(versions: &[String], ecosystem: Ecosystem) -> Vec<String> {
-    match ecosystem {
-        Ecosystem::Python => versions
-            .iter()
-            .filter_map(|v| dependable_core::semver::python::pep440_to_semver(v))
-            .collect(),
-        Ecosystem::CSharp => versions
-            .iter()
-            .filter_map(|v| dependable_core::semver::nuget::nuget_to_semver(v))
-            .collect(),
-        Ecosystem::Jvm => versions
-            .iter()
-            .filter_map(|v| dependable_core::semver::maven::maven_to_semver(v))
-            .collect(),
-        _ => versions.to_vec(),
+/// Translate registry-native version strings into semver for comparison, keeping
+/// each translation paired with the string the registry actually publishes.
+///
+/// Python (PEP 440), C# (NuGet), and the JVM (Maven) all spell versions in a
+/// dialect semver cannot parse, so comparison needs a translation — but the
+/// translation is **lossy in the direction that matters for reporting**:
+/// `6.4.4.Final`, `5.3.9.RELEASE`, and `9.4.51.v20230217` translate to `6.4.4`,
+/// `5.3.9`, and `9.4.51-v.20230217`, and none of those names a published artifact.
+/// Reporting the translated string — or splicing it into a manifest with `--fix` —
+/// hands the user a version that does not exist. So the pairing is carried through
+/// evaluation and [`in_native_versions`] puts the native spelling back.
+///
+/// The result keeps the input order, which is the registry's newest-first order
+/// ([`crate::registries::FetchedVersions`]).
+fn to_semver_versions(versions: &[String], ecosystem: Ecosystem) -> Vec<(String, String)> {
+    let translate: fn(&str) -> Option<String> = match ecosystem {
+        Ecosystem::Python => dependable_core::semver::python::pep440_to_semver,
+        Ecosystem::CSharp => dependable_core::semver::nuget::nuget_to_semver,
+        Ecosystem::Jvm => dependable_core::semver::maven::maven_to_semver,
+        // Every other ecosystem publishes semver already, so the native string is
+        // its own translation.
+        _ => return versions.iter().map(|v| (v.clone(), v.clone())).collect(),
+    };
+    versions
+        .iter()
+        .filter_map(|v| translate(v).map(|semver| (semver, v.clone())))
+        .collect()
+}
+
+/// Restore the registry-native spelling of an evaluation's reported versions.
+///
+/// `check_version` compares semver and reports semver, so its `latest_compatible`
+/// / `latest_available` are translated strings. Each is matched back to the native
+/// string it came from by *parsed* semver equality rather than by text, because a
+/// version that round-trips through [`semver::Version`] can come back spelled
+/// differently from the string that was handed in.
+///
+/// Several natives can translate to one semver — Maven reads `1.0` and `1.0.0` as
+/// the same version, so both translate to `1.0.0`. The first match in the list
+/// wins, and the list is the registry's newest-first order, so the winner is the
+/// newest native spelling of that version. A translated version with no surviving
+/// native (which nothing produces today) is left as it was rather than dropped.
+fn in_native_versions(mut eval: Evaluation, translated: &[(String, String)]) -> Evaluation {
+    eval.latest_compatible = eval
+        .latest_compatible
+        .map(|v| native_for(&v, translated).unwrap_or(v));
+    eval.latest_available = eval
+        .latest_available
+        .map(|v| native_for(&v, translated).unwrap_or(v));
+    eval
+}
+
+/// The native string whose translation is `semver`, or `None` when none matches.
+fn native_for(semver: &str, translated: &[(String, String)]) -> Option<String> {
+    let wanted = SemverVersion::parse(semver).ok()?;
+    translated
+        .iter()
+        .find(|(candidate, _)| SemverVersion::parse(candidate).is_ok_and(|parsed| parsed == wanted))
+        .map(|(_, native)| native.clone())
+}
+
+/// Keep only the candidates in the same Maven *flavour* as the current version.
+///
+/// A flavour is a build variant published under the same version number —
+/// `com.google.guava:guava` ships `32.1.3-android` beside `32.1.3-jre` — and it is
+/// not a version at all: it selects which artifact, not which release. Maven's own
+/// order compares the numbers first, so `33.7.1-jre` outranks `32.1.3-android` and
+/// an Android project offered "the latest version" is quietly moved onto the JRE
+/// jar, which is the classic desugaring break. Versions in a different flavour are
+/// therefore not candidates for this dependency at all.
+///
+/// Filtering to nothing means the current flavour has no published versions, which
+/// is not an answer anyone can use; the unfiltered list is returned instead, the
+/// same fallback [`UnstableFilter::filter`] makes.
+fn same_flavour_only(
+    versions: &[String],
+    current: Option<&str>,
+    ecosystem: Ecosystem,
+) -> Vec<String> {
+    if ecosystem != Ecosystem::Jvm {
+        return versions.to_vec();
+    }
+    let wanted = current.and_then(dependable_core::semver::maven::flavour);
+    let kept: Vec<String> = versions
+        .iter()
+        .filter(|v| dependable_core::semver::maven::flavour(v) == wanted)
+        .cloned()
+        .collect();
+    if kept.is_empty() {
+        versions.to_vec()
+    } else {
+        kept
     }
 }
 
@@ -1220,5 +1300,227 @@ mod tests {
             DependencyStatus::Error("registry unreachable".to_string()),
         );
         assert!(osv_query_for(&result, Ecosystem::Rust).is_none());
+    }
+
+    /// The single item declared by `manifest`, parsed as `kind`.
+    fn item_of(kind: ManifestKind, manifest: &str) -> Item {
+        parse(kind, manifest)
+            .expect("fixture should parse")
+            .items
+            .into_iter()
+            .next()
+            .expect("fixture should declare a dependency")
+    }
+
+    /// A Maven coordinate declared in a Gradle catalog at `version`.
+    fn jvm_item(coordinate: &str, version: &str) -> Item {
+        item_of(
+            ManifestKind::GradleVersionCatalog,
+            &format!("[libraries]\nlib = \"{coordinate}:{version}\"\n"),
+        )
+    }
+
+    /// Evaluate `item` against `versions` (newest-first, as a registry returns them).
+    fn evaluated(
+        item: &Item,
+        versions: &[&str],
+        ecosystem: Ecosystem,
+        unstable: UnstableFilter,
+    ) -> CheckResult {
+        let mut fetched: FetchedMap = HashMap::new();
+        fetched.insert(
+            item.name.clone(),
+            Ok(versions.iter().map(|v| (*v).to_string()).collect()),
+        );
+        evaluate_item(item, &fetched, ecosystem, unstable)
+    }
+
+    /// Every version this tool reports has to be one the registry publishes. The
+    /// semver translation is for comparison only: `6.4.4.Final` compares as
+    /// `6.4.4`, but `6.4.4` names no artifact, and `--fix` splices whatever is
+    /// reported straight into the manifest.
+    #[test]
+    fn a_reported_jvm_version_is_one_maven_central_publishes() {
+        // Reproduced live against Maven Central before this was fixed: each of
+        // these was reported (and written by `--fix`) as its translation.
+        for (coordinate, declared, available, expected_latest) in [
+            (
+                "org.hibernate.orm:hibernate-core",
+                "6.4.4.Final",
+                ["6.6.0.Final", "6.4.4.Final"],
+                "6.6.0.Final",
+            ),
+            (
+                "org.springframework:spring-core",
+                "5.3.9.RELEASE",
+                ["5.3.39.RELEASE", "5.3.9.RELEASE"],
+                "5.3.39.RELEASE",
+            ),
+            (
+                "org.eclipse.jetty:jetty-server",
+                "9.4.51.v20230217",
+                ["9.4.53.v20231009", "9.4.51.v20230217"],
+                "9.4.53.v20231009",
+            ),
+        ] {
+            let item = jvm_item(coordinate, declared);
+            let result = evaluated(&item, &available, Ecosystem::Jvm, UnstableFilter::Exclude);
+            assert_eq!(
+                result.latest_available.as_deref(),
+                Some(expected_latest),
+                "{coordinate}"
+            );
+            // The constraint is exact, so the best compatible version is the
+            // declared one — spelled the way the catalog spells it, or `--fix`
+            // would see a change where there is none and rewrite the line.
+            assert_eq!(
+                result.latest_compatible.as_deref(),
+                Some(declared),
+                "{coordinate}"
+            );
+        }
+    }
+
+    /// The same loss, in the two other ecosystems that translate: NuGet drops a
+    /// fourth segment and PEP 440 respells a pre-release, so both would report a
+    /// version their registry has never heard of.
+    #[test]
+    fn a_reported_version_keeps_its_registry_spelling_outside_the_jvm() {
+        let nuget = item_of(
+            ManifestKind::Csproj,
+            "<Project><ItemGroup>\
+             <PackageReference Include=\"Newtonsoft.Json\" Version=\"13.0.1\" />\
+             </ItemGroup></Project>",
+        );
+        let result = evaluated(
+            &nuget,
+            &["13.0.3.1", "13.0.1"],
+            Ecosystem::CSharp,
+            UnstableFilter::Exclude,
+        );
+        assert_eq!(
+            result.latest_available.as_deref(),
+            Some("13.0.3.1"),
+            "the revision segment is dropped by the translation, not by NuGet"
+        );
+
+        let python = item_of(ManifestKind::RequirementsTxt, "requests==2.31.0\n");
+        let result = evaluated(
+            &python,
+            &["3.0.0b1", "2.31.0"],
+            Ecosystem::Python,
+            UnstableFilter::IncludeAlways,
+        );
+        assert_eq!(
+            result.latest_available.as_deref(),
+            Some("3.0.0b1"),
+            "PEP 440 spells this `3.0.0b1`; semver spells it `3.0.0-beta.1`"
+        );
+    }
+
+    /// Maven reads `1.0` and `1.0.0` as one version, so two natives can translate
+    /// to one semver. The list is newest-first, so the first match is the newest
+    /// spelling — and the choice has to be a rule, not whichever the hash order
+    /// happened to yield.
+    #[test]
+    fn the_first_native_wins_when_two_translate_to_one_version() {
+        let item = jvm_item("org.example:lib", "0.9");
+        let result = evaluated(
+            &item,
+            &["1.0.0", "1.0", "0.9"],
+            Ecosystem::Jvm,
+            UnstableFilter::Exclude,
+        );
+        assert_eq!(result.latest_available.as_deref(), Some("1.0.0"));
+
+        let reversed = evaluated(
+            &item,
+            &["1.0", "1.0.0", "0.9"],
+            Ecosystem::Jvm,
+            UnstableFilter::Exclude,
+        );
+        assert_eq!(reversed.latest_available.as_deref(), Some("1.0"));
+    }
+
+    /// A flavour is which artifact, not which release: moving an Android project
+    /// onto the JRE jar is the classic desugaring break, and `fix --all` did it
+    /// silently because Maven's order compares the numbers first.
+    #[test]
+    fn an_android_build_is_never_offered_the_jre_one() {
+        let item = jvm_item("com.google.guava:guava", "32.1.3-android");
+        let result = evaluated(
+            &item,
+            &[
+                "33.7.1-jre",
+                "33.7.1-android",
+                "32.1.3-jre",
+                "32.1.3-android",
+            ],
+            Ecosystem::Jvm,
+            UnstableFilter::Exclude,
+        );
+        assert_eq!(result.latest_available.as_deref(), Some("33.7.1-android"));
+        assert_eq!(result.latest_compatible.as_deref(), Some("32.1.3-android"));
+
+        // And the other way round, which is the same defect mirrored.
+        let jre = jvm_item("com.google.guava:guava", "32.1.3-jre");
+        let result = evaluated(
+            &jre,
+            &[
+                "33.7.1-jre",
+                "33.7.1-android",
+                "32.1.3-jre",
+                "32.1.3-android",
+            ],
+            Ecosystem::Jvm,
+            UnstableFilter::Exclude,
+        );
+        assert_eq!(result.latest_available.as_deref(), Some("33.7.1-jre"));
+    }
+
+    /// A dated build stamp is not a flavour: Jetty stamps its whole 9.4 line, and
+    /// reading that as a variant would hide every release above it.
+    #[test]
+    fn a_dated_build_stamp_does_not_partition_a_version_line() {
+        let item = jvm_item("org.eclipse.jetty:jetty-server", "9.4.51.v20230217");
+        let result = evaluated(
+            &item,
+            &["12.0.9", "9.4.53.v20231009", "9.4.51.v20230217"],
+            Ecosystem::Jvm,
+            UnstableFilter::Exclude,
+        );
+        assert_eq!(result.latest_available.as_deref(), Some("12.0.9"));
+    }
+
+    /// Under the default filter — the one every user gets — a milestone or a beta
+    /// is not the latest release.
+    #[test]
+    fn a_maven_prerelease_is_not_offered_as_the_latest_stable() {
+        let hibernate = jvm_item("org.hibernate.orm:hibernate-core", "6.4.4.Final");
+        let result = evaluated(
+            &hibernate,
+            &["8.0.0.Beta1", "6.6.0.Final", "6.4.4.Final"],
+            Ecosystem::Jvm,
+            UnstableFilter::Exclude,
+        );
+        assert_eq!(result.latest_available.as_deref(), Some("6.6.0.Final"));
+
+        let spring = jvm_item("org.springframework:spring-core", "5.3.9.RELEASE");
+        let result = evaluated(
+            &spring,
+            &["7.1.0.M1", "6.1.14", "5.3.9.RELEASE"],
+            Ecosystem::Jvm,
+            UnstableFilter::Exclude,
+        );
+        assert_eq!(result.latest_available.as_deref(), Some("6.1.14"));
+
+        // Asking for them still finds them, in their published spelling.
+        let result = evaluated(
+            &spring,
+            &["7.1.0.M1", "6.1.14", "5.3.9.RELEASE"],
+            Ecosystem::Jvm,
+            UnstableFilter::IncludeAlways,
+        );
+        assert_eq!(result.latest_available.as_deref(), Some("7.1.0.M1"));
     }
 }

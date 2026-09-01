@@ -1,0 +1,3 @@
+// Its own build root: `legacy/` is not a subproject of the catalog above it, so
+// that catalog does not speak for it and the script below stays unread.
+rootProject.name = "legacy"

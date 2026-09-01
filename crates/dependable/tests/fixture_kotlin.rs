@@ -84,13 +84,20 @@ fn parses_a_gradle_version_catalog() {
     }
 }
 
-/// Both halves of the required behaviour, from one scan: the build script beside a
-/// catalog had its dependencies read and is silent, while the one with no catalog is
-/// visibly unread — the way `bun.lockb` is. Reporting a short dependency list would
-/// be worse than reporting none, because only one of the two looks wrong.
+/// Every half of the required behaviour, from one scan of a multi-module build.
+///
+/// The root script and **both subprojects** are silent: a Gradle catalog is
+/// build-root scoped, so `<root>/gradle/libs.versions.toml` is what `app/` and
+/// `core/` read, and neither has a `gradle/` directory of its own. Resolving
+/// supersession in the containing directory reported all three unread and advised
+/// the user to declare their dependencies in a catalog that already held them.
+///
+/// `legacy/` is its own build root with no catalog, so it stays visibly unread —
+/// the way `bun.lockb` is. Reporting a short dependency list would be worse than
+/// reporting none, because only one of the two looks wrong.
 #[test]
-fn only_a_build_script_without_a_catalog_is_reported_unread() {
-    let notices = manifest_notices(&fixture("sample-kotlin"), 3);
+fn only_a_build_without_a_catalog_is_reported_unread() {
+    let notices = manifest_notices(&fixture("sample-kotlin"), 3, |_| true);
     assert_eq!(notices.len(), 1, "{notices:?}");
     assert_eq!(
         notices[0].path,
@@ -103,4 +110,12 @@ fn only_a_build_script_without_a_catalog_is_reported_unread() {
         "{rendered}"
     );
     assert!(rendered.contains("gradle/libs.versions.toml"), "{rendered}");
+}
+
+/// A notice is advice to enable something. `[jvm] enabled = false` has already
+/// answered it, and the scan used to run regardless.
+#[test]
+fn a_disabled_jvm_ecosystem_gets_no_gradle_notices() {
+    let notices = manifest_notices(&fixture("sample-kotlin"), 3, |eco| eco != Ecosystem::Jvm);
+    assert!(notices.is_empty(), "{notices:?}");
 }

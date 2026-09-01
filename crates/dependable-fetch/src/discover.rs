@@ -20,8 +20,8 @@
 use std::path::{Path, PathBuf};
 
 use dependable_core::{
-    DependencyKind, Item, LockfileData, LockfileKind, ManifestKind, UNREADABLE_MANIFESTS, parse,
-    parse_lockfile_kind,
+    DependencyKind, Ecosystem, Item, LockfileData, LockfileKind, ManifestKind,
+    UNREADABLE_MANIFESTS, UnreadableManifest, parse, parse_lockfile_kind,
 };
 
 /// Directories never descended into during discovery: build output, vendored
@@ -38,15 +38,54 @@ pub fn is_skipped_dir(name: &str) -> bool {
 /// directories deep, skipping build/vendor directories.
 ///
 /// The result is sorted, so callers render a stable order.
+///
+/// A caller that also wants [`manifest_notices`] should call [`discover`] instead
+/// and take both from one walk.
 #[must_use]
 pub fn find_manifests(root: &Path, max_depth: usize) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    walk(root, max_depth, &mut out);
-    out.sort();
-    out
+    discover(root, max_depth, |_| false).manifests
 }
 
-fn walk(dir: &Path, depth_left: usize, out: &mut Vec<PathBuf>) {
+/// What one walk of a project tree found: the manifests that can be read, and the
+/// files that cannot.
+///
+/// The two used to be two identical recursive walks — same depth bound, same
+/// skipped directories, run back to back by every caller that wanted both — which
+/// is one `readdir` per directory too many in every project, Gradle or not.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Discovered {
+    /// Every recognized manifest, sorted.
+    pub manifests: Vec<PathBuf>,
+    /// Every recognized-but-unreadable manifest, sorted, for the enabled
+    /// ecosystems only.
+    pub notices: Vec<LockfileNotice>,
+}
+
+/// Walk `root` once for both the manifests to read and the manifests that cannot be
+/// read.
+///
+/// `enabled` says whether an ecosystem is switched on. It gates the notices only —
+/// discovery still returns every manifest it recognizes, and narrowing that set
+/// stays the caller's job (see the module docs) — because a notice is advice to
+/// *enable* something, and giving it to someone who has turned that ecosystem off
+/// is noise they cannot act on. A caller with no configuration to consult passes
+/// `|_| true`.
+#[must_use]
+pub fn discover(root: &Path, max_depth: usize, enabled: impl Fn(Ecosystem) -> bool) -> Discovered {
+    let mut found = Discovered::default();
+    walk(root, max_depth, &enabled, &mut found);
+    found.manifests.sort();
+    found.notices.sort_by(|a, b| a.path.cmp(&b.path));
+    found
+}
+
+fn walk(
+    dir: &Path,
+    depth_left: usize,
+    enabled: &dyn Fn(Ecosystem) -> bool,
+    found: &mut Discovered,
+) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -61,9 +100,70 @@ fn walk(dir: &Path, depth_left: usize, out: &mut Vec<PathBuf>) {
             {
                 continue;
             }
-            walk(&path, depth_left - 1, out);
+            walk(&path, depth_left - 1, enabled, found);
         } else if ManifestKind::detect(&path).is_some() {
-            out.push(path);
+            found.manifests.push(path);
+        } else if let Some(unreadable) = unreadable_manifest(&path)
+            && enabled(unreadable.ecosystem)
+            && !is_superseded(dir, unreadable)
+        {
+            found.notices.push(LockfileNotice {
+                path,
+                reason: unreadable.reason.to_owned(),
+            });
+        }
+    }
+}
+
+/// The [`UnreadableManifest`] entry `path` names, if any.
+fn unreadable_manifest(path: &Path) -> Option<&'static UnreadableManifest> {
+    let name = path.file_name()?.to_str()?;
+    UNREADABLE_MANIFESTS
+        .iter()
+        .find(|unreadable| unreadable.file_name == name)
+}
+
+/// Whether the dependencies of an unreadable manifest in `dir` are declared
+/// somewhere readable after all.
+///
+/// The search walks **up** from `dir`, because supersession is build-root scoped
+/// and not directory-local: one `<root>/gradle/libs.versions.toml` serves every
+/// subproject of a Gradle build, and a subproject has no `gradle/` directory. It
+/// stops at the first directory holding a build-root marker (having checked that
+/// directory), and at a repository boundary — a `.git`, the same bound
+/// [`find_lockfile`] uses — so a project never adopts the catalog of an unrelated
+/// checkout above it.
+///
+/// `dir` is canonicalized first, for the reason [`nearest_workspace_root`]
+/// documents: [`Path::parent`] is lexical, so walking up from a relative `.` yields
+/// `""`, which every later `join` resolves against the current directory instead of
+/// against an ancestor. A directory that cannot be canonicalized is answered from
+/// itself alone.
+fn is_superseded(dir: &Path, unreadable: &UnreadableManifest) -> bool {
+    let holds = |dir: &Path| {
+        unreadable
+            .superseded_by
+            .iter()
+            .any(|relative| dir.join(relative).is_file())
+    };
+    let Ok(canonical) = std::fs::canonicalize(dir) else {
+        return holds(dir);
+    };
+    let mut cur = canonical.as_path();
+    loop {
+        if holds(cur) {
+            return true;
+        }
+        let at_root = unreadable
+            .build_root_markers
+            .iter()
+            .any(|marker| cur.join(marker).is_file());
+        if at_root || cur.join(".git").exists() {
+            return false;
+        }
+        match cur.parent() {
+            Some(parent) => cur = parent,
+            None => return false,
         }
     }
 }
@@ -344,63 +444,27 @@ pub fn lockfile_notices(manifest: &Path, kind: ManifestKind) -> Vec<LockfileNoti
     notices
 }
 
-/// Report manifests under `root` that are recognised but cannot be read.
+/// Report manifests under `root` that are recognised but cannot be read, for the
+/// ecosystems `enabled` says are switched on.
 ///
 /// The companion to [`lockfile_notices`], and a directory scan rather than a
 /// per-manifest check for the reason the notice exists at all: a Gradle project
 /// with no version catalog produces **no** manifest for discovery to hand over, so
-/// there is nothing to hang the question on. The walk mirrors [`find_manifests`] —
-/// same depth bound, same skipped directories — so the two see one tree.
+/// there is nothing to hang the question on.
 ///
 /// A file whose readable alternative is present is not reported: a
-/// `build.gradle.kts` beside a `gradle/libs.versions.toml` had its dependencies
-/// read from the catalog, and warning about it would be noise.
+/// `build.gradle.kts` under a build root holding `gradle/libs.versions.toml` had
+/// its dependencies read from the catalog, and warning about it would be noise.
+///
+/// [`discover`] answers this and [`find_manifests`] from one walk; prefer it when
+/// both are wanted.
 #[must_use]
-pub fn manifest_notices(root: &Path, max_depth: usize) -> Vec<LockfileNotice> {
-    let mut out = Vec::new();
-    scan_unreadable(root, max_depth, &mut out);
-    out.sort_by(|a, b| a.path.cmp(&b.path));
-    out
-}
-
-fn scan_unreadable(dir: &Path, depth_left: usize, out: &mut Vec<LockfileNotice>) {
-    for unreadable in UNREADABLE_MANIFESTS {
-        let path = dir.join(unreadable.file_name);
-        if !path.is_file() {
-            continue;
-        }
-        if unreadable
-            .superseded_by
-            .iter()
-            .any(|relative| dir.join(relative).is_file())
-        {
-            continue;
-        }
-        out.push(LockfileNotice {
-            path,
-            reason: unreadable.reason.to_owned(),
-        });
-    }
-    if depth_left == 0 {
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        if path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(is_skipped_dir)
-        {
-            continue;
-        }
-        scan_unreadable(&path, depth_left - 1, out);
-    }
+pub fn manifest_notices(
+    root: &Path,
+    max_depth: usize,
+    enabled: impl Fn(Ecosystem) -> bool,
+) -> Vec<LockfileNotice> {
+    discover(root, max_depth, enabled).notices
 }
 
 #[cfg(test)]
@@ -731,7 +795,7 @@ mod tests {
         let root = dir.path();
         write(&root.join("app/build.gradle.kts"), "dependencies {}\n");
 
-        let notices = manifest_notices(root, 3);
+        let notices = manifest_notices(root, 3, |_| true);
         assert_eq!(notices.len(), 1, "{notices:?}");
         assert_eq!(notices[0].path, root.join("app/build.gradle.kts"));
         assert!(
@@ -753,7 +817,95 @@ mod tests {
             "[versions]\nkotlin = \"1.9.24\"\n",
         );
 
-        assert!(manifest_notices(root, 3).is_empty());
+        assert!(manifest_notices(root, 3, |_| true).is_empty());
+    }
+
+    /// A Gradle catalog is build-root scoped: one `<root>/gradle/libs.versions.toml`
+    /// serves every subproject, and a subproject has no `gradle/` directory of its
+    /// own. Resolving supersession in the containing directory therefore called
+    /// every module of a *correctly* configured multi-module build unread, and told
+    /// each of them to declare its dependencies in a catalog that already held them.
+    #[test]
+    fn a_multi_module_build_is_superseded_by_its_root_catalog() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        write(&root.join(".git/HEAD"), "ref: refs/heads/main\n");
+        write(&root.join("settings.gradle.kts"), "include(\":app\")\n");
+        write(&root.join("build.gradle.kts"), "plugins {}\n");
+        write(
+            &root.join("gradle/libs.versions.toml"),
+            "[versions]\nkotlin = \"1.9.24\"\n",
+        );
+        for module in ["app", "core", "data", "ui", "cli"] {
+            write(
+                &root.join(module).join("build.gradle.kts"),
+                "dependencies {}\n",
+            );
+        }
+
+        assert!(
+            manifest_notices(root, 3, |_| true).is_empty(),
+            "the catalog above every module is the one they all read"
+        );
+    }
+
+    /// The walk up stops at the build root, so one build's catalog never speaks for
+    /// a different build beside it.
+    #[test]
+    fn a_neighbouring_builds_catalog_supersedes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        write(&root.join(".git/HEAD"), "ref: refs/heads/main\n");
+        write(&root.join("gradle/libs.versions.toml"), "[versions]\n");
+        write(&root.join("other/settings.gradle"), "\n");
+        write(&root.join("other/app/build.gradle"), "dependencies {}\n");
+
+        let notices = manifest_notices(root, 3, |_| true);
+        let paths: Vec<&Path> = notices.iter().map(|n| n.path.as_path()).collect();
+        assert_eq!(
+            paths,
+            [root.join("other/app/build.gradle").as_path()],
+            "`other/` is its own build and declares no catalog"
+        );
+    }
+
+    /// A warning about an unread manifest is advice to enable something. Someone who
+    /// turned the ecosystem off has already answered it.
+    #[test]
+    fn a_disabled_ecosystem_is_not_warned_about() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        write(&root.join(".git/HEAD"), "ref: refs/heads/main\n");
+        write(&root.join("build.gradle.kts"), "dependencies {}\n");
+
+        assert_eq!(manifest_notices(root, 3, |_| true).len(), 1);
+        assert!(
+            manifest_notices(root, 3, |eco| eco != Ecosystem::Jvm).is_empty(),
+            "`[jvm] enabled = false` is an answer, not a question"
+        );
+    }
+
+    /// Discovery reads each directory once for both answers, which is what stopped
+    /// the notice scan from being a second full walk beside `find_manifests`.
+    #[test]
+    fn one_walk_answers_both_questions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        write(&root.join(".git/HEAD"), "ref: refs/heads/main\n");
+        write(&root.join("Cargo.toml"), "[package]\nname = \"a\"\n");
+        write(&root.join("app/build.gradle"), "dependencies {}\n");
+
+        let found = discover(root, 3, |_| true);
+        assert_eq!(found.manifests, vec![root.join("Cargo.toml")]);
+        assert_eq!(
+            found
+                .notices
+                .iter()
+                .map(|n| n.path.clone())
+                .collect::<Vec<_>>(),
+            vec![root.join("app/build.gradle")]
+        );
+        assert_eq!(found.manifests, find_manifests(root, 3));
     }
 
     /// The same tree `find_manifests` sees: build output and vendored code are not
@@ -768,13 +920,13 @@ mod tests {
         write(&root.join("a/b/c/build.gradle"), "\n");
 
         // `build/` is not in SKIP_DIRS, so only the dotted and vendored ones go.
-        let deep = manifest_notices(root, 9);
+        let deep = manifest_notices(root, 9, |_| true);
         let paths: Vec<&Path> = deep.iter().map(|n| n.path.as_path()).collect();
         assert!(paths.contains(&root.join("a/b/c/build.gradle").as_path()));
         assert!(!paths.contains(&root.join(".git/hooks/build.gradle").as_path()));
         assert!(!paths.contains(&root.join("node_modules/x/build.gradle").as_path()));
 
-        let shallow = manifest_notices(root, 2);
+        let shallow = manifest_notices(root, 2, |_| true);
         assert!(
             !shallow
                 .iter()
