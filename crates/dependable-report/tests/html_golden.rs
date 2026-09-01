@@ -84,7 +84,8 @@ fn full_report() -> Report {
          serde = \"1.0.228\"\n\
          regex = \"1.5\"\n\
          dependable-core = { path = \"../dependable-core\" }\n\
-         brokenpkg = \"2\"\n",
+         brokenpkg = \"2\"\n\
+         helper = { workspace = true }\n",
     );
     let mut rust_results: Vec<CheckResult> = Vec::new();
 
@@ -159,6 +160,13 @@ fn full_report() -> Report {
         rust[4].clone(),
         DependencyStatus::Error("502 Bad Gateway from the index".to_owned()),
     ));
+    // An entry whose version was never read: on a registry, but nothing was fetched
+    // for it. It is in `summary.total`, so a status table that omits it accounts for
+    // fewer dependencies than the run reports.
+    rust_results.push(CheckResult::new(
+        rust[5].clone(),
+        DependencyStatus::Undetermined,
+    ));
 
     let npm = items(
         ManifestKind::PackageJson,
@@ -215,6 +223,36 @@ fn full_report_matches_the_golden() {
     // Sanity checks the golden alone would not make obvious.
     assert!(html.contains("<path d=\"M 110.0000 110.0000"), "{html}");
     assert!(!html.contains("href=\"javascript:"), "{html}");
+    // Every dependency the summary counts is accounted for by a row of the status
+    // table beneath it — the table read "6 dependencies" over rows summing to 5.
+    let summary = full_report().summary();
+    assert_eq!(
+        summary.up_to_date
+            + summary.patch_available
+            + summary.update_available
+            + summary.outdated
+            + summary.vulnerable
+            + summary.error
+            + summary.local
+            + summary.git
+            + summary.undetermined,
+        summary.total,
+        "the status table's rows have to account for every dependency"
+    );
+    assert!(
+        summary.undetermined > 0,
+        "the fixture exercises the new row"
+    );
+    // The count, not just the label: an undeclared template variable renders as the
+    // empty string rather than failing, so a row that reads nothing still "contains"
+    // its own heading.
+    assert!(
+        html.contains(&format!(
+            "<tr><th scope=\"row\">Undetermined</th><td class=\"num\">{}</td></tr>",
+            summary.undetermined
+        )),
+        "{html}"
+    );
     assert_golden("full", &html);
 }
 
