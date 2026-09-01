@@ -4,6 +4,7 @@ use std::path::Path;
 
 use crate::ecosystem::Ecosystem;
 use crate::item::Item;
+use crate::parsers::parse_workspace;
 
 /// The result of parsing a manifest: its kind and the dependencies it declares.
 #[derive(Debug, Clone)]
@@ -109,6 +110,38 @@ impl ManifestKind {
         !self.lockfiles().is_empty()
     }
 
+    /// Where a manifest of this kind looks for the manifest holding its central
+    /// dependency declarations, or `None` for a kind that has no such indirection.
+    ///
+    /// `None` is the answer for every kind whose dependencies declare their own
+    /// versions in place, and it is what lets a caller skip the upward walk
+    /// entirely rather than walking a tree that can hold no answer.
+    #[must_use]
+    pub fn workspace_roots(self) -> Option<WorkspaceRoots> {
+        match self {
+            ManifestKind::CargoToml => Some(WorkspaceRoots {
+                root_names: &["Cargo.toml"],
+                root_kind: ManifestKind::CargoToml,
+                self_governing: true,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Whether `content`, read as this kind, offers central dependency
+    /// declarations — that is, whether it is a workspace root.
+    ///
+    /// This is the recognition half of [`ManifestKind::workspace_roots`]: a
+    /// candidate found by name still has to say so in its content, because a
+    /// `Cargo.toml` above a member is far more often just another package.
+    #[must_use]
+    pub fn declares_workspace(self, content: &str) -> bool {
+        match self {
+            ManifestKind::CargoToml => parse_workspace(content).is_some(),
+            _ => false,
+        }
+    }
+
     /// Detect a manifest kind from a file path.
     ///
     /// Recognition is by file name. A kind being recognized here does not imply a
@@ -134,6 +167,34 @@ impl ManifestKind {
         };
         Some(kind)
     }
+}
+
+/// Where a manifest kind's central dependency declarations live, and how the
+/// manifest holding them is recognized.
+///
+/// The indirection is not Cargo-shaped in principle. A Cargo member's
+/// `serde.workspace = true` resolving against a root's `[workspace.dependencies]`
+/// is the same problem as a Gradle version-catalog `version.ref = "kotlin"`
+/// resolving against `[versions]`: a dependency whose version literal is written
+/// somewhere other than the dependency itself. Describing that per kind is what
+/// keeps the walk that finds the root (`dependable_fetch::workspace_root_of`) out
+/// of any single ecosystem's shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct WorkspaceRoots {
+    /// Candidate file names for a root, tried in order within each directory —
+    /// the same precedence rule [`ManifestKind::lockfiles`] uses, so a root beside
+    /// the manifest always beats one further up whichever name it goes by.
+    pub root_names: &'static [&'static str],
+    /// The kind a located root is parsed as. Not necessarily the kind that went
+    /// looking: an ecosystem may keep its central declarations in a different file
+    /// format from the manifests that inherit them.
+    pub root_kind: ManifestKind,
+    /// Whether a manifest may be its own root. Cargo's root-that-is-also-a-package
+    /// writes `serde.workspace = true` against its own table, so walking past
+    /// itself would leave exactly those entries unresolved; a kind whose central
+    /// declarations always live in a separate file sets this `false`.
+    pub self_governing: bool,
 }
 
 /// A lockfile format we recognise but cannot read, and what to do about it.
@@ -274,6 +335,58 @@ mod tests {
         assert_eq!(names(ManifestKind::MixExs), ["mix.lock"]);
         assert!(names(ManifestKind::GoMod).is_empty());
         assert!(!ManifestKind::GoMod.has_lockfile_support());
+    }
+
+    /// Every kind but Cargo declares its versions in place, so the upward walk is
+    /// skipped for all of them — the behaviour the boolean gate this replaced had.
+    #[test]
+    fn only_cargo_looks_for_a_workspace_root() {
+        let cargo = ManifestKind::CargoToml
+            .workspace_roots()
+            .expect("Cargo inherits");
+        assert_eq!(cargo.root_names, ["Cargo.toml"]);
+        assert_eq!(cargo.root_kind, ManifestKind::CargoToml);
+        assert!(cargo.self_governing, "a Cargo root may be a package too");
+
+        for kind in [
+            ManifestKind::GoMod,
+            ManifestKind::PackageJson,
+            ManifestKind::DenoJson,
+            ManifestKind::PnpmWorkspaceYaml,
+            ManifestKind::ComposerJson,
+            ManifestKind::RequirementsTxt,
+            ManifestKind::PyprojectToml,
+            ManifestKind::PubspecYaml,
+            ManifestKind::MixExs,
+            ManifestKind::Csproj,
+        ] {
+            assert!(kind.workspace_roots().is_none(), "{kind:?}");
+            assert!(
+                !kind.declares_workspace("[workspace]\nmembers = []\n"),
+                "{kind:?} recognised a Cargo workspace table"
+            );
+        }
+    }
+
+    /// Recognition has to stay the same predicate the walk used before, or a root
+    /// that used to govern a member would be walked straight past.
+    #[test]
+    fn declaring_a_workspace_is_exactly_what_the_cargo_parser_sees() {
+        let fixtures = [
+            "[workspace]\nmembers = [\"sub\"]\n",
+            "[workspace]\nmembers = []\n\n[workspace.dependencies]\nserde = \"1\"\n",
+            "[package]\nname = \"root\"\n\n[workspace]\nmembers = []\n",
+            "[package]\nname = \"solo\"\n\n[dependencies]\nserde = \"1\"\n",
+            "",
+            "this is not toml at all {{{",
+        ];
+        for content in fixtures {
+            assert_eq!(
+                ManifestKind::CargoToml.declares_workspace(content),
+                parse_workspace(content).is_some(),
+                "{content:?}"
+            );
+        }
     }
 
     #[test]

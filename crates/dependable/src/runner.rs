@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::Context;
 use dependable_fetch::core::{
     AlternateRegistryDecl, NpmrcConfig, PackageField, ProjectMeta, apply_lockfile, parse,
-    parse_cargo_config, parse_npmrc, parse_project, resolve_workspace_inheritance,
+    parse_cargo_config, parse_npmrc, parse_project, parse_workspace, resolve_workspace_inheritance,
 };
 use dependable_fetch::{
     CheckError, Checker, DependencyStatus, Ecosystem, GoProxyFetcher, GraphSource, HexFetcher,
@@ -695,6 +695,10 @@ fn resolve_version(
 }
 
 /// `[workspace.package]` from the nearest ancestor `Cargo.toml` declaring a workspace.
+///
+/// Reading the located root as a Cargo `[workspace]` table is this function's own
+/// business: scalar inheritance (`version.workspace = true`) is a different axis from the
+/// dependency inheritance the walk itself serves, and only Cargo has it.
 fn workspace_package_defaults(
     manifest: &Path,
     kind: ManifestKind,
@@ -702,8 +706,8 @@ fn workspace_package_defaults(
     if kind != ManifestKind::CargoToml {
         return None;
     }
-    let (_, workspace, _) = nearest_workspace_root(manifest)?;
-    Some(workspace.package_defaults)
+    let (_, content) = nearest_workspace_root(manifest, kind)?;
+    Some(parse_workspace(&content)?.package_defaults)
 }
 
 /// A `*.csproj`'s project name is its file stem; `Directory.Packages.props` is a central
