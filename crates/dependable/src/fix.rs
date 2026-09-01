@@ -5,12 +5,20 @@
 //! surrounding formatting and comments untouched. The leading operator/`v` prefix
 //! is preserved (`^1.0` → `^1.5.0`, `v1.2.3` → `v1.5.0`) so a constraint's meaning
 //! is not silently changed (e.g. an npm caret range is not turned into a pin).
+//!
+//! Preserving the operator is not enough on its own, because a constraint that
+//! carried no operator is written back as a bare version — and what a bare
+//! version means is an ecosystem question, not a string one. Cargo's `1.*` and
+//! npm's `1.x` are the same shape and opposite calls: `1.0.219` is `^1.0.219` in
+//! one and one release in the other. The manifest path answers it, via
+//! [`Ecosystem::bare_version`]; see [`rewrite_constraint`].
 
 use std::collections::HashMap;
 use std::io::Write as _;
 use std::path::Path;
 
 use anyhow::Context;
+use dependable_fetch::core::{BareVersion, Ecosystem, ManifestKind};
 use dependable_fetch::{CheckResult, DependencyStatus};
 
 /// A single applied (or would-be-applied) version change.
@@ -63,7 +71,12 @@ pub struct PlannedFix {
 pub fn plan(manifest: &Path, results: &[CheckResult], all: bool) -> anyhow::Result<PlannedFix> {
     let content = std::fs::read_to_string(manifest)
         .with_context(|| format!("reading {}", manifest.display()))?;
-    let (updated, records) = plan_fixes(&content, results, all)
+    // What a rewritten constraint *means* is an ecosystem question, and the file
+    // name is where the answer is. `None` — a manifest discovery surfaced but
+    // `detect` does not recognize — is not an error here: the rewrite still runs,
+    // under the reading that declines the most (see [`rewrite_constraint`]).
+    let ecosystem = ManifestKind::detect(manifest).map(ManifestKind::ecosystem);
+    let (updated, records) = plan_fixes(&content, results, all, ecosystem)
         .with_context(|| format!("rewriting {}", manifest.display()))?;
     Ok(PlannedFix {
         path: manifest.to_path_buf(),
@@ -115,13 +128,19 @@ pub fn commit(planned: &PlannedFix) -> anyhow::Result<()> {
 }
 
 /// Compute the rewritten manifest and the applied records from `content` and the
-/// check `results`, with no filesystem IO (the file boundary lives in
-/// [`apply_fixes`]). Format-agnostic: it edits each recorded version span in place,
-/// so JSON, YAML, and TOML manifests are rewritten without reformatting.
+/// check `results`, with no filesystem IO (the file boundary lives in [`plan`]).
+/// Format-agnostic: it edits each recorded version span in place, so JSON, YAML,
+/// and TOML manifests are rewritten without reformatting.
+///
+/// `ecosystem` decides which constraints are safe to rewrite at all —
+/// [`rewrite_constraint`] explains what turns on it — and `None` means the
+/// manifest kind was not recognized, which is treated as the most restrictive
+/// answer rather than as permission.
 fn plan_fixes(
     content: &str,
     results: &[CheckResult],
     all: bool,
+    ecosystem: Option<Ecosystem>,
 ) -> anyhow::Result<(String, Vec<FixRecord>)> {
     let mut edits: Vec<Edit> = Vec::new();
     let mut records = Vec::new();
@@ -151,7 +170,8 @@ fn plan_fixes(
             result.latest_compatible.as_ref()
         };
         let Some(target) = target else { continue };
-        let Some(new_constraint) = rewrite_constraint(&item.version_constraint, target) else {
+        let Some(new_constraint) = rewrite_constraint(&item.version_constraint, target, ecosystem)
+        else {
             continue;
         };
         if new_constraint == item.version_constraint {
@@ -182,13 +202,25 @@ fn plan_fixes(
 
 /// Build a new constraint from `original`, preserving its leading operator/`v`
 /// prefix and substituting `new_version`. Returns `None` for the forms that
-/// can't be rewritten to a single version without changing their meaning: a
-/// comma-separated range (Cargo `>=1.0, <2.0`), a space-separated range
-/// (npm/pubspec `>=1.0.0 <2.0.0`), a `||` alternation (`^1 || ^2`), a dist-tag
-/// (`latest`), a wildcard (`*`, `1.x`, `1.*`), or anything carrying an `@`
-/// (a Composer stability flag such as `@dev` or `^1.0@beta`, an npm alias such
-/// as `npm:pkg@1.0.0`).
-fn rewrite_constraint(original: &str, new_version: &str) -> Option<String> {
+/// can't be rewritten without changing their meaning: a comma-separated range
+/// (Cargo `>=1.0, <2.0`), a space-separated range (npm/pubspec `>=1.0.0 <2.0.0`),
+/// a `||` alternation (`^1 || ^2`), a dist-tag (`latest`), anything carrying an
+/// `@` (a Composer stability flag such as `@dev` or `^1.0@beta`, an npm alias
+/// such as `npm:pkg@1.0.0`), and — depending on `ecosystem` — a wildcard (`*`,
+/// `1.x`, `1.*`).
+///
+/// `ecosystem` is what the wildcard guard turns on, because of what the guard
+/// actually asks: the rewrite writes the new version back bare, so is a bare
+/// version in this ecosystem still the range the author had? `None`
+/// means the manifest kind was not recognized; it is read as
+/// [`BareVersion::Exact`], which declines strictly more than either other
+/// reading, so an unknown manifest is never rewritten into something a known one
+/// would have refused.
+fn rewrite_constraint(
+    original: &str,
+    new_version: &str,
+    ecosystem: Option<Ecosystem>,
+) -> Option<String> {
     let trimmed = original.trim();
     if trimmed.contains(',') {
         return None;
@@ -220,18 +252,60 @@ fn rewrite_constraint(original: &str, new_version: &str) -> Option<String> {
     if rest.starts_with(|c: char| c.is_ascii_alphabetic()) {
         return None;
     }
-    // A wildcard (`*`, `1.x`, `1.*`, Gradle's `1.+`) is a range the author chose,
-    // not a version — substituting a concrete release narrows it to a pin (#87).
-    // The decline is deliberately blanket rather than per-ecosystem: substituting
-    // is safe where a bare version is a caret or an inclusive minimum (Cargo, Go,
-    // Dart) and unsafe where it is an exact pin (npm, Composer, Hex), and this
-    // signature carries no `Ecosystem` to tell them apart. `apply_fixes` does hold
-    // the manifest path and could supply one — #92 tracks narrowing the decline to
-    // the ecosystems that need it. Until then, decline as a dist-tag is declined.
+
+    let bare = ecosystem.map_or(BareVersion::Exact, Ecosystem::bare_version);
+
     if is_wildcard(rest) {
-        return None;
+        // A wildcard (`*`, `1.x`, `1.*`, Gradle's `1.+`) is a range the author
+        // chose, not a version. Substituting a concrete release preserves it in
+        // exactly one situation: the constraint carries no operator, the wildcard
+        // sits in the minor position, and the ecosystem reads the bare version we
+        // write back as a caret range. Then `1.*` (`>=1.0.0, <2.0.0`) becomes
+        // `1.0.219` (`>=1.0.219, <2.0.0`) — the floor is raised, which is what
+        // `fix` does to every other constraint, and the author's upper bound
+        // survives.
+        //
+        // Every other combination changes what the constraint admits (#87, #92):
+        //
+        // - [`BareVersion::Exact`] collapses the range to one release: npm's
+        //   `"lodash": "1.x"` would become `"1.9.0"`, and Composer and Hex read a
+        //   bare version the same way.
+        // - [`BareVersion::Minimum`] loses the upper bound instead: NuGet's `1.*`
+        //   is any 1.x resolved to the newest, while a bare `1.9.0` is `>= 1.9.0`
+        //   resolved to the *oldest* — a different range and a different pick.
+        //   Gradle's `1.+` against its `require` semantics is the same trade.
+        // - A bare `*` is every version, and any concrete release confines it to
+        //   one major — a narrowing even where the bare form is a caret.
+        // - `1.2.*` is `>=1.2.0, <1.3.0`, and a caret over any 1.2.z release
+        //   reaches to `<2.0.0` — a widening even where the bare form is a caret.
+        // - An operator in front (`^1.x`, `=1.*`, Python's `==1.*`) means the
+        //   result is not a bare version at all, so the caret reading that
+        //   justifies the rewrite does not apply to it.
+        if bare != BareVersion::Caret || !prefix.is_empty() || !is_minor_wildcard(rest) {
+            return None;
+        }
     }
     Some(format!("{prefix}{new_version}"))
+}
+
+/// Whether `rest` — a wildcard constraint with its operator prefix already
+/// stripped — is the one wildcard shape a caret reading reproduces: a numeric
+/// major followed by a wildcard in the minor position, `1.*` or `1.x`.
+///
+/// Deliberately narrow. `*`, `1.2.*`, and NuGet's `1.0.0.*` are all wildcards
+/// too, and a caret over a concrete release matches none of their ranges. The
+/// wildcard character must be `*`, `x`, or `X`: Gradle's `+` is a prefix range
+/// with its own resolution rules and no ecosystem that reads a bare version as a
+/// caret accepts it.
+fn is_minor_wildcard(rest: &str) -> bool {
+    let mut segments = rest.split('.');
+    let (Some(major), Some(minor), None) = (segments.next(), segments.next(), segments.next())
+    else {
+        return false;
+    };
+    !major.is_empty()
+        && major.bytes().all(|b| b.is_ascii_digit())
+        && matches!(minor, "*" | "x" | "X")
 }
 
 /// Whether `rest` — a constraint with its leading operator prefix already
@@ -295,72 +369,216 @@ fn apply_edits(content: &str, edits: &[Edit]) -> anyhow::Result<String> {
 mod tests {
     use super::*;
 
+    /// Every ecosystem, so a guard that is ecosystem-independent is asserted
+    /// against all of them rather than against a convenient one — and so a new
+    /// variant cannot quietly opt out of a claim made here.
+    const EVERY_ECOSYSTEM: [Ecosystem; 9] = [
+        Ecosystem::Rust,
+        Ecosystem::Go,
+        Ecosystem::Npm,
+        Ecosystem::Python,
+        Ecosystem::Php,
+        Ecosystem::Dart,
+        Ecosystem::CSharp,
+        Ecosystem::Elixir,
+        Ecosystem::Jvm,
+    ];
+
+    /// Preserving the operator prefix has nothing to do with the ecosystem: every
+    /// form here either carries an operator or is a full concrete version, so what
+    /// a *bare* version means cannot bear on it. Asserted against all nine rather
+    /// than one, which is what makes that a claim instead of an assumption.
     #[test]
     fn rewrite_preserves_operator_prefix() {
-        assert_eq!(
-            rewrite_constraint("^1.0", "1.5.0").as_deref(),
-            Some("^1.5.0")
-        );
-        assert_eq!(
-            rewrite_constraint("~1.0", "1.5.0").as_deref(),
-            Some("~1.5.0")
-        );
-        assert_eq!(
-            rewrite_constraint(">=1.0", "1.5.0").as_deref(),
-            Some(">=1.5.0")
-        );
-        assert_eq!(
-            rewrite_constraint("v1.2.3", "1.5.0").as_deref(),
-            Some("v1.5.0")
-        );
-        assert_eq!(
-            rewrite_constraint("1.0.0", "1.5.0").as_deref(),
-            Some("1.5.0")
-        );
-        assert_eq!(
-            rewrite_constraint("=1.2.0", "1.5.0").as_deref(),
-            Some("=1.5.0")
-        );
-        // The bare wildcard `*` is a range, not a version — see
-        // `rewrite_never_narrows_a_wildcard_to_a_pin`.
-        assert_eq!(rewrite_constraint("*", "1.5.0"), None);
+        for ecosystem in EVERY_ECOSYSTEM {
+            let it = Some(ecosystem);
+            assert_eq!(
+                rewrite_constraint("^1.0", "1.5.0", it).as_deref(),
+                Some("^1.5.0"),
+                "{ecosystem:?}"
+            );
+            assert_eq!(
+                rewrite_constraint("~1.0", "1.5.0", it).as_deref(),
+                Some("~1.5.0"),
+                "{ecosystem:?}"
+            );
+            assert_eq!(
+                rewrite_constraint(">=1.0", "1.5.0", it).as_deref(),
+                Some(">=1.5.0"),
+                "{ecosystem:?}"
+            );
+            assert_eq!(
+                rewrite_constraint("v1.2.3", "1.5.0", it).as_deref(),
+                Some("v1.5.0"),
+                "{ecosystem:?}"
+            );
+            // A full bare version names one release under every reading, and
+            // moving it forward is what `fix` is for.
+            assert_eq!(
+                rewrite_constraint("1.0.0", "1.5.0", it).as_deref(),
+                Some("1.5.0"),
+                "{ecosystem:?}"
+            );
+            assert_eq!(
+                rewrite_constraint("=1.2.0", "1.5.0", it).as_deref(),
+                Some("=1.5.0"),
+                "{ecosystem:?}"
+            );
+            // The bare wildcard `*` is a range, not a version — see
+            // `rewrite_never_narrows_a_wildcard_to_a_pin`. Declined everywhere,
+            // Cargo included: `*` admits every major and a caret admits one.
+            assert_eq!(rewrite_constraint("*", "1.5.0", it), None, "{ecosystem:?}");
+        }
     }
 
     #[test]
     fn rewrite_skips_multi_constraint() {
-        assert_eq!(rewrite_constraint(">=1.0,<2.0", "1.5.0"), None);
+        for ecosystem in EVERY_ECOSYSTEM {
+            assert_eq!(
+                rewrite_constraint(">=1.0,<2.0", "1.5.0", Some(ecosystem)),
+                None,
+                "{ecosystem:?}"
+            );
+        }
     }
 
     #[test]
     fn rewrite_skips_dist_tags() {
         // npm dist-tags / channels are not version ranges — never pin them, so a
-        // `"latest"` dependency keeps tracking the channel after `--fix`.
-        assert_eq!(rewrite_constraint("latest", "2.3.0"), None);
-        assert_eq!(rewrite_constraint("next", "2.3.0"), None);
-        assert_eq!(rewrite_constraint("beta", "2.3.0"), None);
-        // The wildcard `*` is declined for the same reason: it is a range the
-        // author chose, and pinning it would narrow their manifest (issue #87).
-        assert_eq!(rewrite_constraint("*", "2.3.0"), None);
+        // `"latest"` dependency keeps tracking the channel after `--fix`. The
+        // guard is a leading-letter test, so it fires for every ecosystem, and a
+        // channel name means the same thing wherever one is written.
+        for ecosystem in EVERY_ECOSYSTEM {
+            let it = Some(ecosystem);
+            assert_eq!(
+                rewrite_constraint("latest", "2.3.0", it),
+                None,
+                "{ecosystem:?}"
+            );
+            assert_eq!(
+                rewrite_constraint("next", "2.3.0", it),
+                None,
+                "{ecosystem:?}"
+            );
+            assert_eq!(
+                rewrite_constraint("beta", "2.3.0", it),
+                None,
+                "{ecosystem:?}"
+            );
+            // The bare wildcard `*` is declined for the same reason: it is a range
+            // the author chose, and pinning it would narrow their manifest (#87).
+            assert_eq!(rewrite_constraint("*", "2.3.0", it), None, "{ecosystem:?}");
+        }
     }
 
     /// Issue #87: a wildcard is a range, not a version. Rewriting `1.x` to a
     /// concrete release narrows what the author wrote into a pin — in npm a bare
     /// version is an exact match, so the floating constraint is destroyed. None of
-    /// the three existing guards sees a wildcard: there is no comma, no space or
-    /// `|` after the (empty) operator prefix, and `1.x` starts with a digit so the
-    /// dist-tag guard passes it through.
+    /// the other guards sees a wildcard: there is no comma, no space or `|` after
+    /// the (empty) operator prefix, and `1.x` starts with a digit so the dist-tag
+    /// guard passes it through.
+    ///
+    /// Issue #92 narrowed the decline to the ecosystems that need it, so the rule
+    /// is now asserted in two halves. Wherever a bare version is *not* a caret
+    /// range, every wildcard shape is still declined; and where it is — Cargo
+    /// alone — every shape a caret does not reproduce is still declined too. The
+    /// one shape that survives has its own test.
     #[test]
     fn rewrite_never_narrows_a_wildcard_to_a_pin() {
-        assert_eq!(rewrite_constraint("1.x", "2.0.0"), None);
-        assert_eq!(rewrite_constraint("1.*", "2.0.0"), None);
-        assert_eq!(rewrite_constraint("1.X", "2.0.0"), None);
-        // Gradle's dynamic version has the same shape (issue #87), and NuGet's
-        // floating `1.*` resolves differently from a bare `2.0.0`.
-        assert_eq!(rewrite_constraint("1.+", "2.0.0"), None);
-        assert_eq!(rewrite_constraint("^1.x", "2.0.0"), None);
-        assert_eq!(rewrite_constraint("1.2.x", "2.0.0"), None);
-        // The bare wildcard is the same kind of thing.
-        assert_eq!(rewrite_constraint("*", "2.0.0"), None);
+        for ecosystem in EVERY_ECOSYSTEM {
+            if ecosystem.bare_version() == BareVersion::Caret {
+                continue;
+            }
+            let it = Some(ecosystem);
+            assert_eq!(
+                rewrite_constraint("1.x", "2.0.0", it),
+                None,
+                "{ecosystem:?}"
+            );
+            assert_eq!(
+                rewrite_constraint("1.*", "2.0.0", it),
+                None,
+                "{ecosystem:?}"
+            );
+            assert_eq!(
+                rewrite_constraint("1.X", "2.0.0", it),
+                None,
+                "{ecosystem:?}"
+            );
+            // Gradle's dynamic version has the same shape (issue #87), and NuGet's
+            // floating `1.*` resolves differently from a bare `2.0.0`.
+            assert_eq!(
+                rewrite_constraint("1.+", "2.0.0", it),
+                None,
+                "{ecosystem:?}"
+            );
+            assert_eq!(
+                rewrite_constraint("^1.x", "2.0.0", it),
+                None,
+                "{ecosystem:?}"
+            );
+            assert_eq!(
+                rewrite_constraint("1.2.x", "2.0.0", it),
+                None,
+                "{ecosystem:?}"
+            );
+            // The bare wildcard is the same kind of thing.
+            assert_eq!(rewrite_constraint("*", "2.0.0", it), None, "{ecosystem:?}");
+        }
+
+        // Cargo reads a bare version as a caret, which reproduces exactly one
+        // wildcard shape. The rest are declined there too, each for its own reason.
+        let cargo = Some(Ecosystem::Rust);
+        // Gradle's `+` is a prefix range with its own resolution rules, and no
+        // caret-reading ecosystem accepts it as a wildcard at all.
+        assert_eq!(rewrite_constraint("1.+", "2.0.0", cargo), None);
+        // An operator means what gets written back is not a bare version, so the
+        // caret reading that would justify the rewrite does not apply to it.
+        assert_eq!(rewrite_constraint("^1.x", "2.0.0", cargo), None);
+        assert_eq!(rewrite_constraint("=1.*", "2.0.0", cargo), None);
+        // `1.2.*` is `>=1.2.0, <1.3.0`; a caret over any 1.2.z release reaches to
+        // `<2.0.0`, so substituting *widens* what the author admitted.
+        assert_eq!(rewrite_constraint("1.2.x", "2.0.0", cargo), None);
+        // `*` is every version; any concrete release confines it to one major.
+        assert_eq!(rewrite_constraint("*", "2.0.0", cargo), None);
+    }
+
+    /// The other side of issue #92: declining every wildcard was conservatism, not
+    /// necessity. Where the ecosystem reads a bare version as a caret range, `1.*`
+    /// and `1.0.219` are the same *kind* of constraint — `>=1.0.0, <2.0.0` and
+    /// `>=1.0.219, <2.0.0` — so substituting raises the floor exactly as it does
+    /// for `^1.0`, and the manifest keeps a range in the form the Cargo book calls
+    /// equivalent. Before this, `serde = "1.*"` was simply left behind by `fix`.
+    #[test]
+    fn rewrite_updates_a_minor_wildcard_where_a_bare_version_is_a_caret() {
+        let cargo = Some(Ecosystem::Rust);
+        assert_eq!(
+            rewrite_constraint("1.*", "1.0.219", cargo).as_deref(),
+            Some("1.0.219")
+        );
+        assert_eq!(
+            rewrite_constraint("1.x", "1.0.219", cargo).as_deref(),
+            Some("1.0.219")
+        );
+        assert_eq!(
+            rewrite_constraint("1.X", "1.0.219", cargo).as_deref(),
+            Some("1.0.219")
+        );
+        // The same input is declined for every ecosystem that reads a bare version
+        // any other way — the whole point of asking which one this is.
+        for ecosystem in EVERY_ECOSYSTEM {
+            if ecosystem == Ecosystem::Rust {
+                continue;
+            }
+            assert_eq!(
+                rewrite_constraint("1.*", "1.0.219", Some(ecosystem)),
+                None,
+                "{ecosystem:?}"
+            );
+        }
+        // And a manifest whose kind was not recognized gets the reading that
+        // declines the most, never the one that permits the most.
+        assert_eq!(rewrite_constraint("1.*", "1.0.219", None), None);
     }
 
     /// A wildcard segment is not always the whole dot-segment. Composer allows a
@@ -369,13 +587,40 @@ mod tests {
     /// whole-segment guard hands back `7.0.0`, an exact pin in Composer that
     /// destroys both the wildcard and the stability flag. That is issue #87 one
     /// flag away from the guard.
+    ///
+    /// The `@` guard that catches these runs before the ecosystem is consulted, so
+    /// the verdict is the same for all nine — including Cargo, where the wildcard
+    /// alone would now be rewritten.
     #[test]
     fn rewrite_declines_a_wildcard_wearing_a_stability_flag() {
-        assert_eq!(rewrite_constraint("2.8.*@dev", "7.0.0"), None);
-        assert_eq!(rewrite_constraint("2.8.x@dev", "7.0.0"), None);
-        assert_eq!(rewrite_constraint("1.*@stable", "7.0.0"), None);
-        assert_eq!(rewrite_constraint("*@dev", "7.0.0"), None);
-        assert_eq!(rewrite_constraint("^2.8.*@dev", "7.0.0"), None);
+        for ecosystem in EVERY_ECOSYSTEM {
+            let it = Some(ecosystem);
+            assert_eq!(
+                rewrite_constraint("2.8.*@dev", "7.0.0", it),
+                None,
+                "{ecosystem:?}"
+            );
+            assert_eq!(
+                rewrite_constraint("2.8.x@dev", "7.0.0", it),
+                None,
+                "{ecosystem:?}"
+            );
+            assert_eq!(
+                rewrite_constraint("1.*@stable", "7.0.0", it),
+                None,
+                "{ecosystem:?}"
+            );
+            assert_eq!(
+                rewrite_constraint("*@dev", "7.0.0", it),
+                None,
+                "{ecosystem:?}"
+            );
+            assert_eq!(
+                rewrite_constraint("^2.8.*@dev", "7.0.0", it),
+                None,
+                "{ecosystem:?}"
+            );
+        }
     }
 
     /// A Composer stability flag qualifies the range, and nothing in a rewritten
@@ -384,19 +629,43 @@ mod tests {
     /// version used to pass every guard and be rewritten flag-free — `">=2.8@dev"`
     /// became `">=7.0.0"`, and the unbounded `"@dev"` ("any version, dev
     /// stability") became the exact pin `"7.0.0"`: issue #87's harm again, reached
-    /// without a wildcard. An `@` never belongs to a version, so decline the lot.
+    /// without a wildcard. An `@` never belongs to a version, so decline the lot,
+    /// in every ecosystem — the guard runs before the ecosystem is consulted.
     #[test]
     fn rewrite_declines_a_stability_flag_on_a_plain_version() {
-        // The bare flag: a range over every version, collapsed to a pin.
-        assert_eq!(rewrite_constraint("@dev", "7.0.0"), None);
-        // Flag on an operator-led constraint, and on a bare version.
-        assert_eq!(rewrite_constraint(">=2.8@dev", "7.0.0"), None);
-        assert_eq!(rewrite_constraint("2.8@dev", "7.0.0"), None);
-        assert_eq!(rewrite_constraint("^1.0@beta", "7.0.0"), None);
-        // npm's alias form carries an `@` too. The dist-tag guard caught it only
-        // incidentally, because `npm:` happens to start with a letter; now it is
-        // declined for the reason that actually applies.
-        assert_eq!(rewrite_constraint("npm:pkg@1.0.0", "7.0.0"), None);
+        for ecosystem in EVERY_ECOSYSTEM {
+            let it = Some(ecosystem);
+            // The bare flag: a range over every version, collapsed to a pin.
+            assert_eq!(
+                rewrite_constraint("@dev", "7.0.0", it),
+                None,
+                "{ecosystem:?}"
+            );
+            // Flag on an operator-led constraint, and on a bare version.
+            assert_eq!(
+                rewrite_constraint(">=2.8@dev", "7.0.0", it),
+                None,
+                "{ecosystem:?}"
+            );
+            assert_eq!(
+                rewrite_constraint("2.8@dev", "7.0.0", it),
+                None,
+                "{ecosystem:?}"
+            );
+            assert_eq!(
+                rewrite_constraint("^1.0@beta", "7.0.0", it),
+                None,
+                "{ecosystem:?}"
+            );
+            // npm's alias form carries an `@` too. The dist-tag guard caught it only
+            // incidentally, because `npm:` happens to start with a letter; now it is
+            // declined for the reason that actually applies.
+            assert_eq!(
+                rewrite_constraint("npm:pkg@1.0.0", "7.0.0", it),
+                None,
+                "{ecosystem:?}"
+            );
+        }
     }
 
     /// The other side of the guard: every concrete form the shipped parsers
@@ -405,69 +674,96 @@ mod tests {
     /// silently stop `fix` from working on ordinary dependencies, so each shape
     /// is asserted by name. None of them contains an `@`, which is what makes
     /// declining every `@` form safe.
+    ///
+    /// Each shape is now asserted against the ecosystem that actually writes it,
+    /// which is a stronger claim than the single-ecosystem version it replaces: a
+    /// partial-version or wildcard guard that fired on the wrong reading would
+    /// take one of these with it.
     #[test]
     fn rewrite_leaves_every_concrete_version_form_rewritable() {
+        let go = Some(Ecosystem::Go);
+        let rust = Some(Ecosystem::Rust);
+        let nuget = Some(Ecosystem::CSharp);
+        let python = Some(Ecosystem::Python);
+        let hex = Some(Ecosystem::Elixir);
+
         // Go: a pseudo-version and the `+incompatible` marker.
         assert_eq!(
-            rewrite_constraint("v0.0.0-20191109021931-daa7c04131f5", "1.5.0").as_deref(),
+            rewrite_constraint("v0.0.0-20191109021931-daa7c04131f5", "1.5.0", go).as_deref(),
             Some("v1.5.0")
         );
         assert_eq!(
-            rewrite_constraint("v2.0.0+incompatible", "1.5.0").as_deref(),
+            rewrite_constraint("v2.0.0+incompatible", "1.5.0", go).as_deref(),
             Some("v1.5.0")
         );
         // Semver build metadata and prereleases — note the dotted identifiers,
         // which a leading-character test for `x` would have to survive.
         assert_eq!(
-            rewrite_constraint("1.2.3+build.5", "1.5.0").as_deref(),
+            rewrite_constraint("1.2.3+build.5", "1.5.0", rust).as_deref(),
             Some("1.5.0")
         );
         assert_eq!(
-            rewrite_constraint("1.0.0-alpha+exp.sha.5114f85", "1.5.0").as_deref(),
+            rewrite_constraint("1.0.0-alpha+exp.sha.5114f85", "1.5.0", rust).as_deref(),
             Some("1.5.0")
         );
         // From the semver spec itself: a prerelease whose identifiers include `x`.
         assert_eq!(
-            rewrite_constraint("1.0.0-x.7.z.92", "1.5.0").as_deref(),
+            rewrite_constraint("1.0.0-x.7.z.92", "1.5.0", rust).as_deref(),
             Some("1.5.0")
         );
-        // NuGet's four-part version.
+        // NuGet's four-part version — four numeric segments, which the
+        // partial-version guard must not mistake for a truncated one.
         assert_eq!(
-            rewrite_constraint("1.0.0.4", "1.5.0").as_deref(),
+            rewrite_constraint("1.0.0.4", "1.5.0", nuget).as_deref(),
             Some("1.5.0")
         );
         // Python epochs and compatible-release operators.
         assert_eq!(
-            rewrite_constraint("1!2.0", "1.5.0").as_deref(),
+            rewrite_constraint("1!2.0", "1.5.0", python).as_deref(),
             Some("1.5.0")
         );
         assert_eq!(
-            rewrite_constraint("~=1.4", "1.5.0").as_deref(),
+            rewrite_constraint("~=1.4", "1.5.0", python).as_deref(),
             Some("~=1.5.0")
         );
         // Hex's `~>`, whose space belongs to the operator prefix.
         assert_eq!(
-            rewrite_constraint("~> 1.0", "1.5.0").as_deref(),
+            rewrite_constraint("~> 1.0", "1.5.0", hex).as_deref(),
             Some("~> 1.5.0")
         );
         // Declined already, and for a different reason: NuGet's bracketed range
         // holds a comma. The wildcard guard must not change that verdict.
-        assert_eq!(rewrite_constraint("[1.0,2.0)", "1.5.0"), None);
-        // Python's `==1.*` is a wildcard, and stays declined.
-        assert_eq!(rewrite_constraint("==1.*", "1.5.0"), None);
+        assert_eq!(rewrite_constraint("[1.0,2.0)", "1.5.0", nuget), None);
+        // Python's `==1.*` is a wildcard, and stays declined — twice over: Python
+        // reads a bare version exactly, and the `==` means the rewrite would not
+        // have produced a bare version anyway.
+        assert_eq!(rewrite_constraint("==1.*", "1.5.0", python), None);
     }
 
     #[test]
     fn rewrite_skips_space_and_pipe_compound_constraints() {
         // npm / pubspec space-separated ranges and `||` alternations can't collapse
         // to a single version without dropping a clause, so they are left untouched.
-        assert_eq!(rewrite_constraint(">=1.0.0 <2.0.0", "1.5.0"), None);
-        assert_eq!(rewrite_constraint("^1.0.0 || ^2.0.0", "1.5.0"), None);
-        // A single constraint that merely spaces its operator is still rewritten.
-        assert_eq!(
-            rewrite_constraint(">= 1.0.0", "1.5.0").as_deref(),
-            Some(">= 1.5.0")
-        );
+        // Dropping a clause is a loss in every ecosystem, so assert it in all nine.
+        for ecosystem in EVERY_ECOSYSTEM {
+            let it = Some(ecosystem);
+            assert_eq!(
+                rewrite_constraint(">=1.0.0 <2.0.0", "1.5.0", it),
+                None,
+                "{ecosystem:?}"
+            );
+            assert_eq!(
+                rewrite_constraint("^1.0.0 || ^2.0.0", "1.5.0", it),
+                None,
+                "{ecosystem:?}"
+            );
+            // A single constraint that merely spaces its operator is still rewritten.
+            assert_eq!(
+                rewrite_constraint(">= 1.0.0", "1.5.0", it).as_deref(),
+                Some(">= 1.5.0"),
+                "{ecosystem:?}"
+            );
+        }
     }
 
     #[test]
@@ -509,9 +805,7 @@ mod tests {
         assert_eq!(out, "a=1.9 b=2.9\n");
     }
 
-    use dependable_fetch::core::{
-        DependencyKind, ManifestKind, parse, resolve_workspace_inheritance,
-    };
+    use dependable_fetch::core::{DependencyKind, parse, resolve_workspace_inheritance};
 
     /// Parse `content`, then build an `UpdateAvailable` result with the given
     /// target for each named dependency — enough to drive `plan_fixes`. The target
@@ -559,7 +853,13 @@ mod tests {
             content,
             &[("react", "18.2.0"), ("typescript", "5.4.5")],
         );
-        let (updated, records) = plan_fixes(content, &results, false).expect("the plan applies");
+        let (updated, records) = plan_fixes(
+            content,
+            &results,
+            false,
+            Some(ManifestKind::PackageJson.ecosystem()),
+        )
+        .expect("the plan applies");
 
         assert_eq!(
             updated,
@@ -597,7 +897,13 @@ mod tests {
             content,
             &[("monolog/monolog", "2.9.1")],
         );
-        let (updated, records) = plan_fixes(content, &results, false).expect("the plan applies");
+        let (updated, records) = plan_fixes(
+            content,
+            &results,
+            false,
+            Some(ManifestKind::ComposerJson.ecosystem()),
+        )
+        .expect("the plan applies");
 
         assert_eq!(
             updated,
@@ -623,7 +929,13 @@ mod tests {
             content,
             &[("http", "1.2.0"), ("provider", "6.1.0")],
         );
-        let (updated, records) = plan_fixes(content, &results, false).expect("the plan applies");
+        let (updated, records) = plan_fixes(
+            content,
+            &results,
+            false,
+            Some(ManifestKind::PubspecYaml.ecosystem()),
+        )
+        .expect("the plan applies");
 
         // Versions bumped, indentation and the trailing comment untouched.
         assert_eq!(
@@ -667,7 +979,13 @@ mod tests {
             "the old guards would both have passed"
         );
 
-        let (updated, records) = plan_fixes(member, &results, false).expect("the plan applies");
+        let (updated, records) = plan_fixes(
+            member,
+            &results,
+            false,
+            Some(ManifestKind::CargoToml.ecosystem()),
+        )
+        .expect("the plan applies");
 
         assert!(records.is_empty(), "{records:?}");
         assert_eq!(
@@ -696,7 +1014,13 @@ mod tests {
         );
         assert_eq!(declaration.version_line, 1, "and the span points at it");
 
-        let (updated, records) = plan_fixes(root, &results, false).expect("the plan applies");
+        let (updated, records) = plan_fixes(
+            root,
+            &results,
+            false,
+            Some(ManifestKind::CargoToml.ecosystem()),
+        )
+        .expect("the plan applies");
 
         assert_eq!(records.len(), 1, "{records:?}");
         assert_eq!(updated, "[workspace.dependencies]\nserde = \"1.0.219\"\n");
@@ -772,7 +1096,13 @@ mod tests {
             "the fixture must produce a checkable item"
         );
 
-        let (updated, records) = plan_fixes(content, &results, false).expect("the plan applies");
+        let (updated, records) = plan_fixes(
+            content,
+            &results,
+            false,
+            Some(ManifestKind::PackageJson.ecosystem()),
+        )
+        .expect("the plan applies");
 
         assert!(records.is_empty(), "{records:?}");
         assert_eq!(updated, content, "the manifest must be byte-identical");
@@ -808,7 +1138,13 @@ mod tests {
             "the `--all` branch reads `latest_available`, so the fixture must set it"
         );
 
-        let (updated, records) = plan_fixes(content, &results, true).expect("the plan applies");
+        let (updated, records) = plan_fixes(
+            content,
+            &results,
+            true,
+            Some(ManifestKind::ComposerJson.ecosystem()),
+        )
+        .expect("the plan applies");
 
         // The wildcard is declined; its non-wildcard neighbour still gets fixed, so
         // this asserts the guard and not a `--all` path that simply does nothing.
@@ -829,6 +1165,92 @@ mod tests {
   }
 }
 "#
+        );
+    }
+
+    /// Issue #92 end to end, and the case the issue was opened for.
+    ///
+    /// `serde = "1.*"` locked at `1.0.100` with `1.0.219` published: `check`
+    /// reports an upgrade, and before #92 `fix` declined it because the guard from
+    /// #87 could not tell Cargo from npm. Cargo reads a bare version as a caret, so
+    /// `1.0.219` here *is* `^1.0.219` — still a range, still bounded below 2.0, and
+    /// the form the Cargo book calls equivalent to what was written.
+    ///
+    /// The `1.2.*` neighbour is the boundary: its range stops at `1.3.0` and a
+    /// caret does not, so it stays untouched in the same file, under the same
+    /// ecosystem, on the same run.
+    #[test]
+    fn a_cargo_minor_wildcard_is_updated_by_fix() {
+        let content = "[dependencies]\nserde = \"1.*\"\nclap = \"1.2.*\"\n";
+        let results = results_for(
+            ManifestKind::CargoToml,
+            content,
+            &[("serde", "1.0.219"), ("clap", "1.2.9")],
+        );
+        assert_eq!(results.len(), 2, "the fixture must produce two items");
+
+        let (updated, records) = plan_fixes(
+            content,
+            &results,
+            false,
+            Some(ManifestKind::CargoToml.ecosystem()),
+        )
+        .expect("the plan applies");
+
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| (record.name.as_str(), record.to.as_str()))
+                .collect::<Vec<_>>(),
+            [("serde", "1.0.219")],
+            "{records:?}"
+        );
+        assert_eq!(
+            updated,
+            "[dependencies]\nserde = \"1.0.219\"\nclap = \"1.2.*\"\n"
+        );
+    }
+
+    /// The same manifest shape in the ecosystem that must still decline it: npm
+    /// reads a bare `1.0.219` as that release and nothing else, so the identical
+    /// rewrite would destroy the range. One ecosystem apart, opposite verdicts —
+    /// which is the whole of #92.
+    #[test]
+    fn the_same_wildcard_is_still_declined_for_npm() {
+        let content = "{\n  \"dependencies\": {\n    \"lodash\": \"1.*\"\n  }\n}\n";
+        let results = results_for(ManifestKind::PackageJson, content, &[("lodash", "1.9.0")]);
+        assert_eq!(results.len(), 1, "the fixture must produce one item");
+
+        let (updated, records) = plan_fixes(
+            content,
+            &results,
+            false,
+            Some(ManifestKind::PackageJson.ecosystem()),
+        )
+        .expect("the plan applies");
+
+        assert!(records.is_empty(), "{records:?}");
+        assert_eq!(updated, content, "the manifest must be byte-identical");
+    }
+
+    /// A manifest whose kind `ManifestKind::detect` does not recognize reaches the
+    /// rewriter with no ecosystem, and the answer is to decline, not to guess:
+    /// every reading that could apply is one where at least one of these rewrites
+    /// destroys the constraint. The `^1.0` neighbour still moves, so the decline is
+    /// scoped to the forms whose meaning depends on the ecosystem.
+    #[test]
+    fn an_unrecognized_manifest_kind_declines_every_ecosystem_dependent_form() {
+        assert_eq!(rewrite_constraint("1.*", "1.5.0", None), None);
+        assert_eq!(rewrite_constraint("1.x", "1.5.0", None), None);
+        // Not ecosystem-dependent: an operator-led range and a full bare version
+        // mean the same thing everywhere, so they are still rewritten.
+        assert_eq!(
+            rewrite_constraint("^1.0", "1.5.0", None).as_deref(),
+            Some("^1.5.0")
+        );
+        assert_eq!(
+            rewrite_constraint("1.0.0", "1.5.0", None).as_deref(),
+            Some("1.5.0")
         );
     }
 }
