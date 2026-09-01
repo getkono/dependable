@@ -42,8 +42,13 @@
 //! built-in properties (`${project.version}`, `${revision}`, …) are not
 //! `<properties>` entries and are likewise not resolved.
 //!
-//! A dependency whose version those rules leave unknown is **reported anyway**,
-//! with no constraint and no span — the shape a Cargo member's unresolved
+//! The same holds for a coordinate: `<groupId>${project.groupId}</groupId>` — the
+//! standard idiom for a sibling module in a multi-module build — names a built-in
+//! this file does not state, and the dependency is reported under that literal
+//! rather than dropped.
+//!
+//! A dependency whose version or coordinate those rules leave unknown is
+//! **reported anyway**, with no constraint and no span — the shape a Cargo member's unresolved
 //! `dep.workspace = true` already has, which the CLI renders as `(unresolved)` and
 //! never fetches, fixes, or claims a status for. Dropping it instead, as the
 //! `csproj` parser drops an MSBuild `$(…)` version, would report a POM that
@@ -91,6 +96,14 @@ enum Source {
     /// Not knowable from this file alone: absent, a built-in property, a composed
     /// value, or a property this POM does not declare.
     Unknown,
+}
+
+/// One half of a `groupId:artifactId` coordinate: the text to report it under, and
+/// whether that text is the resolved value or the literal this file could not
+/// resolve.
+struct Half {
+    text: String,
+    resolved: bool,
 }
 
 /// One `<dependency>`, read but not yet resolved.
@@ -177,22 +190,36 @@ fn read_dependencies<'a>(
         if node.tag_name().name() != "dependency" {
             continue;
         }
-        // Without both halves there is no coordinate to look up, and nothing that
-        // could be reported under a name. A `${…}` group is interpolated first,
-        // since `${project.groupId}` aside, a group is often a property.
-        let (Some(group), Some(artifact)) = (
-            interpolated(node, "groupId", properties),
-            interpolated(node, "artifactId", properties),
-        ) else {
+        // A `${…}` half is interpolated, since `${project.groupId}` aside, a group is
+        // often a property. A half this file cannot resolve is reported under the
+        // literal it states rather than dropped — see [`coordinate`].
+        let group = coordinate(node, "groupId", properties);
+        let artifact = coordinate(node, "artifactId", properties);
+        // A `<dependency>` naming neither half states nothing at all: there is no
+        // text to report it under, so there is nothing to report.
+        if group.is_none() && artifact.is_none() {
             continue;
-        };
+        }
+        let known = group.as_ref().is_some_and(|half| half.resolved)
+            && artifact.as_ref().is_some_and(|half| half.resolved);
+        let name = format!(
+            "{}:{}",
+            group.map(|half| half.text).unwrap_or_default(),
+            artifact.map(|half| half.text).unwrap_or_default(),
+        );
         let scope = child(node, "scope")
             .and_then(text_of)
             .map(|located| located.value)
             .unwrap_or_default();
         out.push(Declared {
-            name: format!("{group}:{artifact}"),
-            version: version_source(node, properties),
+            name,
+            // A coordinate this file cannot state is a coordinate nothing can be
+            // fetched for, whatever version sits beside it.
+            version: if known {
+                version_source(node, properties)
+            } else {
+                Source::Unknown
+            },
             // A `system` dependency is a jar at a path on this machine, not
             // something a registry has ever heard of.
             source: match scope.as_str() {
@@ -273,18 +300,38 @@ fn interpolation(value: &str) -> Option<&str> {
     Some(inner)
 }
 
-/// A child element's text, with `${…}` resolved against `properties`.
-fn interpolated(
+/// One half of a coordinate, with `${…}` resolved against `properties` where it can
+/// be — and reported as written where it cannot.
+///
+/// `None` only when the element is absent or states nothing. An *unresolvable* half
+/// (`${project.groupId}`, the standard idiom for a sibling module, or a property
+/// declared in a `<parent>`) still yields the literal text, because dropping the
+/// dependency would report a POM as depending on fewer things than it declares —
+/// the silent omission this parser exists to avoid, and an asymmetry with
+/// `<version>`, which is reported unresolved rather than deleted.
+fn coordinate(
     node: roxmltree::Node<'_, '_>,
     tag: &str,
     properties: &HashMap<String, Located>,
-) -> Option<String> {
+) -> Option<Half> {
     let located = child(node, tag).and_then(text_of)?;
-    match interpolation(&located.value) {
-        Some(reference) => Some(properties[terminal(reference, properties)?].value.clone()),
+    let resolved = match interpolation(&located.value) {
+        Some(reference) => terminal(reference, properties)
+            .map(|name| properties[name].value.clone())
+            .map(|text| Half {
+                text,
+                resolved: true,
+            }),
         None if located.value.contains('$') => None,
-        None => Some(located.value),
-    }
+        None => Some(Half {
+            text: located.value.clone(),
+            resolved: true,
+        }),
+    };
+    Some(resolved.unwrap_or(Half {
+        text: located.value,
+        resolved: false,
+    }))
 }
 
 /// Count every `${…}` reference in the document, by the property its chain ends at.
@@ -733,8 +780,10 @@ mod tests {
         assert_eq!(find(&m, "g:a").version_constraint, "");
     }
 
-    /// A group stated as a property still names a package; one that is not
-    /// resolvable names nothing that could be looked up.
+    /// A group stated as a property still names a package. One that is not
+    /// resolvable names nothing that could be looked up — but the dependency is
+    /// still declared, so it is reported under the literal it states rather than
+    /// deleted from the manifest's own list.
     #[test]
     fn a_coordinate_may_be_stated_by_property() {
         let content = pom("  <properties>\n\
@@ -754,7 +803,63 @@ mod tests {
              \x20 </dependencies>\n");
         let m = parse(&content);
         let names: Vec<&str> = m.items.iter().map(|i| i.name.as_str()).collect();
-        assert_eq!(names, vec!["org.example:named"]);
+        assert_eq!(
+            names,
+            vec!["org.example:named", "${project.groupId}:unnameable"]
+        );
+    }
+
+    /// `${project.groupId}` is *the* idiom for a sibling module in a multi-module
+    /// build, and a POM using it for two of its three dependencies must not list as
+    /// depending on one. Reported under the literal, with no constraint — the shape
+    /// a parent-deferred version already has, which the CLI renders `(unresolved)`
+    /// and never fetches — rather than dropped in silence.
+    #[test]
+    fn a_group_this_file_cannot_resolve_is_reported_not_dropped() {
+        let content = pom("  <dependencies>\n\
+             \x20   <dependency>\n\
+             \x20     <groupId>${project.groupId}</groupId>\n\
+             \x20     <artifactId>app-core</artifactId>\n\
+             \x20     <version>${project.version}</version>\n\
+             \x20   </dependency>\n\
+             \x20   <dependency>\n\
+             \x20     <groupId>org.slf4j</groupId>\n\
+             \x20     <artifactId>slf4j-api</artifactId>\n\
+             \x20     <version>2.0.13</version>\n\
+             \x20   </dependency>\n\
+             \x20 </dependencies>\n");
+        let m = parse(&content);
+        assert_eq!(m.items.len(), 2, "both dependencies are declared");
+        let sibling = find(&m, "${project.groupId}:app-core");
+        assert_eq!(sibling.version_constraint, "");
+        assert_eq!(sibling.source, PackageSource::Inherited);
+        assert!(
+            !sibling.is_checkable(),
+            "no coordinate, so nothing to fetch"
+        );
+        assert!(!sibling.is_rewritable());
+        assert_eq!(find(&m, "org.slf4j:slf4j-api").version_constraint, "2.0.13");
+    }
+
+    /// A `<groupId>` this file never states is the same omission by a shorter
+    /// route: the artifact is named, so the entry is reported under what there is.
+    /// A `<dependency>` naming neither half states nothing at all and is skipped.
+    #[test]
+    fn a_missing_coordinate_half_is_still_reported_under_the_other() {
+        let content = pom("  <dependencies>\n\
+             \x20   <dependency>\n\
+             \x20     <artifactId>orphan</artifactId>\n\
+             \x20     <version>1.0.0</version>\n\
+             \x20   </dependency>\n\
+             \x20   <dependency>\n\
+             \x20     <version>2.0.0</version>\n\
+             \x20   </dependency>\n\
+             \x20 </dependencies>\n");
+        let m = parse(&content);
+        let names: Vec<&str> = m.items.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, vec![":orphan"]);
+        assert_eq!(m.items[0].version_constraint, "");
+        assert!(!m.items[0].is_checkable());
     }
 
     /// Whitespace around a version is formatting, not part of it, and the span has
