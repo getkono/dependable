@@ -353,6 +353,11 @@ pub enum LockfileKind {
     PubspecLock,
     /// Mix's `mix.lock`.
     MixLock,
+    /// SwiftPM's `Package.resolved`.
+    ///
+    /// The only kind here that is a *source* of dependencies rather than an
+    /// annotation on them — see [`LockfileKind::is_dependency_source`].
+    PackageResolved,
 }
 
 impl LockfileKind {
@@ -366,7 +371,23 @@ impl LockfileKind {
             LockfileKind::ComposerLock => "composer.lock",
             LockfileKind::PubspecLock => "pubspec.lock",
             LockfileKind::MixLock => "mix.lock",
+            LockfileKind::PackageResolved => "Package.resolved",
         }
+    }
+
+    /// Whether this lockfile *is* the dependency list rather than an annotation on
+    /// one the manifest beside it already produced.
+    ///
+    /// False for every format whose manifest is readable data: there the lockfile
+    /// only supplies resolved versions, and
+    /// [`apply_lockfile`](crate::lockfiles::apply_lockfile) annotates existing items
+    /// and never inserts. Swift is the exception — `Package.swift` is executable
+    /// Swift and is deliberately not read — so `Package.resolved` is the only honest
+    /// record of what the project depends on, and a caller has to take items *from*
+    /// it. [`lockfile_items`](crate::lockfiles::lockfile_items) is that path.
+    #[must_use]
+    pub fn is_dependency_source(self) -> bool {
+        matches!(self, LockfileKind::PackageResolved)
     }
 
     /// Recognise a lockfile by its file name.
@@ -380,6 +401,7 @@ impl LockfileKind {
             LockfileKind::ComposerLock,
             LockfileKind::PubspecLock,
             LockfileKind::MixLock,
+            LockfileKind::PackageResolved,
         ]
         .into_iter()
         .find(|kind| kind.file_name() == name)
@@ -550,6 +572,10 @@ mod tests {
         assert_eq!(
             LockfileKind::detect(Path::new("package-lock.json")),
             Some(LockfileKind::PackageLockJson)
+        );
+        assert_eq!(
+            LockfileKind::detect(Path::new("app/Package.resolved")),
+            Some(LockfileKind::PackageResolved)
         );
         assert_eq!(LockfileKind::detect(Path::new("Cargo.toml")), None);
         assert_eq!(LockfileKind::detect(Path::new("")), None);
