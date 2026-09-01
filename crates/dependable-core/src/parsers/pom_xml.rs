@@ -451,6 +451,11 @@ fn child<'a>(node: roxmltree::Node<'a, 'a>, tag: &str) -> Option<roxmltree::Node
 /// cannot be the same bytes: a character reference (`1.0&#46;0`), a `CDATA`
 /// section, or text interrupted like this. An empty element yields nothing: it
 /// states no value, which is not the same as stating one this parser resolved.
+///
+/// A joined value with whitespace inside it yields nothing either. Only the ends of
+/// the join are trimmed, so a value broken over lines around a comment keeps the
+/// indentation between its halves — and that is neither a version this file states
+/// nor one Maven would accept.
 fn text_of(node: roxmltree::Node<'_, '_>) -> Option<Located> {
     let mut texts = node.children().filter(roxmltree::Node::is_text);
     let first = texts.next()?;
@@ -463,6 +468,15 @@ fn text_of(node: roxmltree::Node<'_, '_>) -> Option<Located> {
     }
     let value = joined.trim();
     if value.is_empty() {
+        return None;
+    }
+    // Concatenating across a comment splices whatever a pretty-printer put around
+    // it into the middle of the value: a `<version>` broken over three lines joins
+    // to `1.0\n        \n        .0`, which is no version anyone wrote and which
+    // Maven itself would reject. Trimming the ends does not reach it, and stitching
+    // the halves together would state a version the file does not. Refusing leaves
+    // the dependency unresolved, which is what it is.
+    if !single && value.chars().any(char::is_whitespace) {
         return None;
     }
     let range = first.range();
@@ -890,6 +904,29 @@ mod tests {
         assert_eq!(item.version_constraint, "1.0.0");
         assert_eq!(item.source, PackageSource::Local);
         assert!(!item.is_checkable(), "a system jar has no registry to ask");
+    }
+
+    /// The same trick spread over lines splices the pretty-printer's indentation
+    /// into the middle of the version. `1.0\n        \n        .0` is no version
+    /// anyone wrote; stating it as the constraint would send it to the registry as
+    /// if it were.
+    #[test]
+    fn a_version_split_across_lines_states_no_version() {
+        let content = pom("  <dependencies>\n\
+             \x20   <dependency>\n\
+             \x20     <groupId>g</groupId>\n\
+             \x20     <artifactId>a</artifactId>\n\
+             \x20     <version>\n\
+             \x20       1.0\n\
+             \x20       <!--x-->\n\
+             \x20       .0\n\
+             \x20     </version>\n\
+             \x20   </dependency>\n\
+             \x20 </dependencies>\n");
+        let m = parse(&content);
+        let item = find(&m, "g:a");
+        assert_eq!(item.version_constraint, "");
+        assert!(!item.is_checkable());
     }
 
     /// Whitespace around a version is formatting, not part of it, and the span has
