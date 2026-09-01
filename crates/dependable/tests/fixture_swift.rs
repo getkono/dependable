@@ -70,10 +70,57 @@ fn v2_and_v3_package_resolved_yield_the_same_pins() {
             "github.com/apple/swift-crypto",
             "github.com/apple/swift-log",
             "github.com/apple/swift-nio",
+            "github.com/apple/swift-atomics",
             "sample-helpers",
             "github.com/acme/swift-experimental",
         ],
         "every pin, in the order the file records them"
+    );
+}
+
+/// `Package.resolved` records the flattened resolution. The fixture's
+/// `Package.swift` declares swift-nio and never mentions swift-atomics, yet the
+/// pin list holds both and marks neither apart — so nothing read from it may be
+/// called a direct dependency. `list --format json` publishes that as a boolean a
+/// machine reads, and `"direct": true` on a transitive pin is a claim the file
+/// never made.
+#[test]
+fn no_pin_is_published_as_a_direct_dependency() {
+    let manifest = std::fs::read_to_string(fixture("sample-swift/Package.swift")).unwrap();
+    let code: String = manifest
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !code.contains("swift-atomics"),
+        "the fixture's transitive pin must not be declared by its manifest"
+    );
+
+    for item in pins("sample-swift/Package.resolved") {
+        assert!(
+            !item.kind.is_direct(),
+            "{}: a flattened resolution cannot say which pins are direct",
+            item.name
+        );
+    }
+
+    let output = run(&[
+        "list",
+        "--manifest",
+        fixture("sample-swift/Package.swift").to_str().unwrap(),
+        "--format",
+        "json",
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "stdout: {stdout}");
+    assert!(
+        stdout.contains("\"name\": \"github.com/apple/swift-atomics\""),
+        "stdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("\"direct\": true"),
+        "no Swift pin may be published as direct; stdout: {stdout}"
     );
 }
 
@@ -297,4 +344,58 @@ fn live_osv_reports_a_known_vulnerable_swift_package() {
         "an advisory keyed by repository URL must match; stdout: {stdout}\nstderr: {stderr}"
     );
     assert!(stdout.contains("GHSA-r6r4-5pr8-gjcp"), "stdout: {stdout}");
+}
+
+/// A scratch directory with a `.git`, so the lockfile walk sees a repository
+/// boundary exactly where a real checkout would put one.
+fn scratch(name: &str) -> PathBuf {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join(".git")).expect("create the scratch repository");
+    dir
+}
+
+/// A half-written `Package.resolved` used to crash the process outright, and the
+/// degradation waiting behind that crash was worse: a *prefix* of the pins,
+/// presented as the whole dependency list, with the packages past the cut never
+/// scanned and nothing said about it.
+#[test]
+fn a_truncated_package_resolved_is_reported_unread_rather_than_read_short() {
+    let dir = scratch("swift_truncated");
+    std::fs::copy(
+        fixture("sample-swift/Package.swift"),
+        dir.join("Package.swift"),
+    )
+    .unwrap();
+    let whole = std::fs::read_to_string(fixture("sample-swift/Package.resolved")).unwrap();
+    // Past the first pin and into the second, so a partial scan would return a
+    // plausible, and wrong, list.
+    let cut = whole.find("swift-log").expect("the second pin") + 20;
+    std::fs::write(dir.join("Package.resolved"), &whole[..cut]).unwrap();
+
+    for command in [
+        vec!["list", dir.to_str().unwrap()],
+        vec![
+            "check",
+            "--manifest",
+            dir.join("Package.swift").to_str().unwrap(),
+            "--no-vuln",
+        ],
+    ] {
+        let output = run(&command);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("panicked"),
+            "{command:?} must not crash; stderr: {stderr}"
+        );
+        assert!(
+            !stdout.contains("swift-crypto"),
+            "{command:?}: a prefix of the pins is not a dependency list; stdout: {stdout}"
+        );
+        assert!(
+            stderr.contains("could not be parsed"),
+            "{command:?}: and the file must be reported unread; stderr: {stderr}"
+        );
+    }
 }

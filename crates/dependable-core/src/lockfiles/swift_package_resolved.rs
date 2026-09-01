@@ -15,13 +15,28 @@
 //! read too, because the alternative — reporting a Swift 5.5 project as having no
 //! dependencies at all — is the silent wrong answer this whole ecosystem is
 //! shaped to avoid.
+//!
+//! Two consequences of the file being the list rather than an annotation on one:
+//! a malformed file is reported as **unread** rather than degraded to the pins
+//! scanned before the error, and every pin is [`DependencyKind::Indirect`],
+//! because the resolution is flattened and marks no pin as direct.
+//!
+//! # Known limitation: repository path case
+//! OSV keys `SwiftURL` advisories case-sensitively and real keys are mixed-case
+//! (`github.com/weichsel/ZIPFoundation`, `github.com/marmelroy/Zip`). A
+//! `Package.resolved` recording a lowercase spelling of such a repository —
+//! which git clones happily, and which SwiftPM's own `identity` field uses —
+//! produces a key OSV does not match, and the package is reported clean.
+//! [`swift_package_name`] lowercases the host and queries a lowercase path
+//! variant alongside the written one, which covers every direction but this: the
+//! canonical casing is a fact only the forge holds.
 
 use std::collections::{BTreeMap, HashMap};
 
 use crate::error::ParseError;
 use crate::item::{DependencyKind, Item, PackageSource};
 use crate::lockfiles::LockfileData;
-use crate::parsers::json_scan::scan_strings;
+use crate::parsers::json_scan::scan_document;
 
 /// URL schemes a Swift package location may carry, longest-prefix first so
 /// `git+https://` is never mistaken for `https://` with a `git+` host.
@@ -51,16 +66,24 @@ struct Pin {
     revision: Option<String>,
 }
 
-/// The dependencies `Package.resolved` pins, in the order it records them.
+/// The dependencies `Package.resolved` pins, in the order it records them, or
+/// `None` when the file did not read.
 ///
 /// This is the whole flattened resolution — SwiftPM records transitive pins
 /// beside direct ones and does not distinguish them, so neither does this.
 ///
-/// Never fails: malformed JSON yields whatever pins were scanned before the
-/// error, which is the same degradation every other reader here offers.
+/// # Malformed input is unread, not partial
+/// Every other reader here degrades to "whatever was scanned before the error",
+/// because it annotates a list some manifest already produced: a pin it misses
+/// costs a locked version, not a dependency. This file *is* the list — a
+/// `Package.swift` is a program this crate declines to read — so a partial scan
+/// would hand back a silently **short** dependency list presented as the whole
+/// one, and a package dropped off the end is a package never scanned for
+/// advisories. `None` says "this file told us nothing", which callers already
+/// know how to report; a short list is the silent wrong answer.
 #[must_use]
-pub fn swift_package_resolved_items(content: &str) -> Vec<Item> {
-    pins(content).iter().filter_map(pin_item).collect()
+pub fn swift_package_resolved_items(content: &str) -> Option<Vec<Item>> {
+    Some(pins(content)?.iter().filter_map(pin_item).collect())
 }
 
 /// Parse `Package.resolved` into a name → resolved-version map.
@@ -69,11 +92,21 @@ pub fn swift_package_resolved_items(content: &str) -> Vec<Item> {
 /// two agree about what a package is called.
 ///
 /// # Errors
-/// Never fails today; the signature matches every other lockfile reader so the
-/// dispatch in [`crate::lockfiles::parse_lockfile_kind`] stays uniform.
+/// Returns [`ParseError::Structural`] when the JSON does not read to its end, for
+/// the reason [`swift_package_resolved_items`] documents: a partial pin set is a
+/// short dependency list, not a partial annotation, and reporting the file as
+/// unreadable is what puts a notice in front of the user.
 pub fn parse_swift_package_resolved(content: &str) -> Result<LockfileData, ParseError> {
+    let items = swift_package_resolved_items(content).ok_or_else(|| {
+        ParseError::Structural(
+            "Package.resolved is not well-formed JSON, so the pins it records could not be \
+             read; this file is the whole dependency list of a Swift project, so a partial \
+             read of it is not a shorter answer but a wrong one"
+                .to_owned(),
+        )
+    })?;
     let mut versions: HashMap<String, Vec<String>> = HashMap::new();
-    for item in swift_package_resolved_items(content) {
+    for item in items {
         if let Some(version) = item.locked_version {
             versions.entry(item.name).or_default().push(version);
         }
@@ -87,6 +120,24 @@ pub fn parse_swift_package_resolved(content: &str) -> Result<LockfileData, Parse
 /// advisories by the same URL with the scheme and the `.git` suffix removed
 /// (`github.com/vapor/vapor`). Getting either wrong does not fail loudly — it
 /// silently matches nothing — so both are stripped here rather than at the query.
+///
+/// # Case
+/// The **host** is lowercased unconditionally: hostnames are case-insensitive by
+/// definition, and every OSV `SwiftURL` key spells one in lowercase, so
+/// `GitHub.com/vapor/vapor` would otherwise match nothing.
+///
+/// The **path is left exactly as written**, because OSV's keys are case-sensitive
+/// and mixed-case ones are real — `github.com/weichsel/ZIPFoundation`,
+/// `github.com/marmelroy/Zip`, `github.com/migueldeicaza/SwiftTerm`. Lowercasing
+/// the path would break precisely those.
+///
+/// That leaves one case nothing local can repair: a `Package.resolved` that
+/// records a *lowercase* spelling of a repository whose OSV key is mixed-case
+/// (`…/zipfoundation` for `…/ZIPFoundation`). Git clones either spelling happily
+/// and SwiftPM lowercases `identity`, so both spellings circulate; recovering the
+/// canonical one needs the forge, not this string. The other direction *is*
+/// repaired — see [`swift_package_name_variants`], which the OSV scan queries
+/// alongside the name — so only "written lower, keyed mixed" is missed.
 #[must_use]
 pub fn swift_package_name(location: &str) -> String {
     let trimmed = location.trim();
@@ -111,14 +162,51 @@ pub fn swift_package_name(location: &str) -> String {
 
     let name = name.trim_end_matches('/');
     let name = name.strip_suffix(".git").unwrap_or(name);
-    name.trim_end_matches('/').to_string()
+    lowercase_host(name.trim_end_matches('/'))
+}
+
+/// Lowercase the host component of an OSV `SwiftURL` name, leaving the path alone.
+fn lowercase_host(name: &str) -> String {
+    match name.split_once('/') {
+        Some((host, path)) => format!("{}/{path}", host.to_ascii_lowercase()),
+        None => name.to_ascii_lowercase(),
+    }
+}
+
+/// Extra OSV `SwiftURL` keys worth asking about for a package named `name`.
+///
+/// OSV matches its Swift keys byte for byte while git forges treat a repository
+/// path case-insensitively, so the same repository reaches us under whichever
+/// spelling somebody pasted into `Package.swift`. Where a pin's path is not
+/// already lowercase, the all-lowercase spelling is a second real key for the
+/// same repository — `github.com/vapor/vapor` is keyed that way — and asking for
+/// it too costs one batch entry and can only ever add a true match, since OSV
+/// answers for the package it was asked about or not at all.
+///
+/// Empty when the name is already lowercase, which is the overwhelming majority.
+#[must_use]
+pub fn swift_package_name_variants(name: &str) -> Vec<String> {
+    let lowered = name.to_lowercase();
+    if lowered == name {
+        Vec::new()
+    } else {
+        vec![lowered]
+    }
 }
 
 /// Collect every pin in the document, keyed by its array index so the fields of
 /// one pin — which the scanner reports one at a time — reassemble in order.
-fn pins(content: &str) -> Vec<Pin> {
+///
+/// `None` when the document is not well-formed JSON: see
+/// [`swift_package_resolved_items`] for why a prefix of the pins is refused here
+/// rather than returned.
+fn pins(content: &str) -> Option<Vec<Pin>> {
+    let scanned = scan_document(content);
+    if !scanned.well_formed {
+        return None;
+    }
     let mut by_index: BTreeMap<usize, Pin> = BTreeMap::new();
-    for entry in scan_strings(content) {
+    for entry in scanned.values {
         let Some((index, field)) = pin_field(&entry.path) else {
             continue;
         };
@@ -135,7 +223,7 @@ fn pins(content: &str) -> Vec<Pin> {
             _ => {}
         }
     }
-    by_index.into_values().collect()
+    Some(by_index.into_values().collect())
 }
 
 /// Split a scanned path into the pin index and the field path within that pin,
@@ -203,7 +291,13 @@ fn pin_item(pin: &Pin) -> Option<Item> {
         version_col_end: 0,
         registry: None,
         locked_version: locked,
-        kind: DependencyKind::Normal,
+        // `Package.resolved` is the *flattened* resolution: a project depending
+        // only on `swift-nio-ssl` gets pins for `swift-nio`, `swift-collections`,
+        // and `swift-atomics` too, and the file marks none of them apart. So
+        // nothing here can be called a direct dependency without inventing the
+        // claim — and `direct: true` in `list --format json` is exactly that claim,
+        // read by machines. `Indirect` is the kind that declines to make it.
+        kind: DependencyKind::Indirect,
     })
 }
 
@@ -245,6 +339,11 @@ mod tests {
 }
 "#;
 
+    /// The pins of a file that is expected to read.
+    fn items(content: &str) -> Vec<Item> {
+        swift_package_resolved_items(content).expect("well-formed Package.resolved")
+    }
+
     fn find<'a>(items: &'a [Item], name: &str) -> &'a Item {
         items
             .iter()
@@ -254,7 +353,7 @@ mod tests {
 
     #[test]
     fn reads_every_pin_as_a_dependency() {
-        let items = swift_package_resolved_items(V2);
+        let items = items(V2);
         let names: Vec<&str> = items.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(
             names,
@@ -272,14 +371,23 @@ mod tests {
     /// version it states is not written in any manifest this tool parsed.
     #[test]
     fn a_pin_is_checkable_but_has_nowhere_to_be_rewritten() {
-        let nio = find(
-            &swift_package_resolved_items(V2),
-            "github.com/apple/swift-nio",
-        )
-        .clone();
+        let nio = find(&items(V2), "github.com/apple/swift-nio").clone();
         assert!(nio.is_checkable());
         assert!(!nio.has_position());
         assert!(!nio.is_rewritable());
+    }
+
+    /// `Package.resolved` is the flattened resolution: it lists a package the
+    /// project depends on and a package that package depends on identically. So no
+    /// pin may be reported as a direct dependency — `list --format json` publishes
+    /// exactly that field, and a machine reading `"direct": true` off a transitive
+    /// pin is being told something the file never said.
+    #[test]
+    fn a_pin_is_never_claimed_to_be_a_direct_dependency() {
+        for item in items(V2) {
+            assert_eq!(item.kind, DependencyKind::Indirect, "{}", item.name);
+            assert!(!item.kind.is_direct(), "{}", item.name);
+        }
     }
 
     /// v3 adds `originHash` and nothing else that matters, so it must read
@@ -291,10 +399,7 @@ mod tests {
             "\"pins\" : [",
             "\"originHash\" : \"abc123\",\n  \"pins\" : [",
         );
-        assert_eq!(
-            swift_package_resolved_items(&v3),
-            swift_package_resolved_items(V2)
-        );
+        assert_eq!(items(&v3), items(V2));
     }
 
     /// v1 spells the same facts differently. Reading it wrong would report a
@@ -313,7 +418,7 @@ mod tests {
   },
   "version": 1
 }"#;
-        let items = swift_package_resolved_items(v1);
+        let items = items(v1);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].name, "github.com/apple/swift-nio");
         assert_eq!(items[0].locked_version.as_deref(), Some("2.65.0"));
@@ -335,7 +440,7 @@ mod tests {
   ],
   "version": 2
 }"#;
-        let items = swift_package_resolved_items(lock);
+        let items = items(lock);
         assert_eq!(items[0].source, PackageSource::Git);
         assert_eq!(items[0].version_constraint, "main");
         assert_eq!(items[0].locked_version, None);
@@ -350,7 +455,7 @@ mod tests {
   ],
   "version": 2
 }"#;
-        let items = swift_package_resolved_items(lock);
+        let items = items(lock);
         assert_eq!(items[0].name, "helpers");
         assert_eq!(items[0].source, PackageSource::Local);
         assert!(!items[0].is_checkable());
@@ -387,6 +492,65 @@ mod tests {
         }
     }
 
+    /// OSV's `SwiftURL` keys are matched byte for byte, and the real ones are
+    /// mixed-case: `github.com/weichsel/ZIPFoundation`, `github.com/marmelroy/Zip`,
+    /// `github.com/migueldeicaza/SwiftTerm`. Lowercasing the path would turn every
+    /// one of those into a key OSV has never heard of — reporting a vulnerable
+    /// package as clean, silently, which is the failure this ecosystem exists to
+    /// avoid.
+    #[test]
+    fn a_mixed_case_repository_path_is_preserved_exactly() {
+        let cases = [
+            (
+                "https://github.com/weichsel/ZIPFoundation.git",
+                "github.com/weichsel/ZIPFoundation",
+            ),
+            (
+                "https://github.com/marmelroy/Zip",
+                "github.com/marmelroy/Zip",
+            ),
+            (
+                "git@github.com:migueldeicaza/SwiftTerm.git",
+                "github.com/migueldeicaza/SwiftTerm",
+            ),
+        ];
+        for (location, expected) in cases {
+            assert_eq!(swift_package_name(location), expected, "{location}");
+        }
+    }
+
+    /// A hostname is case-insensitive by definition and every OSV `SwiftURL` key
+    /// spells one in lowercase, so `GitHub.com/...` must not be carried through as
+    /// written — and normalizing it must not touch the path beside it.
+    #[test]
+    fn the_host_is_lowercased_and_the_path_is_not() {
+        assert_eq!(
+            swift_package_name("https://GitHub.com/vapor/vapor.git"),
+            "github.com/vapor/vapor"
+        );
+        assert_eq!(
+            swift_package_name("https://GitHub.COM/weichsel/ZIPFoundation.git"),
+            "github.com/weichsel/ZIPFoundation"
+        );
+        assert_eq!(
+            swift_package_name("git@GitHub.com:marmelroy/Zip.git"),
+            "github.com/marmelroy/Zip"
+        );
+    }
+
+    /// A forge treats the repository path case-insensitively while OSV does not, so
+    /// the all-lowercase spelling of a mixed-case name is a second real key for the
+    /// same repository and is worth asking about too. A name that is already
+    /// lowercase has no second spelling and must not cost a second query.
+    #[test]
+    fn a_mixed_case_name_offers_its_lowercase_spelling_as_a_second_key() {
+        assert_eq!(
+            swift_package_name_variants("github.com/Vapor/Vapor"),
+            ["github.com/vapor/vapor"]
+        );
+        assert!(swift_package_name_variants("github.com/vapor/vapor").is_empty());
+    }
+
     #[test]
     fn locked_versions_agree_with_the_items() {
         let data = parse_swift_package_resolved(V2).unwrap();
@@ -399,12 +563,37 @@ mod tests {
     #[test]
     fn an_unrelated_pins_key_is_not_a_pin_list() {
         let lock = r#"{ "meta": { "pins": [ { "location": "https://x/y.git" } ] } }"#;
-        assert!(swift_package_resolved_items(lock).is_empty());
+        assert!(items(lock).is_empty());
     }
 
+    /// Malformed input is reported as unread rather than degraded to the pins that
+    /// happened to scan first. Every other lockfile here annotates a list a manifest
+    /// already produced, so a pin it misses costs a locked version; this file *is*
+    /// the list, so a pin it misses is a dependency that is never scanned for
+    /// advisories — presented, with no warning, as the complete set.
     #[test]
-    fn malformed_json_yields_no_pins_rather_than_an_error() {
-        assert!(swift_package_resolved_items("not json at all {{{").is_empty());
-        assert!(parse_swift_package_resolved("").is_ok());
+    fn a_malformed_file_reads_as_unread_not_as_a_short_list() {
+        assert!(swift_package_resolved_items("not json at all {{{").is_none());
+        assert!(swift_package_resolved_items("").is_none());
+        assert!(parse_swift_package_resolved("not json at all {{{").is_err());
+    }
+
+    /// A file truncated mid-pin is the realistic malformed case (an interrupted
+    /// write, a bad merge, a partial checkout) and the one that scans *most* of the
+    /// pins before failing — which is exactly what makes a partial answer dangerous
+    /// rather than obviously broken. It also used to panic outright.
+    #[test]
+    fn a_truncated_file_is_unread_rather_than_partially_read() {
+        // Up to but not including the closing brace — a prefix that happens to end
+        // there is the whole document, trailing newline aside.
+        for cut in 1..V2.trim_end().len() {
+            let truncated = &V2[..cut];
+            assert!(
+                swift_package_resolved_items(truncated).is_none(),
+                "a prefix of {cut} bytes must not read as a dependency list"
+            );
+        }
+        // The whole file still reads, so the check above is not vacuous.
+        assert_eq!(items(V2).len(), 2);
     }
 }

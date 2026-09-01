@@ -5,6 +5,11 @@ import PackageDescription
 // assembled at build time: one entry comes from a literal, one from a loop over a
 // value defined elsewhere, and one only exists on Apple platforms. A regex over
 // this file does not return a short list, it returns a wrong one.
+//
+// Note also what is *absent*: nothing here declares swift-atomics. The
+// Package.resolved beside this file pins one anyway, because it records the
+// flattened resolution — swift-nio's own dependency, indistinguishable there from
+// the three declared below. That is why no pin may be reported as direct.
 let extraPackages = ["swift-log": "1.5.0"]
 
 var dependencies: [Package.Dependency] = [

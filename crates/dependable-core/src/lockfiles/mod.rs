@@ -29,7 +29,8 @@ pub use mix_lock_graph::parse_mix_lock_graph;
 pub use package_lock_graph::parse_package_lock_graph;
 pub use package_lock_json::parse_package_lock;
 pub use swift_package_resolved::{
-    parse_swift_package_resolved, swift_package_name, swift_package_resolved_items,
+    parse_swift_package_resolved, swift_package_name, swift_package_name_variants,
+    swift_package_resolved_items,
 };
 
 /// Parse lockfile `content` with the parser for the file that was found.
@@ -66,10 +67,16 @@ pub fn parse_lockfile_kind(kind: LockfileKind, content: &str) -> Result<Lockfile
 /// [`parse_lockfile_kind`] for their versions and apply them.
 /// [`LockfileKind::is_dependency_source`] answers the same question without
 /// parsing.
+///
+/// `None` **also** when the kind is a dependency source whose file did not read.
+/// Both answers mean the same thing to a caller — "no dependency list came from
+/// this file" — and both leave it to fall through to [`parse_lockfile_kind`],
+/// which reports the failure. Handing back a prefix of a truncated
+/// `Package.resolved` would instead present a short list as a complete one.
 #[must_use]
 pub fn lockfile_items(kind: LockfileKind, content: &str) -> Option<Vec<Item>> {
     match kind {
-        LockfileKind::PackageResolved => Some(swift_package_resolved_items(content)),
+        LockfileKind::PackageResolved => swift_package_resolved_items(content),
         _ => None,
     }
 }
