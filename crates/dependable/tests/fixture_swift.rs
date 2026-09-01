@@ -929,6 +929,17 @@ fn a_quiet_html_report_still_says_the_dependency_list_went_unread() {
         !unread.contains("This manifest declares no dependencies"),
         "nothing established that; the file that would have said so was never read"
     );
+    // §3's headings are what a reader skims, and a count is a claim. "(0
+    // dependencies)" sat directly above the paragraph disclaiming it, so the
+    // heading asserted exactly what the prose below denied.
+    assert!(
+        !unread.contains("Swift (0 dependencies)"),
+        "the heading counted a list nobody read: {unread}"
+    );
+    assert!(
+        unread.contains("Swift (dependency list unread)"),
+        "the heading has to say the list went unread: {unread}"
+    );
 
     // The other half: a project that really is resolved and really has no pins is
     // still reported exactly as before, with no caveat it has not earned.
@@ -937,4 +948,61 @@ fn a_quiet_html_report_still_says_the_dependency_list_went_unread() {
         "a resolved project with no pins has nothing to caveat"
     );
     assert!(empty.contains("This manifest declares no dependencies"));
+    assert!(
+        empty.contains("Swift (0 dependencies)"),
+        "a resolved project with no pins really does declare none: {empty}"
+    );
+}
+
+/// The same claim in the same words, in the output most runs actually look at.
+/// `check`'s per-manifest heading counted the results it had, so a Swift project
+/// with no readable `Package.resolved` was headed "(0 dependencies)" — a statement
+/// about the project, made by a run that read nothing about it.
+#[test]
+fn the_check_heading_says_the_list_went_unread_rather_than_counting_zero() {
+    let unread_dir = scratch("swift_check_heading_unread");
+    std::fs::copy(
+        fixture("sample-swift/Package.swift"),
+        unread_dir.join("Package.swift"),
+    )
+    .unwrap();
+
+    let empty_dir = scratch("swift_check_heading_empty");
+    std::fs::copy(
+        fixture("sample-swift/Package.swift"),
+        empty_dir.join("Package.swift"),
+    )
+    .unwrap();
+    std::fs::write(
+        empty_dir.join("Package.resolved"),
+        r#"{"pins":[],"version":2}"#,
+    )
+    .unwrap();
+
+    let heading = |dir: &Path| {
+        let output = run(&[
+            "check",
+            "--manifest",
+            dir.join("Package.swift").to_str().unwrap(),
+            "--no-vuln",
+        ]);
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+
+    let unread = heading(&unread_dir);
+    assert!(
+        !unread.contains("(0 dependencies)"),
+        "nothing was counted because nothing was read: {unread}"
+    );
+    assert!(
+        unread.contains("Swift (dependency list unread)"),
+        "the heading has to say so: {unread}"
+    );
+
+    // And a project that really is resolved and really has no pins still counts.
+    let empty = heading(&empty_dir);
+    assert!(
+        empty.contains("Swift (0 dependencies)"),
+        "a resolved project with no pins declares none, and says so: {empty}"
+    );
 }
