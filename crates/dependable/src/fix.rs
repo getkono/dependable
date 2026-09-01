@@ -207,11 +207,11 @@ fn plan_fixes(
 /// a `||` alternation (`^1 || ^2`), a dist-tag (`latest`), anything carrying an
 /// `@` (a Composer stability flag such as `@dev` or `^1.0@beta`, an npm alias
 /// such as `npm:pkg@1.0.0`), and — depending on `ecosystem` — a wildcard (`*`,
-/// `1.x`, `1.*`).
+/// `1.x`, `1.*`) or a partial version (npm `"16"`).
 ///
-/// `ecosystem` is what the wildcard guard turns on, because of what the guard
-/// actually asks: the rewrite writes the new version back bare, so is a bare
-/// version in this ecosystem still the range the author had? `None`
+/// `ecosystem` is what the wildcard and partial-version guards turn on, because
+/// both ask the same question: the rewrite writes the new version back bare, so
+/// is a bare version in this ecosystem still the range the author had? `None`
 /// means the manifest kind was not recognized; it is read as
 /// [`BareVersion::Exact`], which declines strictly more than either other
 /// reading, so an unknown manifest is never rewritten into something a known one
@@ -284,6 +284,20 @@ fn rewrite_constraint(
         if bare != BareVersion::Caret || !prefix.is_empty() || !is_minor_wildcard(rest) {
             return None;
         }
+    } else if bare == BareVersion::Exact && prefix.is_empty() && is_partial_version(rest) {
+        // The same harm one wildcard character away. npm treats a partial version
+        // as an X-range — `"react": "16"` is `16.x`, `"1.0"` is `1.0.x` — so
+        // rewriting it to `"16.14.0"` pins a dependency that was tracking a line
+        // of releases, with no `*` anywhere for `is_wildcard` to see.
+        //
+        // Guarded for every ecosystem that reads a bare version exactly, not just
+        // npm. Composer normalizes a partial to a full version and Hex and pub
+        // reject one outright, so there the rewrite would have been harmless — but
+        // "harmless" is the whole claim being made, and declining costs a fix on a
+        // constraint that already pins while a wrong `true` costs the author their
+        // range. Cargo and NuGet keep the rewrite: `1.0` is `^1.0` and `>=1.0`
+        // respectively, and raising the floor of either is exactly what `fix` is.
+        return None;
     }
     Some(format!("{prefix}{new_version}"))
 }
@@ -306,6 +320,21 @@ fn is_minor_wildcard(rest: &str) -> bool {
     !major.is_empty()
         && major.bytes().all(|b| b.is_ascii_digit())
         && matches!(minor, "*" | "x" | "X")
+}
+
+/// Whether `rest` — a constraint with its operator prefix already stripped, and
+/// already known to hold no wildcard — names fewer components than a full
+/// version: `16` or `1.0` rather than `1.0.0`.
+///
+/// Every component must be pure digits, which is what keeps the concrete forms
+/// out: Python's `1!2.0` carries an epoch, semver build metadata and prereleases
+/// put non-digits in the last component, and NuGet's `1.0.0.4` has four.
+fn is_partial_version(rest: &str) -> bool {
+    let segments: Vec<&str> = rest.split('.').collect();
+    segments.len() < 3
+        && segments
+            .iter()
+            .all(|segment| !segment.is_empty() && segment.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Whether `rest` — a constraint with its leading operator prefix already
@@ -579,6 +608,44 @@ mod tests {
         // And a manifest whose kind was not recognized gets the reading that
         // declines the most, never the one that permits the most.
         assert_eq!(rewrite_constraint("1.*", "1.0.219", None), None);
+    }
+
+    /// Issue #92's second gap, and the one with no `*` in it. npm reads a partial
+    /// version as an X-range — `"react": "16"` is `16.x`, `"1.0"` is `1.0.x` — so
+    /// rewriting one to `"16.14.0"` pins a dependency that was tracking a line of
+    /// releases. `is_wildcard` sees nothing to object to, and the only thing
+    /// separating it from Cargo's `"1.0"`, where that rewrite is correct, is which
+    /// ecosystem is being written.
+    #[test]
+    fn rewrite_declines_a_partial_version_where_a_bare_version_is_exact() {
+        let npm = Some(Ecosystem::Npm);
+        assert_eq!(rewrite_constraint("16", "16.14.0", npm), None);
+        assert_eq!(rewrite_constraint("1.0", "1.5.0", npm), None);
+        // Cargo's `1.0` is `^1.0` and `1.5.0` is `^1.5.0`: the floor rises and the
+        // upper bound holds, which is what every other `fix` rewrite does.
+        assert_eq!(
+            rewrite_constraint("1.0", "1.5.0", Some(Ecosystem::Rust)).as_deref(),
+            Some("1.5.0")
+        );
+        // NuGet's `1.0` is `>= 1.0` and `1.5.0` is `>= 1.5.0` — a raised floor too.
+        assert_eq!(
+            rewrite_constraint("1.0", "1.5.0", Some(Ecosystem::CSharp)).as_deref(),
+            Some("1.5.0")
+        );
+        // Only the *partial* form is a range. A full bare version is a pin, and
+        // moving a pin forward is exactly what `fix` is asked to do.
+        assert_eq!(
+            rewrite_constraint("16.0.0", "16.14.0", npm).as_deref(),
+            Some("16.14.0")
+        );
+        // An operator makes it a range in its own right, npm included: `^16` is a
+        // caret range and `^16.14.0` is that range with a raised floor.
+        assert_eq!(
+            rewrite_constraint("^16", "16.14.0", npm).as_deref(),
+            Some("^16.14.0")
+        );
+        // An unrecognized manifest declines, like every exact reading.
+        assert_eq!(rewrite_constraint("16", "16.14.0", None), None);
     }
 
     /// A wildcard segment is not always the whole dot-segment. Composer allows a
@@ -1233,6 +1300,44 @@ mod tests {
         assert_eq!(updated, content, "the manifest must be byte-identical");
     }
 
+    /// Issue #92's second gap, end to end: npm reads `"react": "16"` as `16.x`,
+    /// and `fix` used to write `"16.14.0"` into it — a pin, with no wildcard
+    /// character anywhere for the #87 guard to catch. Its `^18.0.0` neighbour is
+    /// rewritten on the same run, so this asserts the new guard rather than a path
+    /// that quietly does nothing.
+    #[test]
+    fn an_npm_partial_version_is_left_untouched_by_fix() {
+        let content =
+            "{\n  \"dependencies\": {\n    \"react\": \"16\",\n    \"vue\": \"^3.0.0\"\n  }\n}\n";
+        let results = results_for(
+            ManifestKind::PackageJson,
+            content,
+            &[("react", "16.14.0"), ("vue", "3.4.21")],
+        );
+        assert_eq!(results.len(), 2, "the fixture must produce two items");
+
+        let (updated, records) = plan_fixes(
+            content,
+            &results,
+            false,
+            Some(ManifestKind::PackageJson.ecosystem()),
+        )
+        .expect("the plan applies");
+
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.name.as_str())
+                .collect::<Vec<_>>(),
+            ["vue"],
+            "{records:?}"
+        );
+        assert_eq!(
+            updated,
+            "{\n  \"dependencies\": {\n    \"react\": \"16\",\n    \"vue\": \"^3.4.21\"\n  }\n}\n"
+        );
+    }
+
     /// A manifest whose kind `ManifestKind::detect` does not recognize reaches the
     /// rewriter with no ecosystem, and the answer is to decline, not to guess:
     /// every reading that could apply is one where at least one of these rewrites
@@ -1242,6 +1347,8 @@ mod tests {
     fn an_unrecognized_manifest_kind_declines_every_ecosystem_dependent_form() {
         assert_eq!(rewrite_constraint("1.*", "1.5.0", None), None);
         assert_eq!(rewrite_constraint("1.x", "1.5.0", None), None);
+        assert_eq!(rewrite_constraint("1.0", "1.5.0", None), None);
+        assert_eq!(rewrite_constraint("16", "16.14.0", None), None);
         // Not ecosystem-dependent: an operator-led range and a full bare version
         // mean the same thing everywhere, so they are still rewritten.
         assert_eq!(
