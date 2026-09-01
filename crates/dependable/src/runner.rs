@@ -11,8 +11,9 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use dependable_fetch::core::{
-    AlternateRegistryDecl, NpmrcConfig, PackageField, ProjectMeta, apply_lockfile, parse,
-    parse_cargo_config, parse_npmrc, parse_project, parse_workspace, resolve_workspace_inheritance,
+    AlternateRegistryDecl, NpmrcConfig, PackageField, ProjectMeta, apply_lockfile, lockfile_items,
+    parse, parse_cargo_config, parse_npmrc, parse_project, parse_workspace,
+    resolve_workspace_inheritance,
 };
 use dependable_fetch::{
     CheckError, Checker, DependencyStatus, Ecosystem, GoProxyFetcher, GraphSource, HexFetcher,
@@ -239,6 +240,12 @@ impl Engine {
                     cfg.jvm.registry.clone(),
                 )),
             );
+        }
+        // Swift has no fetcher to register — it has no registry — so enabling it is
+        // an assertion rather than a registration. Same switch, same config key,
+        // and without it `[swift] enabled = false` would do nothing at all.
+        if cfg.swift.enabled {
+            builder = builder.registryless(Ecosystem::Swift);
         }
         if show_progress {
             builder = builder.on_progress(progress_sink());
@@ -686,8 +693,19 @@ fn apply_nearest_lockfile(
     manifest: &Path,
     kind: ManifestKind,
     root: &Path,
-    items: &mut [Item],
+    items: &mut Vec<Item>,
 ) -> Option<PathBuf> {
+    // One lockfile *is* the dependency list rather than an annotation on one: a
+    // `Package.swift` is a program this tool declines to read, so its
+    // `Package.resolved` is where the dependencies come from. Without this branch
+    // `list` reports a Swift project as depending on nothing.
+    if let Some((path, lock_kind)) = dependable_fetch::locate_lockfile(manifest, kind)
+        && lock_kind.is_dependency_source()
+    {
+        let content = std::fs::read_to_string(&path).ok()?;
+        items.extend(lockfile_items(lock_kind, &content)?);
+        return Some(relative_to(root, &path));
+    }
     let (path, resolved) = dependable_fetch::find_lockfile(manifest, kind)?;
     apply_lockfile(items, &resolved);
     Some(relative_to(root, &path))

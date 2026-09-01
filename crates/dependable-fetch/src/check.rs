@@ -608,6 +608,10 @@ impl Checker {
         if let Some(warning) = deferred_versions(&parsed.items, kind) {
             warnings.push(warning);
         }
+        if let Some(warning) = currency_is_unknowable(ecosystem, &parsed.items, self.osv.is_some())
+        {
+            warnings.push(warning);
+        }
 
         let mut results: Vec<CheckResult> = if let Some(fetcher) = &fetcher {
             // Build the fetch task list, routing each checkable item to a fetcher:
@@ -865,6 +869,42 @@ fn deferred_versions(items: &[Item], kind: ManifestKind) -> Option<String> {
         "{} {subject} {verb} from {source}, so no version was read for {object} and nothing was checked: {}",
         names.len(),
         names.join(", ")
+    ))
+}
+
+/// Say, once per manifest, that this ecosystem publishes no registry — so nothing
+/// here was, or could be, compared against a newer version.
+///
+/// Emitted for **every** manifest of such an ecosystem, including one that declares
+/// nothing, and deliberately conditioned on nothing else. The hazard is precise: a
+/// Swift run that turns up no advisories looks exactly like a clean, up-to-date one,
+/// and a reader who is not told otherwise will read it that way.
+/// [`DependencyStatus::Undetermined`] says so per row, in a table nobody is obliged
+/// to read column by column; this says it in the same place, and as loudly as, the
+/// unreadable-lockfile notices.
+fn currency_is_unknowable(ecosystem: Ecosystem, items: &[Item], scanned: bool) -> Option<String> {
+    if ecosystem.has_registry() {
+        return None;
+    }
+    let name = ecosystem.display_name();
+    let count = items.iter().filter(|item| item.is_checkable()).count();
+    let plural = if count == 1 { "y" } else { "ies" };
+    // With scanning off there is no verdict left at all, and saying "scanned for
+    // vulnerabilities only" would name a check that did not run.
+    let outcome = if scanned {
+        format!(
+            "{count} dependenc{plural} scanned for known vulnerabilities only. A run that \
+             reports none is not a run that found them up to date"
+        )
+    } else {
+        format!(
+            "with vulnerability scanning off, nothing was established about any of the \
+             {count} dependenc{plural} here at all"
+        )
+    };
+    Some(format!(
+        "{name} publishes no package registry, so nothing here can be checked for a newer \
+         version: {outcome}, and `--fix` cannot apply to a {name} project."
     ))
 }
 
@@ -1501,6 +1541,60 @@ mod tests {
                 Err(CheckError::UnsupportedEcosystem(Ecosystem::Swift))
             ),
             "an ecosystem nobody asked for is off, registry or no registry"
+        );
+    }
+
+    /// The issue's hard requirement: a Swift run that finds no advisories looks
+    /// exactly like a clean, current one, so the manifest has to say otherwise
+    /// every time — not only when there is something to report.
+    #[tokio::test]
+    async fn every_registryless_manifest_states_that_currency_is_unknown() {
+        let with_pins = offline_checker()
+            .check_manifest(ManifestKind::PackageSwift, "", Some(PACKAGE_RESOLVED))
+            .await
+            .expect("checked");
+        let warning = with_pins
+            .warnings
+            .iter()
+            .find(|w| w.contains("no package registry"))
+            .expect("a manifest-level statement, not just a status word");
+        assert!(warning.contains("1 dependency"), "{warning}");
+        assert!(
+            warning.contains("vulnerability scanning off"),
+            "this checker has scanning off, so it must not claim a scan ran: {warning}"
+        );
+        assert!(warning.contains("`--fix` cannot apply"), "{warning}");
+
+        // And with nothing pinned at all, where there is no table row to carry it.
+        let empty = offline_checker()
+            .check_manifest(ManifestKind::PackageSwift, "", None)
+            .await
+            .expect("checked");
+        assert!(
+            empty
+                .warnings
+                .iter()
+                .any(|w| w.contains("no package registry")),
+            "{:?}",
+            empty.warnings
+        );
+
+        // Never for an ecosystem that does have a registry.
+        let rust = offline_checker()
+            .check_manifest(
+                ManifestKind::CargoToml,
+                "[dependencies]\nserde = \"1\"\n",
+                None,
+            )
+            .await
+            .expect("checked");
+        assert!(
+            !rust
+                .warnings
+                .iter()
+                .any(|w| w.contains("no package registry")),
+            "{:?}",
+            rust.warnings
         );
     }
 

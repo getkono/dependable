@@ -39,6 +39,7 @@ Or download a prebuilt binary for your platform from the
 | C# / .NET | `*.csproj`, `Directory.Packages.props` | NuGet | — | 🧪 Experimental |
 | Elixir | `mix.exs` | Hex | `mix.lock` | 🧪 Experimental |
 | Kotlin / Java | `gradle/libs.versions.toml`, `pom.xml` | Maven Central | — | 🧪 Experimental |
+| Swift | `Package.swift` (never read) | — none exists | `Package.resolved` | 🧪 Experimental |
 
 Kotlin / Java coverage is the **declarative** half of a JVM build. For Gradle that is
 the version catalog: a build script (`build.gradle`, `build.gradle.kts`) is a program,
@@ -53,6 +54,22 @@ resolved — doing so correctly can mean fetching the parent POM from a registry
 is a resolution engine rather than a parser. Those dependencies are still listed, with
 no version and nothing claimed about them, so a POM that inherits some of its versions
 is never presented as depending on only the rest.
+
+**Swift is vulnerability-only, and says so.** SwiftPM identifies a package by its git
+URL and discovers versions by enumerating git tags. SE-0292 defines a registry API, but
+no dominant public instance operates one — so there is nothing to ask "is a newer
+version available?", and `dependable` never pretends otherwise. A Swift dependency is
+reported `undetermined`: scanned against OSV's `SwiftURL` advisories, and **never**
+compared for currency. Every Swift manifest carries a warning saying so, because a
+Swift run that turns up no advisories otherwise reads exactly like a clean, up-to-date
+one. `--fix` cannot apply to a Swift project.
+
+`Package.swift` is executable Swift, and unlike `mix.exs` it cannot be read as text
+honestly — dependencies are routinely assembled in loops, behind conditionals, and from
+variables, so a text-level reader returns a *wrong* list rather than a short one. It is
+never read. `Package.resolved` is plain JSON carrying the full flattened pin set, and it
+is where every Swift dependency comes from: the one lockfile here that is the dependency
+list rather than an annotation on one.
 
 ### Lockfiles
 
@@ -70,6 +87,7 @@ dependencies.
 | `composer.lock` | ✅ | ✅ |
 | `mix.lock` | ✅ | ✅ |
 | `pubspec.lock` | ✅ | ✕ — records versions but not which package required which |
+| `Package.resolved` | ✅ | ✕ — records pins but not which package required which |
 
 Not read: `yarn.lock`, `pnpm-lock.yaml`, `deno.lock`, `go.sum`, `uv.lock`,
 `poetry.lock`, `Pipfile.lock`, `packages.lock.json`.
@@ -92,17 +110,14 @@ V2 reporting features and other deferred work are tracked as GitHub issues; see
 
 ### Not yet supported
 
-Three languages come up often enough to answer here. Each is absent for a different
-reason, and one of them is closer than it looks:
+Two languages come up often enough to answer here. Each is absent for a different
+reason:
 
 - **Gradle build scripts and `pom.xml`** — the JVM's declarative half ships (see the
   table above); the rest does not. A `build.gradle.kts` is a program, and its ground
   truth needs `./gradlew dependencies` — a JVM daemon executing your build. `pom.xml` is
   data and is readable in principle, but its versions are frequently `${properties}`
   inherited through a parent chain, which is a resolution step of its own.
-- **Swift** — SwiftPM has no canonical registry: packages are git URLs and versions are
-  git tags, and `Package.swift` is executable Swift. `Package.resolved` is readable, so
-  locked versions and vulnerability scanning are feasible, but "outdated" is not.
 - **C / C++** — there is no canonical registry (vcpkg is a git repository of ports whose
   versions are pinned by one baseline commit), vcpkg's `version-string` scheme is
   unordered by design, and OSV publishes no advisory data for vcpkg or ConanCenter. This

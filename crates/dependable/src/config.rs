@@ -39,6 +39,8 @@ pub struct Config {
     #[serde(default)]
     pub jvm: JvmConfig,
     #[serde(default)]
+    pub swift: SwiftConfig,
+    #[serde(default)]
     pub vulnerability: VulnConfig,
     /// CI gating rules. Empty by default, so policy gates nothing until a
     /// `[policy]` block is written.
@@ -70,6 +72,7 @@ impl Config {
             Ecosystem::CSharp => self.csharp.enabled,
             Ecosystem::Elixir => self.elixir.enabled,
             Ecosystem::Jvm => self.jvm.enabled,
+            Ecosystem::Swift => self.swift.enabled,
             // `Ecosystem` is `#[non_exhaustive]`: a variant added there but not
             // configured here is on, which is what every ecosystem defaults to.
             _ => true,
@@ -245,6 +248,27 @@ impl Default for JvmConfig {
             // here: an Artifactory or Nexus mirror is the usual reason to change it.
             registry: "https://repo1.maven.org/maven2".to_string(),
         }
+    }
+}
+
+/// Swift, the one ecosystem with no `registry` key.
+///
+/// SwiftPM identifies a package by its git URL and discovers versions by
+/// enumerating git tags; SE-0292 defines a registry API, but no dominant public
+/// instance operates one. There is nothing to point at, so nothing is offered —
+/// a URL here would only give a fetcher somewhere to send requests that cannot be
+/// answered. `enabled` still means what it does everywhere else: a Swift project
+/// reports what its `Package.resolved` pins and what OSV knows about them, or it
+/// is skipped.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SwiftConfig {
+    pub enabled: bool,
+}
+
+impl Default for SwiftConfig {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 
