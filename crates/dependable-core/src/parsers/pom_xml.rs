@@ -111,14 +111,11 @@ impl Parser for PomXmlParser {
         let properties = read_properties(project);
         let declared = read_dependencies(project, &properties);
 
-        // A property used by exactly one dependency is that dependency's own line
-        // to fix; one shared by several belongs to none of them.
-        let mut uses: HashMap<&str, usize> = HashMap::new();
-        for entry in &declared {
-            if let Source::Property(name) = &entry.version {
-                *uses.entry(name.as_str()).or_default() += 1;
-            }
-        }
+        // A property used by exactly one thing in this document is that
+        // dependency's own line to fix; one anything else also reads belongs to
+        // none of them — see `count_property_refs`.
+        let mut uses: HashMap<String, usize> = HashMap::new();
+        count_property_refs(project, &properties, &mut uses);
 
         let items = declared
             .iter()
@@ -287,6 +284,71 @@ fn interpolated(
         None if located.value.contains('$') => None,
         None => Some(located.value),
     }
+}
+
+/// Count every `${…}` reference in the document, by the property its chain ends at.
+///
+/// The whole document, because sole ownership of a `<properties>` line is a fact
+/// about that line and not about `<dependencies>`. A POM that states
+/// `<lib.version>32.1.3-jre</lib.version>` and reads it from both the top-level
+/// `guava` and a `<profiles>`-only `guava-gwt` has one line and two readers;
+/// counting only the top-level list makes `guava` the sole reader, so `--fix`
+/// rewrites the `<properties>` line and silently moves `guava-gwt` with it — a
+/// different artifact, never fetched, never validated, never named in the fix
+/// record. `<dependencyManagement>` and a `<plugin>`'s `<version>` are the same
+/// story. This is the `count_version_refs` rule of
+/// [`gradle_catalog`](super::gradle_catalog), applied to the same defect.
+///
+/// A `<properties>` value that is *entirely* one `${…}` is a link in a chain
+/// rather than a reader of it, and is skipped: the reference is counted against
+/// the property the chain ends at when whoever started the chain is counted.
+/// A composed value (`${core.version}-jre`) **is** a reader, and is counted.
+fn count_property_refs(
+    project: roxmltree::Node<'_, '_>,
+    properties: &HashMap<String, Located>,
+    uses: &mut HashMap<String, usize>,
+) {
+    let table = child(project, "properties");
+    for node in project.descendants().filter(roxmltree::Node::is_text) {
+        let Some(text) = node.text() else { continue };
+        // A top-level `<properties>` entry's own value: a pure `${…}` is a chain
+        // link, not a use of the property it names.
+        let chain_link = table
+            .is_some_and(|table| node.parent().and_then(|entry| entry.parent()) == Some(table))
+            && interpolation(text.trim()).is_some();
+        if chain_link {
+            continue;
+        }
+        for reference in references(text) {
+            if let Some(name) = terminal(reference, properties) {
+                *uses.entry(name.to_owned()).or_default() += 1;
+            }
+        }
+    }
+}
+
+/// Every `${…}` reference in a string, in order, by the name each names.
+///
+/// A version may compose one (`1.${minor}`) and a plugin configuration may hold
+/// several, so this scans rather than matching the whole value the way
+/// [`interpolation`] does.
+fn references(value: &str) -> impl Iterator<Item = &str> {
+    let mut rest = value;
+    std::iter::from_fn(move || {
+        loop {
+            let start = rest.find("${")?;
+            let after = &rest[start + 2..];
+            let Some(end) = after.find('}') else {
+                rest = "";
+                return None;
+            };
+            let inner = &after[..end];
+            rest = &after[end + 1..];
+            if !inner.is_empty() && !inner.contains(['$', '{']) {
+                return Some(inner);
+            }
+        }
+    })
 }
 
 /// The first direct child element named `tag`.
@@ -750,6 +812,132 @@ mod tests {
             assert_eq!(item.version_constraint, "1.0.0", "{spelling}");
             assert!(!item.is_rewritable(), "{spelling}");
         }
+    }
+
+    /// A property the top-level list reads once but a `<profiles>` block reads too
+    /// has two readers, not one. Rewriting its line would move an artifact that was
+    /// never fetched, never validated, and never named in the fix record.
+    #[test]
+    fn a_property_a_profile_also_reads_is_not_one_dependencys_to_rewrite() {
+        let content = pom("  <properties>\n\
+             \x20   <lib.version>32.1.3-jre</lib.version>\n\
+             \x20 </properties>\n\
+             \x20 <dependencies>\n\
+             \x20   <dependency>\n\
+             \x20     <groupId>com.google.guava</groupId>\n\
+             \x20     <artifactId>guava</artifactId>\n\
+             \x20     <version>${lib.version}</version>\n\
+             \x20   </dependency>\n\
+             \x20 </dependencies>\n\
+             \x20 <profiles>\n\
+             \x20   <profile>\n\
+             \x20     <id>gwt</id>\n\
+             \x20     <dependencies>\n\
+             \x20       <dependency>\n\
+             \x20         <groupId>com.google.guava</groupId>\n\
+             \x20         <artifactId>guava-gwt</artifactId>\n\
+             \x20         <version>${lib.version}</version>\n\
+             \x20       </dependency>\n\
+             \x20     </dependencies>\n\
+             \x20   </profile>\n\
+             \x20 </profiles>\n");
+        let m = parse(&content);
+        let guava = find(&m, "com.google.guava:guava");
+        assert_eq!(guava.version_constraint, "32.1.3-jre");
+        assert!(
+            guava.is_checkable(),
+            "the version is known and worth checking"
+        );
+        assert!(
+            !guava.is_rewritable(),
+            "the profile reads the same line, and would move with it"
+        );
+    }
+
+    /// The same rule for the other two readers a POM has, so no single reader is
+    /// privileged: `<dependencyManagement>` and a build plugin's own version.
+    #[test]
+    fn a_property_read_elsewhere_in_the_document_is_never_rewritable() {
+        let elsewhere = [
+            "  <dependencyManagement>\n\
+             \x20   <dependencies>\n\
+             \x20     <dependency>\n\
+             \x20       <groupId>g</groupId>\n\
+             \x20       <artifactId>managed</artifactId>\n\
+             \x20       <version>${lib.version}</version>\n\
+             \x20     </dependency>\n\
+             \x20   </dependencies>\n\
+             \x20 </dependencyManagement>\n",
+            "  <build>\n\
+             \x20   <plugins>\n\
+             \x20     <plugin>\n\
+             \x20       <groupId>g</groupId>\n\
+             \x20       <artifactId>plug</artifactId>\n\
+             \x20       <version>${lib.version}</version>\n\
+             \x20     </plugin>\n\
+             \x20   </plugins>\n\
+             \x20 </build>\n",
+        ];
+        for other in elsewhere {
+            let content = pom(&format!(
+                "  <properties>\n\
+                 \x20   <lib.version>1.2.3</lib.version>\n\
+                 \x20 </properties>\n\
+                 {other}\
+                 \x20 <dependencies>\n\
+                 \x20   <dependency>\n\
+                 \x20     <groupId>g</groupId>\n\
+                 \x20     <artifactId>a</artifactId>\n\
+                 \x20     <version>${{lib.version}}</version>\n\
+                 \x20   </dependency>\n\
+                 \x20 </dependencies>\n"
+            ));
+            let m = parse(&content);
+            let item = find(&m, "g:a");
+            assert_eq!(item.version_constraint, "1.2.3", "{other}");
+            assert!(!item.is_rewritable(), "{other}");
+        }
+    }
+
+    /// A composed `<properties>` value reads the property it names, so the line it
+    /// names is shared; a value that is *only* a reference is a link in a chain and
+    /// is not itself a reader, or no chained property could ever be rewritten.
+    #[test]
+    fn a_chain_link_is_not_a_reader_but_a_composed_value_is() {
+        let chained = pom("  <properties>\n\
+             \x20   <alias>${real.version}</alias>\n\
+             \x20   <real.version>9.9.9</real.version>\n\
+             \x20 </properties>\n\
+             \x20 <dependencies>\n\
+             \x20   <dependency>\n\
+             \x20     <groupId>g</groupId>\n\
+             \x20     <artifactId>a</artifactId>\n\
+             \x20     <version>${alias}</version>\n\
+             \x20   </dependency>\n\
+             \x20 </dependencies>\n");
+        assert!(
+            find(&parse(&chained), "g:a").is_rewritable(),
+            "one dependency, one chain, one line to rewrite"
+        );
+
+        // A second property composing the same line is a reader of it, so the line
+        // is no longer any one dependency's to rewrite.
+        let composed = chained
+            .replace(
+                "<version>${alias}</version>",
+                "<version>${real.version}</version>",
+            )
+            .replace(
+                "<alias>${real.version}</alias>",
+                "<bundle.version>${real.version}-jre</bundle.version>",
+            );
+        let m = parse(&composed);
+        let item = find(&m, "g:a");
+        assert_eq!(item.version_constraint, "9.9.9");
+        assert!(
+            !item.is_rewritable(),
+            "`<bundle.version>` composes the same line into a second value"
+        );
     }
 
     /// Eight hops is what the constant says, so eight hops has to resolve.
