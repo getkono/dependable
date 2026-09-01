@@ -88,6 +88,9 @@ code, .ver, .vector { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menl
 .st-OK { border-color: var(--ok); color: var(--ok); }
 .st-ERROR { border-color: var(--bad); color: var(--bad); }
 .sev-UNRATED, .sev-NONE, .st-LOCAL, .st-GIT { color: var(--muted); }
+/* Not muted with the skipped statuses: nothing is known about this row, which is
+   a gap in the report rather than a row there was nothing to say about. */
+.st-UNDETERMINED { border-color: var(--warn); color: var(--warn); }
 .withdrawn { color: var(--muted); text-transform: lowercase; }
 .score { color: var(--muted); font-size: .8rem; }
 
