@@ -209,7 +209,13 @@ fn walk_members(
 }
 
 /// Build a shallow graph from member manifests when there is no `Cargo.lock`:
-/// each member plus its direct declared dependencies, versions unresolved.
+/// each member plus its direct declared dependencies.
+///
+/// A member's *own* version is read from its `[package] version` — a path member
+/// is not resolved against anything, so what the manifest declares **is** its
+/// version, whether or not a lockfile exists. Its dependencies are a different
+/// matter: a manifest declares a constraint, not a resolution, so those stay
+/// unknown.
 fn shallow_graph(
     members: &[(String, String)],
     workspace_names: &HashSet<String>,
@@ -227,6 +233,11 @@ fn shallow_graph(
         .into_iter()
         .filter(|item| item.kind == DependencyKind::Workspace)
         .collect();
+    // `[workspace.package]`, the source a member's `version.workspace = true`
+    // inherits from. A member that inherits its version still has one.
+    let package_defaults = parse_workspace(root_content)
+        .map(|ws| ws.package_defaults)
+        .unwrap_or_default();
     let mut member_pkgs: Vec<LockedPackage> = Vec::new();
     let mut external_pkgs: Vec<LockedPackage> = Vec::new();
     let mut external_seen: HashSet<String> = HashSet::new();
@@ -262,7 +273,16 @@ fn shallow_graph(
         }
         deps.sort();
         deps.dedup();
-        member_pkgs.push(LockedPackage::new(name.clone(), None, None, deps));
+        // The member's declared version, inherited one included. Unlike a
+        // dependency's constraint this is not a range to resolve — it is what
+        // this crate is — so leaving it unknown would understate what the
+        // manifest already said.
+        let version = parse_project(ManifestKind::CargoToml, content)
+            .version
+            .as_ref()
+            .and_then(|field| field.resolve(&package_defaults, "version"))
+            .map(str::to_owned);
+        member_pkgs.push(LockedPackage::new(name.clone(), version, None, deps));
     }
 
     member_pkgs.append(&mut external_pkgs);

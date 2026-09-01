@@ -242,12 +242,72 @@ fn falls_back_to_shallow_graph_without_lockfile() {
     assert!(a.is_some());
     assert!(flat.iter().any(|(n, _)| n == "b"));
 
-    // Nothing here resolved a version, and the graph says so rather than
-    // recording a blank one that reads downstream as a version.
+    // A member's own version is declared, not resolved: `crates/a` says
+    // `version = "0.1.0"` and that *is* what the crate is, lockfile or not.
+    let version_of = |name: &str| {
+        g.nodes()
+            .iter()
+            .find(|n| n.name == name)
+            .unwrap_or_else(|| panic!("a node for {name}"))
+            .version
+            .as_deref()
+    };
+    assert_eq!(version_of("a"), Some("0.1.0"));
+    assert_eq!(version_of("b"), Some("0.1.0"));
+    assert_eq!(version_of("c"), Some("0.1.0"));
+
+    // A dependency is the other case: the manifest declares a constraint, and
+    // nothing here resolved it. The graph says so rather than recording a blank
+    // string that reads downstream as a version.
+    assert_eq!(version_of("serde"), None);
+    assert_eq!(version_of("gitdep"), None);
     assert!(
-        g.nodes().iter().all(|n| n.version.is_none()),
-        "a manifest-only graph resolves no versions"
+        g.nodes().iter().all(|n| n.version != Some(String::new())),
+        "and never the empty string"
     );
+}
+
+/// A member with `version.workspace = true` still has a version — the root's
+/// `[workspace.package]` declares it, and the root is already read here. Reading
+/// only the literal would report every member of a version-inheriting workspace
+/// as unknown, which is the majority shape for a Cargo workspace.
+#[test]
+fn a_member_inheriting_its_version_from_the_workspace_root_still_reports_one() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    fs::write(
+        dir.join("Cargo.toml"),
+        r#"
+[workspace]
+resolver = "2"
+members = ["crates/a"]
+
+[workspace.package]
+version = "3.1.4"
+"#,
+    )
+    .unwrap();
+    let crate_dir = dir.join("crates").join("a");
+    fs::create_dir_all(&crate_dir).unwrap();
+    fs::write(
+        crate_dir.join("Cargo.toml"),
+        r#"
+[package]
+name = "a"
+version.workspace = true
+"#,
+    )
+    .unwrap();
+
+    let built = build_workspace_graph(dir, &WorkspaceGraphOptions::default()).unwrap();
+    assert_eq!(built.source, GraphSource::Manifests);
+    let a = built
+        .graph
+        .nodes()
+        .iter()
+        .find(|n| n.name == "a")
+        .expect("a node for the member");
+    assert_eq!(a.version.as_deref(), Some("3.1.4"));
 }
 
 /// Without a lockfile the graph is built from manifests alone, and a member's
