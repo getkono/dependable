@@ -21,11 +21,17 @@ pub struct LockedPackage {
     /// Exact resolved version, or `None` when no version was read for this
     /// package at all.
     ///
-    /// A lockfile always records one, so a parsed entry is always `Some`. `None`
-    /// is what a *synthesized* entry carries — a manifest-only graph, or a
-    /// project whose manifest declares no version of its own — and it is
-    /// deliberately not an empty string, so that "we never learned the version"
-    /// cannot be mistaken downstream for a version that happens to be blank.
+    /// `None` is carried by a *synthesized* entry — a manifest-only graph, or a
+    /// project whose manifest declares no version of its own — and also by the
+    /// entries a lockfile records without one: an npm or Bun workspace link is
+    /// a location (`workspace:packages/lib`), not a version, so parsing one
+    /// yields `None` too.
+    ///
+    /// It is never `Some("")`. [`LockedPackage::new`] normalizes an empty
+    /// version to `None`, so a blank field in a hand-edited or
+    /// generator-produced lockfile cannot reach a consumer as a version that
+    /// happens to be empty — a string every version comparison silently
+    /// mishandles.
     pub version: Option<String>,
     /// Package source (`registry+https://…`, `git+…`, `sparse+…`). `None` for
     /// path/workspace packages — that absence is how local crates are told apart
@@ -48,8 +54,15 @@ pub struct ResolvedLockfile {
 }
 
 impl LockedPackage {
-    /// Construct a package entry directly — used when synthesizing a graph from
-    /// manifests (e.g. the shallow fallback when no `Cargo.lock` is present).
+    /// Construct a package entry directly — used both by the lockfile parsers
+    /// and when synthesizing a graph from manifests (e.g. the shallow fallback
+    /// when no `Cargo.lock` is present).
+    ///
+    /// An empty `version` becomes [`None`]. This is the one choke point every
+    /// package entry passes through, which is what makes `Some("")`
+    /// unrepresentable rather than merely discouraged: a blank version is not a
+    /// version, and each consumer re-deriving that from an `is_empty()` check is
+    /// how the distinction gets lost again.
     #[must_use]
     pub fn new(
         name: String,
@@ -59,7 +72,7 @@ impl LockedPackage {
     ) -> Self {
         Self {
             name,
-            version,
+            version: version.filter(|v| !v.is_empty()),
             source,
             dependencies,
         }
@@ -188,6 +201,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
             Some("registry+https://github.com/rust-lang/crates.io-index")
         );
         assert!(serde.dependencies.is_empty());
+    }
+
+    #[test]
+    fn an_empty_version_is_recorded_as_no_version_at_all() {
+        // A blank `version` is not a version, and every consumer that compares
+        // versions mishandles the empty string: `Version::parse("")` fails, so a
+        // freshness check falls through to "no locked version" and answers
+        // "up to date" about a package nobody read a version for. Normalizing
+        // here, at the single constructor every parser and every synthesized
+        // entry passes through, is what makes `Some("")` unrepresentable.
+        let lock = parse_cargo_lock_graph(
+            r#"
+version = 4
+
+[[package]]
+name = "serde"
+version = ""
+source = "registry+https://github.com/rust-lang/crates.io-index"
+"#,
+        )
+        .unwrap();
+        assert_eq!(lock.packages[0].version, None);
+        assert_eq!(
+            LockedPackage::new("x".to_owned(), Some(String::new()), None, Vec::new()).version,
+            None,
+            "a synthesized entry is normalized the same way"
+        );
     }
 
     #[test]

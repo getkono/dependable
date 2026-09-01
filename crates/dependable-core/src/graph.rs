@@ -35,14 +35,20 @@ pub enum NodeKind {
 pub struct Node {
     /// Package name.
     pub name: String,
-    /// Resolved version, or `None` when no version was ever read for this
-    /// package.
+    /// The version this package is at, or `None` when no version was ever read
+    /// for it.
     ///
-    /// An [`Option`] rather than an empty-string sentinel: a graph built from
-    /// manifests alone resolves no versions, and a renderer must be able to say
-    /// "unknown" rather than evaluate a blank string as though it were one. The
-    /// two states are different claims about a dependency, and the type is what
-    /// keeps them from being confused.
+    /// A workspace member carries the version its own manifest declares — a
+    /// member is resolved against nothing, so its declaration *is* its version,
+    /// whether or not a lockfile exists. `None` is a dependency in a graph built
+    /// from manifests alone, where the manifest gave a constraint and nothing
+    /// resolved it, and a package a lockfile records without a version at all.
+    ///
+    /// An [`Option`] rather than an empty-string sentinel, and never
+    /// `Some("")`: a renderer must be able to say "unknown" rather than evaluate
+    /// a blank string as though it were a version. The two states are different
+    /// claims about a dependency, and the type is what keeps them from being
+    /// confused.
     pub version: Option<String>,
     /// Relationship to the workspace.
     pub kind: NodeKind,

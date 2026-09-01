@@ -1151,3 +1151,65 @@ fn a_freshness_verdict_never_attaches_to_a_version_we_did_not_read() {
         "nor a latest version to compare it against: {screen}"
     );
 }
+
+/// The same shape, but with the empty string where a version would be — what a
+/// hand-edited or generator-produced lockfile carries. `Some("")` is not a
+/// version, and the graph must not let it pose as one.
+fn empty_version_project() -> Project {
+    let packages = vec![
+        LockedPackage::new(
+            "app".into(),
+            Some(String::new()),
+            None,
+            vec!["serde".into()],
+        ),
+        LockedPackage::new(
+            "serde".into(),
+            Some(String::new()),
+            Some("registry+https://example.com".into()),
+            Vec::new(),
+        ),
+    ];
+    let resolved = ResolvedLockfile::from_packages(packages);
+    let names = std::iter::once("app".to_owned()).collect();
+    Project {
+        manifest: PathBuf::from("Cargo.toml"),
+        label: "Cargo.toml".to_owned(),
+        ecosystem: Ecosystem::Rust,
+        graph: DependencyGraph::from_resolved(&resolved, &names, &["app".to_owned()]),
+        source: GraphSource::Lockfile,
+    }
+}
+
+#[test]
+fn an_empty_version_string_is_treated_as_no_version_at_all_not_as_up_to_date() {
+    // Issue #96's exact symptom, through the narrower door an `Option` alone
+    // leaves open: `Some("")` fails `Version::parse`, so the checker falls back
+    // to the latest compatible release under a `*` constraint and answers
+    // `UpToDate` — a green verdict about a version nobody ever read. The empty
+    // string is normalized away at the parse boundary, so the row reports
+    // `unknown` and no lookup is ever spawned for it.
+    let mut app = App::new(vec![empty_version_project()]);
+    app.apply(Action::Move(1)); // the `app` root
+    app.apply(Action::Expand);
+    app.apply(Action::Move(1)); // `serde`
+
+    assert_eq!(app.selected().map(|r| r.name.as_str()), Some("serde"));
+    assert_eq!(
+        app.selected().and_then(|r| r.version.clone()),
+        None,
+        "an empty version reaches the row as no version at all"
+    );
+    assert_eq!(
+        app.selected_key(),
+        None,
+        "and so is never looked up against a registry"
+    );
+
+    let screen = render(&mut app);
+    assert_eq!(
+        status_cell_of(&screen, "serde"),
+        "unknown",
+        "an empty version must never read as a freshness verdict: {screen}"
+    );
+}

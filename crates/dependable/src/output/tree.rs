@@ -404,6 +404,45 @@ source = "registry+https://x"
         assert!(!out.contains("\"version\": \"\""), "{out}");
     }
 
+    /// A hand-edited or generator-produced lockfile can carry `version = ""`.
+    /// That is not a version, and no renderer may print it as one: the label
+    /// `serde v` claims a version whose text happens to be empty. The empty
+    /// string is normalized away when the entry is built, so every renderer sees
+    /// the same absence a manifest-only graph produces.
+    #[test]
+    fn an_empty_version_in_a_lockfile_is_never_rendered_as_a_version() {
+        let graph = {
+            let lock = parse_cargo_lock_graph(
+                r#"
+[[package]]
+name = "app"
+version = "0.1.0"
+dependencies = ["serde"]
+
+[[package]]
+name = "serde"
+version = ""
+source = "registry+https://example.com"
+"#,
+            )
+            .unwrap();
+            let names = ["app".to_owned()].into_iter().collect();
+            DependencyGraph::from_resolved(&lock, &names, &["app".to_owned()])
+        };
+        let opts = TreeOptions::default();
+
+        let text = ascii(&graph, &opts);
+        assert!(text.contains("\u{2514}\u{2500}\u{2500} serde\n"), "{text}");
+        assert!(!text.contains("serde v"), "no trailing `v`: {text}");
+
+        let out = dot(&graph, &opts);
+        assert!(out.contains("[label=\"serde\"]"), "{out}");
+
+        let out = json(&graph, &opts).unwrap();
+        assert!(out.contains("\"version\": null"), "{out}");
+        assert!(!out.contains("\"version\": \"\""), "{out}");
+    }
+
     #[test]
     fn dot_is_a_digraph_with_styled_workspace() {
         let out = dot(&sample(), &TreeOptions::default());
