@@ -109,7 +109,11 @@ fn level_of(status: &DependencyStatus) -> Option<Level> {
     match status {
         DependencyStatus::Vulnerable => Some(Level::Error),
         DependencyStatus::Outdated | DependencyStatus::UpdateAvailable => Some(Level::Warning),
-        DependencyStatus::Error(_) => Some(Level::Notice),
+        // Both are "this dependency was not checked": one because the registry or the
+        // fetch failed, one because the declared version could not be read. A plain
+        // `Error` got a notice and `Undetermined` got nothing at all, so the status made
+        // honest elsewhere was the one status a pull request never heard about.
+        DependencyStatus::Error(_) | DependencyStatus::Undetermined => Some(Level::Notice),
         _ => None,
     }
 }
@@ -374,6 +378,9 @@ fn message(finding: &Finding<'_>, level: Level) -> String {
         ),
         Level::Notice => match &result.status {
             DependencyStatus::Error(why) => format!("{name} could not be checked: {why}"),
+            DependencyStatus::Undetermined => {
+                format!("{name} could not be checked: its declared version could not be read")
+            }
             other => format!("{name}: {}", other.label()),
         },
     };
@@ -1134,5 +1141,23 @@ mod tests {
     fn table_cells_cannot_break_the_table() {
         assert_eq!(cell("a|b\nc"), "a\\|b c");
         assert_eq!(code_cell("a`b`c"), "`abc`");
+    }
+
+    /// Both statuses mean "this dependency was not checked", and a pull request has to
+    /// hear about both. `Undetermined` produced no annotation at all while a plain
+    /// `Error` got a notice, so the one status that says "we could not read this" was
+    /// the one nobody saw.
+    #[test]
+    fn a_dependency_that_could_not_be_checked_is_annotated_either_way() {
+        assert_eq!(
+            level_of(&DependencyStatus::Undetermined),
+            Some(Level::Notice)
+        );
+        assert_eq!(
+            level_of(&DependencyStatus::Error("boom".to_owned())),
+            Some(Level::Notice)
+        );
+        assert_eq!(level_of(&DependencyStatus::UpToDate), None);
+        assert_eq!(level_of(&DependencyStatus::PatchAvailable), None);
     }
 }

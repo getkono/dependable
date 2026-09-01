@@ -44,15 +44,28 @@ pub struct ScanIntegrity {
     /// through: the registry declined to answer, so the run has no facts about the
     /// dependencies it asked about.
     pub registry_unreachable: bool,
-    /// How many dependencies came back with no status at all.
+    /// How many dependencies a registry answered about by name: no such package.
     ///
-    /// Reported, never gated on. With [`registry_unreachable`](Self::registry_unreachable)
-    /// clear, every one of these is a registry answering that the package does not
-    /// exist — a private or internal package, one served by a registry this run does not
-    /// route to, a deleted package. That is a permanent fact about that dependency and
-    /// says nothing about the ones that did resolve, so it must not turn a whole gate
-    /// into a failure; it is said plainly on stderr instead.
+    /// Reported, never gated on. Each is a permanent fact about one dependency — a
+    /// private or internal package, one served by a registry this run does not route to,
+    /// a deleted package — and says nothing about the ones that did resolve, so it must
+    /// not turn a whole gate into a failure; it is said plainly on stderr instead.
+    ///
+    /// Counted from [`CheckResult::registry_not_found`], never from the error message:
+    /// the carve-out is only safe while it covers exactly the answers a registry gave.
+    ///
+    /// [`CheckResult::registry_not_found`]: dependable_fetch::CheckResult::registry_not_found
     pub unresolved: usize,
+    /// How many dependencies this run failed to evaluate on its own.
+    ///
+    /// An `Error` that no registry ever produced: a constraint written in a dialect that
+    /// did not parse, a dependency whose fetch task never ran. Nothing was established
+    /// about the package, and unlike a 404 there is no fact to report in place of a
+    /// status — so a `--fail-on` gate cannot be honoured over it, exactly as it could
+    /// not before the 404 carve-out existed. Folding these in with the 404s let two
+    /// unparseable constraints pass `--fail-on vulnerable` under a note claiming the
+    /// registry had not found them.
+    pub unevaluated: usize,
 }
 
 /// Aggregate status counts across one or more reports.
