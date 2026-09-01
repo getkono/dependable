@@ -157,7 +157,7 @@ impl Visitor for RowBuilder<'_> {
             project: self.project_index,
             node: Some(visit.node),
             name: info.name.clone(),
-            version: info.version.clone(),
+            version: info.version.clone().unwrap_or_default(),
             node_kind: Some(info.kind),
             has_children: expandable,
             expanded: visit.placement == Placement::Full && visit.degree > 0,

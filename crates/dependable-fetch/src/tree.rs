@@ -252,7 +252,9 @@ fn shallow_graph(
                 };
                 external_pkgs.push(LockedPackage::new(
                     item.name.clone(),
-                    String::new(),
+                    // A manifest declares a constraint, not a resolved version;
+                    // nothing here read one.
+                    None,
                     source,
                     Vec::new(),
                 ));
@@ -260,7 +262,7 @@ fn shallow_graph(
         }
         deps.sort();
         deps.dedup();
-        member_pkgs.push(LockedPackage::new(name.clone(), String::new(), None, deps));
+        member_pkgs.push(LockedPackage::new(name.clone(), None, None, deps));
     }
 
     member_pkgs.append(&mut external_pkgs);
@@ -307,7 +309,9 @@ pub fn build_project_graph(
         .clone()
         .or_else(|| project_name_from_path(manifest))
         .unwrap_or_else(|| kind.ecosystem().display_name().to_owned());
-    let root_version = meta.literal_version().unwrap_or_default().to_owned();
+    // A manifest that declares no version of its own — a `pom.xml` inheriting
+    // from a `<parent>`, a `*.csproj` — leaves this unknown rather than blank.
+    let root_version: Option<String> = meta.literal_version().map(str::to_owned);
 
     // The project's own declared dependencies, used as the root's edges whenever the
     // lockfile carries no entry for the project itself.
@@ -322,7 +326,13 @@ pub fn build_project_graph(
     };
 
     if !has_graph_parser(kind) {
-        let graph = direct_graph(&root_name, &root_version, &direct, &workspace_names, &roots);
+        let graph = direct_graph(
+            &root_name,
+            root_version.as_deref(),
+            &direct,
+            &workspace_names,
+            &roots,
+        );
         return Ok(WorkspaceGraph {
             graph,
             source: GraphSource::Unsupported,
@@ -330,7 +340,13 @@ pub fn build_project_graph(
     }
 
     let Some((lock_path, lock_kind)) = crate::discover::locate_lockfile(manifest, kind) else {
-        let graph = direct_graph(&root_name, &root_version, &direct, &workspace_names, &roots);
+        let graph = direct_graph(
+            &root_name,
+            root_version.as_deref(),
+            &direct,
+            &workspace_names,
+            &roots,
+        );
         // Distinguish "there is none" from "there is one we cannot use".
         let source = if crate::discover::lockfile_notices(manifest, kind).is_empty() {
             GraphSource::Manifests
@@ -343,7 +359,13 @@ pub fn build_project_graph(
     // The manifest has *a* format we can read edges from, but the one actually
     // on disk may not be it.
     let Some(parser) = graph_parser(lock_kind) else {
-        let graph = direct_graph(&root_name, &root_version, &direct, &workspace_names, &roots);
+        let graph = direct_graph(
+            &root_name,
+            root_version.as_deref(),
+            &direct,
+            &workspace_names,
+            &roots,
+        );
         return Ok(WorkspaceGraph {
             graph,
             source: GraphSource::Unsupported,
@@ -351,7 +373,7 @@ pub fn build_project_graph(
     };
 
     let resolved = parser(&read(&lock_path)?)?;
-    let resolved = with_root(resolved, &root_name, &root_version, direct);
+    let resolved = with_root(resolved, &root_name, root_version.as_deref(), direct);
     Ok(WorkspaceGraph {
         graph: DependencyGraph::from_resolved(&resolved, &workspace_names, &roots),
         source: GraphSource::Lockfile,
@@ -394,7 +416,7 @@ fn has_graph_parser(kind: ManifestKind) -> bool {
 fn with_root(
     mut resolved: ResolvedLockfile,
     root_name: &str,
-    root_version: &str,
+    root_version: Option<&str>,
     direct: Vec<String>,
 ) -> ResolvedLockfile {
     if let Some(existing) = resolved
@@ -412,7 +434,7 @@ fn with_root(
     }
     let mut packages = vec![LockedPackage::new(
         root_name.to_owned(),
-        root_version.to_owned(),
+        root_version.map(str::to_owned),
         None,
         direct,
     )];
@@ -424,14 +446,14 @@ fn with_root(
 /// unresolved. Used when no resolved graph is available.
 fn direct_graph(
     root_name: &str,
-    root_version: &str,
+    root_version: Option<&str>,
     direct: &[String],
     workspace_names: &HashSet<String>,
     roots: &[String],
 ) -> DependencyGraph {
     let mut packages = vec![LockedPackage::new(
         root_name.to_owned(),
-        root_version.to_owned(),
+        root_version.map(str::to_owned),
         None,
         direct.to_vec(),
     )];
@@ -440,7 +462,9 @@ fn direct_graph(
         if name != root_name && seen.insert(name.as_str()) {
             packages.push(LockedPackage::new(
                 name.clone(),
-                String::new(),
+                // A manifest names its dependencies; nothing here resolved one
+                // to a version, and saying so is the point of the `None`.
+                None,
                 Some("registry+".to_owned()),
                 Vec::new(),
             ));

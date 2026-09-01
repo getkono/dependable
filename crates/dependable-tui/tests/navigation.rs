@@ -19,7 +19,7 @@ fn project(label: &str, packages: &[(&str, &str, &[&str])]) -> Project {
         .map(|(i, (name, version, deps))| {
             LockedPackage::new(
                 (*name).to_owned(),
-                (*version).to_owned(),
+                Some((*version).to_owned()),
                 // The first package is the project itself; the rest are external.
                 (i > 0).then(|| "registry+https://example.com".to_owned()),
                 deps.iter().map(|d| (*d).to_owned()).collect(),
@@ -47,7 +47,7 @@ fn workspace(label: &str, members: usize, packages: &[(&str, &str, &[&str])]) ->
         .map(|(i, (name, version, deps))| {
             LockedPackage::new(
                 (*name).to_owned(),
-                (*version).to_owned(),
+                Some((*version).to_owned()),
                 // A member has no `source`; everything else came from a registry.
                 (i >= members).then(|| "registry+https://example.com".to_owned()),
                 deps.iter().map(|d| (*d).to_owned()).collect(),

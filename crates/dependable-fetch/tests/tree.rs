@@ -193,15 +193,15 @@ fn duplicate_versions_are_distinct_nodes() {
     write_workspace(tmp.path());
     write_lockfile(tmp.path());
     let built = build_workspace_graph(tmp.path(), &WorkspaceGraphOptions::default()).unwrap();
-    let versions: Vec<&str> = built
+    let versions: Vec<Option<&str>> = built
         .graph
         .nodes()
         .iter()
         .filter(|n| n.name == "syn")
-        .map(|n| n.version.as_str())
+        .map(|n| n.version.as_deref())
         .collect();
-    assert!(versions.contains(&"1.0.0"));
-    assert!(versions.contains(&"2.0.0"));
+    assert!(versions.contains(&Some("1.0.0")));
+    assert!(versions.contains(&Some("2.0.0")));
 }
 
 #[test]
@@ -241,6 +241,13 @@ fn falls_back_to_shallow_graph_without_lockfile() {
     let a = flat.iter().position(|(n, _)| n == "a");
     assert!(a.is_some());
     assert!(flat.iter().any(|(n, _)| n == "b"));
+
+    // Nothing here resolved a version, and the graph says so rather than
+    // recording a blank one that reads downstream as a version.
+    assert!(
+        g.nodes().iter().all(|n| n.version.is_none()),
+        "a manifest-only graph resolves no versions"
+    );
 }
 
 /// Without a lockfile the graph is built from manifests alone, and a member's

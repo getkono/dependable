@@ -89,10 +89,9 @@ fn write_node(
 /// yellow, registry plain) and dimmed wherever it is collapsed.
 fn label(graph: &DependencyGraph, node: &TreeNode) -> String {
     let n = &graph.nodes()[node.node];
-    let mut text = if n.version.is_empty() {
-        n.name.clone()
-    } else {
-        format!("{} v{}", n.name, n.version)
+    let mut text = match n.version.as_deref() {
+        Some(version) => format!("{} v{}", n.name, version),
+        None => n.name.clone(),
     };
     match n.kind {
         NodeKind::Workspace => text.push_str(" (workspace)"),
@@ -216,7 +215,7 @@ fn json(graph: &DependencyGraph, opts: &TreeOptions) -> anyhow::Result<String> {
             NodeDto {
                 id,
                 name: &n.name,
-                version: &n.version,
+                version: n.version.as_deref().unwrap_or_default(),
                 kind: kind_str(n.kind),
             }
         })
@@ -242,10 +241,9 @@ fn dot(graph: &DependencyGraph, opts: &TreeOptions) -> String {
     );
     for (id, &orig) in flat.order.iter().enumerate() {
         let n = &graph.nodes()[orig];
-        let label = if n.version.is_empty() {
-            n.name.clone()
-        } else {
-            format!("{} v{}", n.name, n.version)
+        let label = match n.version.as_deref() {
+            Some(version) => format!("{} v{}", n.name, version),
+            None => n.name.clone(),
         };
         let escaped = label.replace('"', "\\\"");
         let attrs = match n.kind {

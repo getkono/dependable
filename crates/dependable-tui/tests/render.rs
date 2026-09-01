@@ -50,10 +50,15 @@ fn metadata() -> PackageMetadata {
 
 fn project(source: GraphSource) -> Project {
     let packages = vec![
-        LockedPackage::new("app".into(), "0.1.0".into(), None, vec!["serde".into()]),
+        LockedPackage::new(
+            "app".into(),
+            Some("0.1.0".into()),
+            None,
+            vec!["serde".into()],
+        ),
         LockedPackage::new(
             "serde".into(),
-            "1.0.0".into(),
+            Some("1.0.0".into()),
             Some("registry+https://example.com".into()),
             Vec::new(),
         ),
@@ -955,11 +960,11 @@ fn a_registry_that_publishes_no_metadata_still_offers_the_docs_it_builds() {
 /// Two workspace members, `a` -> `b`, so `b` has a tree of its own.
 fn two_members() -> App {
     let packages = vec![
-        LockedPackage::new("a".into(), "0.1.0".into(), None, vec!["b".into()]),
-        LockedPackage::new("b".into(), "0.1.0".into(), None, vec!["serde".into()]),
+        LockedPackage::new("a".into(), Some("0.1.0".into()), None, vec!["b".into()]),
+        LockedPackage::new("b".into(), Some("0.1.0".into()), None, vec!["serde".into()]),
         LockedPackage::new(
             "serde".into(),
-            "1.0.0".into(),
+            Some("1.0.0".into()),
             Some("registry+https://example.com".into()),
             Vec::new(),
         ),

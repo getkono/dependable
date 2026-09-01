@@ -18,8 +18,15 @@ use crate::error::ParseError;
 pub struct LockedPackage {
     /// Package name.
     pub name: String,
-    /// Exact resolved version.
-    pub version: String,
+    /// Exact resolved version, or `None` when no version was read for this
+    /// package at all.
+    ///
+    /// A lockfile always records one, so a parsed entry is always `Some`. `None`
+    /// is what a *synthesized* entry carries — a manifest-only graph, or a
+    /// project whose manifest declares no version of its own — and it is
+    /// deliberately not an empty string, so that "we never learned the version"
+    /// cannot be mistaken downstream for a version that happens to be blank.
+    pub version: Option<String>,
     /// Package source (`registry+https://…`, `git+…`, `sparse+…`). `None` for
     /// path/workspace packages — that absence is how local crates are told apart
     /// from external ones.
@@ -46,7 +53,7 @@ impl LockedPackage {
     #[must_use]
     pub fn new(
         name: String,
-        version: String,
+        version: Option<String>,
         source: Option<String>,
         dependencies: Vec<String>,
     ) -> Self {
@@ -88,7 +95,7 @@ impl ResolvedLockfile {
             Some(version) => candidates
                 .iter()
                 .copied()
-                .find(|&i| self.packages[i].version == version),
+                .find(|&i| self.packages[i].version.as_deref() == Some(version)),
         }
     }
 }
@@ -124,7 +131,7 @@ pub fn parse_cargo_lock_graph(content: &str) -> Result<ResolvedLockfile, ParseEr
                 .unwrap_or_default();
             packages.push(LockedPackage::new(
                 name.to_owned(),
-                version.to_owned(),
+                Some(version.to_owned()),
                 source,
                 dependencies,
             ));
@@ -194,10 +201,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
     fn resolves_disambiguated_name_and_version() {
         let lock = parse_cargo_lock_graph(LOCK).unwrap();
         let idx = lock.resolve("getrandom 0.2.17").unwrap();
-        assert_eq!(lock.packages[idx].version, "0.2.17");
+        assert_eq!(lock.packages[idx].version.as_deref(), Some("0.2.17"));
         // The other version is a distinct package, resolvable on its own.
         let other = lock.resolve("getrandom 0.3.4").unwrap();
-        assert_eq!(lock.packages[other].version, "0.3.4");
+        assert_eq!(lock.packages[other].version.as_deref(), Some("0.3.4"));
     }
 
     #[test]
@@ -206,7 +213,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
         let idx = lock
             .resolve("getrandom 0.2.17 (registry+https://github.com/rust-lang/crates.io-index)")
             .unwrap();
-        assert_eq!(lock.packages[idx].version, "0.2.17");
+        assert_eq!(lock.packages[idx].version.as_deref(), Some("0.2.17"));
     }
 
     #[test]

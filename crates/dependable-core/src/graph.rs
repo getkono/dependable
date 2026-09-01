@@ -35,8 +35,15 @@ pub enum NodeKind {
 pub struct Node {
     /// Package name.
     pub name: String,
-    /// Resolved version.
-    pub version: String,
+    /// Resolved version, or `None` when no version was ever read for this
+    /// package.
+    ///
+    /// An [`Option`] rather than an empty-string sentinel: a graph built from
+    /// manifests alone resolves no versions, and a renderer must be able to say
+    /// "unknown" rather than evaluate a blank string as though it were one. The
+    /// two states are different claims about a dependency, and the type is what
+    /// keeps them from being confused.
+    pub version: Option<String>,
     /// Relationship to the workspace.
     pub kind: NodeKind,
 }
@@ -556,7 +563,11 @@ mod tests {
     fn flatten<'a>(g: &'a DependencyGraph, t: &Tree) -> Vec<(&'a str, &'a str, bool)> {
         fn walk<'a>(g: &'a DependencyGraph, n: &TreeNode, out: &mut Vec<(&'a str, &'a str, bool)>) {
             let node = &g.nodes()[n.node];
-            out.push((&node.name, &node.version, n.deduped()));
+            out.push((
+                &node.name,
+                node.version.as_deref().unwrap_or_default(),
+                n.deduped(),
+            ));
             for c in &n.children {
                 walk(g, c, out);
             }
@@ -628,7 +639,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
         let kind_at = |version: &str| {
             g.nodes()
                 .iter()
-                .find(|n| n.name == "b" && n.version == version)
+                .find(|n| n.name == "b" && n.version.as_deref() == Some(version))
                 .unwrap()
                 .kind
         };
@@ -662,7 +673,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
         let roots: Vec<(&str, &str)> = g
             .roots()
             .iter()
-            .map(|&i| (g.nodes()[i].name.as_str(), g.nodes()[i].version.as_str()))
+            .map(|&i| {
+                (
+                    g.nodes()[i].name.as_str(),
+                    g.nodes()[i].version.as_deref().unwrap_or_default(),
+                )
+            })
             .collect();
         assert_eq!(
             roots,
@@ -908,7 +924,7 @@ source = "registry+https://x"
         let tree = g.tree(&TreeOptions::default());
 
         let namesake = under_root(&g, &tree, "a", "b");
-        assert_eq!(g.nodes()[namesake.node].version, "9.0.0");
+        assert_eq!(g.nodes()[namesake.node].version.as_deref(), Some("9.0.0"));
         assert_eq!(
             namesake.placement,
             Placement::Full,
