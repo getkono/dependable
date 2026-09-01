@@ -1010,30 +1010,6 @@ mod tests {
 
     // -- A.4 ----------------------------------------------------------------
 
-    /// A path that is absolute on the platform the test is running on.
-    ///
-    /// `/elsewhere/Cargo.toml` is absolute on Unix and *not* on Windows, where
-    /// [`Path::is_absolute`] wants a drive prefix. A fixture written that way
-    /// takes `uri_for`'s relative branch on Windows while asserting the absolute
-    /// branch's answer, so the assertion tests nothing there and fails.
-    fn outside_root(rest: &str) -> PathBuf {
-        if cfg!(windows) {
-            PathBuf::from(format!("C:\\{}", rest.replace('/', "\\")))
-        } else {
-            PathBuf::from(format!("/{rest}"))
-        }
-    }
-
-    /// The `file:` URI [`outside_root`] renders to, whose drive prefix Windows
-    /// keeps and Unix has none of.
-    fn outside_root_uri(rest: &str) -> String {
-        if cfg!(windows) {
-            format!("file:///C:/{rest}")
-        } else {
-            format!("file:///{rest}")
-        }
-    }
-
     #[test]
     fn uri_is_relative_to_report_root_and_slash_joined() {
         let log = rendered(&report_at(
@@ -1052,12 +1028,12 @@ mod tests {
         // `uriBaseId`, which this log deliberately omits.
         let outside = rendered(&report_at(
             PathBuf::from("/repo"),
-            outside_root("elsewhere/Cargo.toml"),
+            PathBuf::from("/elsewhere/Cargo.toml"),
             vec![outdated()],
         ));
         assert_eq!(
             results_of(&outside)[0]["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
-            outside_root_uri("elsewhere/Cargo.toml").as_str()
+            "file:///elsewhere/Cargo.toml"
         );
 
         // `.` components are normalized away even when the prefix does not strip.
@@ -1489,8 +1465,8 @@ mod tests {
             "my%20app/Cargo.toml"
         );
         assert_eq!(
-            uri_for(Path::new("/repo"), &outside_root("other dir/Cargo.toml")),
-            outside_root_uri("other%20dir/Cargo.toml")
+            uri_for(Path::new("/repo"), Path::new("/other dir/Cargo.toml")),
+            "file:///other%20dir/Cargo.toml"
         );
     }
 
