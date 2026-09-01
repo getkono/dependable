@@ -33,7 +33,10 @@ pub struct AlternateRegistryDecl {
 /// Distinguishes manifest files. Every variant has a parser; the mapping to
 /// [`Ecosystem`] is many-to-one, since several manifest formats can belong to one
 /// registry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Hash` because a kind is part of a cache key: a path alone does not say which parser
+/// read it, and two kinds can name the same file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ManifestKind {
     CargoToml,
@@ -138,8 +141,7 @@ impl ManifestKind {
     pub fn workspace_roots(self) -> Option<WorkspaceRoots> {
         match self {
             ManifestKind::CargoToml => Some(WorkspaceRoots {
-                root_names: &["Cargo.toml"],
-                root_kind: ManifestKind::CargoToml,
+                root_names: &[("Cargo.toml", ManifestKind::CargoToml)],
                 self_governing: true,
             }),
             _ => None,
@@ -203,18 +205,36 @@ impl ManifestKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct WorkspaceRoots {
-    /// Candidate file names for a root, tried in order within each directory —
-    /// the same precedence rule [`ManifestKind::lockfiles`] uses, so a root beside
-    /// the manifest always beats one further up whichever name it goes by.
-    pub root_names: &'static [&'static str],
-    /// The kind a located root is parsed as. Not necessarily the kind that went
-    /// looking: an ecosystem may keep its central declarations in a different file
-    /// format from the manifests that inherit them.
-    pub root_kind: ManifestKind,
+    /// Candidate roots, each a path relative to a directory being searched, paired
+    /// with the kind that candidate is recognized and parsed as.
+    ///
+    /// They are tried in order within each directory — the same precedence rule
+    /// [`ManifestKind::lockfiles`] uses, so a root beside the manifest always beats
+    /// one further up whichever name it goes by.
+    ///
+    /// Each name carries its **own** kind rather than the list sharing one, because a
+    /// single ecosystem's roots need not share a file format: a pnpm member roots at
+    /// `pnpm-workspace.yaml`, a Bun member at the workspace root's own `package.json`,
+    /// and one kind over both names would run the wrong parser over one of them. The
+    /// paired kind is also not necessarily the kind that went looking — an ecosystem may
+    /// keep its central declarations in a format none of its members are written in.
+    ///
+    /// A candidate is a *path*, not just a file name: Gradle's is
+    /// `gradle/libs.versions.toml`, and the `dir.join()` the walk performs already
+    /// resolves the separator.
+    pub root_names: &'static [(&'static str, ManifestKind)],
     /// Whether a manifest may be its own root. Cargo's root-that-is-also-a-package
     /// writes `serde.workspace = true` against its own table, so walking past
     /// itself would leave exactly those entries unresolved; a kind whose central
     /// declarations always live in a separate file sets this `false`.
+    ///
+    /// A self-governing manifest is recognized **and** parsed as its own kind, so this
+    /// may only be set on a kind that appears among its own [`root_names`] kinds.
+    /// Setting it on a kind that is only ever read by a different parser would accept a
+    /// manifest as its own root with one parser and then read it with another, which
+    /// answers `Err`, and an unparseable root silently declares nothing.
+    ///
+    /// [`root_names`]: WorkspaceRoots::root_names
     pub self_governing: bool,
 }
 
@@ -468,6 +488,48 @@ mod tests {
         assert!(!ManifestKind::GoMod.has_lockfile_support());
     }
 
+    /// Every manifest kind, so an invariant that has to hold for *all* of them can be
+    /// asserted over the whole set rather than over whichever ones a test remembered.
+    const ALL_KINDS: [ManifestKind; 12] = [
+        ManifestKind::CargoToml,
+        ManifestKind::GoMod,
+        ManifestKind::PackageJson,
+        ManifestKind::DenoJson,
+        ManifestKind::PnpmWorkspaceYaml,
+        ManifestKind::ComposerJson,
+        ManifestKind::RequirementsTxt,
+        ManifestKind::PyprojectToml,
+        ManifestKind::PubspecYaml,
+        ManifestKind::MixExs,
+        ManifestKind::Csproj,
+        ManifestKind::GradleVersionCatalog,
+    ];
+
+    /// The match is what keeps [`ALL_KINDS`] honest: a new variant stops this compiling,
+    /// so it cannot be added and quietly skip every kind-wide invariant below.
+    #[test]
+    fn all_kinds_lists_every_variant_once() {
+        let mut seen = Vec::new();
+        for kind in ALL_KINDS {
+            match kind {
+                ManifestKind::CargoToml
+                | ManifestKind::GoMod
+                | ManifestKind::PackageJson
+                | ManifestKind::DenoJson
+                | ManifestKind::PnpmWorkspaceYaml
+                | ManifestKind::ComposerJson
+                | ManifestKind::RequirementsTxt
+                | ManifestKind::PyprojectToml
+                | ManifestKind::PubspecYaml
+                | ManifestKind::MixExs
+                | ManifestKind::Csproj
+                | ManifestKind::GradleVersionCatalog => {}
+            }
+            assert!(!seen.contains(&kind), "{kind:?} listed twice");
+            seen.push(kind);
+        }
+    }
+
     /// Every kind but Cargo declares its versions in place, so the upward walk is
     /// skipped for all of them — the behaviour the boolean gate this replaced had.
     #[test]
@@ -475,27 +537,40 @@ mod tests {
         let cargo = ManifestKind::CargoToml
             .workspace_roots()
             .expect("Cargo inherits");
-        assert_eq!(cargo.root_names, ["Cargo.toml"]);
-        assert_eq!(cargo.root_kind, ManifestKind::CargoToml);
+        assert_eq!(cargo.root_names, [("Cargo.toml", ManifestKind::CargoToml)]);
         assert!(cargo.self_governing, "a Cargo root may be a package too");
 
-        for kind in [
-            ManifestKind::GoMod,
-            ManifestKind::PackageJson,
-            ManifestKind::DenoJson,
-            ManifestKind::PnpmWorkspaceYaml,
-            ManifestKind::ComposerJson,
-            ManifestKind::RequirementsTxt,
-            ManifestKind::PyprojectToml,
-            ManifestKind::PubspecYaml,
-            ManifestKind::MixExs,
-            ManifestKind::Csproj,
-            ManifestKind::GradleVersionCatalog,
-        ] {
+        for kind in ALL_KINDS {
+            if kind == ManifestKind::CargoToml {
+                continue;
+            }
             assert!(kind.workspace_roots().is_none(), "{kind:?}");
             assert!(
                 !kind.declares_workspace("[workspace]\nmembers = []\n"),
                 "{kind:?} recognised a Cargo workspace table"
+            );
+        }
+    }
+
+    /// The invariant [`WorkspaceRoots::self_governing`] states, checked against every
+    /// descriptor that exists.
+    ///
+    /// A self-governing manifest is accepted as its own root by its own kind's
+    /// `declares_workspace` and then read by its own kind's parser. A kind that claimed
+    /// to govern itself while only ever appearing under a *different* root kind would be
+    /// recognised with one parser and read with another: the read fails, the root
+    /// declares nothing, and every entry inheriting from it is silently reported as
+    /// unresolved rather than as wrong.
+    #[test]
+    fn a_self_governing_kind_is_one_of_its_own_root_kinds() {
+        for kind in ALL_KINDS {
+            let Some(roots) = kind.workspace_roots() else {
+                continue;
+            };
+            assert!(
+                !roots.self_governing || roots.root_names.iter().any(|(_, root)| *root == kind),
+                "{kind:?} governs itself but is not among its own root kinds: {:?}",
+                roots.root_names
             );
         }
     }
