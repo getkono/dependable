@@ -264,8 +264,9 @@ pub(crate) struct ManifestView {
     pub total: usize,
     /// Whether the file that *is* this project's dependency list went unread, so
     /// zero rows means nothing was read rather than nothing was declared. Without
-    /// it the section prints "This manifest declares no dependencies", which is a
-    /// claim the run never established.
+    /// it the section prints "This manifest declares no dependencies" and heads
+    /// itself "(0 dependencies)", both of which are claims the run never
+    /// established — and the heading is the half a reader skimming §3 sees.
     pub dependencies_unread: bool,
     pub rows: Vec<DepRow>,
 }
