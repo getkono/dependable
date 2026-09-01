@@ -829,7 +829,8 @@ fn evaluate_item(
 }
 
 /// Translate registry-native version strings into semver for comparison. Python
-/// (PEP 440) and C# (NuGet) need conversion; other ecosystems already use semver.
+/// (PEP 440), C# (NuGet), and the JVM (Maven) need conversion; other ecosystems
+/// already use semver.
 fn to_semver_versions(versions: &[String], ecosystem: Ecosystem) -> Vec<String> {
     match ecosystem {
         Ecosystem::Python => versions
@@ -839,6 +840,10 @@ fn to_semver_versions(versions: &[String], ecosystem: Ecosystem) -> Vec<String> 
         Ecosystem::CSharp => versions
             .iter()
             .filter_map(|v| dependable_core::semver::nuget::nuget_to_semver(v))
+            .collect(),
+        Ecosystem::Jvm => versions
+            .iter()
+            .filter_map(|v| dependable_core::semver::maven::maven_to_semver(v))
             .collect(),
         _ => versions.to_vec(),
     }

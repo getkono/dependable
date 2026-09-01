@@ -66,9 +66,9 @@ pub use error::FetchError;
 pub use osv::{OsvClient, OsvQuery};
 pub use registries::npm::ScopedRegistry;
 pub use registries::{
-    CratesIoFetcher, FetchedVersions, GoProxyFetcher, HexFetcher, JsrFetcher, NpmFetcher,
-    NuGetFetcher, Owner, OwnerKind, PackageMetadata, PackagistFetcher, PubDevFetcher, PyPiFetcher,
-    RegistryFetcher,
+    CratesIoFetcher, FetchedVersions, GoProxyFetcher, HexFetcher, JsrFetcher, MavenCentralFetcher,
+    NpmFetcher, NuGetFetcher, Owner, OwnerKind, PackageMetadata, PackagistFetcher, PubDevFetcher,
+    PyPiFetcher, RegistryFetcher,
 };
 
 // Re-export the core types a consumer needs, so depending on `dependable-fetch`
