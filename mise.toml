@@ -28,6 +28,17 @@ run = "cargo install --path crates/dependable --locked --force"
 description = "Run all tests (live network tests are #[ignore]d and skipped)"
 run = "cargo test --workspace"
 
+# The tree output is styled through `if_supports_color`, which consults the
+# environment. The suite asserts on unstyled text, so a run with color forced on
+# is the only thing that proves those assertions do not quietly depend on the
+# terminal they happen to be run from. `FORCE_COLOR` outranks the TTY check in
+# `supports-color`, which is what makes this a real second configuration rather
+# than a repeat of the first.
+[tasks."test:color"]
+description = "Run the test suite with terminal color forced on"
+run = "cargo test --workspace"
+env = { FORCE_COLOR = "3" }
+
 [tasks."test:live"]
 description = "Run the live network smoke tests (hits crates.io + OSV)"
 run = "cargo test --workspace -- --ignored"

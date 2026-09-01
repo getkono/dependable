@@ -328,7 +328,6 @@ source = "registry+https://x"
 
     #[test]
     fn ascii_marks_workspace_and_dedupe() {
-        // Color is disabled in the test harness (not a TTY), so labels are plain.
         let out = plain(&sample(), &TreeOptions::default());
         assert!(out.contains("app v0.1.0 (workspace)"));
         assert!(out.contains("├── serde v1.0.0"));
