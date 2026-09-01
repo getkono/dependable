@@ -437,12 +437,20 @@ fn fingerprint(
 /// instead, where a drive prefix is legal and keeps its colon. A *relative* path outside
 /// the root stays relative — it is already the form a consumer can resolve.
 ///
+/// "Outside the root" is decided by [`Path::has_root`] and not [`Path::is_absolute`],
+/// which on Windows are not the same question: `/elsewhere/Cargo.toml` is rooted but
+/// carries no drive, so `is_absolute` is false there and the same input produced a
+/// `file:` URI on Unix and a bare path-absolute string on Windows. A rooted path is
+/// exactly as unresolvable without a base on one platform as on the other, and a SARIF
+/// log should not describe the same manifest differently for the machine that rendered
+/// it. A drive-relative path (`C:foo`) is rooted by neither test and stays relative.
+///
 /// No filesystem access: nothing here canonicalizes or probes.
 fn uri_for(root: &Path, path: &Path) -> String {
     if let Ok(relative) = path.strip_prefix(root) {
         return encode_uri(&join_components(relative));
     }
-    if path.is_absolute() {
+    if path.has_root() {
         return absolute_file_uri(path);
     }
     encode_uri(&join_components(path))
@@ -1315,6 +1323,22 @@ mod tests {
         );
         assert!(!uri.contains("%3A"), "the drive colon was encoded: {uri}");
         assert_eq!(uri, "file:///C:/Users/dev/my%20project/Cargo.toml");
+
+        // A rooted path carrying no drive is `is_absolute() == false` on Windows and
+        // true everywhere else. It is unresolvable without a base on both, so it takes
+        // the same `file:` form on both — a log must not describe one manifest two ways
+        // depending on the machine that rendered it.
+        assert_eq!(
+            uri_for(Path::new(r"D:\repo"), Path::new("/elsewhere/Cargo.toml")),
+            "file:///elsewhere/Cargo.toml"
+        );
+
+        // A drive-relative path (`C:foo`) is rooted by neither test: it resolves
+        // against that drive's working directory, so it is left as it is.
+        assert_eq!(
+            uri_for(Path::new(r"D:\repo"), Path::new(r"C:crates\app\Cargo.toml")),
+            "crates/app/Cargo.toml"
+        );
     }
 
     /// A space in a directory name still has to be encoded, in both forms.
