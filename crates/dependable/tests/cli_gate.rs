@@ -249,6 +249,39 @@ fn an_override_key_carrying_a_range_is_checked_as_its_own_package() {
 }
 
 // ---------------------------------------------------------------------------
+// Poetry's `"*"`
+// ---------------------------------------------------------------------------
+
+/// `*` is PEP 440's and Poetry's explicit "any version", and the most common way to
+/// write an unpinned dependency. It translated to the empty string, which the
+/// failed-translation heuristic then read as a constraint nobody could parse — so every
+/// Poetry project with an unpinned dependency was excluded from `--fail-on outdated` and
+/// failed `--fail-on any`.
+#[test]
+fn a_poetry_wildcard_resolves_instead_of_going_undetermined() {
+    let dir = workdir("gate_poetry_wildcard");
+    let base = registry(vec![(
+        "/pypi/requests/json".to_string(),
+        json("{\"releases\":{\"2.31.0\":[],\"2.32.3\":[]}}"),
+    )]);
+    let config = write_config(&dir, &base);
+    fs::write(
+        dir.join("pyproject.toml"),
+        "[tool.poetry.dependencies]\nrequests = \"*\"\n",
+    )
+    .unwrap();
+
+    let output = check(&dir, &config, &["--fail-on", "any"]);
+    let (stdout, stderr, code) = outcome(&output);
+
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("up to date") && !stdout.contains("undetermined"),
+        "stdout: {stdout}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // A 200 that lists no versions
 // ---------------------------------------------------------------------------
 

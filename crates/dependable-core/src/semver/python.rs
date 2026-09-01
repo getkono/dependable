@@ -116,6 +116,15 @@ pub fn pep440_constraint_to_semver(constraint: &str) -> String {
 const OPERATORS: &[&str] = &["===", "==", "~=", "!=", ">=", "<=", "^", "~", ">", "<", "="];
 
 fn convert_clause(clause: &str) -> Option<String> {
+    // PEP 440's — and Poetry's — explicit "any version", and the most common way to
+    // write an unpinned dependency. It matches no operator and holds no numeric release,
+    // so it used to be dropped, leaving an empty translation from a non-empty input;
+    // once an empty translation meant "we could not read this", `requests = "*"` became
+    // `undetermined` — excluded from `--fail-on outdated` and failing `--fail-on any`.
+    // The NuGet and Maven translators already map their own wildcards to `*`.
+    if clause == "*" {
+        return Some("*".to_string());
+    }
     for op in OPERATORS {
         if let Some(rest) = clause.strip_prefix(op) {
             return convert_op(op, rest.trim());
@@ -318,6 +327,19 @@ mod tests {
         assert_eq!(pep440_constraint_to_semver("==1.0.*"), ">=1.0.0, <1.1.0");
         assert_eq!(pep440_constraint_to_semver("~=1.4"), ">=1.4.0, <2.0.0");
         assert_eq!(pep440_constraint_to_semver("~=1.4.2"), ">=1.4.2, <1.5.0");
+    }
+
+    /// Poetry's unpinned dependency. This translated to the empty string, which the
+    /// failed-translation heuristic then read as a constraint it could not parse.
+    #[test]
+    fn a_bare_wildcard_is_any_version() {
+        assert_eq!(pep440_constraint_to_semver("*"), "*");
+        assert_eq!(pep440_constraint_to_semver(" * "), "*");
+        assert_eq!(
+            pep440_constraint_to_semver("* ; python_version < \"3.8\""),
+            "*"
+        );
+        assert!(::semver::VersionReq::parse("*").is_ok());
     }
 
     #[test]

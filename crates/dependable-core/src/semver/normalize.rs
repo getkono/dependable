@@ -256,6 +256,70 @@ mod tests {
         list.iter().map(|s| (*s).to_string()).collect()
     }
 
+    /// Every ecosystem's spelling of "any version", plus the ordinary forms around it.
+    /// A translator that drops one of these hands the checker an empty string, which
+    /// [`try_to_semver_constraint`] then reports as a constraint it could not read —
+    /// which is how `requests = "*"` became `undetermined` for every Poetry project
+    /// with an unpinned dependency.
+    #[test]
+    fn a_constraint_that_states_something_never_translates_to_nothing() {
+        let cases: &[(Ecosystem, &str)] = &[
+            (Ecosystem::Python, "*"),
+            (Ecosystem::Python, ">=1.0"),
+            (Ecosystem::Python, "==1.2.3"),
+            (Ecosystem::Python, "~=1.4"),
+            (Ecosystem::Python, "==1.0.*"),
+            (Ecosystem::Python, "^1.2"),
+            (Ecosystem::Python, "~1.2"),
+            (Ecosystem::Python, ">=1.0,<2.0"),
+            (Ecosystem::Python, "1.2.3"),
+            (Ecosystem::Python, "===1.0"),
+            (Ecosystem::CSharp, "*"),
+            (Ecosystem::CSharp, "1.0.0"),
+            (Ecosystem::CSharp, "[1.0,2.0)"),
+            (Ecosystem::CSharp, "1.*"),
+            (Ecosystem::Jvm, "+"),
+            (Ecosystem::Jvm, "latest.release"),
+            (Ecosystem::Jvm, "1.+"),
+            (Ecosystem::Jvm, "[1.0,2.0)"),
+            (Ecosystem::Elixir, "~> 1.0"),
+            (Ecosystem::Elixir, ">= 1.0.0"),
+            (Ecosystem::Rust, "*"),
+            (Ecosystem::Npm, "*"),
+            (Ecosystem::Npm, "1.x"),
+            (Ecosystem::Php, "*"),
+            (Ecosystem::Dart, "any"),
+        ];
+        for (ecosystem, constraint) in cases {
+            let translated = try_to_semver_constraint(constraint, *ecosystem);
+            assert!(
+                translated.is_some(),
+                "{ecosystem:?} `{constraint}` translated to nothing"
+            );
+        }
+    }
+
+    /// The other side of the same coin: a dialect semver genuinely cannot express must
+    /// keep coming back as a failed translation, or the checker resolves it to `*` and
+    /// reports `up to date` for a constraint nobody read.
+    #[test]
+    fn a_constraint_semver_cannot_express_stays_a_failed_translation() {
+        // Exclusion has no semver spelling; `$(Version)` is an MSBuild property, not a
+        // version; `LATEST`/`RELEASE` are Maven's server-resolved tags.
+        for (ecosystem, constraint) in [
+            (Ecosystem::Python, "!=1.5"),
+            (Ecosystem::CSharp, "$(Version)"),
+            (Ecosystem::Jvm, "LATEST"),
+            (Ecosystem::Jvm, "RELEASE"),
+        ] {
+            assert_eq!(
+                try_to_semver_constraint(constraint, ecosystem),
+                None,
+                "{ecosystem:?} `{constraint}`"
+            );
+        }
+    }
+
     #[test]
     fn universal_prerelease_markers() {
         for v in ["1.0.0-alpha", "1.0.0-RC1", "2.0.0-beta.3", "1.0.0-SNAPSHOT"] {
