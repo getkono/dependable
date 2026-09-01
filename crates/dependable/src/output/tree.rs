@@ -294,10 +294,41 @@ source = "registry+https://x"
         DependencyGraph::from_resolved(&resolved, &names, &["app".to_owned()])
     }
 
+    /// `ascii` output with any terminal styling removed.
+    ///
+    /// [`label`] colours through `if_supports_color`, which asks the ambient
+    /// environment whether stdout can take ANSI — and `FORCE_COLOR`, which a
+    /// terminal multiplexer or a task runner may well export, answers yes even
+    /// under a captured test harness. These tests assert on the shape of the
+    /// tree, never on its colour, so a styled run must not fail them; stripping
+    /// here is what states that, rather than leaving it to whatever the process
+    /// happened to inherit.
+    fn plain(graph: &DependencyGraph, opts: &TreeOptions) -> String {
+        let raw = ascii(graph, opts);
+        let mut out = String::with_capacity(raw.len());
+        let mut chars = raw.chars();
+        while let Some(c) = chars.next() {
+            if c != '\u{1b}' {
+                out.push(c);
+                continue;
+            }
+            // Only CSI sequences (`ESC [ … final`) are ever emitted here, and a
+            // CSI's final byte is the first in `@..=~` after the `[`.
+            if chars.next() != Some('[') {
+                continue;
+            }
+            for c in chars.by_ref() {
+                if matches!(c, '@'..='~') {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
     #[test]
     fn ascii_marks_workspace_and_dedupe() {
-        // Color is disabled in the test harness (not a TTY), so labels are plain.
-        let out = ascii(&sample(), &TreeOptions::default());
+        let out = plain(&sample(), &TreeOptions::default());
         assert!(out.contains("app v0.1.0 (workspace)"));
         assert!(out.contains("├── serde v1.0.0"));
         assert!(out.contains("└── ")); // last-child connector
@@ -329,7 +360,7 @@ source = "registry+https://x"
 
     #[test]
     fn ascii_points_a_member_at_its_own_tree() {
-        let out = ascii(&workspace(), &TreeOptions::default());
+        let out = plain(&workspace(), &TreeOptions::default());
         assert!(
             out.contains("└── lib v0.1.0 (workspace) (see root)"),
             "under `app`, `lib` is a pointer rather than a copy; {out}"
@@ -352,7 +383,7 @@ source = "registry+https://x"
             collapse_roots: false,
             ..TreeOptions::default()
         };
-        let out = ascii(&workspace(), &opts);
+        let out = plain(&workspace(), &opts);
         assert!(!out.contains("(see root)"), "{out}");
         assert_eq!(out.matches("serde v1.0.0").count(), 2, "{out}");
     }
@@ -364,7 +395,7 @@ source = "registry+https://x"
             dedupe: true,
             ..TreeOptions::default()
         };
-        let out = ascii(&sample(), &opts);
+        let out = plain(&sample(), &opts);
         assert!(out.contains("app v0.1.0 (workspace)"));
         assert!(!out.contains("serde"));
     }

@@ -22,6 +22,14 @@ local test = new Step {
     check = "cargo test --workspace"
 }
 
+// The same suite with color forced on. `FORCE_COLOR` outranks the TTY check inside
+// `supports-color`, so this is a second configuration rather than a repeat: it is what
+// catches an assertion that matches unstyled text and would otherwise pass here and
+// fail for whoever runs the suite from a terminal that exports the variable.
+local testColor = new Step {
+    check = "mise run test:color"
+}
+
 local coverage = new Step {
     check = "cargo llvm-cov --workspace"
 }
@@ -61,6 +69,7 @@ hooks {
             ["fmt"] = fmt
             ["clippy"] = clippy
             ["test"] = test
+            ["test-color"] = testColor
             ["coverage"] = coverage
         }
     }
