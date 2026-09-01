@@ -11,6 +11,14 @@
 //! libraries already declared here, and `[plugins]` resolves against the Gradle
 //! Plugin Portal rather than a Maven repository.
 //!
+//! A `[libraries]` entry is reported as a [`DependencyKind::Normal`] dependency and
+//! not as a central [`DependencyKind::Workspace`] declaration, which is what its
+//! shape would otherwise suggest — a build script opts into it by alias, the way a
+//! `csproj` opts into a `Directory.Packages.props` version. The difference is that
+//! the opting-in half is readable there and unreadable here, so treating a catalog
+//! entry as a declaration nothing has been shown to depend on would report every
+//! Gradle project as depending on nothing at all.
+//!
 //! # `version.ref`
 //!
 //! A library may name a version instead of stating one:
