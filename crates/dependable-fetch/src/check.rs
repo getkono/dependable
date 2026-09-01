@@ -513,11 +513,15 @@ impl Checker {
         kind: ManifestKind,
         manifest: &str,
     ) -> Option<(PathBuf, Arc<Vec<Item>>)> {
-        let (root, root_content) = crate::discover::workspace_root_of(path, kind, manifest)?;
+        let (root, root_kind, root_content) =
+            crate::discover::workspace_root_of(path, kind, manifest)?;
         if let Some(hit) = self.workspace_cache.get(&root).await {
             return Some((root, hit));
         }
-        let declarations = Arc::new(crate::discover::workspace_declarations(kind, &root_content));
+        let declarations = Arc::new(crate::discover::workspace_declarations(
+            root_kind,
+            &root_content,
+        ));
         self.workspace_cache
             .insert(root.clone(), declarations.clone())
             .await;

@@ -722,7 +722,7 @@ fn workspace_package_defaults(
     if kind != ManifestKind::CargoToml {
         return None;
     }
-    let (_, content) = nearest_workspace_root(manifest, kind)?;
+    let (_, _, content) = nearest_workspace_root(manifest, kind)?;
     Some(parse_workspace(&content)?.package_defaults)
 }
 

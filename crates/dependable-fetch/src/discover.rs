@@ -273,13 +273,19 @@ pub fn find_lockfile(manifest: &Path, kind: ManifestKind) -> Option<(PathBuf, Lo
 }
 
 /// The nearest manifest above `manifest` offering central dependency declarations, with
-/// its path and content.
+/// its path, the kind it is to be parsed as, and its content.
 ///
 /// Which names to try in each directory, and what recognizes one as a root, come from
 /// `kind` ([`ManifestKind::workspace_roots`]); a kind with no such indirection is
 /// answered without touching the filesystem at all. Each directory is searched for every
 /// candidate name before moving up, so a root beside the manifest always beats one
 /// further away — the same precedence [`find_lockfile`] gives lockfiles.
+///
+/// The returned kind is the one the *matched name* is paired with, not `kind`: a member
+/// and the root governing it need not share a file format, and within one ecosystem two
+/// candidate names need not share one either. It is what the root's content must be
+/// parsed with, so a caller reading the returned text passes it to
+/// [`workspace_declarations`] unchanged.
 ///
 /// `manifest` itself is excluded, so a member always resolves against a root *above* it.
 /// A root that is also a package declares its own values literally, and
@@ -299,19 +305,16 @@ pub fn find_lockfile(manifest: &Path, kind: ManifestKind) -> Option<(PathBuf, Lo
 /// spelled as. A manifest that cannot be canonicalized (it was deleted between discovery
 /// and here) belongs to no workspace.
 #[must_use]
-pub fn nearest_workspace_root(manifest: &Path, kind: ManifestKind) -> Option<(PathBuf, String)> {
+pub fn nearest_workspace_root(
+    manifest: &Path,
+    kind: ManifestKind,
+) -> Option<(PathBuf, ManifestKind, String)> {
     let roots = kind.workspace_roots()?;
     let manifest = std::fs::canonicalize(manifest).ok()?;
     let mut dir = manifest.parent()?;
     loop {
-        for name in roots.root_names {
-            let candidate = dir.join(name);
-            if !same_file(&candidate, &manifest)
-                && let Ok(content) = std::fs::read_to_string(&candidate)
-                && roots.root_kind.declares_workspace(&content)
-            {
-                return Some((simplified(candidate), content));
-            }
+        if let Some(found) = root_in_dir(dir, roots.root_names, &manifest) {
+            return Some(found);
         }
         if dir.join(".git").exists() {
             return None;
@@ -320,7 +323,38 @@ pub fn nearest_workspace_root(manifest: &Path, kind: ManifestKind) -> Option<(Pa
     }
 }
 
-/// The manifest whose central declarations govern `manifest`, and its text.
+/// The first of `candidates` present in `dir` that its own paired kind recognizes as a
+/// root, with the path, that kind, and the content.
+///
+/// Each candidate is recognized by **its own** kind rather than by one kind shared across
+/// the list, which is what lets an ecosystem name roots of more than one file format: a
+/// pnpm member roots at `pnpm-workspace.yaml`, a Bun member at the workspace root's own
+/// `package.json`, and a shared kind would run the YAML parser over one or the JSON
+/// parser over the other. A candidate its paired kind does not recognize is walked past,
+/// not treated as the end of the search, so a name that exists but declares nothing never
+/// hides a real root further down the list.
+///
+/// `exclude` is the manifest doing the asking: a member always resolves against a root
+/// *other than* itself, and [`workspace_root_of`] is what handles the self case.
+fn root_in_dir(
+    dir: &Path,
+    candidates: &[(&str, ManifestKind)],
+    exclude: &Path,
+) -> Option<(PathBuf, ManifestKind, String)> {
+    for (name, root_kind) in candidates {
+        let candidate = dir.join(name);
+        if !same_file(&candidate, exclude)
+            && let Ok(content) = std::fs::read_to_string(&candidate)
+            && root_kind.declares_workspace(&content)
+        {
+            return Some((simplified(candidate), *root_kind, content));
+        }
+    }
+    None
+}
+
+/// The manifest whose central declarations govern `manifest`, the kind it is to be
+/// parsed as, and its text.
 ///
 /// A manifest that declares a root itself governs **itself**, where its kind allows that
 /// ([`WorkspaceRoots::self_governing`](dependable_core::WorkspaceRoots)): Cargo lets a
@@ -328,6 +362,12 @@ pub fn nearest_workspace_root(manifest: &Path, kind: ManifestKind) -> Option<(Pa
 /// walking past it would leave those entries unresolved. Otherwise the nearest ancestor
 /// root governs. `content` is the manifest's own text, already in the caller's hand, so
 /// the self case costs no extra read.
+///
+/// The self case reports `kind` as the root kind, because it is `kind`'s own
+/// `declares_workspace` that accepted the text — recognising a root with one parser and
+/// then reading it with another is exactly the mismatch
+/// [`WorkspaceRoots::self_governing`](dependable_core::WorkspaceRoots) is documented to
+/// forbid, and the `debug_assert` below is what catches a descriptor that breaks it.
 ///
 /// Separate from [`workspace_declarations`] so a caller checking many members of one
 /// workspace can key a cache on the root's path and parse it only once; use
@@ -340,14 +380,19 @@ pub fn workspace_root_of(
     manifest: &Path,
     kind: ManifestKind,
     content: &str,
-) -> Option<(PathBuf, String)> {
+) -> Option<(PathBuf, ManifestKind, String)> {
     let roots = kind.workspace_roots()?;
+    debug_assert!(
+        !roots.self_governing || roots.root_names.iter().any(|(_, root)| *root == kind),
+        "{kind:?} governs itself but is not among its own root kinds: {:?}",
+        roots.root_names
+    );
     if roots.self_governing && kind.declares_workspace(content) {
         // Canonical, to match the shape [`nearest_workspace_root`] returns.
         let root = std::fs::canonicalize(manifest)
             .map(simplified)
             .unwrap_or_else(|_| manifest.to_path_buf());
-        return Some((root, content.to_owned()));
+        return Some((root, kind, content.to_owned()));
     }
     nearest_workspace_root(manifest, kind)
 }
@@ -362,25 +407,25 @@ pub fn workspace_source(
     kind: ManifestKind,
     content: &str,
 ) -> Option<(PathBuf, Vec<Item>)> {
-    let (root, root_content) = workspace_root_of(manifest, kind, content)?;
-    Some((root, workspace_declarations(kind, &root_content)))
+    let (root, root_kind, root_content) = workspace_root_of(manifest, kind, content)?;
+    Some((root, workspace_declarations(root_kind, &root_content)))
 }
 
-/// The central declarations offered by `content`, a root governing a manifest of kind
-/// `kind`.
+/// The central declarations offered by `content`, the text of a root of kind `root_kind`.
 ///
-/// The root is parsed as its own kind, not as `kind`, since an ecosystem may keep its
-/// central declarations in a different file format from the manifests inheriting them.
+/// The kind taken is the **root's own**, not that of the member inheriting from it, since
+/// an ecosystem may keep its central declarations in a different file format from the
+/// manifests inheriting them. It is the kind [`workspace_root_of`] and
+/// [`nearest_workspace_root`] return alongside the root, so a caller holding nothing but
+/// a located root and its text can call this — which a caller taking the member's kind
+/// could not.
 ///
 /// A manifest that will not parse declares nothing, which is the same answer as a
 /// manifest with no such table — neither is worth failing a whole check over, and neither
 /// is a kind that has no central declarations to offer.
 #[must_use]
-pub fn workspace_declarations(kind: ManifestKind, content: &str) -> Vec<Item> {
-    let Some(roots) = kind.workspace_roots() else {
-        return Vec::new();
-    };
-    parse(roots.root_kind, content)
+pub fn workspace_declarations(root_kind: ManifestKind, content: &str) -> Vec<Item> {
+    parse(root_kind, content)
         .map(|parsed| {
             parsed
                 .items
@@ -762,6 +807,97 @@ mod tests {
         assert_eq!(found, simplified(manifest.clone()));
         assert_eq!(declarations.len(), 1, "{declarations:?}");
         assert_eq!(declarations[0].name, "serde");
+    }
+
+    /// The trap a single `root_kind` over a whole name list sets: the paired kind, not
+    /// the list's, decides which parser reads a candidate.
+    ///
+    /// The real case is a JavaScript member, which roots either at a
+    /// `pnpm-workspace.yaml` or at the workspace root's own `package.json`. One kind
+    /// across both names has to mis-read one of them. Cargo is the only kind that
+    /// recognises anything today, so the heterogeneity is staged with a name whose usual
+    /// kind is JSON: paired with `PackageJson` the file is not a root, paired with
+    /// `CargoToml` the same bytes are.
+    #[test]
+    fn a_candidate_is_read_with_the_kind_it_is_paired_with() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = dir.path().canonicalize().expect("canonical");
+        let central =
+            "[workspace]\nmembers = []\n\n[workspace.dependencies]\nserde = \"1.0.200\"\n";
+        write(&dir.join("package.json"), central);
+        let nobody = dir.join("member/Cargo.toml");
+
+        // Paired with `PackageJson`, the JSON parser reads TOML, sees no workspace, and
+        // the candidate is not a root.
+        assert!(
+            root_in_dir(
+                &dir,
+                &[("package.json", ManifestKind::PackageJson)],
+                &nobody
+            )
+            .is_none()
+        );
+
+        // Paired with `CargoToml`, the very same bytes are a root — and the kind reported
+        // back is the pair's, so the caller parses it with the parser that recognised it.
+        let (path, root_kind, content) =
+            root_in_dir(&dir, &[("package.json", ManifestKind::CargoToml)], &nobody)
+                .expect("a root");
+        assert_eq!(path, simplified(dir.join("package.json")));
+        assert_eq!(root_kind, ManifestKind::CargoToml);
+        let declarations = workspace_declarations(ManifestKind::CargoToml, &content);
+        assert_eq!(declarations.len(), 1, "{declarations:?}");
+        assert_eq!(declarations[0].name, "serde");
+    }
+
+    /// A candidate its own kind cannot recognise is walked past, not taken as the answer:
+    /// with one kind over a heterogeneous list, the unreadable name would silently hide
+    /// the real root later in the list.
+    #[test]
+    fn an_unrecognised_candidate_does_not_hide_a_later_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = dir.path().canonicalize().expect("canonical");
+        write(&dir.join("package.json"), "{\"name\": \"web\"}");
+        write(
+            &dir.join("Cargo.toml"),
+            "[workspace]\nmembers = []\n\n[workspace.dependencies]\nserde = \"1\"\n",
+        );
+        let nobody = dir.join("member/Cargo.toml");
+
+        let (path, root_kind, _) = root_in_dir(
+            &dir,
+            &[
+                ("package.json", ManifestKind::PackageJson),
+                ("Cargo.toml", ManifestKind::CargoToml),
+            ],
+            &nobody,
+        )
+        .expect("the second candidate");
+
+        assert_eq!(path, simplified(dir.join("Cargo.toml")));
+        assert_eq!(root_kind, ManifestKind::CargoToml);
+    }
+
+    /// A root that governs itself is reported as its own kind, which is what
+    /// `self_governing` promises: the parser that accepted the text is the parser that
+    /// then reads it. Reporting the descriptor's root kind instead would, for a kind
+    /// whose ancestors are a different format, hand the caller a parser that returns
+    /// `Err` — and an unparseable root declares nothing, so every inherited entry comes
+    /// back unresolved rather than wrong.
+    #[test]
+    fn a_self_governing_root_is_reported_as_its_own_kind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest = dir
+            .path()
+            .canonicalize()
+            .expect("canonical")
+            .join("Cargo.toml");
+        let content = "[workspace]\nmembers = []\n\n[workspace.dependencies]\nserde = \"1\"\n";
+        write(&manifest, content);
+
+        let (_, root_kind, _) =
+            workspace_root_of(&manifest, ManifestKind::CargoToml, content).expect("itself");
+        assert_eq!(root_kind, ManifestKind::CargoToml);
     }
 
     /// The same boundary the lockfile search respects: an unrelated checkout above the
