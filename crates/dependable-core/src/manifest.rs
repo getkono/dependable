@@ -47,6 +47,7 @@ pub enum ManifestKind {
     PubspecYaml,
     MixExs,
     Csproj,
+    GradleVersionCatalog,
 }
 
 impl ManifestKind {
@@ -64,6 +65,7 @@ impl ManifestKind {
             ManifestKind::PubspecYaml => Ecosystem::Dart,
             ManifestKind::MixExs => Ecosystem::Elixir,
             ManifestKind::Csproj => Ecosystem::CSharp,
+            ManifestKind::GradleVersionCatalog => Ecosystem::Jvm,
         }
     }
 
@@ -161,6 +163,9 @@ impl ManifestKind {
             "pubspec.yaml" => ManifestKind::PubspecYaml,
             "mix.exs" => ManifestKind::MixExs,
             "Directory.Packages.props" => ManifestKind::Csproj,
+            // Gradle reads every `*.versions.toml` under `gradle/` as a catalog;
+            // `libs` is only the conventional name of the default one.
+            _ if name.ends_with(".versions.toml") => ManifestKind::GradleVersionCatalog,
             _ if is_requirements_file(name) => ManifestKind::RequirementsTxt,
             _ if name.ends_with(".csproj") => ManifestKind::Csproj,
             _ => return None,
@@ -298,6 +303,14 @@ mod tests {
             ("mix.exs", ManifestKind::MixExs),
             ("App.csproj", ManifestKind::Csproj),
             ("Directory.Packages.props", ManifestKind::Csproj),
+            (
+                "gradle/libs.versions.toml",
+                ManifestKind::GradleVersionCatalog,
+            ),
+            (
+                "gradle/deps.versions.toml",
+                ManifestKind::GradleVersionCatalog,
+            ),
         ];
         for (path, expected) in cases {
             assert_eq!(
@@ -359,6 +372,7 @@ mod tests {
             ManifestKind::PubspecYaml,
             ManifestKind::MixExs,
             ManifestKind::Csproj,
+            ManifestKind::GradleVersionCatalog,
         ] {
             assert!(kind.workspace_roots().is_none(), "{kind:?}");
             assert!(

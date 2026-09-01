@@ -75,8 +75,10 @@ pub fn parse_project(kind: ManifestKind, content: &str) -> ProjectMeta {
         ManifestKind::PubspecYaml => pubspec(content),
         ManifestKind::MixExs => mix(content),
         // A `pnpm-workspace.yaml` exists to hold catalogs; `Directory.Packages.props`
-        // exists to hold central versions. Neither names a project.
-        ManifestKind::PnpmWorkspaceYaml => workspace_meta(),
+        // exists to hold central versions. A Gradle version catalog is the same shape
+        // again — the project it serves is described by a build script. None names a
+        // project.
+        ManifestKind::PnpmWorkspaceYaml | ManifestKind::GradleVersionCatalog => workspace_meta(),
         // A `*.csproj` is named by its file and `requirements.txt` names nothing; both
         // are identified by path, which this reader cannot see.
         ManifestKind::Csproj | ManifestKind::RequirementsTxt => unnamed(),
@@ -380,6 +382,14 @@ mod tests {
             "catalog:\n  react: ^18.0.0\n",
         );
         assert_eq!(m.role, ProjectRole::Workspace);
+        assert_eq!(
+            meta(
+                ManifestKind::GradleVersionCatalog,
+                "[versions]\nkotlin = \"1.9.24\"\n",
+            )
+            .role,
+            ProjectRole::Workspace
+        );
     }
 
     #[test]

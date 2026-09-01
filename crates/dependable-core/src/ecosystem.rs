@@ -20,6 +20,7 @@ pub enum Ecosystem {
     Dart,
     CSharp,
     Elixir,
+    Jvm,
 }
 
 impl Ecosystem {
@@ -35,6 +36,7 @@ impl Ecosystem {
             Ecosystem::Dart => "Pub",
             Ecosystem::CSharp => "NuGet",
             Ecosystem::Elixir => "Hex",
+            Ecosystem::Jvm => "Maven",
         }
     }
 
@@ -50,6 +52,7 @@ impl Ecosystem {
             Ecosystem::Dart => "Dart",
             Ecosystem::CSharp => "C#",
             Ecosystem::Elixir => "Elixir",
+            Ecosystem::Jvm => "JVM",
         }
     }
 
@@ -65,6 +68,7 @@ impl Ecosystem {
             Ecosystem::Dart => "https://pub.dev",
             Ecosystem::CSharp => "https://api.nuget.org",
             Ecosystem::Elixir => "https://hex.pm",
+            Ecosystem::Jvm => "https://repo1.maven.org/maven2",
         }
     }
 
@@ -93,6 +97,12 @@ impl Ecosystem {
             Ecosystem::Dart => format!("https://pub.dev/packages/{name}"),
             Ecosystem::CSharp => format!("https://www.nuget.org/packages/{name}"),
             Ecosystem::Elixir => format!("https://hex.pm/packages/{name}"),
+            // The one name that is not a path segment: a Maven coordinate is
+            // `groupId:artifactId`, and Central spells the two as directories.
+            Ecosystem::Jvm => format!(
+                "https://central.sonatype.com/artifact/{}",
+                name.replace(':', "/")
+            ),
         }
     }
 
@@ -114,6 +124,10 @@ impl Ecosystem {
             Ecosystem::Dart => format!("https://pub.dev/packages/{name}/versions/{version}"),
             Ecosystem::CSharp => format!("https://www.nuget.org/packages/{name}/{version}"),
             Ecosystem::Elixir => format!("https://hex.pm/packages/{name}/{version}"),
+            Ecosystem::Jvm => format!(
+                "https://central.sonatype.com/artifact/{}/{version}",
+                name.replace(':', "/")
+            ),
             // Packagist renders every version on the package page itself.
             Ecosystem::Php => self.package_url(name),
         }
@@ -146,7 +160,7 @@ mod tests {
 
     /// Every variant, so a new ecosystem cannot be added without being given
     /// its pages.
-    const ALL: [Ecosystem; 8] = [
+    const ALL: [Ecosystem; 9] = [
         Ecosystem::Rust,
         Ecosystem::Go,
         Ecosystem::Npm,
@@ -155,6 +169,7 @@ mod tests {
         Ecosystem::Dart,
         Ecosystem::CSharp,
         Ecosystem::Elixir,
+        Ecosystem::Jvm,
     ];
 
     #[test]
@@ -186,6 +201,15 @@ mod tests {
             Ecosystem::Go.package_url("github.com/spf13/cobra"),
             "https://pkg.go.dev/github.com/spf13/cobra",
             "a module path is the name"
+        );
+        assert_eq!(
+            Ecosystem::Jvm.package_url("com.google.guava:guava"),
+            "https://central.sonatype.com/artifact/com.google.guava/guava",
+            "a Maven coordinate is one name spelled with a colon"
+        );
+        assert_eq!(
+            Ecosystem::Jvm.version_url("com.google.guava:guava", "33.0.0-jre"),
+            "https://central.sonatype.com/artifact/com.google.guava/guava/33.0.0-jre"
         );
     }
 
@@ -221,6 +245,7 @@ mod tests {
             Ecosystem::Python,
             Ecosystem::Php,
             Ecosystem::CSharp,
+            Ecosystem::Jvm,
         ] {
             assert_eq!(ecosystem.docs_url("a", "1.0.0"), None, "{ecosystem:?}");
         }

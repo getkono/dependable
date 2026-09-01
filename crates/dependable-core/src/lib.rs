@@ -36,10 +36,10 @@ pub use npmrc::{NpmrcConfig, parse_npmrc};
 pub use parsers::{
     AutoTargets, CargoPackageManifest, CargoTarget, CargoTargetKind, CargoTomlParser,
     CfgDependencyTable, ComposerJsonParser, CsprojParser, DenoJsonParser, DependencySection,
-    GoModParser, MixExsParser, PackageField, PackageJsonParser, Parser, PnpmWorkspaceParser,
-    ProjectMeta, ProjectRole, PubspecYamlParser, PyprojectTomlParser, RequirementsTxtParser,
-    WorkspaceDecl, parse, parse_cargo_config, parse_package_manifest, parse_package_name,
-    parse_project, parse_workspace, resolve_workspace_inheritance,
+    GoModParser, GradleCatalogParser, MixExsParser, PackageField, PackageJsonParser, Parser,
+    PnpmWorkspaceParser, ProjectMeta, ProjectRole, PubspecYamlParser, PyprojectTomlParser,
+    RequirementsTxtParser, WorkspaceDecl, parse, parse_cargo_config, parse_package_manifest,
+    parse_package_name, parse_project, parse_workspace, resolve_workspace_inheritance,
 };
 pub use result::{CheckResult, DependencyStatus};
 pub use semver::{Evaluation, UnstableFilter, check_version, is_prerelease, to_semver_constraint};

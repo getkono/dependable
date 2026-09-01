@@ -15,6 +15,7 @@ pub mod composer_json;
 pub mod csproj;
 pub mod deno_json;
 pub mod go_mod;
+pub mod gradle_catalog;
 pub mod json_scan;
 pub mod mix_exs;
 pub mod package_json;
@@ -37,6 +38,7 @@ pub use composer_json::ComposerJsonParser;
 pub use csproj::CsprojParser;
 pub use deno_json::DenoJsonParser;
 pub use go_mod::GoModParser;
+pub use gradle_catalog::GradleCatalogParser;
 pub use mix_exs::MixExsParser;
 pub use package_json::PackageJsonParser;
 pub use pnpm_workspace::PnpmWorkspaceParser;
@@ -65,5 +67,6 @@ pub fn parse(kind: ManifestKind, content: &str) -> Result<ParsedManifest, ParseE
         ManifestKind::PubspecYaml => PubspecYamlParser.parse(content),
         ManifestKind::Csproj => CsprojParser.parse(content),
         ManifestKind::MixExs => MixExsParser.parse(content),
+        ManifestKind::GradleVersionCatalog => GradleCatalogParser.parse(content),
     }
 }
