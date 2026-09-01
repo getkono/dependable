@@ -136,13 +136,23 @@ fn unreadable_manifest(path: &Path) -> Option<&'static UnreadableManifest> {
 ///
 /// Three bounds stop the walk, and every one of them is load-bearing:
 ///
-/// - `scan_root`, the canonicalized directory the scan was asked about. Nothing
-///   above it was searched, so nothing above it may answer for what is inside it —
-///   and without this bound a checkout with no `.git` (a source tarball, a
-///   `git archive`, a vendored copy) walks to `/` once per unreadable file.
 /// - The first directory holding a build-root marker, having checked that
 ///   directory, so one build never adopts the catalog of another beside it.
 /// - A `.git`, the same repository boundary [`find_lockfile`] uses.
+/// - `scan_root`, the canonicalized directory the scan was asked about — but as a
+///   bound on *stepping out of the scanned tree*, not as a wall. Scanning one
+///   module of a multi-module build (`dependable list <repo>/app`, or a CI matrix
+///   job per module) is a normal thing to ask for, and the build root that declares
+///   that module is by definition above the directory asked about: a hard stop here
+///   warned that `app/build.gradle.kts` was unread and told the user to declare its
+///   dependencies in the catalog they already have. So the walk may leave the
+///   scanned tree, and only for a directory that declares subprojects.
+///
+/// That last rule bounds the walk to **one** directory above `scan_root`: every
+/// `subproject_markers` file is a `build_root_markers` file too, so the ancestor the
+/// walk is allowed to step onto is a build root and stops it. Without it, a checkout
+/// with no `.git` (a source tarball, a `git archive`, a vendored copy) walked to `/`
+/// once per unreadable file, adopting whatever it found on the way.
 ///
 /// An ancestor's catalog counts only when that ancestor declares subprojects
 /// (`subproject_markers`): a repository-root catalog with no `settings.gradle` is a
@@ -166,14 +176,17 @@ fn is_superseded(dir: &Path, scan_root: Option<&Path>, unreadable: &UnreadableMa
     let (Ok(canonical), Some(scan_root)) = (std::fs::canonicalize(dir), scan_root) else {
         return holds(dir);
     };
+    let declares_subprojects = |dir: &Path| {
+        unreadable
+            .subproject_markers
+            .iter()
+            .any(|marker| dir.join(marker).is_file())
+    };
     let mut cur = canonical.as_path();
     let mut own_directory = true;
+    let mut leaving_scan = false;
     loop {
-        let governs = own_directory
-            || unreadable
-                .subproject_markers
-                .iter()
-                .any(|marker| cur.join(marker).is_file());
+        let governs = own_directory || declares_subprojects(cur);
         if governs && holds(cur) {
             return true;
         }
@@ -181,15 +194,18 @@ fn is_superseded(dir: &Path, scan_root: Option<&Path>, unreadable: &UnreadableMa
             .build_root_markers
             .iter()
             .any(|marker| cur.join(marker).is_file());
-        if at_root || cur == scan_root || cur.join(".git").exists() {
+        if at_root || cur.join(".git").exists() {
             return false;
         }
+        // Outside the scanned tree the walk moves only onto a directory that
+        // declares subprojects — the build root the scanned module belongs to.
+        leaving_scan |= cur == scan_root;
         match cur.parent() {
-            Some(parent) => {
+            Some(parent) if !leaving_scan || declares_subprojects(parent) => {
                 cur = parent;
                 own_directory = false;
             }
-            None => return false,
+            _ => return false,
         }
     }
 }
@@ -895,31 +911,65 @@ mod tests {
         );
     }
 
-    /// Nothing above the scanned directory was searched, so nothing above it may
-    /// answer for what is inside it.
+    /// The walk leaves the scanned tree for the build root that declares the scanned
+    /// module, and for nothing else — so it stops one directory above `scan_root`.
     ///
-    /// The walk used to stop only at a build root, a `.git`, or `/` — so in a
-    /// checkout with no `.git` (a source tarball, a `git archive`, a vendored copy)
-    /// it ran to the filesystem root once per unreadable file, and adopted whatever
-    /// it found on the way.
+    /// It used to stop only at a build root, a `.git`, or `/`, so in a checkout with
+    /// no `.git` (a source tarball, a `git archive`, a vendored copy) it ran to the
+    /// filesystem root once per unreadable file, adopting whatever it found on the
+    /// way. Here the catalog is two levels up, behind a directory that declares
+    /// nothing, and the walk never reaches it.
     #[test]
-    fn a_catalog_above_the_scan_root_answers_for_nothing_inside_it() {
+    fn the_walk_out_of_the_scanned_tree_stops_at_the_first_directory_that_declares_nothing() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let outside = dir.path();
-        write(&outside.join("settings.gradle"), "include(\":app\")\n");
-        write(&outside.join("gradle/libs.versions.toml"), "[versions]\n");
+        let top = dir.path();
+        write(&top.join("settings.gradle"), "include(\":app\")\n");
+        write(&top.join("gradle/libs.versions.toml"), "[versions]\n");
+        // `unrelated/` is neither a build root nor a declarer of subprojects.
         write(
-            &outside.join("scanned/app/build.gradle"),
+            &top.join("unrelated/scanned/app/build.gradle"),
             "dependencies {}\n",
         );
 
-        let scanned = outside.join("scanned");
+        let scanned = top.join("unrelated/scanned");
         let notices = manifest_notices(&scanned, 3, |_| true);
         let paths: Vec<&Path> = notices.iter().map(|n| n.path.as_path()).collect();
         assert_eq!(
             paths,
             [scanned.join("app/build.gradle").as_path()],
-            "the catalog is outside the directory the user asked about"
+            "the catalog is two directories above the one the user asked about"
+        );
+    }
+
+    /// Scanning one module of a multi-module build — `dependable list <repo>/app`,
+    /// or a CI matrix job per module — is a normal thing to ask for, and the
+    /// `settings.gradle.kts` that declares the module is above the directory asked
+    /// about by definition.
+    ///
+    /// Stopping the walk at the scanned directory therefore warned that
+    /// `app/build.gradle.kts` could not be read and told the user to declare its
+    /// dependencies in the catalog they already have. Scanning the repository root
+    /// was silent, which is the same build answered two different ways.
+    #[test]
+    fn scanning_one_module_of_a_build_reads_its_root_catalog() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        write(&root.join(".git/HEAD"), "ref: refs/heads/main\n");
+        write(&root.join("settings.gradle.kts"), "include(\":app\")\n");
+        write(
+            &root.join("gradle/libs.versions.toml"),
+            "[versions]\nkotlin = \"1.9.24\"\n",
+        );
+        write(&root.join("app/build.gradle.kts"), "dependencies {}\n");
+
+        assert!(
+            manifest_notices(root, 3, |_| true).is_empty(),
+            "scanning the repository root is quiet"
+        );
+        let notices = manifest_notices(&root.join("app"), 3, |_| true);
+        assert!(
+            notices.is_empty(),
+            "and scanning the module has the same catalog to read: {notices:?}"
         );
     }
 

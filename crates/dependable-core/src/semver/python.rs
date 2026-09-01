@@ -153,6 +153,43 @@ fn compatible_release(version: &str) -> Option<String> {
     Some(format!(">={lower}, <{upper}"))
 }
 
+/// What [`pep440_to_semver`] threw away, as a comparison key.
+///
+/// The translation keeps three release segments and the pre/post/dev suffix, and
+/// drops the epoch and every release segment past the third — so `2.7.6` and
+/// `2.7.6.1` (both published by `psycopg2-binary`) and `3.3.0`/`3.3.0.1` (both
+/// published by `zope.interface`) translate alike and compare equal. Which of them
+/// is actually the newer is decided by exactly what was dropped, and this is it:
+/// the epoch first, since PEP 440 ranks it above everything (`1!2.0` outranks
+/// `2.0`), then segment by segment (`2.7.6.1` outranks `2.7.6`, which has no
+/// fourth segment at all).
+///
+/// A caller that has to name one published artifact out of a group translating
+/// alike orders them by this rather than by their position in a list, which is what
+/// makes the answer independent of the order the registry happened to return —
+/// PyPI's `releases` map has no order of its own to lend.
+#[must_use]
+pub fn discarded_precision(version: &str) -> Vec<u64> {
+    let v = version.trim();
+    let (epoch, v) = match v.split_once('!') {
+        Some((epoch, rest)) => (epoch.trim().parse().unwrap_or(0), rest),
+        None => (0, v),
+    };
+    let v = v.split('+').next().unwrap_or(v);
+    let release_end = v
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(v.len());
+    let mut key = vec![epoch];
+    key.extend(
+        v[..release_end]
+            .split('.')
+            .filter(|segment| !segment.is_empty())
+            .skip(3)
+            .map(|segment| segment.parse().unwrap_or(0)),
+    );
+    key
+}
+
 /// Render version numbers as an `X.Y.Z` semver string (padding with zeros).
 fn pad_to_semver(nums: &[u64]) -> String {
     let major = nums.first().copied().unwrap_or(0);
@@ -173,6 +210,22 @@ fn bump_last(nums: &[u64]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reported version, the string `--fix` writes, and the version sent to OSV
+    /// all name one artifact out of a translation group, so the group has to have an
+    /// order of its own.
+    #[test]
+    fn a_dropped_segment_or_epoch_still_ranks_two_versions_that_translate_alike() {
+        assert_eq!(pep440_to_semver("2.7.6").as_deref(), Some("2.7.6"));
+        assert_eq!(pep440_to_semver("2.7.6.1").as_deref(), Some("2.7.6"));
+        assert!(discarded_precision("2.7.6") < discarded_precision("2.7.6.1"));
+        assert!(discarded_precision("3.3.0") < discarded_precision("3.3.0.1"));
+        assert!(discarded_precision("2.7.6.1") < discarded_precision("2.7.6.2"));
+        assert!(discarded_precision("2.7.6.9") < discarded_precision("2.7.6.10"));
+        // An epoch outranks any amount of trailing precision without one.
+        assert!(discarded_precision("2.0.0.99") < discarded_precision("1!2.0.0"));
+        assert_eq!(discarded_precision("2.7.6"), discarded_precision("2.7.6"));
+    }
 
     #[test]
     fn converts_release_versions() {
