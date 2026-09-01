@@ -226,6 +226,32 @@ fn a_disabled_swift_ecosystem_is_skipped() {
     );
 }
 
+/// `fix` used to end every run that rewrote nothing with "Everything is already up
+/// to date." For a Swift project it rewrites nothing *by construction*, so that
+/// line would be a flat claim of currency on the one ecosystem that can never
+/// establish it.
+#[test]
+fn fix_never_claims_a_swift_project_is_up_to_date() {
+    let manifest = fixture("sample-swift/Package.swift");
+    let output = run(&["fix", "--manifest", manifest.to_str().unwrap(), "--dry-run"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert!(
+        !stdout.contains("Everything is already up to date"),
+        "\"we did not look\" must never be printed as \"we looked and found nothing\"; \
+         stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("could not be checked for a newer version"),
+        "stdout: {stdout}"
+    );
+    // And the manifest is left exactly as it was.
+    let before = std::fs::read_to_string(&manifest).unwrap();
+    assert!(before.contains("for (name, version) in extraPackages"));
+}
+
 /// Live: the one verdict a Swift run can actually give. `SwiftURL` advisories are
 /// keyed by the repository URL with no scheme and no `.git`, and getting that
 /// wrong fails silently — it reports a vulnerable package as clean — so only a

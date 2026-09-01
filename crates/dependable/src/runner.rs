@@ -873,11 +873,17 @@ pub async fn run_fix(args: FixArgs) -> anyhow::Result<ExitCode> {
 
     let engine = Engine::new(&settings, &cfg, true)?;
     let mut total = 0;
+    let mut unchecked = 0;
     for manifest in &manifests {
         let Some(report) = engine.check_manifest(manifest).await? else {
             continue;
         };
         report_inherited_skips(manifest, &report);
+        unchecked += report
+            .results
+            .iter()
+            .filter(|result| result.status == DependencyStatus::Undetermined)
+            .count();
         let records = fix::apply_fixes(manifest, &report.results, args.all, args.dry_run)?;
         if records.is_empty() {
             continue;
@@ -892,8 +898,20 @@ pub async fn run_fix(args: FixArgs) -> anyhow::Result<ExitCode> {
             total += 1;
         }
     }
-    if total == 0 {
+    if total == 0 && unchecked == 0 {
         println!("Everything is already up to date.");
+    } else if total == 0 {
+        // "Up to date" is a claim about versions that were compared against a
+        // registry. Where none could be — an ecosystem that publishes no registry
+        // at all, or an entry whose version this manifest never states — nothing
+        // was established, and printing the clean line anyway turns "we did not
+        // look" into "we looked and found nothing", which is the one thing a fix
+        // run must never say.
+        println!(
+            "Nothing to rewrite. {unchecked} dependenc{} could not be checked for a newer \
+             version; see the warnings above.",
+            if unchecked == 1 { "y" } else { "ies" }
+        );
     } else if !args.dry_run {
         println!(
             "\nUpdated {total} dependenc{}.",
