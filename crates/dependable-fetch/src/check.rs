@@ -570,6 +570,8 @@ impl Checker {
             // The resolved names are the caller's business; the annotated items are ours.
             let _ = resolve_workspace_inheritance(&mut parsed.items, declarations);
             warnings.extend(undeclared_inheritance(&parsed.items, root));
+        } else {
+            warnings.extend(detached_inheritance(&parsed.items, kind));
         }
 
         // Apply the lockfile to annotate locked versions, dispatching on the file
@@ -789,6 +791,38 @@ fn undeclared_inheritance(items: &[Item], root: &Path) -> Vec<String> {
                 "`{}` is declared `workspace = true`, but {} declares no such dependency",
                 item.name,
                 root.display()
+            )
+        })
+        .collect()
+}
+
+/// Name every entry that says it inherits when no governing root was found at all.
+///
+/// The sibling of [`undeclared_inheritance`], for the case where the walk upwards ran
+/// out before it found a root rather than finding one that declares the wrong things.
+/// A detached member — a `Cargo.toml` with `serde = { workspace = true }` and nothing
+/// above it — reports every such entry as [`DependencyStatus::Undetermined`], which
+/// `--fail-on any` treats as a failure; without this the run exits non-zero with
+/// nothing on stderr to say why.
+///
+/// Only Cargo, because `workspace = true` is the only spelling that promises a root:
+/// a POM deferring to its `<parent>` has no root to be missing and is
+/// [`deferred_versions`]' story to tell.
+fn detached_inheritance(items: &[Item], kind: ManifestKind) -> Vec<String> {
+    if kind != ManifestKind::CargoToml {
+        return Vec::new();
+    }
+    let mut seen = HashSet::new();
+    items
+        .iter()
+        .filter(|item| {
+            item.source == PackageSource::Inherited && item.version_constraint.is_empty()
+        })
+        .filter(|item| seen.insert(item.name.as_str()))
+        .map(|item| {
+            format!(
+                "`{}` is declared `workspace = true`, but no workspace root was found above this manifest, so no version was read for it and nothing was checked",
+                item.name,
             )
         })
         .collect()
