@@ -27,6 +27,8 @@ struct SummaryDto {
     outdated: usize,
     vulnerable: usize,
     error: usize,
+    /// Additive: real packages whose declared version this run could not read.
+    undetermined: usize,
 }
 
 #[derive(Serialize)]
@@ -94,6 +96,7 @@ pub fn render(reports: &[ManifestReport]) -> anyhow::Result<()> {
             outdated: summary.outdated,
             vulnerable: summary.vulnerable,
             error: summary.error,
+            undetermined: summary.undetermined,
         },
         results,
     };

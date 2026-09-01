@@ -294,3 +294,44 @@ async fn live_query_detail_enriches_a_known_advisory() {
         }
     }
 }
+
+/// The API answers one result per query, in order. A short body used to leave the
+/// unanswered slots empty — recorded as "no vulnerabilities" *and cached as clean* for
+/// ten minutes, so even a retry in the same process could not recover.
+#[tokio::test]
+async fn a_short_querybatch_response_is_an_error_not_a_clean_bill() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/querybatch"))
+        // Two queries go out; one result comes back.
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"results":[{"vulns":[{"id":"RUSTSEC-2020-0071"}]}]}"#),
+        )
+        .mount(&server)
+        .await;
+
+    let client = OsvClient::with_url(
+        build_client().unwrap(),
+        format!("{}/v1/querybatch", server.uri()),
+        false,
+    );
+    let queries = vec![
+        OsvQuery {
+            ecosystem: "crates.io".into(),
+            name: "time".into(),
+            version: "0.2.7".into(),
+        },
+        OsvQuery {
+            ecosystem: "crates.io".into(),
+            name: "serde".into(),
+            version: "1.0.0".into(),
+        },
+    ];
+
+    let result = client.query_batch(&queries).await;
+    assert!(
+        result.is_err(),
+        "a truncated batch response was accepted as a complete answer"
+    );
+}

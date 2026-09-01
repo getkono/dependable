@@ -19,7 +19,7 @@ pub use ecosystem::Ecosystem;
 pub use error::ParseError;
 pub use graph::{
     DependencyGraph, Node, NodeKind, PathPredicate, Placement, Tree, TreeNode, TreeOptions, Visit,
-    Visitor, WalkOptions,
+    Visitor, WalkOptions, WalkStats,
 };
 pub use item::{DependencyKind, Item, PackageSource};
 pub use lockfiles::{
@@ -41,5 +41,8 @@ pub use parsers::{
     RequirementsTxtParser, WorkspaceDecl, parse, parse_cargo_config, parse_package_manifest,
     parse_package_name, parse_project, parse_workspace, resolve_workspace_inheritance,
 };
-pub use result::{CheckResult, DependencyStatus};
-pub use semver::{Evaluation, UnstableFilter, check_version, is_prerelease, to_semver_constraint};
+pub use result::{CheckResult, DependencyStatus, ErrorOrigin};
+pub use semver::{
+    Evaluation, UnstableFilter, check_version, check_version_for, is_prerelease,
+    to_semver_constraint, try_to_semver_constraint,
+};

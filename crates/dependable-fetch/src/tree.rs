@@ -350,7 +350,19 @@ pub fn build_project_graph(
         });
     };
 
-    let resolved = parser(&read(&lock_path)?)?;
+    // A lockfile we cannot read is not a reason to fail the command. The manifests still
+    // describe the direct dependencies, and `UnreadableLockfile` is how the caller tells
+    // the user that a lockfile is sitting there unread — which is the actionable half.
+    let resolved = match parser(&read(&lock_path)?) {
+        Ok(resolved) => resolved,
+        Err(_) => {
+            let graph = direct_graph(&root_name, &root_version, &direct, &workspace_names, &roots);
+            return Ok(WorkspaceGraph {
+                graph,
+                source: GraphSource::UnreadableLockfile,
+            });
+        }
+    };
     let resolved = with_root(resolved, &root_name, &root_version, direct);
     Ok(WorkspaceGraph {
         graph: DependencyGraph::from_resolved(&resolved, &workspace_names, &roots),

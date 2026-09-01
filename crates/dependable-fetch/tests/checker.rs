@@ -1150,3 +1150,137 @@ async fn an_inherited_name_the_root_never_declared_is_reported() {
         assert_eq!(result.status, DependencyStatus::Local);
     }
 }
+
+/// One name, two registries, one manifest. The fetch map used to be keyed by name
+/// alone while the tasks were deduplicated by `(cache_key, name)`, so both routes
+/// landed in the same slot and whichever request finished last answered for both —
+/// non-deterministically, since they complete out of order.
+#[tokio::test]
+async fn a_name_published_to_two_registries_is_not_collapsed() {
+    let server = MockServer::start().await;
+    // The npm `foo` and the JSR `foo` are different packages with different versions.
+    Mock::given(method("GET"))
+        .and(path("/foo"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(r#"{"versions":{"1.0.0":{},"9.9.9":{}}}"#),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/foo/meta.json"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"latest":"2.0.0","versions":{"2.0.0":{}}}"#),
+        )
+        .mount(&server)
+        .await;
+
+    let client = build_client().unwrap();
+    let checker = Checker::builder()
+        .http_client(client.clone())
+        .registry(
+            Ecosystem::Npm,
+            Arc::new(NpmFetcher::with_registry(client.clone(), server.uri())),
+        )
+        .jsr_registry(Arc::new(JsrFetcher::with_registry(client, server.uri())))
+        .vulnerabilities(false)
+        .build()
+        .unwrap();
+
+    let manifest = r#"{ "imports": { "a": "npm:foo@^1.0.0", "b": "jsr:foo@^2.0.0" } }"#;
+    let check = checker
+        .check_manifest(ManifestKind::DenoJson, manifest, None)
+        .await
+        .unwrap();
+
+    let npm = check
+        .results
+        .iter()
+        .find(|r| r.item.name == "foo" && r.item.source == PackageSource::Registry)
+        .expect("npm foo");
+    let jsr = check
+        .results
+        .iter()
+        .find(|r| r.item.name == "foo" && r.item.source == PackageSource::Jsr)
+        .expect("jsr foo");
+
+    assert_eq!(npm.latest_available.as_deref(), Some("9.9.9"));
+    assert_eq!(jsr.latest_available.as_deref(), Some("2.0.0"));
+}
+
+/// A private index and the public registry publish different version lists for the same
+/// name. The on-disk entry records only `(key, name)`, so with the key naming just the
+/// ecosystem, one run's answers were served to the other — and the entry's name guard
+/// cannot catch it, because the name matches.
+#[tokio::test]
+async fn a_private_registry_does_not_share_disk_cache_entries_with_the_public_one() {
+    let private = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/se/rd/serde"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("{\"name\":\"serde\",\"vers\":\"0.0.1\",\"yanked\":false}\n"),
+        )
+        .mount(&private)
+        .await;
+
+    let public = MockServer::start().await;
+    mount_index(&public).await;
+
+    let dir = tempfile::tempdir().unwrap();
+
+    let build = |uri: String| {
+        Checker::builder()
+            .http_client(build_client().unwrap())
+            .rust_registry(uri, None)
+            .vulnerabilities(false)
+            .disk_cache_dir(dir.path())
+            .build()
+            .unwrap()
+    };
+
+    // Populate the cache from the private index first.
+    let from_private = build(private.uri())
+        .check_manifest(ManifestKind::CargoToml, MANIFEST, Some(LOCK))
+        .await
+        .unwrap();
+    let private_serde = from_private
+        .results
+        .iter()
+        .find(|r| r.item.name == "serde")
+        .expect("serde");
+    assert_eq!(private_serde.latest_available.as_deref(), Some("0.0.1"));
+
+    // A public run sharing the same cache directory must ask the public index, not read
+    // the private index's answer back out of the cache.
+    let from_public = build(public.uri())
+        .check_manifest(ManifestKind::CargoToml, MANIFEST, Some(LOCK))
+        .await
+        .unwrap();
+    let public_serde = from_public
+        .results
+        .iter()
+        .find(|r| r.item.name == "serde")
+        .expect("serde");
+    assert_ne!(
+        public_serde.latest_available.as_deref(),
+        Some("0.0.1"),
+        "the public run was served the private index's version list"
+    );
+    assert!(!public.received_requests().await.unwrap().is_empty());
+}
+
+/// The leak that started all of this: constructing a checker must not, on its own, give
+/// it write access to the cache directory shared by every run on the machine.
+#[test]
+fn a_default_checker_writes_to_no_shared_cache() {
+    let checker = Checker::builder()
+        .http_client(build_client().unwrap())
+        .vulnerabilities(false)
+        .build()
+        .unwrap();
+    assert!(
+        !checker.uses_disk_cache(),
+        "the disk cache must be opted into, not inherited"
+    );
+}

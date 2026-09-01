@@ -46,6 +46,12 @@ pub struct CheckResult {
     /// leaves this `None` everywhere; only a caller that asked for license
     /// collection sees it filled in.
     pub license: Option<String>,
+    /// Where an [`Error`](DependencyStatus::Error) status came from.
+    ///
+    /// [`ErrorOrigin::None`] for every other status. Carried from the typed fetch error
+    /// rather than re-derived from the message, because the message cannot answer it and
+    /// a gate turns on the answer.
+    pub error_origin: ErrorOrigin,
 }
 
 impl CheckResult {
@@ -55,7 +61,6 @@ impl CheckResult {
     pub fn new(item: Item, status: DependencyStatus) -> Self {
         Self {
             item,
-            status,
             latest_compatible: None,
             latest_available: None,
             patch_available: false,
@@ -63,6 +68,27 @@ impl CheckResult {
             all_vulnerabilities: HashMap::new(),
             advisories: Vec::new(),
             license: None,
+            // Unrecorded provenance is not evidence that a registry answered, and the
+            // safe reading of "we do not know" is the one that keeps a gate failing.
+            error_origin: match &status {
+                DependencyStatus::Error(_) => ErrorOrigin::Local,
+                _ => ErrorOrigin::None,
+            },
+            status,
+        }
+    }
+
+    /// A result for a dependency that has no status, carrying **where** the failure
+    /// came from — see [`ErrorOrigin`].
+    ///
+    /// [`Self::new`] with an `Error` status records [`ErrorOrigin::Local`], the answer
+    /// that keeps a gate failing; only a caller that knows a registry answered may say
+    /// so, and it says so here.
+    #[must_use]
+    pub fn errored(item: Item, message: impl Into<String>, origin: ErrorOrigin) -> Self {
+        Self {
+            error_origin: origin,
+            ..Self::new(item, DependencyStatus::Error(message.into()))
         }
     }
 
@@ -72,7 +98,6 @@ impl CheckResult {
     pub fn from_evaluation(item: Item, eval: Evaluation) -> Self {
         Self {
             item,
-            status: eval.status,
             latest_compatible: eval.latest_compatible,
             latest_available: eval.latest_available,
             patch_available: eval.patch_available,
@@ -80,6 +105,11 @@ impl CheckResult {
             all_vulnerabilities: HashMap::new(),
             advisories: Vec::new(),
             license: None,
+            error_origin: match &eval.status {
+                DependencyStatus::Error(_) => ErrorOrigin::Local,
+                _ => ErrorOrigin::None,
+            },
+            status: eval.status,
         }
     }
 
@@ -108,6 +138,34 @@ impl CheckResult {
     }
 }
 
+/// Where a [`DependencyStatus::Error`] came from.
+///
+/// A `--fail-on` gate has to tell these apart and the message cannot tell it: "not
+/// found" and "unparseable constraint" are both prose, and reading provenance out of
+/// prose is what folded them together. A registry answering that a package does not
+/// exist is a permanent per-dependency fact that must not fail a whole build — gating on
+/// it turned every repository with one unpublished internal package into exit 2. A
+/// constraint this run could not read reached no registry at all: nothing was
+/// established, and certifying the build over it is the gate lying.
+///
+/// `#[non_exhaustive]`: match with a wildcard arm so new origins are additive.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ErrorOrigin {
+    /// Not an error: the dependency has a real status.
+    #[default]
+    None,
+    /// The registry answered by name: no such package. A private or internal package,
+    /// one served by a registry this run does not route to, a deleted package.
+    NotFound,
+    /// A registry request that produced no answer — a timeout, a refused connection, a
+    /// 5xx, an undecodable response, a document listing no versions at all.
+    Unanswered,
+    /// A failure this run reached without a registry ever being asked: a constraint
+    /// written in a dialect that did not parse, or a fetch whose result never arrived.
+    Local,
+}
+
 /// The status of a single dependency.
 ///
 /// `#[non_exhaustive]`: match with a wildcard arm so new statuses are additive.
@@ -120,6 +178,15 @@ pub enum DependencyStatus {
     Outdated,
     Vulnerable,
     Error(String),
+    /// A real package whose declared version this run could not read: the
+    /// constraint is written in a dialect that did not translate, or it refers to
+    /// something the manifest never declares.
+    ///
+    /// Distinct from [`Self::Error`], which is the registry or the fetch failing,
+    /// and deliberately distinct from [`Self::UpToDate`]: an unreadable constraint
+    /// is not evidence that a dependency is current, and reporting it as current
+    /// is what disarms `--fail-on outdated`.
+    Undetermined,
     Local,
     Git,
 }
@@ -135,6 +202,7 @@ impl DependencyStatus {
             DependencyStatus::Outdated => "outdated",
             DependencyStatus::Vulnerable => "vulnerable",
             DependencyStatus::Error(_) => "error",
+            DependencyStatus::Undetermined => "undetermined",
             DependencyStatus::Local => "local",
             DependencyStatus::Git => "git",
         }
@@ -150,6 +218,7 @@ impl DependencyStatus {
             DependencyStatus::Outdated => "OUTDATED",
             DependencyStatus::Vulnerable => "VULN",
             DependencyStatus::Error(_) => "ERROR",
+            DependencyStatus::Undetermined => "UNDETERMINED",
             DependencyStatus::Local => "LOCAL",
             DependencyStatus::Git => "GIT",
         }

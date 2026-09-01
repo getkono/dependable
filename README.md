@@ -550,6 +550,26 @@ skipped and transitive deps are never fetched), and the public API is
 forward-compatible: enums are `#[non_exhaustive]` and the registry layer routes
 per ecosystem, so future registries (npm, PyPI, Go, …) are additive.
 
+## Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| `0` | The run completed and no armed gate was tripped. |
+| `1` | A gate was tripped: `--fail-on` matched, or a `[policy]` rule was violated. |
+| `2` | The tool could not do the job — a config it cannot read, a policy it cannot enforce, or **a gate it cannot answer**. |
+
+That last case matters for CI. If you arm `--fail-on` (or a `[policy]` severity
+rule) and the run cannot establish what the gate needs — the vulnerability scan did
+not complete, or dependencies could not be resolved against their registry —
+`dependable` exits `2` and says so, rather than exiting `0`. A gate that reports
+success on the run it could not perform is worse than no gate at all. With no gate
+armed, an unreachable registry is still reported per dependency and the run exits
+`0`, because nothing was promised.
+
+`.dependable.toml` is validated: an unknown key or a wrong-typed value is an error,
+not a silent fallback to defaults. One mistyped character used to reset
+`[global] fail_on` to `none` and disarm the gate with nothing on stderr.
+
 ## Development
 
 | Command              | Description                                  |
@@ -568,7 +588,10 @@ per ecosystem, so future registries (npm, PyPI, Go, …) are additive.
 - **`dependable-fetch`** — the high-level library: `Checker` ties parsing to async
   registry + OSV fetching and caching. The public end-to-end entry point for other
   tools; re-exports the core types so consumers need only this crate.
-- **`dependable`** — the CLI binary; a thin wrapper over `dependable-fetch`.
+- **`dependable-report`** — HTML, SARIF, and the `[policy]` engine, over the finished
+  report model. A library only.
+- **`dependable-tui`** — the interactive terminal UI (ratatui), driving `dependable-fetch`.
+- **`dependable`** — the CLI binary; a thin wrapper over the crates above.
 
 ## Git Hooks
 
@@ -583,7 +606,7 @@ is a composite action that installs the released binary and runs the check:
 
 ```yaml
 - uses: actions/checkout@v4
-- uses: getkono/dependable/.github/actions/dependable-check@v0.1.4
+- uses: getkono/dependable/.github/actions/dependable-check@v0.1.3
   with:
     fail-on: vulnerable
 ```
@@ -609,7 +632,7 @@ both the annotations and the job summary. Annotations go to **stderr**, so
 stdout.
 
 This repository's own GitHub Actions workflow runs format checks, linting, and
-tests on pushes to `main` and on pull requests, plus a coverage job that uploads
+tests on pushes to `master` and on pull requests, plus a coverage job that uploads
 an `lcov.info` artifact.
 
 ## License

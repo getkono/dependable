@@ -81,24 +81,37 @@ const PYTHON_PRERELEASE: &[&str] = &[
     ".experimental",
     ".canary",
     ".pre",
-    ".post",
 ];
 
 /// Whether `version` looks like a pre-release / unstable version for `ecosystem`.
 ///
-/// Uses a case-insensitive substring match against a marker set, plus Python's
-/// implicit forms (`1.0a1`, `1.0b2`, `1.0rc1`) and the JVM's, which no substring
-/// list can cover.
+/// A version that parses as semver answers for itself — that is the definition, and it
+/// is exact in both directions. The substring test alone was wrong both ways:
+/// `1.0.0-M1` and `1.0.0-unstable.3` are pre-releases carrying no listed marker, and
+/// `1.2.3+build-rc` is a *stable* release whose build metadata happens to contain one.
 ///
-/// The marker list is hyphen-prefixed, which is the spelling every ecosystem that
-/// publishes semver uses. Maven does not: it separates a qualifier with a dot as
-/// readily as with a hyphen (`6.0.0.M1`, `8.0.0.Beta1`, `5.3.0.RC1`) and
-/// abbreviates the word (`2.0-M1`, `2.0-CR1`, `2.0-a1`). `-SNAPSHOT` is the one
-/// form the universal list happens to catch, so before
-/// [`maven::is_prerelease`](crate::semver::maven::is_prerelease) was consulted the
-/// default `Exclude` filter offered a beta as the latest stable release.
+/// The marker list is the fallback for the many ecosystem versions that are *not*
+/// semver (PEP 440, NuGet's four-part versions, Go's `v` prefix), where a substring is
+/// the best available signal, plus Python's implicit forms (`1.0a1`, `1.0b2`, `1.0rc1`).
+///
+/// The JVM needs both exceptions. Maven separates a qualifier with a dot as readily as
+/// with a hyphen (`6.0.0.M1`, `8.0.0.Beta1`, `5.3.0.RC1`) and abbreviates the word
+/// (`2.0-M1`, `2.0-CR1`, `2.0-a1`), none of which the marker list spells, so
+/// [`maven::is_prerelease`](crate::semver::maven::is_prerelease) is consulted; and it
+/// treats a trailing word as a build variant rather than a preview, so `32.1.3-android`
+/// — which *is* semver with a pre-release segment — is a release, and the semver
+/// reading is skipped there. Before both, the default `Exclude` filter offered a beta
+/// as the latest stable release.
 #[must_use]
 pub fn is_prerelease(version: &str, ecosystem: Ecosystem) -> bool {
+    // The semver reading is skipped for the JVM: `32.1.3-android` parses as semver with
+    // a pre-release segment, but under Maven's order that trailing word is a build
+    // variant of a release. Maven's tokenizer, consulted below, is the authority there.
+    if !matches!(ecosystem, Ecosystem::Jvm)
+        && let Ok(parsed) = ::semver::Version::parse(version.trim_start_matches('v'))
+    {
+        return !parsed.pre.is_empty();
+    }
     let lower = version.to_ascii_lowercase();
     if UNIVERSAL_PRERELEASE.iter().any(|m| lower.contains(m)) {
         return true;
@@ -108,10 +121,9 @@ pub fn is_prerelease(version: &str, ecosystem: Ecosystem) -> bool {
             PYTHON_PRERELEASE.iter().any(|m| lower.contains(m))
                 || python_implicit_prerelease(&lower)
         }
-        // Maven's qualifiers are tokens, not suffixes, so they are recognized by
-        // the tokenizer that already models Maven's order rather than by substring
-        // — which would read `9.4.51.v20230217` (a dated build of a release) or
-        // `32.1.3-android` (a build variant) as unstable.
+        // Maven's qualifiers are tokens, not suffixes, so they are recognized by the
+        // tokenizer that already models Maven's order rather than by substring — which
+        // would read `9.4.51.v20230217` (a dated build of a release) as unstable.
         Ecosystem::Jvm => crate::semver::maven::is_prerelease(version),
         _ => false,
     }
@@ -168,6 +180,32 @@ pub fn to_semver_constraint(constraint: &str, ecosystem: Ecosystem) -> String {
     }
 }
 
+/// Convert a constraint for `semver`, or `None` when the ecosystem's dialect could
+/// not be expressed as a `semver::VersionReq`.
+///
+/// Three of the four translators signal failure by dropping everything they could
+/// not read: [`maven_constraint_to_semver`](crate::semver::maven::maven_constraint_to_semver)
+/// and [`nuget_constraint_to_semver`](crate::semver::nuget::nuget_constraint_to_semver)
+/// return an empty string for an unreadable version or a malformed interval, and
+/// [`pep440_constraint_to_semver`](crate::semver::python::pep440_constraint_to_semver)
+/// does the same once every clause has been dropped. An empty result is therefore
+/// ambiguous on its own: it means "the author declared no constraint" *and* "we
+/// could not read the constraint the author declared", and the checker treating the
+/// second as the first turned it into `*` — which resolves to the newest release and
+/// reports `up to date`, the one answer a constraint that was never understood must
+/// not give.
+///
+/// The two are told apart by what went in: an empty result from a **non-empty**
+/// input is a failed translation, and nothing else produces one.
+#[must_use]
+pub fn try_to_semver_constraint(constraint: &str, ecosystem: Ecosystem) -> Option<String> {
+    let translated = to_semver_constraint(constraint, ecosystem);
+    if translated.trim().is_empty() && !constraint.trim().is_empty() {
+        return None;
+    }
+    Some(translated)
+}
+
 /// Normalize a concrete version string: strip a leading `v`/`V` and pad partial
 /// versions (`1` → `1.0.0`, `1.2` → `1.2.0`) so they parse as `semver::Version`.
 #[must_use]
@@ -218,6 +256,70 @@ mod tests {
         list.iter().map(|s| (*s).to_string()).collect()
     }
 
+    /// Every ecosystem's spelling of "any version", plus the ordinary forms around it.
+    /// A translator that drops one of these hands the checker an empty string, which
+    /// [`try_to_semver_constraint`] then reports as a constraint it could not read —
+    /// which is how `requests = "*"` became `undetermined` for every Poetry project
+    /// with an unpinned dependency.
+    #[test]
+    fn a_constraint_that_states_something_never_translates_to_nothing() {
+        let cases: &[(Ecosystem, &str)] = &[
+            (Ecosystem::Python, "*"),
+            (Ecosystem::Python, ">=1.0"),
+            (Ecosystem::Python, "==1.2.3"),
+            (Ecosystem::Python, "~=1.4"),
+            (Ecosystem::Python, "==1.0.*"),
+            (Ecosystem::Python, "^1.2"),
+            (Ecosystem::Python, "~1.2"),
+            (Ecosystem::Python, ">=1.0,<2.0"),
+            (Ecosystem::Python, "1.2.3"),
+            (Ecosystem::Python, "===1.0"),
+            (Ecosystem::CSharp, "*"),
+            (Ecosystem::CSharp, "1.0.0"),
+            (Ecosystem::CSharp, "[1.0,2.0)"),
+            (Ecosystem::CSharp, "1.*"),
+            (Ecosystem::Jvm, "+"),
+            (Ecosystem::Jvm, "latest.release"),
+            (Ecosystem::Jvm, "1.+"),
+            (Ecosystem::Jvm, "[1.0,2.0)"),
+            (Ecosystem::Elixir, "~> 1.0"),
+            (Ecosystem::Elixir, ">= 1.0.0"),
+            (Ecosystem::Rust, "*"),
+            (Ecosystem::Npm, "*"),
+            (Ecosystem::Npm, "1.x"),
+            (Ecosystem::Php, "*"),
+            (Ecosystem::Dart, "any"),
+        ];
+        for (ecosystem, constraint) in cases {
+            let translated = try_to_semver_constraint(constraint, *ecosystem);
+            assert!(
+                translated.is_some(),
+                "{ecosystem:?} `{constraint}` translated to nothing"
+            );
+        }
+    }
+
+    /// The other side of the same coin: a dialect semver genuinely cannot express must
+    /// keep coming back as a failed translation, or the checker resolves it to `*` and
+    /// reports `up to date` for a constraint nobody read.
+    #[test]
+    fn a_constraint_semver_cannot_express_stays_a_failed_translation() {
+        // Exclusion has no semver spelling; `$(Version)` is an MSBuild property, not a
+        // version; `LATEST`/`RELEASE` are Maven's server-resolved tags.
+        for (ecosystem, constraint) in [
+            (Ecosystem::Python, "!=1.5"),
+            (Ecosystem::CSharp, "$(Version)"),
+            (Ecosystem::Jvm, "LATEST"),
+            (Ecosystem::Jvm, "RELEASE"),
+        ] {
+            assert_eq!(
+                try_to_semver_constraint(constraint, ecosystem),
+                None,
+                "{ecosystem:?} `{constraint}`"
+            );
+        }
+    }
+
     #[test]
     fn universal_prerelease_markers() {
         for v in ["1.0.0-alpha", "1.0.0-RC1", "2.0.0-beta.3", "1.0.0-SNAPSHOT"] {
@@ -229,13 +331,44 @@ mod tests {
 
     #[test]
     fn python_specific_prereleases() {
-        for v in ["1.0a1", "1.0b2", "1.0rc1", "1.0.dev3", "1.0.post1"] {
+        for v in ["1.0a1", "1.0b2", "1.0rc1", "1.0.dev3"] {
             assert!(is_prerelease(v, Ecosystem::Python), "{v}");
         }
         // The `[ab]\d` rule must not fire on non-Python ecosystems.
         assert!(!is_prerelease("1.0a1", Ecosystem::Rust));
         // A bare stable version is never a pre-release.
         assert!(!is_prerelease("1.0.0", Ecosystem::Python));
+    }
+
+    /// PEP 440 orders `1.0 < 1.0.post1`: a post-release is a *later* release of the same
+    /// version, not a preview of it. Treating it as unstable hid it from the default
+    /// filter, so a project on `1.0` was told it was current.
+    #[test]
+    fn a_python_post_release_is_not_a_prerelease() {
+        for v in ["1.0.post1", "1.0.post2", "2.1.post0"] {
+            assert!(!is_prerelease(v, Ecosystem::Python), "{v}");
+        }
+        // A post-release of a pre-release is still a pre-release.
+        assert!(is_prerelease("1.0rc1.post1", Ecosystem::Python));
+    }
+
+    /// The old substring test was wrong in both directions, and each direction cost
+    /// something: a missed pre-release is recommended as an upgrade, and a stable
+    /// release whose build metadata happens to read `-rc` is hidden from one.
+    #[test]
+    fn semver_versions_are_classified_by_parsing_not_by_substring() {
+        for v in [
+            "1.0.0-M1",
+            "1.0.0-CR2",
+            "1.0.0-unstable.3",
+            "1.0.0-0",
+            "4.0.0-insiders",
+        ] {
+            assert!(is_prerelease(v, Ecosystem::Rust), "{v}");
+        }
+        for v in ["1.2.3+build-rc", "1.2.3+alpha", "1.0.0", "10.20.30"] {
+            assert!(!is_prerelease(v, Ecosystem::Rust), "{v}");
+        }
     }
 
     /// The marker list is hyphen-prefixed; Maven's qualifiers are not. Under the

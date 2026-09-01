@@ -80,9 +80,41 @@ impl Parser for PyprojectTomlParser {
             }
         }
 
-        // pixi: top-level [dependencies] (name = "version-spec").
+        // pixi: top-level [dependencies] (name = "version-spec"), and the same tables
+        // nested under [tool.pixi] in a pyproject.toml.
         if let Some(t) = root.get("dependencies").and_then(TomlItem::as_table_like) {
             collect_table_deps(t, DependencyKind::Normal, &starts, &mut items);
+        }
+        for path in [
+            ["tool", "pixi", "dependencies"],
+            ["tool", "pixi", "pypi-dependencies"],
+        ] {
+            if let Some(t) = nav(root, &path).and_then(TomlItem::as_table_like) {
+                collect_table_deps(t, DependencyKind::Normal, &starts, &mut items);
+            }
+        }
+
+        // PEP 518 build requirements. Cargo's `[build-dependencies]` are read, and these
+        // are the same thing for Python: real packages, resolved and installed, and just
+        // as capable of carrying an advisory.
+        if let Some(arr) = nav(root, &["build-system", "requires"]).and_then(TomlItem::as_array) {
+            collect_pep508_array(arr, DependencyKind::Build, &starts, &mut items);
+        }
+
+        // uv and PDM development groups.
+        if let Some(arr) =
+            nav(root, &["tool", "uv", "dev-dependencies"]).and_then(TomlItem::as_array)
+        {
+            collect_pep508_array(arr, DependencyKind::Dev, &starts, &mut items);
+        }
+        if let Some(t) =
+            nav(root, &["tool", "pdm", "dev-dependencies"]).and_then(TomlItem::as_table_like)
+        {
+            for (_group, value) in t.iter() {
+                if let Some(arr) = value.as_array() {
+                    collect_pep508_array(arr, DependencyKind::Dev, &starts, &mut items);
+                }
+            }
         }
 
         Ok(ParsedManifest {
@@ -138,6 +170,37 @@ fn parse_table_dep(
             kind,
             starts,
         ));
+    }
+    // Poetry's multiple-constraint form: an array of tables, each with its own marker
+    // (`foo = [{version = "^1.0", python = "<3.8"}, {version = "^2.0", python = ">=3.8"}]`).
+    // Markers are not evaluated here, so the first entry that declares a version stands
+    // for the dependency — which reports it, where dropping the whole array did not.
+    if let Some(array) = item.as_array() {
+        for value in array.iter() {
+            let Some(table) = value.as_inline_table() else {
+                continue;
+            };
+            if table.contains_key("path") || table.contains_key("url") {
+                return Some(skip_item(name, PackageSource::Local, kind));
+            }
+            if table.contains_key("git") {
+                return Some(skip_item(name, PackageSource::Git, kind));
+            }
+            if let Some(version_value) = table.get("version")
+                && let Some(version) = version_value.as_str()
+                && let Some(span) = version_value.span()
+            {
+                return Some(make_item(
+                    name,
+                    version,
+                    span,
+                    PackageSource::Registry,
+                    kind,
+                    starts,
+                ));
+            }
+        }
+        return None;
     }
     // Inline table / `[tool.poetry.dependencies.x]`.
     if let Some(table) = item.as_table_like() {
@@ -290,5 +353,61 @@ mod tests {
         let m = parse(content);
         assert_eq!(find(&m, "pytest").version_constraint, ">=7.0");
         assert_eq!(sliced(content, find(&m, "coverage")), ">=6.0");
+    }
+
+    /// PEP 518 build requirements are packages like any other. Cargo's
+    /// `[build-dependencies]` are read; the Python equivalent was not.
+    #[test]
+    fn build_system_requires_are_collected() {
+        let content = "[build-system]\nrequires = [\"setuptools>=61\", \"wheel\"]\nbuild-backend = \"setuptools.build_meta\"\n";
+        let m = PyprojectTomlParser.parse(content).expect("valid TOML");
+        let setuptools = m
+            .items
+            .iter()
+            .find(|i| i.name == "setuptools")
+            .expect("setuptools");
+        assert_eq!(setuptools.kind, DependencyKind::Build);
+        assert_eq!(setuptools.version_constraint, ">=61");
+        assert!(m.items.iter().any(|i| i.name == "wheel"));
+    }
+
+    #[test]
+    fn uv_pdm_and_pixi_tables_are_collected() {
+        let content = concat!(
+            "[tool.uv]\n",
+            "dev-dependencies = [\"pytest>=8\"]\n\n",
+            "[tool.pdm.dev-dependencies]\n",
+            "test = [\"coverage>=7\"]\n\n",
+            "[tool.pixi.dependencies]\n",
+            "numpy = \">=1.26\"\n\n",
+            "[tool.pixi.pypi-dependencies]\n",
+            "requests = \">=2.31\"\n",
+        );
+        let m = PyprojectTomlParser.parse(content).expect("valid TOML");
+        for name in ["pytest", "coverage", "numpy", "requests"] {
+            assert!(m.items.iter().any(|i| i.name == name), "{name} missing");
+        }
+        assert_eq!(
+            m.items.iter().find(|i| i.name == "pytest").unwrap().kind,
+            DependencyKind::Dev
+        );
+    }
+
+    /// Poetry's array-of-tables form used to fall through every branch and vanish — no
+    /// item, no error, no way to tell it apart from a manifest that never named it.
+    #[test]
+    fn poetry_multiple_constraint_arrays_are_not_dropped() {
+        let content = concat!(
+            "[tool.poetry.dependencies]\n",
+            "foo = [{version = \"^1.0\", python = \"<3.8\"}, {version = \"^2.0\", python = \">=3.8\"}]\n",
+        );
+        let m = PyprojectTomlParser.parse(content).expect("valid TOML");
+        let foo = m
+            .items
+            .iter()
+            .find(|i| i.name == "foo")
+            .expect("foo missing");
+        assert_eq!(foo.version_constraint, "^1.0");
+        assert!(foo.is_rewritable());
     }
 }

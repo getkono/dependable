@@ -15,11 +15,11 @@ use dependable_fetch::core::{
     parse_cargo_config, parse_npmrc, parse_project, parse_workspace, resolve_workspace_inheritance,
 };
 use dependable_fetch::{
-    CheckError, Checker, DependencyStatus, Ecosystem, GoProxyFetcher, GraphSource, HexFetcher,
-    Item, JsrFetcher, ManifestKind, MavenCentralFetcher, NpmFetcher, NuGetFetcher, PackageSource,
-    PackagistFetcher, ParseError, ProgressEvent, PubDevFetcher, PyPiFetcher, ScopedRegistry,
-    TreeOptions, UnstableFilter, WorkspaceGraphOptions, build_client, build_workspace_graph,
-    nearest_workspace_root, workspace_source,
+    CheckError, Checker, DependencyStatus, Ecosystem, ErrorOrigin, GoProxyFetcher, GraphSource,
+    HexFetcher, Item, JsrFetcher, ManifestKind, MavenCentralFetcher, NpmFetcher, NuGetFetcher,
+    PackageSource, PackagistFetcher, ParseError, ProgressEvent, PubDevFetcher, PyPiFetcher,
+    ScopedRegistry, TreeOptions, UnstableFilter, WorkspaceGraphOptions, build_client,
+    build_workspace_graph, nearest_workspace_root, workspace_source,
 };
 use dependable_tui::TuiOptions;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
@@ -31,7 +31,7 @@ use crate::config::{Config, load_config};
 use crate::config::{PolicySource, load_policy};
 use crate::fix;
 use crate::output::list::ProjectReport;
-use crate::output::{self, ManifestReport};
+use crate::output::{self, ManifestReport, ScanIntegrity};
 
 /// Effective settings after layering CLI flags over env vars over config.
 struct Settings {
@@ -61,11 +61,11 @@ fn resolve_check_settings(args: &CheckArgs, cfg: &Config) -> Settings {
         .ok()
         .and_then(|s| FailOn::from_env(&s));
 
-    let fail_on = if args.fail_on != FailOn::None {
-        args.fail_on
-    } else {
-        env_fail_on.unwrap_or(cfg.global.fail_on)
-    };
+    // Documented precedence, honoured for every value: CLI, then env, then config.
+    // The old test `args.fail_on != FailOn::None` could not tell an explicit
+    // `--fail-on none` from clap's default, so a config `fail_on` could not be turned
+    // off from the command line at all.
+    let fail_on = args.fail_on.or(env_fail_on).unwrap_or(cfg.global.fail_on);
 
     Settings {
         concurrency: args
@@ -78,6 +78,9 @@ fn resolve_check_settings(args: &CheckArgs, cfg: &Config) -> Settings {
         check_vuln: cfg.vulnerability.enabled && !args.no_vuln && !env_no_vuln,
         licenses: policy_requires_licenses(cfg),
         cache: !args.no_cache && !env_no_cache,
+        // `--include-ghsa` is a flag, so absence is indistinguishable from `false` and
+        // it can only ever widen the scan. OR-ing is therefore the whole contract: any
+        // layer asking for GHSA gets it, and no layer can silently take it away.
         include_ghsa: args.include_ghsa || cfg.global.include_ghsa || env_ghsa,
         fail_on,
         unstable: args
@@ -257,11 +260,28 @@ impl Engine {
                 for warning in &check.warnings {
                     eprintln!("warning: {} — {warning}", path.display());
                 }
+                // Split by provenance, not by status: a 404 is the registry answering,
+                // and anything else that produced an `Error` is this run failing to
+                // evaluate the dependency. Only the first is exempt from the gate.
+                let count = |origin| {
+                    check
+                        .results
+                        .iter()
+                        .filter(|r| r.error_origin == origin)
+                        .count()
+                };
+                let integrity = ScanIntegrity {
+                    vulnerability_scan_failed: check.vulnerability_scan_failed,
+                    registry_unreachable: check.registry_unreachable,
+                    unresolved: count(ErrorOrigin::NotFound),
+                    unevaluated: count(ErrorOrigin::Local),
+                };
                 Ok(Some(ManifestReport {
                     path: path.to_path_buf(),
                     ecosystem: check.ecosystem,
                     results: check.results,
                     workspace_root: check.workspace_root,
+                    integrity,
                 }))
             }
             Err(CheckError::UnsupportedEcosystem(eco)) => {
@@ -334,7 +354,8 @@ fn progress_sink() -> Arc<dyn Fn(ProgressEvent) + Send + Sync> {
 
 /// `dependable check`
 pub async fn run_check(args: CheckArgs) -> anyhow::Result<ExitCode> {
-    let cfg = load_config(&args.config);
+    let cfg =
+        load_config(&args.config).with_context(|| format!("reading {}", args.config.display()))?;
     let settings = resolve_check_settings(&args, &cfg);
     // Both policy steps run before discovery, so a misconfigured gate costs a
     // parse rather than a full network check.
@@ -384,6 +405,21 @@ pub async fn run_check(args: CheckArgs) -> anyhow::Result<ExitCode> {
     // user explicitly asked for.
     #[cfg(feature = "report")]
     if let Some(policy) = &policy {
+        // The static check above proved the gate *could* be enforced; this one proves it
+        // *was*. A CVSS rule reads advisory lists, and a scan that never ran leaves those
+        // empty — indistinguishable from a project with no advisories, so the gate would
+        // pass vacuously on exactly the run that could not check it.
+        if policy.requires_cvss()
+            && reports
+                .iter()
+                .any(|r| r.integrity.vulnerability_scan_failed)
+        {
+            eprintln!(
+                "error: `[policy]` gates on advisory severity, but the vulnerability scan did not complete"
+            );
+            eprintln!("       refusing to pass a policy that was never evaluated");
+            return Ok(ExitCode::from(2));
+        }
         let root = args.path.clone().unwrap_or_else(|| PathBuf::from("."));
         let outcome = dependable_report::policy::evaluate(&build_report(root, &reports), policy);
         report_policy(&outcome);
@@ -391,7 +427,7 @@ pub async fn run_check(args: CheckArgs) -> anyhow::Result<ExitCode> {
             return Ok(ExitCode::from(1));
         }
     }
-    Ok(exit_code(&reports, fail_on))
+    Ok(exit_code(&reports, fail_on, args.quiet))
 }
 
 /// Assemble the neutral report model the policy engine consumes from the CLI's
@@ -460,7 +496,8 @@ fn check_policy_is_enforceable(
             "fail_on_severity"
         };
         anyhow::bail!(
-            "`[policy] {key}` requires vulnerability scanning, which is disabled;              drop `--no-vuln` (or re-enable `[vulnerability] enabled`), or remove the CVSS rule"
+            "`[policy] {key}` requires vulnerability scanning, which is disabled; drop \
+             `--no-vuln` (or re-enable `[vulnerability] enabled`), or remove the CVSS rule"
         );
     }
     Ok(())
@@ -569,7 +606,7 @@ fn env_override<T>(
 fn warn_policy_ignored(config: &Path) {
     if crate::config::has_policy_table(config) {
         eprintln!(
-            "warning: {} declares `[policy]`, but this build has no `report` feature;              the policy is not enforced",
+            "warning: {} declares `[policy]`, but this build has no `report` feature; the policy is not enforced",
             config.display()
         );
     }
@@ -585,7 +622,11 @@ pub async fn run_list(args: ListArgs) -> anyhow::Result<ExitCode> {
     // warnings discovery emits are advice to *enable* something — and telling
     // someone to enable an ecosystem they switched off is noise `check`, `fix`, and
     // `report` already know not to make.
-    let cfg = load_config(&args.config);
+    // Fallible for the same reason as every other command: the file decides which
+    // ecosystems are on, so a config that cannot be read must not be silently
+    // replaced by defaults that enable all of them.
+    let cfg =
+        load_config(&args.config).with_context(|| format!("reading {}", args.config.display()))?;
     let manifests = collect_manifests(
         args.manifest.as_deref(),
         args.path.as_deref(),
@@ -756,7 +797,8 @@ fn relative_to(root: &Path, manifest: &Path) -> PathBuf {
 /// Returns an error if the checker cannot be built or the terminal cannot be
 /// configured.
 pub async fn run_tui(args: TuiArgs) -> anyhow::Result<ExitCode> {
-    let cfg = load_config(&args.config);
+    let cfg =
+        load_config(&args.config).with_context(|| format!("reading {}", args.config.display()))?;
     let settings = tui_settings(&cfg);
     // No progress bar: the UI draws its own screen.
     let engine = Engine::new(&settings, &cfg, false)?;
@@ -823,15 +865,21 @@ pub fn run_tree(args: TreeArgs) -> anyhow::Result<ExitCode> {
 
 /// `dependable fix`
 pub async fn run_fix(args: FixArgs) -> anyhow::Result<ExitCode> {
-    let cfg = load_config(&args.config);
+    let cfg =
+        load_config(&args.config).with_context(|| format!("reading {}", args.config.display()))?;
     let settings = Settings {
         concurrency: args.concurrency.unwrap_or(cfg.global.concurrency).max(1),
         depth: args.depth,
         check_lockfile: cfg.global.lock_file,
-        check_vuln: false,
+        // A vulnerable-but-current dependency is exactly the one worth upgrading, and
+        // `fix.rs` has always had a `Vulnerable` arm — it was simply unreachable.
+        check_vuln: cfg.vulnerability.enabled && !args.no_vuln,
         licenses: false,
-        cache: true,
-        include_ghsa: false,
+        // `fix` writes to the user's manifests, so it must be able to refuse a cached
+        // answer. Without this it decided what to write from an hour-old cache with no
+        // way to bypass it.
+        cache: !args.no_cache,
+        include_ghsa: cfg.global.include_ghsa,
         fail_on: FailOn::None,
         unstable: cfg.global.unstable.into(),
         registry: cfg.rust.registry.clone(),
@@ -850,22 +898,34 @@ pub async fn run_fix(args: FixArgs) -> anyhow::Result<ExitCode> {
     }
 
     let engine = Engine::new(&settings, &cfg, true)?;
-    let mut total = 0;
+
+    // Plan every manifest before writing any of them. Writing as it went left the tree
+    // half-rewritten when a later manifest failed — and because the report was printed
+    // *after* each write, the failing iteration also destroyed the record of what had
+    // already changed.
+    let mut planned = Vec::new();
     for manifest in &manifests {
         let Some(report) = engine.check_manifest(manifest).await? else {
             continue;
         };
         report_inherited_skips(manifest, &report);
-        let records = fix::apply_fixes(manifest, &report.results, args.all, args.dry_run)?;
-        if records.is_empty() {
+        planned.push(fix::plan(manifest, &report.results, args.all)?);
+    }
+
+    let mut total = 0;
+    for plan in &planned {
+        if plan.records.is_empty() {
             continue;
+        }
+        if !args.dry_run {
+            fix::commit(plan)?;
         }
         println!(
             "{}{}",
-            manifest.display(),
+            plan.path.display(),
             if args.dry_run { " (dry run)" } else { "" }
         );
-        for record in &records {
+        for record in &plan.records {
             println!("  {} {} → {}", record.name, record.from, record.to);
             total += 1;
         }
@@ -1040,7 +1100,8 @@ fn load_template_overrides(root: &Path) -> anyhow::Result<BTreeMap<String, Strin
 pub async fn run_report(args: crate::cli::ReportArgs) -> anyhow::Result<ExitCode> {
     use std::io::Write;
 
-    let cfg = load_config(&args.config);
+    let cfg =
+        load_config(&args.config).with_context(|| format!("reading {}", args.config.display()))?;
     let settings = resolve_report_settings(&args, &cfg);
     let root = args.path.clone().unwrap_or_else(|| PathBuf::from("."));
 
@@ -1315,7 +1376,150 @@ fn expand_env(content: &str) -> String {
     out
 }
 
-fn exit_code(reports: &[ManifestReport], fail_on: FailOn) -> ExitCode {
+/// Whether a gate can be honoured from what this run actually established.
+///
+/// `FailOn::None` gates on nothing, so nothing can be missing. Every other setting is a
+/// promise not to pass a build with a particular property, and a run that failed to
+/// *look* cannot keep it.
+///
+/// The question is about the run, not about any one dependency. A registry that never
+/// answered, or an advisory scan that did not complete, leaves the whole result set
+/// unfounded — every dependency it covered is reported non-vulnerable because nothing
+/// was asked. A registry that answered "no such package" left nothing unfounded: that
+/// is a permanent, per-dependency fact about a private, internal, or deleted package,
+/// visible in the table and in `--format json`, and gating the whole build on it turned
+/// one unpublished internal package into a hard exit 2 for every repository that has
+/// one — including every consumer of the shipped Action, which defaults to
+/// `--fail-on vulnerable`.
+///
+/// The carve-out is for that answer alone. A dependency this run failed to evaluate by
+/// itself — a constraint written in a dialect that did not parse — reached no registry,
+/// so there is no fact standing in for its status and the gate is as unanswerable as it
+/// ever was. Exempting those too let `{"lodash": "^^^bogus"}` pass
+/// `--fail-on vulnerable` under a note blaming a registry that was never asked.
+fn gate_is_answerable(reports: &[ManifestReport], fail_on: FailOn) -> Result<(), String> {
+    if fail_on == FailOn::None {
+        return Ok(());
+    }
+    let mut reasons: Vec<String> = Vec::new();
+    if reports
+        .iter()
+        .any(|r| r.integrity.vulnerability_scan_failed)
+    {
+        reasons.push("the vulnerability scan did not complete".to_owned());
+    }
+    // `FailOn::Any` fails on `DependencyStatus::Error`, and both an unanswering registry
+    // and an unreadable constraint produce exactly that — so there the promise is kept
+    // rather than missed, and the run exits 1 on the errors themselves. The other
+    // settings match specific statuses and skip errors entirely, which is where a run
+    // that established nothing could still be reported as clean.
+    if fail_on != FailOn::Any {
+        if reports.iter().any(|r| r.integrity.registry_unreachable) {
+            reasons.push("the registry did not answer".to_owned());
+        }
+        let unevaluated: usize = reports.iter().map(|r| r.integrity.unevaluated).sum();
+        if unevaluated > 0 {
+            reasons.push(format!(
+                "{unevaluated} dependenc{} could not be evaluated",
+                if unevaluated == 1 { "y" } else { "ies" }
+            ));
+        }
+    }
+    if reasons.is_empty() {
+        return Ok(());
+    }
+    Err(join_reasons(&reasons))
+}
+
+/// `a`, `a and b`, `a, b and c` — the gate's reasons read as a sentence.
+fn join_reasons(reasons: &[String]) -> String {
+    match reasons {
+        [] => String::new(),
+        [only] => only.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// Say on stderr how many dependencies the registry reported as non-existent.
+///
+/// Such a dependency has no status to gate on and the gate no longer stops for it, so
+/// the run says plainly that it was not covered — otherwise a passing
+/// `--fail-on vulnerable` reads as "every dependency here is clean" when one of them was
+/// never checked.
+///
+/// Silent for `FailOn::None` (nothing was gated on) and for `FailOn::Any` (which fails
+/// on these results, so they *were* gated on), and silent under `--quiet`, whose help
+/// says "Only print errors" — a note about what was skipped is not one.
+///
+/// Counted from the registry's own answer ([`ScanIntegrity::unresolved`]), never from
+/// every `Error`: an unreadable constraint reached no registry, and saying it was "not
+/// found in its registry" reported a cause that never happened.
+fn note_unresolved(reports: &[ManifestReport], fail_on: FailOn, quiet: bool) {
+    if quiet || matches!(fail_on, FailOn::None | FailOn::Any) {
+        return;
+    }
+    let unresolved: usize = reports.iter().map(|r| r.integrity.unresolved).sum();
+    if unresolved == 0 {
+        return;
+    }
+    eprintln!(
+        "note: {unresolved} dependenc{} not found in {} registry, so {} not gated on",
+        if unresolved == 1 { "y was" } else { "ies were" },
+        if unresolved == 1 { "its" } else { "their" },
+        if unresolved == 1 { "it is" } else { "they are" },
+    );
+}
+
+/// Say on stderr how many dependencies this run could not read a version out of.
+///
+/// `Undetermined` is a real package whose declared constraint this run could not
+/// translate, and the status was made honest without saying so anywhere: it trips no
+/// `--fail-on outdated` gate, produces no SARIF result, and left a passing run reading
+/// as "everything here is current" when a dependency had never been evaluated.
+///
+/// Mirrors [`note_unresolved`] exactly — same silences, same shape. Deliberately *not* a
+/// gate: adding `Undetermined` to `--fail-on outdated` would change what that setting
+/// promises, and `--fail-on any` already fails on it.
+fn note_undetermined(reports: &[ManifestReport], fail_on: FailOn, quiet: bool) {
+    if quiet || matches!(fail_on, FailOn::None | FailOn::Any) {
+        return;
+    }
+    let undetermined = reports
+        .iter()
+        .flat_map(|report| &report.results)
+        .filter(|result| matches!(result.status, DependencyStatus::Undetermined))
+        .count();
+    if undetermined == 0 {
+        return;
+    }
+    eprintln!(
+        "note: {undetermined} dependenc{} a declared version this run could not read, so {} not \
+         gated on",
+        if undetermined == 1 {
+            "y has"
+        } else {
+            "ies have"
+        },
+        if undetermined == 1 {
+            "it is"
+        } else {
+            "they are"
+        },
+    );
+}
+
+fn exit_code(reports: &[ManifestReport], fail_on: FailOn, quiet: bool) -> ExitCode {
+    // A gate whose inputs are missing must fail, not pass. `--fail-on vulnerable` with an
+    // unreachable OSV used to exit 0 while printing the errors that explain why it could
+    // not know — a green build that had never been checked, which is the one outcome a
+    // gate exists to prevent.
+    if let Err(reason) = gate_is_answerable(reports, fail_on) {
+        eprintln!("error: cannot honour --fail-on: {reason}");
+        eprintln!("       refusing to report a clean run that was never completed");
+        return ExitCode::from(2);
+    }
+    note_unresolved(reports, fail_on, quiet);
+    note_undetermined(reports, fail_on, quiet);
     let triggered = reports
         .iter()
         .flat_map(|report| &report.results)
@@ -1447,5 +1651,275 @@ mod tests {
         );
         // An unterminated `${` is emitted verbatim.
         assert_eq!(expand_env("a=${OPEN"), "a=${OPEN");
+    }
+
+    fn fixture_item() -> dependable_fetch::Item {
+        dependable_fetch::core::parse(
+            dependable_fetch::ManifestKind::CargoToml,
+            "[dependencies]\nserde = \"1\"\n",
+        )
+        .expect("fixture manifest")
+        .items
+        .into_iter()
+        .next()
+        .expect("one dependency")
+    }
+
+    /// A result the **registry** produced by name: no such package. Built through
+    /// [`CheckResult::not_found`] rather than by hand, because the provenance — not the
+    /// wording of the message — is what the gate reads.
+    fn not_found_result() -> dependable_fetch::CheckResult {
+        dependable_fetch::CheckResult::errored(
+            fixture_item(),
+            "package `@acme/internal` not found",
+            ErrorOrigin::NotFound,
+        )
+    }
+
+    fn report_of(
+        integrity: ScanIntegrity,
+        results: Vec<dependable_fetch::CheckResult>,
+    ) -> ManifestReport {
+        ManifestReport {
+            path: PathBuf::from("Cargo.toml"),
+            ecosystem: dependable_fetch::Ecosystem::Rust,
+            results,
+            workspace_root: None,
+            integrity,
+        }
+    }
+
+    fn report_with(integrity: ScanIntegrity, statuses: &[DependencyStatus]) -> ManifestReport {
+        report_of(
+            integrity,
+            statuses
+                .iter()
+                .map(|s| dependable_fetch::CheckResult::new(fixture_item(), s.clone()))
+                .collect(),
+        )
+    }
+
+    /// The defect this exists to prevent: OSV unreachable, `--fail-on vulnerable` armed,
+    /// every result left non-vulnerable because nothing was ever asked — and the run
+    /// exiting 0, certifying a build it had not checked.
+    #[test]
+    fn a_failed_scan_cannot_pass_a_vulnerability_gate() {
+        let reports = vec![report_with(
+            ScanIntegrity {
+                vulnerability_scan_failed: true,
+                registry_unreachable: false,
+                unresolved: 0,
+                unevaluated: 0,
+            },
+            &[DependencyStatus::UpToDate],
+        )];
+        assert!(gate_is_answerable(&reports, FailOn::Vulnerable).is_err());
+        assert!(gate_is_answerable(&reports, FailOn::Outdated).is_err());
+        assert!(gate_is_answerable(&reports, FailOn::Any).is_err());
+        // Nothing was gated on, so nothing can be missing.
+        assert!(gate_is_answerable(&reports, FailOn::None).is_ok());
+    }
+
+    /// A registry that never answered leaves every dependency it covered unfounded, so
+    /// the gate still cannot be honoured — the half of the guard that has to survive the
+    /// narrowing below.
+    #[test]
+    fn an_unreachable_registry_cannot_pass_a_status_gate() {
+        let reports = vec![report_with(
+            ScanIntegrity {
+                vulnerability_scan_failed: false,
+                registry_unreachable: true,
+                unresolved: 0,
+                unevaluated: 0,
+            },
+            &[DependencyStatus::Error("registry unreachable".to_owned())],
+        )];
+        assert!(gate_is_answerable(&reports, FailOn::Vulnerable).is_err());
+        assert!(gate_is_answerable(&reports, FailOn::Outdated).is_err());
+        assert_eq!(
+            exit_code(&reports, FailOn::Vulnerable, false),
+            ExitCode::from(2)
+        );
+        // `Any` fails on the `Error` statuses an unanswering registry produces, so its
+        // promise is kept — that is the gate working, not a hole.
+        assert!(gate_is_answerable(&reports, FailOn::Any).is_ok());
+        assert_eq!(exit_code(&reports, FailOn::Any, false), ExitCode::from(1));
+        // Nothing was gated on, so nothing can be missing.
+        assert!(gate_is_answerable(&reports, FailOn::None).is_ok());
+    }
+
+    /// A registry that answered "no such package" answered. A private or internal
+    /// package, one served by a registry this run does not route to, or a deleted one is
+    /// a permanent per-dependency fact: it is reported, and it does not turn every
+    /// `--fail-on` setting into exit 2 for the dependencies that *did* resolve.
+    ///
+    /// This corrects an assertion that pinned the opposite. `--fail-on vulnerable` is
+    /// the shipped Action's default, so under the old rule every repository containing
+    /// one unpublished internal package went from a passing step to a hard failure, with
+    /// no escape short of dropping the gate.
+    #[test]
+    fn a_package_the_registry_says_does_not_exist_does_not_break_the_gate() {
+        let not_found = not_found_result();
+        assert_eq!(
+            not_found.error_origin,
+            ErrorOrigin::NotFound,
+            "the carve-out has to be reached through the provenance, not through the message"
+        );
+        let reports = vec![report_of(
+            ScanIntegrity {
+                vulnerability_scan_failed: false,
+                registry_unreachable: false,
+                unresolved: 1,
+                unevaluated: 0,
+            },
+            vec![
+                dependable_fetch::CheckResult::new(fixture_item(), DependencyStatus::UpToDate),
+                not_found,
+            ],
+        )];
+        assert!(gate_is_answerable(&reports, FailOn::Vulnerable).is_ok());
+        assert!(gate_is_answerable(&reports, FailOn::Outdated).is_ok());
+        assert!(gate_is_answerable(&reports, FailOn::Any).is_ok());
+        assert_eq!(
+            exit_code(&reports, FailOn::Vulnerable, false),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            exit_code(&reports, FailOn::Outdated, false),
+            ExitCode::SUCCESS
+        );
+        // `Any` still fails on the error itself — that is the gate working, and it is
+        // the setting that asks to hear about anything less than a clean answer.
+        assert_eq!(exit_code(&reports, FailOn::Any, false), ExitCode::from(1));
+    }
+
+    /// The other half of the same distinction, and the regression the carve-out
+    /// introduced: an unparseable constraint never reaches a registry, so nothing was
+    /// established about the dependency at all. Exempting it alongside the 404s let
+    /// `{"lodash": "^^^bogus"}` pass `--fail-on vulnerable` under a note saying the
+    /// registry had not found it — a gate certifying a build it had not evaluated.
+    #[test]
+    fn a_dependency_this_run_could_not_evaluate_still_breaks_the_gate() {
+        let error = dependable_fetch::CheckResult::new(
+            fixture_item(),
+            DependencyStatus::Error("unparseable constraint: unexpected character '^'".to_owned()),
+        );
+        assert_eq!(
+            error.error_origin,
+            ErrorOrigin::Local,
+            "no registry was ever asked about this dependency"
+        );
+        let reports = vec![report_of(
+            ScanIntegrity {
+                vulnerability_scan_failed: false,
+                registry_unreachable: false,
+                unresolved: 0,
+                unevaluated: 1,
+            },
+            vec![
+                dependable_fetch::CheckResult::new(fixture_item(), DependencyStatus::UpToDate),
+                error,
+            ],
+        )];
+        assert_eq!(
+            gate_is_answerable(&reports, FailOn::Vulnerable).unwrap_err(),
+            "1 dependency could not be evaluated"
+        );
+        assert!(gate_is_answerable(&reports, FailOn::Outdated).is_err());
+        assert_eq!(
+            exit_code(&reports, FailOn::Vulnerable, false),
+            ExitCode::from(2)
+        );
+        // `Any` fails on the `Error` itself, so its promise is kept.
+        assert!(gate_is_answerable(&reports, FailOn::Any).is_ok());
+        assert_eq!(exit_code(&reports, FailOn::Any, false), ExitCode::from(1));
+        // Nothing was gated on, so nothing can be missing.
+        assert!(gate_is_answerable(&reports, FailOn::None).is_ok());
+    }
+
+    /// Every unanswerable reason at once, read as one sentence rather than as a
+    /// hand-written combination per pair.
+    #[test]
+    fn the_gate_names_every_reason_it_could_not_be_honoured() {
+        let reports = vec![report_of(
+            ScanIntegrity {
+                vulnerability_scan_failed: true,
+                registry_unreachable: true,
+                unresolved: 0,
+                unevaluated: 2,
+            },
+            vec![],
+        )];
+        assert_eq!(
+            gate_is_answerable(&reports, FailOn::Vulnerable).unwrap_err(),
+            "the vulnerability scan did not complete, the registry did not answer and 2 \
+             dependencies could not be evaluated"
+        );
+    }
+
+    /// A complete run still gates on what it found, and still passes when it finds
+    /// nothing — the guard must not turn every check into a failure.
+    #[test]
+    fn a_complete_run_gates_on_its_findings_as_before() {
+        let clean = vec![report_with(
+            ScanIntegrity::default(),
+            &[DependencyStatus::UpToDate],
+        )];
+        assert!(gate_is_answerable(&clean, FailOn::Vulnerable).is_ok());
+        assert_eq!(
+            exit_code(&clean, FailOn::Vulnerable, false),
+            ExitCode::SUCCESS
+        );
+
+        let vulnerable = vec![report_with(
+            ScanIntegrity::default(),
+            &[DependencyStatus::Vulnerable],
+        )];
+        assert_eq!(
+            exit_code(&vulnerable, FailOn::Vulnerable, false),
+            ExitCode::from(1)
+        );
+    }
+
+    /// Parse a real command line, so the test exercises the same `Option` clap produces
+    /// rather than a hand-built struct that could disagree with it.
+    fn check_args(argv: &[&str]) -> crate::cli::CheckArgs {
+        use clap::Parser as _;
+        let cli = crate::cli::Cli::try_parse_from(argv).expect("a valid command line");
+        match cli.command {
+            Some(crate::cli::Command::Check(args)) => args,
+            _ => panic!("expected the check subcommand"),
+        }
+    }
+
+    /// Documented precedence is CLI over env over config. `fail_on` inverted it: the
+    /// guard compared against `FailOn::None`, which is also clap's default, so an
+    /// explicit `--fail-on none` was indistinguishable from the flag being absent and a
+    /// config that armed the gate could not be disarmed from the command line.
+    #[test]
+    fn an_explicit_fail_on_none_beats_the_config() {
+        let mut cfg = Config::default();
+        cfg.global.fail_on = FailOn::Any;
+
+        let explicit = resolve_check_settings(
+            &check_args(&["dependable", "check", "--fail-on", "none"]),
+            &cfg,
+        );
+        assert_eq!(
+            explicit.fail_on,
+            FailOn::None,
+            "the command line was ignored"
+        );
+
+        // Absent, the config still governs.
+        let absent = resolve_check_settings(&check_args(&["dependable", "check"]), &cfg);
+        assert_eq!(absent.fail_on, FailOn::Any);
+
+        // And a non-default flag still wins, as it always did.
+        let vulnerable = resolve_check_settings(
+            &check_args(&["dependable", "check", "--fail-on", "vulnerable"]),
+            &cfg,
+        );
+        assert_eq!(vulnerable.fail_on, FailOn::Vulnerable);
     }
 }
