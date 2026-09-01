@@ -147,18 +147,23 @@ fn a_pin_is_named_by_the_url_osv_keys_advisories_by() {
 /// and asserts it round-trips. There is nothing to slice here, and that is the
 /// assertion: a Swift version is written in `Package.resolved`, not in any file
 /// this tool parsed, so nothing may point at it and `--fix` can never rewrite it.
+///
+/// This holds for *every* pin, not only the checkable ones. The branch pin and the
+/// local package carry `version_line: 0` like the rest, and a `has_position` that
+/// stopped consulting `is_checkable` would hand them line 1 of `Package.swift` in
+/// SARIF and in GitHub annotations. Skipping them here would leave that regression
+/// to be caught by nothing.
 #[test]
 fn a_swift_dependency_has_no_position_and_is_never_rewritable() {
     for item in pins("sample-swift/Package.resolved") {
-        if !item.is_checkable() {
-            continue;
+        if item.is_checkable() {
+            assert_eq!(
+                item.source,
+                PackageSource::Locked,
+                "{}: a checkable Swift pin got its version from the lockfile",
+                item.name
+            );
         }
-        assert_eq!(
-            item.source,
-            PackageSource::Locked,
-            "{}: a checkable Swift pin got its version from the lockfile",
-            item.name
-        );
         assert!(
             !item.has_position(),
             "{}: no span in Package.swift means nothing may point at one",
