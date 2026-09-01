@@ -244,7 +244,10 @@ fn shallow_graph(
                 // Synthesize a source so classification matches the item's kind. An
                 // inherited entry has already taken its root declaration's source above,
                 // so a centrally-declared `path` crate lands on the `Local` arm and a
-                // centrally-declared registry crate does not.
+                // centrally-declared registry crate does not. Only Cargo manifests reach
+                // here, so `Locked` cannot; were it ever to, `registry+` is the right
+                // answer for it anyway — a lockfile pin is a registry package.
+
                 let source = match item.source {
                     PackageSource::Git => Some("git+".to_owned()),
                     PackageSource::Local => None,

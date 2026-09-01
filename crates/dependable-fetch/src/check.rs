@@ -833,6 +833,10 @@ impl Checker {
 
 /// Name every entry that says it inherits but that the governing root never declared.
 ///
+/// Reads `PackageSource::Inherited` specifically, not "checkable without a position":
+/// a `Locked` entry also lacks a position, but nothing above it ever promised to
+/// declare it, so there is no root to accuse.
+///
 /// Cargo refuses to build such a manifest, so it is a real error and not a shrug — but it
 /// is not this tool's error, and a version check that aborted on it would be less useful
 /// than one that reports everything else and says what it could not resolve. The item
@@ -996,6 +1000,10 @@ fn unfetchable(item: &Item) -> CheckResult {
         // which of `spring-boot-starter-web` is simply false, and is the wrong
         // token for a CI consumer to read.
         PackageSource::Inherited => DependencyStatus::Undetermined,
+        // Same reasoning, different reason for the version to be missing: a lockfile
+        // pin with no version recorded is still a real package on a real host, and
+        // `Local` would say there is no host for it.
+        PackageSource::Locked => DependencyStatus::Undetermined,
         _ => DependencyStatus::Local,
     };
     CheckResult::new(item.clone(), status)

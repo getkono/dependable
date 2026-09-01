@@ -293,15 +293,17 @@ fn pin_item(pin: &Pin) -> Option<Item> {
         .or_else(|| pin.revision.clone())
         .unwrap_or_default();
 
-    // `Inherited`, not `Registry`: the version was written somewhere other than
-    // this entry — in `Package.resolved`, never in the manifest — so there is no
-    // span in `Package.swift` to report or to rewrite, which is exactly what
-    // `Item::has_position` reads the source to decide. A branch pin has no
-    // version at all and is the git dependency it looks like.
+    // `Locked`, not `Registry`: the version was written in `Package.resolved` and
+    // never in a manifest, so there is no span in `Package.swift` to report or to
+    // rewrite, which is exactly what `Item::has_position` reads the source to
+    // decide. Not `Inherited` either — nothing was inherited, because nothing
+    // declared it; a consumer told "inherited" would go looking for a central
+    // declaration that does not exist. A branch pin has no version at all and is
+    // the git dependency it looks like.
     let (source, constraint, locked) = if local {
         (PackageSource::Local, state, None)
     } else if let Some(version) = pin.version.clone() {
-        (PackageSource::Inherited, version.clone(), Some(version))
+        (PackageSource::Locked, version.clone(), Some(version))
     } else {
         (PackageSource::Git, state, None)
     };
@@ -387,7 +389,11 @@ mod tests {
         let nio = find(&items, "github.com/apple/swift-nio");
         assert_eq!(nio.locked_version.as_deref(), Some("2.65.0"));
         assert_eq!(nio.version_constraint, "2.65.0");
-        assert_eq!(nio.source, PackageSource::Inherited);
+        assert_eq!(
+            nio.source,
+            PackageSource::Locked,
+            "the version came from this file, not from a declaration anywhere"
+        );
     }
 
     /// The pin set is the only record of what the project depends on, so a pin has
