@@ -323,10 +323,26 @@ pub fn is_prerelease(version: &str) -> bool {
 /// Every qualifier word Maven's own order ranks, in its canonical spelling.
 const KNOWN_QUALIFIERS: &[&str] = &["alpha", "beta", "milestone", "rc", "snapshot", "sp"];
 
-/// The qualifiers that mark a version as not yet released. Maven's table plus
-/// `pre`/`dev`, which projects use for the same purpose without Maven ranking them.
-const PRERELEASE_QUALIFIERS: &[&str] =
-    &["alpha", "beta", "milestone", "rc", "snapshot", "pre", "dev"];
+/// The qualifiers that mark a version as not yet released. Maven's table plus the
+/// words projects use for the same purpose without Maven ranking them: `pre`/`dev`,
+/// `ea` (early access, as the JDK itself ships), `preview`, and `incubating` (an
+/// Apache project that has not graduated).
+///
+/// The universal substring list catches the hyphenated spellings of some of these,
+/// but Maven writes a qualifier with a dot as readily as with a hyphen, and
+/// `1.0.0.Preview1` is a pre-release no substring in that list appears in.
+const PRERELEASE_QUALIFIERS: &[&str] = &[
+    "alpha",
+    "beta",
+    "milestone",
+    "rc",
+    "snapshot",
+    "pre",
+    "dev",
+    "ea",
+    "preview",
+    "incubating",
+];
 
 /// The canonical spelling of a qualifier word, or `None` for Maven's aliases for
 /// "no qualifier at all".
@@ -577,6 +593,24 @@ mod tests {
     fn a_release_is_grouped_by_its_translation_not_its_spelling() {
         let found = partitioning_flavours(["1.0.0", "1.0-jre"]);
         assert!(found.contains("jre"), "{found:?}");
+    }
+
+    /// Maven writes a qualifier with a dot as readily as with a hyphen, so the
+    /// substring list that catches `-preview` misses `1.0.0.Preview1` entirely.
+    #[test]
+    fn an_early_access_or_preview_build_is_a_prerelease() {
+        for version in [
+            "1.0.0.Preview1",
+            "1.0-preview",
+            "21.0.0-ea",
+            "17.0.2.ea1",
+            "0.7.0-incubating",
+        ] {
+            assert!(is_prerelease(version), "{version}");
+        }
+        for version in ["1.0.0", "6.4.4.Final", "33.7.1-jre", "9.4.51.v20230217"] {
+            assert!(!is_prerelease(version), "{version}");
+        }
     }
 
     #[test]
