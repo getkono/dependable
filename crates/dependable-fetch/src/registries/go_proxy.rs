@@ -66,7 +66,7 @@ impl RegistryFetcher for GoProxyFetcher {
                     return Ok(FetchedVersions::new(versions));
                 }
                 // Empty list (e.g. a module with only pseudo-versions): fall back.
-            } else if status != reqwest::StatusCode::NOT_FOUND {
+            } else if !is_absent(status) {
                 return Err(FetchError::Status {
                     code: status.as_u16(),
                     package: name.to_string(),
@@ -77,7 +77,7 @@ impl RegistryFetcher for GoProxyFetcher {
             let latest_url = format!("{}/{escaped}/@latest", self.base_url);
             let resp = self.client.get(&latest_url).send().await?;
             let status = resp.status();
-            if status == reqwest::StatusCode::NOT_FOUND {
+            if is_absent(status) {
                 return Err(FetchError::NotFound(name.to_string()));
             }
             if !status.is_success() {
@@ -94,6 +94,23 @@ impl RegistryFetcher for GoProxyFetcher {
         }
         .boxed()
     }
+}
+
+/// Whether a proxy response means "this module is not here", as opposed to the proxy
+/// failing to answer.
+///
+/// The Go module proxy protocol names **both** `404` and `410` as the not-found
+/// responses, and `410 Gone` is the canonical `proxy.golang.org` answer for a module it
+/// will not serve — the private or internal path a repository excludes with `GOPRIVATE`,
+/// or one the proxy has been asked to forget. Reading it as a transport failure marked
+/// the whole registry unreachable, and a `--fail-on` gate cannot be honoured through
+/// that: one private module turned a passing run into exit 2, which is exactly the CI
+/// break the 404 carve-out exists to prevent.
+fn is_absent(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::GONE
+    )
 }
 
 /// Parse the newline-delimited `@v/list` body into clean (no leading `v`) semver
@@ -158,6 +175,17 @@ mod tests {
     fn parse_list_drops_unparseable() {
         let body = "v1.0.0\ngarbage\n\n";
         assert_eq!(parse_list(body), vec!["1.0.0"]);
+    }
+
+    /// The protocol's two not-found answers, and nothing else. A `410` reaching the
+    /// `Status` arm made a private module unreachable-registry rather than absent.
+    #[test]
+    fn both_not_found_statuses_mean_absent() {
+        assert!(is_absent(reqwest::StatusCode::NOT_FOUND));
+        assert!(is_absent(reqwest::StatusCode::GONE));
+        assert!(!is_absent(reqwest::StatusCode::FORBIDDEN));
+        assert!(!is_absent(reqwest::StatusCode::TOO_MANY_REQUESTS));
+        assert!(!is_absent(reqwest::StatusCode::INTERNAL_SERVER_ERROR));
     }
 
     #[test]
