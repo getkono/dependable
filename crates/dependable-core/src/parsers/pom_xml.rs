@@ -139,8 +139,10 @@ impl Parser for PomXmlParser {
     }
 }
 
-/// Read `<properties>` into property name → literal, skipping any entry that only
-/// points at another unknown.
+/// Read `<properties>` into property name → stated value.
+///
+/// The value is kept exactly as written, `${…}` and all: whether it is a literal or
+/// another reference is [`terminal`]'s question, not this one's.
 fn read_properties<'a>(project: roxmltree::Node<'a, 'a>) -> HashMap<String, Located> {
     let mut out = HashMap::new();
     let Some(table) = child(project, "properties") else {
