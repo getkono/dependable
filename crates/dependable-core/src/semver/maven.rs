@@ -29,10 +29,14 @@
 //!   variant published under the same version number, as `guava` publishes
 //!   `32.1.3-android` beside `32.1.3-jre` — that order is not merely different from
 //!   Maven's, it is meaningless: neither variant is an upgrade of the other. See
-//!   [`flavour`], which is what lets a caller compare only within one of them.
+//!   [`partitioning_flavours`], which is what lets a caller compare only within one
+//!   of them — and which reads the flavours off the published list, because the
+//!   version string alone cannot tell a variant from a release-channel word.
 //! - **`ga`/`final`/`release`** are Maven's aliases for "no qualifier", so
 //!   `6.4.4.Final` translates to `6.4.4` — correct for comparison, and the reason a
 //!   version *reported* for such an artifact is spelled without the suffix.
+
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Convert a Maven version into a parseable semver string.
 ///
@@ -218,18 +222,24 @@ fn strip_leading_zeros(token: &str) -> &str {
     if trimmed.is_empty() { "0" } else { trimmed }
 }
 
-/// The build *flavour* a Maven version names, if any.
+/// The word a Maven version *could* be flavoured on, if any.
 ///
 /// A flavour is a variant of one release built for a different target —
 /// `com.google.guava:guava` publishes `32.1.3-android` and `32.1.3-jre`, and an
 /// Android project moved onto the JRE jar is the classic desugaring break. It is
 /// not a version: nothing in the `android` line is an upgrade of anything in the
-/// `jre` line, so the two are never ranked against each other. Callers use this to
-/// restrict a candidate list to the flavour the project already declares.
+/// `jre` line, so the two are never ranked against each other.
 ///
 /// A version flavours on its **final** token, when that token is not numeric and is
 /// not one of Maven's own qualifier words ([`qualifier_alias`] recognizes those, so
 /// `6.4.4.Final`, `1.0-rc1`, and `1.0-SNAPSHOT` all flavour as `None`).
+///
+/// This is a question about one string, and one string cannot answer it: `-android`
+/// and `-incubating` tokenize identically, and only the first names a variant. So
+/// this is a *candidate* word, and whether it really partitions the artifact is
+/// [`partitioning_flavours`]'s answer, from the published list. A caller
+/// restricting candidates to a flavour must ask that one — filtering on the word
+/// alone hides `0.8.0` from a project on `0.7.0-incubating`.
 ///
 /// A flavour carrying its own number (`1.0-jdk8`) is deliberately **not**
 /// recognized. It tokenizes exactly like a dated build stamp (`9.4.51.v20230217`,
@@ -239,14 +249,58 @@ fn strip_leading_zeros(token: &str) -> &str {
 /// string alone.
 #[must_use]
 pub fn flavour(version: &str) -> Option<String> {
-    let last = tokenize(version).pop()?;
-    if is_numeric(&last) {
+    flavour_of(&tokenize(version))
+}
+
+/// [`flavour`] for a version that is already tokenized.
+fn flavour_of(tokens: &[String]) -> Option<String> {
+    let last = tokens.last()?;
+    if is_numeric(last) {
         return None;
     }
     // A word Maven itself ranks is a qualifier, not a variant; `ga`/`final`/
     // `release` (which alias to `None`) are the release itself.
-    (qualifier_alias(&last) == Some(last.as_str()) && !KNOWN_QUALIFIERS.contains(&last.as_str()))
-        .then_some(last)
+    (qualifier_alias(last) == Some(last.as_str()) && !KNOWN_QUALIFIERS.contains(&last.as_str()))
+        .then(|| last.clone())
+}
+
+/// The flavour words a published version list is actually *partitioned* by.
+///
+/// A flavour is a **parallel** line: the same numeric release is published under it
+/// and under at least one other spelling, because the two are builds of one release
+/// rather than successive releases. `33.7.1-android` beside `33.7.1-jre` is that
+/// shape; `0.7.0-incubating` graduating to `0.8.0` is not — each release is
+/// published once, under one spelling.
+///
+/// That difference is only visible in the list, which is why it is derived here and
+/// not from the version string. A word this does not return is part of the version,
+/// not a variant of it, and restricting a candidate list to it would hide releases:
+/// Apache projects graduate out of `-incubating`, and Guava's own line is
+/// unflavoured through `23.0` and flavoured from `23.1` on, so a project on either
+/// side of that split would be told it is up to date forever.
+///
+/// Releases are grouped by their [`maven_to_semver`] translation, so `1.0` and
+/// `1.0.0` — one version in Maven's order — are one release here too.
+#[must_use]
+pub fn partitioning_flavours<'a>(versions: impl IntoIterator<Item = &'a str>) -> BTreeSet<String> {
+    let mut spellings: BTreeMap<String, BTreeSet<Option<String>>> = BTreeMap::new();
+    for version in versions {
+        let tokens = tokenize(version);
+        let flavour = flavour_of(&tokens);
+        let release = if flavour.is_some() {
+            &tokens[..tokens.len() - 1]
+        } else {
+            &tokens[..]
+        };
+        let joined = release.join(".");
+        let key = maven_to_semver(&joined).unwrap_or(joined);
+        spellings.entry(key).or_default().insert(flavour);
+    }
+    spellings
+        .into_values()
+        .filter(|under| under.len() > 1)
+        .flat_map(|under| under.into_iter().flatten())
+        .collect()
 }
 
 /// Whether a Maven version names a pre-release.
@@ -469,6 +523,60 @@ mod tests {
         ] {
             assert_eq!(flavour(version), None, "{version}");
         }
+    }
+
+    /// The word is only a candidate. What makes it a flavour is the registry
+    /// publishing one release under it *and* under another spelling — Guava's
+    /// `33.7.1` exists as both `-android` and `-jre`, so both words partition.
+    #[test]
+    fn a_word_two_builds_of_one_release_share_is_a_flavour() {
+        let guava = [
+            "33.7.1-jre",
+            "33.7.1-android",
+            "23.1-jre",
+            "23.1-android",
+            "23.0",
+            "22.0",
+        ];
+        let found = partitioning_flavours(guava);
+        assert!(found.contains("android"), "{found:?}");
+        assert!(found.contains("jre"), "{found:?}");
+    }
+
+    /// And a word each release is published under exactly once is not a flavour,
+    /// however unfamiliar it looks. Apache projects graduate out of `-incubating`
+    /// to a plain release; treating the word as a variant would hide every
+    /// graduated version from a project still on the incubating one.
+    #[test]
+    fn a_release_channel_word_is_not_a_flavour() {
+        for line in [
+            ["0.9.0", "0.8.0", "0.7.0-incubating"],
+            ["2.0.0", "1.1.0", "1.0.0-preview"],
+            ["1.2.0", "1.1.0", "1.0.0-dev"],
+        ] {
+            assert!(
+                partitioning_flavours(line).is_empty(),
+                "{line:?} publishes each release once"
+            );
+        }
+    }
+
+    /// A dated build stamp partitions nothing either: Jetty stamps its whole 9.4
+    /// line, but each stamp belongs to one release.
+    #[test]
+    fn a_line_with_no_parallel_builds_partitions_on_nothing() {
+        assert!(
+            partitioning_flavours(["12.0.9", "9.4.53.v20231009", "9.4.51.v20230217"]).is_empty()
+        );
+        assert!(partitioning_flavours(["6.6.0.Final", "6.4.4.Final"]).is_empty());
+    }
+
+    /// `1.0` and `1.0.0` are one version in Maven's order, so a build published
+    /// against the short spelling is a parallel build of the padded one.
+    #[test]
+    fn a_release_is_grouped_by_its_translation_not_its_spelling() {
+        let found = partitioning_flavours(["1.0.0", "1.0-jre"]);
+        assert!(found.contains("jre"), "{found:?}");
     }
 
     #[test]

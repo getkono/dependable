@@ -902,19 +902,33 @@ fn native_for(semver: &str, translated: &[(String, String)]) -> Option<String> {
         .map(|(_, native)| native.clone())
 }
 
-/// Keep only the candidates in the same Maven *flavour* as the current version.
+/// Drop the candidates that are a *different build* of a release rather than a
+/// different release.
 ///
 /// A flavour is a build variant published under the same version number —
 /// `com.google.guava:guava` ships `32.1.3-android` beside `32.1.3-jre` — and it is
 /// not a version at all: it selects which artifact, not which release. Maven's own
 /// order compares the numbers first, so `33.7.1-jre` outranks `32.1.3-android` and
 /// an Android project offered "the latest version" is quietly moved onto the JRE
-/// jar, which is the classic desugaring break. Versions in a different flavour are
-/// therefore not candidates for this dependency at all.
+/// jar, which is the classic desugaring break.
 ///
-/// Filtering to nothing means the current flavour has no published versions, which
-/// is not an answer anyone can use; the unfiltered list is returned instead, the
-/// same fallback [`UnstableFilter::filter`] makes.
+/// Which words are flavours is
+/// [`partitioning_flavours`](dependable_core::semver::maven::partitioning_flavours)'s
+/// answer, read off the published list, and **not** "every trailing word that is
+/// not one of Maven's qualifiers". That weaker rule hides releases rather than variants, in two ways
+/// this filter must not reproduce:
+///
+/// - Guava is unflavoured through `23.0` and flavoured from `23.1` on. Keeping only
+///   the current version's flavour reduces a project declaring `23.0` to the
+///   unflavoured versions — which exist, so no fallback fires — and reports an
+///   eight-year-old release as up to date.
+/// - `0.7.0-incubating` is a release channel, not a variant. An Apache project
+///   graduates to a plain `0.8.0`, which the same filter would hide.
+///
+/// So the filter runs only when the current version's own word is one the registry
+/// really does publish parallel builds under, and it drops only the *competing*
+/// flavours — a word that partitions nothing stays a candidate. That keeps the
+/// Android project off the JRE jar without any list being narrowed to nothing.
 fn same_flavour_only(
     versions: &[String],
     current: Option<&str>,
@@ -923,17 +937,22 @@ fn same_flavour_only(
     if ecosystem != Ecosystem::Jvm {
         return versions.to_vec();
     }
-    let wanted = current.and_then(dependable_core::semver::maven::flavour);
-    let kept: Vec<String> = versions
-        .iter()
-        .filter(|v| dependable_core::semver::maven::flavour(v) == wanted)
-        .cloned()
-        .collect();
-    if kept.is_empty() {
-        versions.to_vec()
-    } else {
-        kept
+    use dependable_core::semver::maven::{flavour, partitioning_flavours};
+    // No declared flavour is no flavour to restrict to: every candidate stays.
+    let Some(wanted) = current.and_then(flavour) else {
+        return versions.to_vec();
+    };
+    let partitioning = partitioning_flavours(versions.iter().map(String::as_str));
+    if !partitioning.contains(&wanted) {
+        return versions.to_vec();
     }
+    // `wanted` partitions the list, so at least one candidate carries it and this
+    // can never filter to nothing.
+    versions
+        .iter()
+        .filter(|v| flavour(v).is_none_or(|f| f == wanted || !partitioning.contains(&f)))
+        .cloned()
+        .collect()
 }
 
 /// The OSV query for one result, or `None` if there is nothing to ask about.
@@ -1499,6 +1518,87 @@ mod tests {
         );
         assert_eq!(result.latest_available.as_deref(), Some("33.7.1-jre"));
     }
+
+    /// Guava's real shape, which the flavour filter has to survive: plain
+    /// `10.0 … 23.0`, then `-android`/`-jre` only, from `23.1` on.
+    ///
+    /// A project declaring `23.0` declares no flavour, so there is no flavour to
+    /// restrict to and every candidate stays. Keeping only the unflavoured ones
+    /// instead — which exist, so no empty-list fallback fires — reported an
+    /// eight-year-old release as up to date, with `max_major_behind` computing
+    /// `behind = 0` and the policy gate passing.
+    #[test]
+    fn an_unflavoured_declaration_still_sees_the_releases_published_after_the_split() {
+        for declared in ["23.0", "22.0", "21.0", "20.0", "19.0"] {
+            let item = jvm_item("com.google.guava:guava", declared);
+            let result = evaluated(&item, &GUAVA, Ecosystem::Jvm, UnstableFilter::Exclude);
+            assert_ne!(
+                result.status,
+                DependencyStatus::UpToDate,
+                "guava {declared} is years behind"
+            );
+            assert_eq!(result.latest_available.as_deref(), Some("33.7.1-jre"));
+        }
+    }
+
+    /// And the fix must not undo the one it repairs: a project that *has* declared
+    /// a flavour is still never offered the other one, even with the whole
+    /// unflavoured history in the list.
+    #[test]
+    fn a_flavoured_declaration_is_still_never_offered_the_other_flavour() {
+        for (declared, expected) in [
+            ("23.1-android", "33.7.1-android"),
+            ("23.1-jre", "33.7.1-jre"),
+        ] {
+            let item = jvm_item("com.google.guava:guava", declared);
+            let result = evaluated(&item, &GUAVA, Ecosystem::Jvm, UnstableFilter::Exclude);
+            assert_eq!(result.latest_available.as_deref(), Some(expected));
+        }
+    }
+
+    /// A flavour that stops being published is not a reason to hide what replaced
+    /// it: the filter drops the *competing* flavour, not every other spelling.
+    #[test]
+    fn a_line_that_stops_splitting_is_not_frozen_at_the_split() {
+        let item = jvm_item("org.example:lib", "1.0-android");
+        let result = evaluated(
+            &item,
+            &["2.0", "1.0-jre", "1.0-android"],
+            Ecosystem::Jvm,
+            UnstableFilter::Exclude,
+        );
+        assert_eq!(result.latest_available.as_deref(), Some("2.0"));
+    }
+
+    /// `-incubating` is a release channel, not a build variant: an Apache project
+    /// graduates to a plain `0.8.0`, and no release is ever published under two
+    /// spellings. Reading the word as a flavour hid every graduated release.
+    #[test]
+    fn a_release_channel_word_does_not_partition_a_version_line() {
+        let item = jvm_item("org.apache.example:lib", "0.7.0-incubating");
+        let available = ["0.9.0", "0.8.0", "0.7.0-incubating"];
+        for unstable in [UnstableFilter::IncludeAlways, UnstableFilter::Exclude] {
+            let result = evaluated(&item, &available, Ecosystem::Jvm, unstable);
+            assert_eq!(
+                result.latest_available.as_deref(),
+                Some("0.9.0"),
+                "{unstable:?} hid the graduated releases"
+            );
+        }
+    }
+
+    /// Guava as Maven Central lists it, newest-first: unflavoured through `23.0`,
+    /// `-android`/`-jre` from `23.1` on.
+    const GUAVA: [&str; 8] = [
+        "33.7.1-jre",
+        "33.7.1-android",
+        "32.1.3-jre",
+        "32.1.3-android",
+        "23.1-jre",
+        "23.1-android",
+        "23.0",
+        "22.0",
+    ];
 
     /// A dated build stamp is not a flavour: Jetty stamps its whole 9.4 line, and
     /// reading that as a variant would hide every release above it.
