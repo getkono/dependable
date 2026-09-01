@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/getkono/dependable/compare/dependable-core-v0.1.3...dependable-core-v0.1.4) - 2026-09-01
+
+### Added
+
+- *(core)* tell a workspace-inherited dependency from a path one
+- *(core)* carry the registry-declared license on CheckResult
+- *(core)* advisory data model on CheckResult
+
+### Fixed
+
+- *(core)* gate a reported location on the position, not on the rewrite
+
+### Other
+
+- Merge remote-tracking branch 'origin/master' into feat/82-gradle-version-catalogs
+- Merge pull request #90 from getkono/refactor/83-generalize-workspace-inheritance
+- *(core)* describe where a workspace root lives per manifest kind
+- *(core)* refresh doc comments that still describe a Rust-only V1
+
 ## [0.1.3](https://github.com/getkono/dependable/compare/dependable-core-v0.1.2...dependable-core-v0.1.3) - 2026-08-29
 
 ### Added

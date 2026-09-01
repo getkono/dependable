@@ -12,7 +12,7 @@ members = [
 exclude = ["crates/dependable/tests/fixtures"]
 
 [workspace.package]
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
@@ -23,10 +23,10 @@ authors = ["Justin Chung"]
 [workspace.dependencies]
 # --- internal crates (published to crates.io together; version kept in lockstep
 # with [workspace.package] by release-plz) ---
-dependable-core = { version = "0.1.3", path = "crates/dependable-core" }
-dependable-fetch = { version = "0.1.3", path = "crates/dependable-fetch" }
-dependable-tui = { version = "0.1.3", path = "crates/dependable-tui" }
-dependable-report = { version = "0.1.3", path = "crates/dependable-report" }
+dependable-core = { version = "0.1.4", path = "crates/dependable-core" }
+dependable-fetch = { version = "0.1.4", path = "crates/dependable-fetch" }
+dependable-tui = { version = "0.1.4", path = "crates/dependable-tui" }
+dependable-report = { version = "0.1.4", path = "crates/dependable-report" }
 # --- dependable-core (pure) ---
 toml_edit = "0.22"
 roxmltree = "0.20"

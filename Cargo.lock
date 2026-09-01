@@ -543,7 +543,7 @@ checksum = "5729f5117e208430e437df2f4843f5e5952997175992d1414f94c57d61e270b4"
 
 [[package]]
 name = "dependable"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -564,7 +564,7 @@ dependencies = [
 
 [[package]]
 name = "dependable-core"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "regex",
  "roxmltree",
@@ -576,7 +576,7 @@ dependencies = [
 
 [[package]]
 name = "dependable-fetch"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "dependable-core",
  "futures",
@@ -595,7 +595,7 @@ dependencies = [
 
 [[package]]
 name = "dependable-report"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "dependable-core",
  "minijinja",
@@ -609,7 +609,7 @@ dependencies = [
 
 [[package]]
 name = "dependable-tui"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "dependable-fetch",
  "globset",
