@@ -872,10 +872,16 @@ fn to_semver_versions(versions: &[String], ecosystem: Ecosystem) -> Vec<(String,
 /// differently from the string that was handed in.
 ///
 /// Several natives can translate to one semver — Maven reads `1.0` and `1.0.0` as
-/// the same version, so both translate to `1.0.0`. The first match in the list
-/// wins, and the list is the registry's newest-first order, so the winner is the
-/// newest native spelling of that version. A translated version with no surviving
-/// native (which nothing produces today) is left as it was rather than dropped.
+/// the same version, and NuGet drops a fourth segment, so `8.0.32` and `8.0.32.1`
+/// are one version to compare and two artifacts to name. Ties are broken by taking
+/// the **last** match: the sort that produced this list compares translations, so a
+/// tie group holds the registry's own listing order, and every registry this
+/// translates for lists oldest-first (`maven-metadata.xml` opens with the first
+/// release ever published; NuGet's registration pages are ascending). Taking the
+/// first would report `8.0.32` as the newest `MySql.Data` and have `--fix` write
+/// it, with `8.0.32.1` published and available. A translated version with no
+/// surviving native (which nothing produces today) is left as it was rather than
+/// dropped.
 fn in_native_versions(mut eval: Evaluation, translated: &[(String, String)]) -> Evaluation {
     eval.latest_compatible = eval
         .latest_compatible
@@ -891,6 +897,7 @@ fn native_for(semver: &str, translated: &[(String, String)]) -> Option<String> {
     let wanted = SemverVersion::parse(semver).ok()?;
     translated
         .iter()
+        .rev()
         .find(|(candidate, _)| SemverVersion::parse(candidate).is_ok_and(|parsed| parsed == wanted))
         .map(|(_, native)| native.clone())
 }
@@ -1418,28 +1425,43 @@ mod tests {
         );
     }
 
-    /// Maven reads `1.0` and `1.0.0` as one version, so two natives can translate
-    /// to one semver. The list is newest-first, so the first match is the newest
-    /// spelling — and the choice has to be a rule, not whichever the hash order
-    /// happened to yield.
+    /// Maven reads `1.0` and `1.0.0` as one version and NuGet folds `8.0.32.1`
+    /// into `8.0.32`, so two natives can translate to one semver — and the tie has
+    /// to be broken by a rule.
+    ///
+    /// The versions arrive sorted by their *translation*, and both that sort and
+    /// `check_version`'s are stable, so a tie group is still in the order the
+    /// registry listed it — which is oldest-first for Maven Central's
+    /// `maven-metadata.xml` and for NuGet's registration pages alike. The newest
+    /// spelling is therefore the **last** match, not the first: taking the first
+    /// told a `MySql.Data` project the newest release was `8.0.32` and had
+    /// `fix --all` write it, with `8.0.32.1` published.
     #[test]
-    fn the_first_native_wins_when_two_translate_to_one_version() {
+    fn the_newest_native_wins_when_two_translate_to_one_version() {
         let item = jvm_item("org.example:lib", "0.9");
         let result = evaluated(
-            &item,
-            &["1.0.0", "1.0", "0.9"],
-            Ecosystem::Jvm,
-            UnstableFilter::Exclude,
-        );
-        assert_eq!(result.latest_available.as_deref(), Some("1.0.0"));
-
-        let reversed = evaluated(
             &item,
             &["1.0", "1.0.0", "0.9"],
             Ecosystem::Jvm,
             UnstableFilter::Exclude,
         );
-        assert_eq!(reversed.latest_available.as_deref(), Some("1.0"));
+        assert_eq!(result.latest_available.as_deref(), Some("1.0.0"));
+
+        // NuGet publishes both of these; the fourth segment is dropped by the
+        // translation, so they compare equal and list in publication order.
+        let nuget = item_of(
+            ManifestKind::Csproj,
+            "<Project><ItemGroup>\
+             <PackageReference Include=\"MySql.Data\" Version=\"8.0.31\" />\
+             </ItemGroup></Project>",
+        );
+        let result = evaluated(
+            &nuget,
+            &["8.0.32", "8.0.32.1", "8.0.31"],
+            Ecosystem::CSharp,
+            UnstableFilter::Exclude,
+        );
+        assert_eq!(result.latest_available.as_deref(), Some("8.0.32.1"));
     }
 
     /// A flavour is which artifact, not which release: moving an Android project
