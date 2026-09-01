@@ -1,6 +1,7 @@
 //! Lockfile parsers and per-kind dispatch.
 
 use crate::error::ParseError;
+use crate::item::Item;
 use crate::manifest::{LockfileKind, ManifestKind};
 
 pub mod bun_lock;
@@ -14,6 +15,7 @@ pub mod mix_lock;
 pub mod mix_lock_graph;
 pub mod package_lock_graph;
 pub mod package_lock_json;
+pub mod swift_package_resolved;
 
 pub use bun_lock::parse_bun_lock;
 pub use bun_lock_graph::parse_bun_lock_graph;
@@ -26,6 +28,10 @@ pub use mix_lock::parse_mix_lock;
 pub use mix_lock_graph::parse_mix_lock_graph;
 pub use package_lock_graph::parse_package_lock_graph;
 pub use package_lock_json::parse_package_lock;
+pub use swift_package_resolved::{
+    parse_swift_package_resolved, swift_package_name, swift_package_name_variants,
+    swift_package_resolved_items,
+};
 
 /// Parse lockfile `content` with the parser for the file that was found.
 ///
@@ -44,6 +50,34 @@ pub fn parse_lockfile_kind(kind: LockfileKind, content: &str) -> Result<Lockfile
         LockfileKind::ComposerLock => parse_composer_lock(content),
         LockfileKind::PubspecLock => parse_dart_pubspec_lock(content),
         LockfileKind::MixLock => parse_mix_lock(content),
+        LockfileKind::PackageResolved => parse_swift_package_resolved(content),
+    }
+}
+
+/// The dependency list a lockfile *is*, for the formats that are the only record
+/// of one.
+///
+/// [`apply_lockfile`] annotates items a manifest already produced and never
+/// inserts, which is the right contract wherever the manifest is readable data.
+/// Swift's is not — `Package.swift` is executable Swift — so `Package.resolved`
+/// is the only honest source of the dependency list, and a caller has to be able
+/// to take items *from* a lockfile rather than only apply one *to* them.
+///
+/// `None` for every other kind, whose contract is unchanged: ask
+/// [`parse_lockfile_kind`] for their versions and apply them.
+/// [`LockfileKind::is_dependency_source`] answers the same question without
+/// parsing.
+///
+/// `None` **also** when the kind is a dependency source whose file did not read.
+/// Both answers mean the same thing to a caller — "no dependency list came from
+/// this file" — and both leave it to fall through to [`parse_lockfile_kind`],
+/// which reports the failure. Handing back a prefix of a truncated
+/// `Package.resolved` would instead present a short list as a complete one.
+#[must_use]
+pub fn lockfile_items(kind: LockfileKind, content: &str) -> Option<Vec<Item>> {
+    match kind {
+        LockfileKind::PackageResolved => swift_package_resolved_items(content),
+        _ => None,
     }
 }
 

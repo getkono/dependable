@@ -75,6 +75,10 @@ pub fn parse_project(kind: ManifestKind, content: &str) -> ProjectMeta {
         ManifestKind::PubspecYaml => pubspec(content),
         ManifestKind::MixExs => mix(content),
         ManifestKind::PomXml => pom(content),
+        // A `Package.swift` names its package in a Swift expression, and reading
+        // that expression is exactly what this ecosystem declines to do. Reporting
+        // no name is what every other manifest whose identity we cannot see reports.
+        ManifestKind::PackageSwift => unnamed(),
         // A `pnpm-workspace.yaml` exists to hold catalogs; `Directory.Packages.props`
         // exists to hold central versions. A Gradle version catalog is the same shape
         // again — the project it serves is described by a build script. None names a

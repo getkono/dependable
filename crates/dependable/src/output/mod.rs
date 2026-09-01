@@ -25,6 +25,15 @@ pub struct ManifestReport {
     /// The manifest whose `[workspace.dependencies]` supplied any inherited constraint.
     /// `None` outside a workspace.
     pub workspace_root: Option<PathBuf>,
+    /// Whether the file that *is* this project's dependency list went unread, so
+    /// [`Self::results`] being empty says nothing about the project.
+    ///
+    /// Only a SwiftPM project can set this: a `Package.swift` is a program this
+    /// tool declines to read, so with no readable `Package.resolved` beside it
+    /// there is no dependency list at all. `--fail-on any` reads it, because
+    /// "nothing was found wrong" and "nothing was looked at" must not share an
+    /// exit code.
+    pub dependencies_unread: bool,
 }
 
 /// Aggregate status counts across one or more reports.
@@ -60,6 +69,15 @@ pub struct Summary {
     /// [`git`](Self::git), which are deliberately skipped and therefore clean,
     /// because these were not skipped on purpose — nothing was learned about them.
     pub undetermined: usize,
+    /// How many of the [`manifests`](Self::manifests) had their dependency list go
+    /// unread — [`ManifestReport::dependencies_unread`].
+    ///
+    /// The counter that stops a machine-readable report saying "clean" about a
+    /// project nothing was read from. Every status count above is a tally of rows
+    /// that *were* read, so all of them are zero for such a manifest and the
+    /// document is byte-identical to a genuinely empty one. Non-zero here is the
+    /// only thing in the summary that separates the two.
+    pub manifests_unread: usize,
 }
 
 impl Summary {
@@ -89,6 +107,7 @@ impl Summary {
             }
         }
         s.manifests = reports.len();
+        s.manifests_unread = reports.iter().filter(|r| r.dependencies_unread).count();
         s.unique_packages = unique.len();
         s
     }
@@ -185,6 +204,7 @@ mod tests {
                 })
                 .collect(),
             workspace_root: None,
+            dependencies_unread: false,
         }
     }
 

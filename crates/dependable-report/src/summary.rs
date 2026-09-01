@@ -21,6 +21,15 @@ use crate::model::Report;
 pub struct Summary {
     /// How many manifests the report covers.
     pub manifests: usize,
+    /// How many of [`Self::manifests`] had the file that *is* their dependency list
+    /// go unread — see [`crate::model::ManifestResults::dependencies_unread`].
+    ///
+    /// Nonzero means the counts below are drawn from fewer projects than
+    /// [`Self::manifests`] names, and that the ones missing contributed no rows
+    /// because none could be read — not because they had none. A renderer that
+    /// ignores this presents a project nothing was established about exactly as it
+    /// presents a clean one.
+    pub manifests_unread: usize,
     /// Every declared dependency across every manifest.
     pub total: usize,
     /// Dependencies whose currency this run actually established:
@@ -197,6 +206,9 @@ impl Report {
         let mut by_ecosystem: Vec<EcosystemSummary> = Vec::new();
 
         for manifest in &self.manifests {
+            if manifest.dependencies_unread {
+                summary.manifests_unread += 1;
+            }
             let slot = by_ecosystem
                 .iter()
                 .position(|e| e.ecosystem == manifest.ecosystem)
@@ -293,6 +305,36 @@ mod tests {
             report.push(manifest);
         }
         report
+    }
+
+    /// A manifest that contributed no rows because none could be read is not the
+    /// same as one that contributed none because it declares none, and the counts
+    /// alone cannot tell them apart — both are zero. Only this counter can, and a
+    /// renderer that has it can say so however quiet the run was.
+    #[test]
+    fn an_unread_manifest_is_counted_apart_from_an_empty_one() {
+        let unread = report(vec![
+            ManifestResults::new(
+                PathBuf::from("a/Package.swift"),
+                Ecosystem::Swift,
+                Vec::new(),
+            )
+            .with_dependencies_unread(true),
+        ]);
+        let empty = report(vec![ManifestResults::new(
+            PathBuf::from("b/Package.swift"),
+            Ecosystem::Swift,
+            Vec::new(),
+        )]);
+
+        assert_eq!(unread.summary().manifests_unread, 1);
+        assert_eq!(empty.summary().manifests_unread, 0);
+        assert_eq!(
+            unread.summary().total,
+            empty.summary().total,
+            "the dependency counts are identical, which is exactly why the caveat has to be \
+             carried separately"
+        );
     }
 
     #[test]

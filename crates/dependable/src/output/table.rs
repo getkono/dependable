@@ -38,15 +38,22 @@ pub fn render(reports: &[ManifestReport], quiet: bool) -> anyhow::Result<()> {
 
 fn render_one(report: &ManifestReport) {
     let count = report.results.len();
+    // "0 dependencies" is a count, and a count is a claim about the project. Where
+    // the file that *is* the dependency list went unread there was nothing to
+    // count, so the heading says that instead: a reader skimming headings must not
+    // come away believing a project depends on nothing when nothing was read.
+    let scope = if count == 0 && report.dependencies_unread {
+        "dependency list unread".to_owned()
+    } else {
+        format!("{count} dependenc{}", if count == 1 { "y" } else { "ies" })
+    };
     println!(
-        "{} — {} ({} dependenc{})",
+        "{} — {} ({scope})",
         report
             .path
             .display()
             .if_supports_color(Stream::Stdout, OwoColorize::bold),
         report.ecosystem.display_name(),
-        count,
-        if count == 1 { "y" } else { "ies" }
     );
     println!();
 

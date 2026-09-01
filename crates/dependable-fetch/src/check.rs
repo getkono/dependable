@@ -13,8 +13,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use dependable_core::{
     CheckResult, DependencyStatus, Ecosystem, Evaluation, Item, LockfileKind, ManifestKind,
-    PackageSource, UnstableFilter, apply_lockfile, check_version, parse, parse_lockfile_kind,
-    resolve_workspace_inheritance, to_semver_constraint,
+    PackageSource, UnstableFilter, apply_lockfile, check_version, lockfile_items, parse,
+    parse_lockfile_kind, resolve_workspace_inheritance, swift_package_name_variants,
+    to_semver_constraint,
 };
 use futures::stream::{self, StreamExt};
 use semver::Version as SemverVersion;
@@ -41,6 +42,10 @@ type ProgressSink = Arc<dyn Fn(ProgressEvent) + Send + Sync>;
 /// Each [`Checker::check_manifest`]/[`Checker::check_path`] call emits one
 /// `Started` → `Advanced`* → `Finished` cycle, letting a UI manage a per-manifest
 /// progress bar. `#[non_exhaustive]` so new phases can be added later.
+///
+/// A manifest whose ecosystem publishes no registry fetches nothing and emits no
+/// cycle at all — never a `Started` without its `Finished`, so a bar is never left
+/// running.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum ProgressEvent {
@@ -158,6 +163,10 @@ pub struct Checker {
     /// Fetcher for [`PackageSource::Jsr`] items (a sub-registry of the npm
     /// ecosystem), used for Deno `jsr:` dependencies.
     jsr: Option<Arc<dyn RegistryFetcher>>,
+    /// Ecosystems that publish no registry and that the caller has nonetheless
+    /// asked to check. `registries` is the on switch for every ecosystem that has
+    /// a fetcher; this is the on switch for the ones that cannot have one.
+    registryless: HashSet<Ecosystem>,
     osv: Option<Arc<OsvClient>>,
     /// Whether `check_*` runs the advisory-enrichment post-pass. Off by default:
     /// enrichment costs one extra OSV request per vulnerable package version, so
@@ -354,7 +363,11 @@ impl Checker {
             .iter()
             .enumerate()
             .filter(|(_, result)| !result.current_vulnerabilities.is_empty())
-            .filter_map(|(i, result)| osv_query_for(result, ecosystem).map(|query| (i, query)))
+            .flat_map(|(i, result)| {
+                osv_queries_for(result, ecosystem)
+                    .into_iter()
+                    .map(move |query| (i, query))
+            })
             .collect();
         if pending.is_empty() {
             return Ok(());
@@ -372,7 +385,18 @@ impl Checker {
         let mut failure: Option<FetchError> = None;
         for (index, outcome) in fetched {
             match outcome {
-                Ok(advisories) => check.results[index].advisories = advisories,
+                // Appended and deduplicated by ID rather than assigned: a result
+                // asked about under two spellings of its name is enriched from
+                // both, and re-enriching a check that already holds its
+                // advisories stays a no-op.
+                Ok(advisories) => {
+                    let slot = &mut check.results[index].advisories;
+                    for advisory in advisories {
+                        if !slot.iter().any(|held| held.id == advisory.id) {
+                            slot.push(advisory);
+                        }
+                    }
+                }
                 Err(e) => failure = failure.or(Some(e)),
             }
         }
@@ -530,15 +554,26 @@ impl Checker {
     /// directory first, then each ancestor, stopping at a repository boundary —
     /// so a workspace member picks up the lockfile at the workspace root rather
     /// than reporting no locked versions.
+    ///
+    /// # `read_lockfiles` governs annotations only
+    /// [`CheckerBuilder::read_lockfiles`] is the `--no-lock-file` switch, and that
+    /// flag suppresses *locked-version annotations* on a list the manifest already
+    /// produced. A `Package.resolved` is not that: it **is** the list, because a
+    /// `Package.swift` is a program this crate declines to read
+    /// ([`LockfileKind::is_dependency_source`]). Honouring the switch there does
+    /// not withhold a column, it reports a Swift project as depending on nothing —
+    /// and since the OSV scan then runs over an empty item list, a project with a
+    /// vulnerable pin comes back clean. So the file is located first and the switch
+    /// is applied only to a lockfile that annotates.
     async fn read_lockfile(
         &self,
         path: &Path,
         kind: ManifestKind,
     ) -> Option<(LockfileKind, String)> {
-        if !self.read_lockfiles {
+        let (lock_path, lock_kind) = crate::discover::locate_lockfile(path, kind)?;
+        if !self.read_lockfiles && !lock_kind.is_dependency_source() {
             return None;
         }
-        let (lock_path, lock_kind) = crate::discover::locate_lockfile(path, kind)?;
         let content = tokio::fs::read_to_string(&lock_path).await.ok()?;
         Some((lock_kind, content))
     }
@@ -551,11 +586,22 @@ impl Checker {
         workspace: Option<(PathBuf, Arc<Vec<Item>>)>,
     ) -> Result<ManifestCheck, CheckError> {
         let ecosystem = kind.ecosystem();
-        let fetcher = self
-            .registries
-            .get(&ecosystem)
-            .ok_or(CheckError::UnsupportedEcosystem(ecosystem))?
-            .clone();
+        // An ecosystem that publishes **no registry at all** is not an unsupported
+        // one: there is nothing to register, and its dependencies are still worth
+        // scanning for vulnerabilities. Returning `UnsupportedEcosystem` here would
+        // drop the manifest before the OSV scan ran, which is the whole feature
+        // silently absent.
+        //
+        // Every other ecosystem keeps the contract it has always had, and that is
+        // the point of asking [`Ecosystem::has_registry`] rather than merely
+        // observing that no fetcher is registered: a *config-disabled* ecosystem
+        // has a registry and is switched off, so it must still be skipped with
+        // "is not enabled or not yet supported" rather than half-checked.
+        let fetcher = match self.registries.get(&ecosystem) {
+            Some(fetcher) => Some(fetcher.clone()),
+            None if !ecosystem.has_registry() && self.registryless.contains(&ecosystem) => None,
+            None => return Err(CheckError::UnsupportedEcosystem(ecosystem)),
+        };
 
         let mut parsed = parse(kind, manifest)?;
 
@@ -574,45 +620,68 @@ impl Checker {
             warnings.extend(detached_inheritance(&parsed.items, kind));
         }
 
-        // Apply the lockfile to annotate locked versions, dispatching on the file
-        // that was found rather than on the manifest beside it. An unparseable
-        // lockfile is ignored — the dependency is simply checked without a locked
-        // version. `apply_lockfile` only annotates existing items, never inserts,
-        // so transitive deps are never introduced.
-        if let Some((lock_kind, lock)) = lockfile
-            && let Ok(data) = parse_lockfile_kind(lock_kind, lock)
-        {
-            apply_lockfile(&mut parsed.items, &data);
+        // Apply the lockfile, dispatching on the file that was found rather than on
+        // the manifest beside it. An unparseable lockfile is ignored — the
+        // dependency is simply checked without a locked version. `apply_lockfile`
+        // only annotates existing items, never inserts, so transitive deps are never
+        // introduced; the one lockfile that *is* the dependency list takes the other
+        // branch, and its ecosystem has no manifest-declared items to add to.
+        if let Some((lock_kind, lock)) = lockfile {
+            if let Some(pins) = lockfile_items(lock_kind, lock) {
+                // The one lockfile that *is* the dependency list. Its manifest is a
+                // program this crate declines to read, so without this a Swift
+                // project reports zero dependencies with a `Package.resolved` full
+                // of them sitting beside it. Appending rather than replacing keeps
+                // the rule that a lockfile never removes what a manifest declared.
+                parsed.items.extend(pins);
+            } else if let Ok(data) = parse_lockfile_kind(lock_kind, lock) {
+                apply_lockfile(&mut parsed.items, &data);
+            }
         }
 
         if let Some(warning) = deferred_versions(&parsed.items, kind) {
             warnings.push(warning);
         }
-
-        // Build the fetch task list, routing each checkable item to a fetcher:
-        // JSR-sourced items (Deno `jsr:` deps) to the JSR fetcher, items naming a
-        // resolved alternate Rust registry to that registry, and everything else
-        // to the ecosystem fetcher — each with a distinct cache key. Deduplicated
-        // by (cache_key, name).
-        let mut seen: HashSet<(String, String)> = HashSet::new();
-        let mut tasks: Vec<FetchTask> = Vec::new();
-        for item in parsed.items.iter().filter(|i| i.is_checkable()) {
-            let (task_fetcher, cache_key) = self.route_item(item, &fetcher, ecosystem);
-            if seen.insert((cache_key.clone(), item.name.clone())) {
-                tasks.push(FetchTask {
-                    name: item.name.clone(),
-                    fetcher: task_fetcher,
-                    cache_key,
-                });
-            }
+        if let Some(warning) = currency_is_unknowable(
+            ecosystem,
+            &parsed.items,
+            self.osv.is_some(),
+            fetcher.is_some(),
+        ) {
+            warnings.push(warning);
         }
 
-        let fetched = self.fetch_all(tasks).await;
-        let mut results: Vec<CheckResult> = parsed
-            .items
-            .iter()
-            .map(|item| evaluate_item(item, &fetched, ecosystem, self.unstable))
-            .collect();
+        let mut results: Vec<CheckResult> = if let Some(fetcher) = &fetcher {
+            // Build the fetch task list, routing each checkable item to a fetcher:
+            // JSR-sourced items (Deno `jsr:` deps) to the JSR fetcher, items naming a
+            // resolved alternate Rust registry to that registry, and everything else
+            // to the ecosystem fetcher — each with a distinct cache key. Deduplicated
+            // by (cache_key, name).
+            let mut seen: HashSet<(String, String)> = HashSet::new();
+            let mut tasks: Vec<FetchTask> = Vec::new();
+            for item in parsed.items.iter().filter(|i| i.is_checkable()) {
+                let (task_fetcher, cache_key) = self.route_item(item, fetcher, ecosystem);
+                if seen.insert((cache_key.clone(), item.name.clone())) {
+                    tasks.push(FetchTask {
+                        name: item.name.clone(),
+                        fetcher: task_fetcher,
+                        cache_key,
+                    });
+                }
+            }
+
+            let fetched = self.fetch_all(tasks).await;
+            parsed
+                .items
+                .iter()
+                .map(|item| evaluate_item(item, &fetched, ecosystem, self.unstable))
+                .collect()
+        } else {
+            // Nothing to ask, so nothing is claimed. The OSV scan below still runs:
+            // it needs a package and a version, not a registry, and the lockfile
+            // supplied both.
+            parsed.items.iter().map(without_a_registry).collect()
+        };
 
         if let Some(osv) = &self.osv
             && let Err(e) = scan_vulnerabilities(osv, ecosystem, &mut results).await
@@ -624,7 +693,11 @@ impl Checker {
         // exactly like the vulnerability scan above: it degrades to a warning
         // rather than failing the check, because the version data is still
         // correct and useful without a license column.
+        // A registry-less ecosystem publishes no metadata endpoint either, so this
+        // would fail every time and say so in a warning about a feature the user
+        // never asked this ecosystem for.
         if self.licenses
+            && fetcher.is_some()
             && let Err(e) = self.attach_licenses(ecosystem, &mut results).await
         {
             warnings.push(format!("license collection skipped: {e}"));
@@ -869,6 +942,91 @@ fn deferred_versions(items: &[Item], kind: ManifestKind) -> Option<String> {
     ))
 }
 
+/// Say, once per manifest, that this ecosystem publishes no registry — so nothing
+/// here was, or could be, compared against a newer version.
+///
+/// Emitted for **every** manifest of such an ecosystem that was in fact checked
+/// without a fetcher, including one that declares nothing. The hazard is precise: a
+/// Swift run that turns up no advisories looks exactly like a clean, up-to-date one,
+/// and a reader who is not told otherwise will read it that way.
+/// [`DependencyStatus::Undetermined`] says so per row, in a table nobody is obliged
+/// to read column by column; this says it in the same place, and as loudly as, the
+/// unreadable-lockfile notices.
+///
+/// `has_fetcher` is the second half of the condition rather than a detail: a library
+/// consumer may register a fetcher for an ecosystem this build ships no registry for
+/// — an SE-0292 Swift registry is the obvious candidate — and that run produces real
+/// `UpToDate` rows. Telling its reader "nothing here can be checked" would then be
+/// the same kind of false statement in the other direction.
+///
+/// The count is of items that *exist*, and says nothing about whether the list they
+/// came from was ever read. Where it is zero the wording says only that nothing was
+/// found to check: "the 0 dependencies here" would turn "we could not look" into a
+/// claim about the project, which is the inversion this whole notice exists to
+/// prevent. The lockfile notice names the cause.
+fn currency_is_unknowable(
+    ecosystem: Ecosystem,
+    items: &[Item],
+    scanned: bool,
+    has_fetcher: bool,
+) -> Option<String> {
+    if ecosystem.has_registry() || has_fetcher {
+        return None;
+    }
+    let name = ecosystem.display_name();
+    let count = items.iter().filter(|item| item.is_checkable()).count();
+    let plural = if count == 1 { "y" } else { "ies" };
+    // With scanning off there is no verdict left at all, and saying "scanned for
+    // vulnerabilities only" would name a check that did not run.
+    let outcome = if count == 0 {
+        "no dependency with a version to check was found here at all".to_owned()
+    } else if scanned {
+        format!(
+            "{count} dependenc{plural} scanned for known vulnerabilities only. A run that \
+             reports none is not a run that found them up to date"
+        )
+    } else {
+        format!(
+            "with vulnerability scanning off, nothing was established about any of the \
+             {count} dependenc{plural} here at all"
+        )
+    };
+    Some(format!(
+        "{name} publishes no package registry, so nothing here can be checked for a newer \
+         version: {outcome}, and `--fix` cannot apply to a {name} project."
+    ))
+}
+
+/// The verdict for an item nothing was ever going to fetch.
+fn unfetchable(item: &Item) -> CheckResult {
+    let status = match item.source {
+        PackageSource::Git => DependencyStatus::Git,
+        // An entry that defers its version elsewhere and found nothing there is
+        // a real package on a real registry whose version this run never read.
+        // `Local` would say the opposite — that there is no registry for it —
+        // which of `spring-boot-starter-web` is simply false, and is the wrong
+        // token for a CI consumer to read.
+        PackageSource::Inherited => DependencyStatus::Undetermined,
+        _ => DependencyStatus::Local,
+    };
+    CheckResult::new(item.clone(), status)
+}
+
+/// The verdict for one item in an ecosystem that publishes no registry.
+///
+/// A path or git dependency reports exactly what it always did — nothing was
+/// going to be fetched for it either way. Everything else is
+/// [`DependencyStatus::Undetermined`]: currency here is not merely unread but
+/// *unknowable*, and both `UpToDate` and `Error` would be claims this run has no
+/// basis for. `Local` would be worse still, since these are real published
+/// packages that simply have no registry behind them.
+fn without_a_registry(item: &Item) -> CheckResult {
+    if !item.is_checkable() {
+        return unfetchable(item);
+    }
+    CheckResult::new(item.clone(), DependencyStatus::Undetermined)
+}
+
 /// Evaluate one parsed item against the fetched version lists, applying the
 /// configured pre-release filter before classification.
 fn evaluate_item(
@@ -878,17 +1036,7 @@ fn evaluate_item(
     unstable: UnstableFilter,
 ) -> CheckResult {
     if !item.is_checkable() {
-        let status = match item.source {
-            PackageSource::Git => DependencyStatus::Git,
-            // An entry that defers its version elsewhere and found nothing there is
-            // a real package on a real registry whose version this run never read.
-            // `Local` would say the opposite — that there is no registry for it —
-            // which of `spring-boot-starter-web` is simply false, and is the wrong
-            // token for a CI consumer to read.
-            PackageSource::Inherited => DependencyStatus::Undetermined,
-            _ => DependencyStatus::Local,
-        };
-        return CheckResult::new(item.clone(), status);
+        return unfetchable(item);
     }
     match fetched.get(&item.name) {
         Some(Ok(versions)) => {
@@ -1095,20 +1243,40 @@ fn same_flavour_only(
 /// actually install. Shared by the batch scan and the advisory-enrichment pass so
 /// the two produce identical cache keys, and so the advisories describe the exact
 /// version that was flagged.
-fn osv_query_for(result: &CheckResult, ecosystem: Ecosystem) -> Option<OsvQuery> {
+fn osv_queries_for(result: &CheckResult, ecosystem: Ecosystem) -> Vec<OsvQuery> {
     if !result.item.is_checkable() || matches!(result.status, DependencyStatus::Error(_)) {
-        return None;
+        return Vec::new();
     }
-    let version = result
+    let Some(version) = result
         .item
         .locked_version
         .clone()
-        .or_else(|| result.latest_compatible.clone())?;
-    Some(OsvQuery {
+        .or_else(|| result.latest_compatible.clone())
+    else {
+        return Vec::new();
+    };
+    let query = |name: String| OsvQuery {
         ecosystem: ecosystem.osv_name().to_string(),
-        name: result.item.name.clone(),
-        version,
-    })
+        name,
+        version: version.clone(),
+    };
+    let name = result.item.name.clone();
+    // Swift is the one ecosystem whose OSV key is a repository URL rather than a
+    // registry name. OSV matches those byte for byte while a git forge treats the
+    // path case-insensitively, so the same repository arrives under whichever
+    // spelling someone pasted into `Package.swift`, and a mismatch is silent — a
+    // vulnerable package simply reports clean. Asking the all-lowercase spelling
+    // too costs one batch entry, only for a name that is not already lowercase,
+    // and can add only a true match: OSV answers about the package it was asked
+    // about or not at all. Every other ecosystem asks exactly one question, as
+    // before.
+    let extra = match ecosystem {
+        Ecosystem::Swift => swift_package_name_variants(&name),
+        _ => Vec::new(),
+    };
+    std::iter::once(query(name))
+        .chain(extra.into_iter().map(query))
+        .collect()
 }
 
 /// Query OSV for the current version of each checkable dependency and flip its
@@ -1122,7 +1290,7 @@ async fn scan_vulnerabilities(
     let mut queries = Vec::new();
     let mut index_for = Vec::new();
     for (i, result) in results.iter().enumerate() {
-        if let Some(query) = osv_query_for(result, ecosystem) {
+        for query in osv_queries_for(result, ecosystem) {
             queries.push(query);
             index_for.push(i);
         }
@@ -1136,7 +1304,16 @@ async fn scan_vulnerabilities(
         if let Some(ids) = osv_results.get(query_idx)
             && !ids.is_empty()
         {
-            results[result_idx].current_vulnerabilities = ids.clone();
+            // Appended rather than assigned, because one result may have been
+            // asked about under more than one spelling of its name. Every
+            // ecosystem but Swift sends exactly one query per result, so this
+            // still ends up as that query's ID list, in its order.
+            let found = &mut results[result_idx].current_vulnerabilities;
+            for id in ids {
+                if !found.contains(id) {
+                    found.push(id.clone());
+                }
+            }
             results[result_idx].status = DependencyStatus::Vulnerable;
         }
     }
@@ -1154,6 +1331,7 @@ pub struct CheckerBuilder {
     rust_alt_registries: Vec<(String, String, Option<String>)>,
     extra_registries: Vec<(Ecosystem, Arc<dyn RegistryFetcher>)>,
     jsr: Option<Arc<dyn RegistryFetcher>>,
+    registryless: Vec<Ecosystem>,
     vulnerabilities: bool,
     include_ghsa: bool,
     advisory_details: bool,
@@ -1176,6 +1354,7 @@ impl Default for CheckerBuilder {
             rust_alt_registries: Vec::new(),
             extra_registries: Vec::new(),
             jsr: None,
+            registryless: Vec::new(),
             vulnerabilities: true,
             include_ghsa: false,
             advisory_details: false,
@@ -1227,6 +1406,24 @@ impl CheckerBuilder {
     /// forward-compatible extension point for npm, PyPI, Go, and others.
     pub fn registry(mut self, ecosystem: Ecosystem, fetcher: Arc<dyn RegistryFetcher>) -> Self {
         self.extra_registries.push((ecosystem, fetcher));
+        self
+    }
+
+    /// Check an ecosystem that publishes no registry, and so has no fetcher to
+    /// register.
+    ///
+    /// For every other ecosystem [`CheckerBuilder::registry`] *is* the switch: a
+    /// `Checker` with no fetcher for one skips its manifests with
+    /// [`CheckError::UnsupportedEcosystem`]. An ecosystem with nothing to register
+    /// would otherwise have no off switch at all, and declining it has to stay
+    /// possible — the answers it gives are shaped differently from every other
+    /// ecosystem's, reporting *vulnerable* but never *outdated*.
+    ///
+    /// Off by default, exactly as every non-Rust ecosystem is. Passing an ecosystem
+    /// for which [`Ecosystem::has_registry`] is `true` does nothing: that ecosystem
+    /// is enabled by registering its fetcher.
+    pub fn registryless(mut self, ecosystem: Ecosystem) -> Self {
+        self.registryless.push(ecosystem);
         self
     }
 
@@ -1287,7 +1484,13 @@ impl CheckerBuilder {
         self
     }
 
-    /// Whether [`Checker::check_path`] reads the sibling lockfile (default: true).
+    /// Whether [`Checker::check_path`] reads an **annotating** sibling lockfile
+    /// (default: true).
+    ///
+    /// A lockfile that *is* the dependency list rather than an annotation on one —
+    /// SwiftPM's `Package.resolved`, see [`LockfileKind::is_dependency_source`] —
+    /// is read regardless: switching it off would report the project as depending
+    /// on nothing rather than as having no locked versions.
     pub fn read_lockfiles(mut self, enabled: bool) -> Self {
         self.read_lockfiles = enabled;
         self
@@ -1380,6 +1583,7 @@ impl CheckerBuilder {
             registries,
             rust_registries,
             jsr: self.jsr,
+            registryless: self.registryless.into_iter().collect(),
             osv,
             advisory_details: self.advisory_details,
             licenses: self.licenses,
@@ -1415,6 +1619,401 @@ mod tests {
         item("[dependencies]\ntime = \"0.2.7\"\n")
     }
 
+    /// A `Package.resolved` v2 pin set, the only record of a Swift project's
+    /// dependencies.
+    const PACKAGE_RESOLVED: &str = r#"{
+  "pins" : [
+    {
+      "identity" : "swift-nio",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/apple/swift-nio.git",
+      "state" : { "revision" : "635b25", "version" : "2.65.0" }
+    },
+    {
+      "identity" : "helpers",
+      "kind" : "fileSystem",
+      "location" : "/Users/me/helpers",
+      "state" : { }
+    }
+  ],
+  "version" : 2
+}"#;
+
+    /// A checker wired the way the CLI wires one when an ecosystem is switched off
+    /// in config: no fetcher for it, and no network reachable if one were tried.
+    fn offline_checker() -> Checker {
+        Checker::builder()
+            .rust_registry("http://127.0.0.1:1".to_string(), None)
+            .registryless(Ecosystem::Swift)
+            .vulnerabilities(false)
+            .disk_cache(false)
+            .build()
+            .expect("a checker builds without a network")
+    }
+
+    /// The feature this whole ecosystem rests on. Before `has_registry`, a manifest
+    /// whose ecosystem had no registered fetcher was dropped with
+    /// `UnsupportedEcosystem` *before* the OSV scan — so a registry-less ecosystem
+    /// was not degraded, it was absent.
+    #[tokio::test]
+    async fn an_ecosystem_with_no_registry_is_checked_rather_than_skipped() {
+        let check = offline_checker()
+            .check_manifest(ManifestKind::PackageSwift, "", Some(PACKAGE_RESOLVED))
+            .await
+            .expect("a registry-less ecosystem is not an unsupported one");
+
+        assert_eq!(check.ecosystem, Ecosystem::Swift);
+        let names: Vec<&str> = check.results.iter().map(|r| r.item.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["github.com/apple/swift-nio", "helpers"],
+            "the pin set is the dependency list; `Package.swift` supplied none"
+        );
+
+        let nio = &check.results[0];
+        assert_eq!(
+            nio.status,
+            DependencyStatus::Undetermined,
+            "no registry exists to compare against, so no currency claim is made"
+        );
+        assert_eq!(nio.item.locked_version.as_deref(), Some("2.65.0"));
+        assert_eq!(
+            nio.latest_available, None,
+            "nothing was fetched, so nothing is offered as newer"
+        );
+        // A local package reports what it always did — nothing was going to be
+        // fetched for it in any ecosystem.
+        assert_eq!(check.results[1].status, DependencyStatus::Local);
+    }
+
+    /// `--no-lock-file` suppresses locked-version *annotations*. A
+    /// `Package.resolved` is not one — it is the whole dependency list a Swift
+    /// project has — so honouring the switch there did not withhold a column, it
+    /// handed the OSV scan an empty item list and reported a project with a
+    /// vulnerable pin as clean.
+    #[tokio::test]
+    async fn lockfiles_off_still_reads_the_lockfile_that_is_the_dependency_list() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("Package.swift"), "// a program\n").unwrap();
+        std::fs::write(dir.path().join("Package.resolved"), PACKAGE_RESOLVED).unwrap();
+
+        let checker = Checker::builder()
+            .rust_registry("http://127.0.0.1:1".to_string(), None)
+            .registryless(Ecosystem::Swift)
+            .vulnerabilities(false)
+            .disk_cache(false)
+            .read_lockfiles(false)
+            .build()
+            .expect("a checker builds without a network");
+
+        let check = checker
+            .check_path(dir.path().join("Package.swift"))
+            .await
+            .expect("checked");
+        let names: Vec<&str> = check.results.iter().map(|r| r.item.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["github.com/apple/swift-nio", "helpers"],
+            "with the list suppressed there is nothing to scan and nothing to report"
+        );
+    }
+
+    /// The other half of the same switch: a lockfile that only *annotates* a list
+    /// the manifest already produced must still be ignored. Reading a dependency
+    /// source regardless must not become reading everything regardless.
+    #[tokio::test]
+    async fn lockfiles_off_still_suppresses_an_annotating_lockfile() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"sample\"\n\n[dependencies]\ntime = \"0.2.7\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.lock"),
+            "[[package]]\nname = \"time\"\nversion = \"0.2.7\"\n",
+        )
+        .unwrap();
+
+        async fn locked(manifest: &std::path::Path, read_lockfiles: bool) -> Option<String> {
+            let checker = Checker::builder()
+                .rust_registry("http://127.0.0.1:1".to_string(), None)
+                .vulnerabilities(false)
+                .disk_cache(false)
+                .read_lockfiles(read_lockfiles)
+                .build()
+                .expect("a checker builds without a network");
+            checker
+                .check_path(manifest)
+                .await
+                .expect("checked")
+                .results
+                .first()
+                .and_then(|r| r.item.locked_version.clone())
+        }
+
+        let manifest = dir.path().join("Cargo.toml");
+        assert_eq!(
+            locked(&manifest, true).await.as_deref(),
+            Some("0.2.7"),
+            "the fixture must have an annotation to suppress"
+        );
+        assert_eq!(
+            locked(&manifest, false).await,
+            None,
+            "`--no-lock-file` must still drop an annotating lockfile"
+        );
+    }
+
+    /// The discriminator. `has_registry()` is true for every ecosystem but Swift,
+    /// so an ecosystem the user switched off in config keeps the old path and the
+    /// CLI keeps printing `skipping … is not enabled or not yet supported`.
+    /// Collapsing the two would silently half-check every disabled ecosystem.
+    #[tokio::test]
+    async fn a_config_disabled_ecosystem_is_still_reported_unsupported() {
+        for (kind, manifest, ecosystem) in [
+            (
+                ManifestKind::PubspecYaml,
+                "dependencies:\n  http: ^1.1.0\n",
+                Ecosystem::Dart,
+            ),
+            (
+                ManifestKind::GoMod,
+                "require github.com/a/b v1.0.0\n",
+                Ecosystem::Go,
+            ),
+            (
+                ManifestKind::MixExs,
+                "defp deps do\n  [{:jason, \"~> 1.4\"}]\nend\n",
+                Ecosystem::Elixir,
+            ),
+        ] {
+            let outcome = offline_checker().check_manifest(kind, manifest, None).await;
+            assert!(
+                matches!(outcome, Err(CheckError::UnsupportedEcosystem(eco)) if eco == ecosystem),
+                "{ecosystem:?} has a registry and was switched off, so it must be skipped, not checked"
+            );
+        }
+    }
+
+    /// Having no registry is not the same as being asked for. A caller that never
+    /// opted in gets the same skip every other unregistered ecosystem gets, which
+    /// is what gives `[swift] enabled = false` something to do.
+    #[tokio::test]
+    async fn a_registryless_ecosystem_not_asked_for_is_skipped() {
+        let checker = Checker::builder()
+            .rust_registry("http://127.0.0.1:1".to_string(), None)
+            .vulnerabilities(false)
+            .disk_cache(false)
+            .build()
+            .expect("a checker builds without a network");
+
+        let outcome = checker
+            .check_manifest(ManifestKind::PackageSwift, "", Some(PACKAGE_RESOLVED))
+            .await;
+        assert!(
+            matches!(
+                outcome,
+                Err(CheckError::UnsupportedEcosystem(Ecosystem::Swift))
+            ),
+            "an ecosystem nobody asked for is off, registry or no registry"
+        );
+    }
+
+    /// The issue's hard requirement: a Swift run that finds no advisories looks
+    /// exactly like a clean, current one, so the manifest has to say otherwise
+    /// every time — not only when there is something to report.
+    #[tokio::test]
+    async fn every_registryless_manifest_states_that_currency_is_unknown() {
+        let with_pins = offline_checker()
+            .check_manifest(ManifestKind::PackageSwift, "", Some(PACKAGE_RESOLVED))
+            .await
+            .expect("checked");
+        let warning = with_pins
+            .warnings
+            .iter()
+            .find(|w| w.contains("no package registry"))
+            .expect("a manifest-level statement, not just a status word");
+        assert!(warning.contains("1 dependency"), "{warning}");
+        assert!(
+            warning.contains("vulnerability scanning off"),
+            "this checker has scanning off, so it must not claim a scan ran: {warning}"
+        );
+        assert!(warning.contains("`--fix` cannot apply"), "{warning}");
+
+        // And with nothing pinned at all, where there is no table row to carry it.
+        let empty = offline_checker()
+            .check_manifest(ManifestKind::PackageSwift, "", None)
+            .await
+            .expect("checked");
+        assert!(
+            empty
+                .warnings
+                .iter()
+                .any(|w| w.contains("no package registry")),
+            "{:?}",
+            empty.warnings
+        );
+
+        // Never for an ecosystem that does have a registry.
+        let rust = offline_checker()
+            .check_manifest(
+                ManifestKind::CargoToml,
+                "[dependencies]\nserde = \"1\"\n",
+                None,
+            )
+            .await
+            .expect("checked");
+        assert!(
+            !rust
+                .warnings
+                .iter()
+                .any(|w| w.contains("no package registry")),
+            "{:?}",
+            rust.warnings
+        );
+    }
+
+    /// A fetcher registered for an ecosystem this build ships no registry for.
+    /// SE-0292 gives SwiftPM a package registry, so a library consumer wiring one
+    /// up is the plausible case, not a contrived one.
+    struct StubFetcher;
+
+    impl RegistryFetcher for StubFetcher {
+        fn fetch_versions<'a>(
+            &'a self,
+            _name: &'a str,
+        ) -> futures::future::BoxFuture<'a, Result<crate::registries::FetchedVersions, FetchError>>
+        {
+            use futures::FutureExt as _;
+            futures::future::ready(Ok(crate::registries::FetchedVersions::new(vec![
+                "2.65.0".to_string(),
+            ])))
+            .boxed()
+        }
+    }
+
+    /// The warning is about this run, not about the ecosystem in the abstract. A
+    /// caller that registered a fetcher for Swift gets real `UpToDate` rows, and
+    /// telling its reader "nothing here can be checked for a newer version" would
+    /// be the same false statement in the other direction — a claim about what the
+    /// run did, contradicted by the table beside it.
+    #[tokio::test]
+    async fn a_registryless_ecosystem_with_a_fetcher_is_not_told_it_cannot_be_checked() {
+        let checker = Checker::builder()
+            .rust_registry("http://127.0.0.1:1".to_string(), None)
+            .registry(Ecosystem::Swift, Arc::new(StubFetcher))
+            .vulnerabilities(false)
+            .disk_cache(false)
+            .build()
+            .expect("a checker builds without a network");
+
+        let check = checker
+            .check_manifest(ManifestKind::PackageSwift, "", Some(PACKAGE_RESOLVED))
+            .await
+            .expect("checked");
+        assert!(
+            !check
+                .warnings
+                .iter()
+                .any(|w| w.contains("no package registry")),
+            "a run that fetched must not say it could not: {:?}",
+            check.warnings
+        );
+        assert!(
+            check
+                .results
+                .iter()
+                .any(|r| matches!(r.status, DependencyStatus::UpToDate)),
+            "and it really did fetch: {:?}",
+            check.results
+        );
+    }
+
+    /// Two ways to have no fetcher, two different answers. This is the pair a
+    /// reviewer should attack first.
+    #[tokio::test]
+    async fn having_no_registry_and_being_switched_off_are_not_the_same_state() {
+        let checker = offline_checker();
+        assert!(
+            checker
+                .check_manifest(ManifestKind::PackageSwift, "", Some(PACKAGE_RESOLVED))
+                .await
+                .is_ok()
+        );
+        assert!(
+            checker
+                .check_manifest(
+                    ManifestKind::PubspecYaml,
+                    "dependencies:\n  http: ^1.1.0\n",
+                    None
+                )
+                .await
+                .is_err()
+        );
+    }
+
+    /// `apply_lockfile` never inserts, and five ecosystems depend on that. Only the
+    /// one lockfile that *is* the dependency list may supply items.
+    #[tokio::test]
+    async fn a_lockfile_that_is_not_a_dependency_source_still_only_annotates() {
+        let lock = "[[package]]\nname = \"serde\"\nversion = \"1.0.0\"\n\n\
+                    [[package]]\nname = \"transitive\"\nversion = \"9.9.9\"\n";
+        let check = offline_checker()
+            .check_manifest(
+                ManifestKind::CargoToml,
+                "[dependencies]\nserde = \"1\"\n",
+                Some(lock),
+            )
+            .await
+            .expect("rust is registered");
+        let names: Vec<&str> = check.results.iter().map(|r| r.item.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["serde"],
+            "a transitive lock entry is not a dependency"
+        );
+    }
+
+    /// The one query every ecosystem but Swift ever asks.
+    fn only_query(result: &CheckResult, ecosystem: Ecosystem) -> OsvQuery {
+        let mut queries = osv_queries_for(result, ecosystem);
+        assert_eq!(queries.len(), 1, "one query per result");
+        queries.remove(0)
+    }
+
+    /// A Swift pin whose repository path is not lowercase is asked about under both
+    /// spellings: OSV matches its `SwiftURL` keys byte for byte while a git forge
+    /// does not, so the same repository circulates under either, and a miss here is
+    /// silent — a vulnerable package reported clean. Every other ecosystem, and a
+    /// name that is already lowercase, still asks exactly one question.
+    #[test]
+    fn a_mixed_case_swift_pin_is_asked_about_under_both_spellings() {
+        let mut pin = registry_item();
+        pin.name = "github.com/weichsel/ZIPFoundation".to_string();
+        pin.locked_version = Some("0.9.16".to_string());
+        let result = CheckResult::new(pin, DependencyStatus::Undetermined);
+
+        let names: Vec<String> = osv_queries_for(&result, Ecosystem::Swift)
+            .into_iter()
+            .map(|query| query.name)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "github.com/weichsel/ZIPFoundation",
+                "github.com/weichsel/zipfoundation"
+            ],
+            "the written spelling first, then the lowercase one"
+        );
+
+        let mut lower = registry_item();
+        lower.name = "github.com/vapor/vapor".to_string();
+        lower.locked_version = Some("4.83.0".to_string());
+        let lower = CheckResult::new(lower, DependencyStatus::Undetermined);
+        assert_eq!(osv_queries_for(&lower, Ecosystem::Swift).len(), 1);
+    }
+
     #[test]
     fn a_locked_version_outranks_the_best_compatible_one() {
         let mut declared = registry_item();
@@ -1422,7 +2021,7 @@ mod tests {
         let mut result = CheckResult::new(declared, DependencyStatus::UpToDate);
         result.latest_compatible = Some("0.2.9".to_string());
 
-        let query = osv_query_for(&result, Ecosystem::Rust).expect("a query");
+        let query = only_query(&result, Ecosystem::Rust);
         assert_eq!(query.ecosystem, "crates.io");
         assert_eq!(query.name, "time");
         assert_eq!(query.version, "0.2.7");
@@ -1432,14 +2031,14 @@ mod tests {
     fn an_unlocked_dependency_is_queried_at_its_best_compatible_version() {
         let mut result = CheckResult::new(registry_item(), DependencyStatus::UpToDate);
         result.latest_compatible = Some("0.2.9".to_string());
-        let query = osv_query_for(&result, Ecosystem::Rust).expect("a query");
+        let query = only_query(&result, Ecosystem::Rust);
         assert_eq!(query.version, "0.2.9");
     }
 
     #[test]
     fn nothing_is_queried_without_a_version() {
         let result = CheckResult::new(registry_item(), DependencyStatus::UpToDate);
-        assert!(osv_query_for(&result, Ecosystem::Rust).is_none());
+        assert!(osv_queries_for(&result, Ecosystem::Rust).is_empty());
     }
 
     #[test]
@@ -1447,7 +2046,7 @@ mod tests {
         let declared = item("[dependencies]\nlocal = { path = \"../local\" }\n");
         assert!(!declared.is_checkable());
         let result = CheckResult::new(declared, DependencyStatus::Local);
-        assert!(osv_query_for(&result, Ecosystem::Rust).is_none());
+        assert!(osv_queries_for(&result, Ecosystem::Rust).is_empty());
     }
 
     #[test]
@@ -1458,7 +2057,7 @@ mod tests {
             declared,
             DependencyStatus::Error("registry unreachable".to_string()),
         );
-        assert!(osv_query_for(&result, Ecosystem::Rust).is_none());
+        assert!(osv_queries_for(&result, Ecosystem::Rust).is_empty());
     }
 
     /// The single item declared by `manifest`, parsed as `kind`.

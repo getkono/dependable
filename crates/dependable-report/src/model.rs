@@ -76,17 +76,40 @@ pub struct ManifestResults {
     pub ecosystem: Ecosystem,
     /// One result per declared dependency.
     pub results: Vec<CheckResult>,
+    /// Whether the file that *is* this project's dependency list went unread, so
+    /// [`Self::results`] being empty says nothing about the project.
+    ///
+    /// Only a SwiftPM project can set this: a `Package.swift` is a program the
+    /// checker declines to read, so with no readable `Package.resolved` beside it
+    /// there is no dependency list at all. A renderer that omits this reports a
+    /// project nothing was read from exactly as it reports a clean one.
+    ///
+    /// `false` from [`ManifestResults::new`]; set it with
+    /// [`ManifestResults::with_dependencies_unread`].
+    pub dependencies_unread: bool,
 }
 
 impl ManifestResults {
-    /// The results for one manifest.
+    /// The results for one manifest, with its dependency list assumed read.
     #[must_use]
     pub fn new(path: PathBuf, ecosystem: Ecosystem, results: Vec<CheckResult>) -> Self {
         Self {
             path,
             ecosystem,
             results,
+            dependencies_unread: false,
         }
+    }
+
+    /// Record whether this manifest's dependency list went unread.
+    ///
+    /// See [`ManifestResults::dependencies_unread`]. A builder rather than a
+    /// constructor argument so callers that cannot produce the flag keep the
+    /// two-line construction they have.
+    #[must_use]
+    pub fn with_dependencies_unread(mut self, unread: bool) -> Self {
+        self.dependencies_unread = unread;
+        self
     }
 }
 
