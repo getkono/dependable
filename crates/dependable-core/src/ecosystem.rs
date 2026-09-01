@@ -2,6 +2,25 @@
 
 use serde::{Deserialize, Serialize};
 
+/// How an ecosystem's resolver reads a version written with **no operator**.
+///
+/// The distinction is what makes a rewrite safe or unsafe. `dependable fix`
+/// replaces a constraint's version span and keeps its operator prefix, so a
+/// constraint that carried no operator is written back as a bare version — and
+/// what a bare version *means* decides whether the rewrite preserved the
+/// author's constraint or quietly replaced it with a different one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum BareVersion {
+    /// One release and no other: `1.9.0` matches `1.9.0` alone.
+    Exact,
+    /// A caret range: at least this release, below the next major —
+    /// `1.9.0` is `>=1.9.0, <2.0.0`.
+    Caret,
+    /// An inclusive minimum with no upper bound: `1.9.0` is `>=1.9.0`.
+    Minimum,
+}
+
 /// A package ecosystem.
 ///
 /// Every variant is wired end-to-end: a parser, a registry fetcher, and an OSV
@@ -70,6 +89,50 @@ impl Ecosystem {
             Ecosystem::Elixir => "https://hex.pm",
             Ecosystem::Jvm => "https://repo1.maven.org/maven2",
         }
+    }
+
+    /// How this ecosystem's resolver reads a version written with no operator.
+    ///
+    /// A wrong answer rewrites someone's manifest into a constraint they did not
+    /// write, so every variant is settled from the resolver's own documentation
+    /// rather than by family resemblance — the three ecosystems that look alike
+    /// here (Go, NuGet, Gradle) all read a bare version as a minimum, while three
+    /// that look like Cargo (npm, Composer, pub) do not.
+    ///
+    /// | Ecosystem | Reading | Why |
+    /// | --- | --- | --- |
+    /// | Rust | [`Caret`](BareVersion::Caret) | The Cargo book: "Specifying only the version number is equivalent to a caret requirement" — `serde = "1.0"` *is* `^1.0`. |
+    /// | Go | [`Minimum`](BareVersion::Minimum) | A `require` line states the lowest version the module needs; minimal version selection then builds with the highest such requirement in the graph. |
+    /// | Npm | [`Exact`](BareVersion::Exact) | node-semver: a fully specified version is a comparator with an implicit `=`. A *partial* bare version is an X-range instead (`"16"` is `16.x`), which is why a caller must not treat `Exact` as "every bare string names one release". |
+    /// | Python | [`Exact`](BareVersion::Exact) | PEP 508 has no bare form at all — an operator is mandatory — so the only reading that occurs is Poetry's, whose "exact requirements" are written bare and install "this version and this version only". |
+    /// | Php | [`Exact`](BareVersion::Exact) | Composer's exact version constraint is the bare form: "install this version and this version only". A range needs the wildcard spelled out (`1.0.*`). |
+    /// | Dart | [`Exact`](BareVersion::Exact) | pub's traditional-syntax table reads `1.2.3` as "only the given version", and the docs steer authors to `^1.2.3` precisely because the bare form is that restrictive. |
+    /// | CSharp | [`Minimum`](BareVersion::Minimum) | NuGet's range table: `1.0` is `x ≥ 1.0`, "minimum version, inclusive". `[1.0]` is how an exact match is written. |
+    /// | Elixir | [`Exact`](BareVersion::Exact) | A Hex requirement with no operator is an equality requirement: `Version.match?("2.0.1", "2.0.0")` is false. Floating needs `~>`. |
+    /// | Jvm | [`Minimum`](BareVersion::Minimum) | A plain Gradle version string is a *required* version — the minimum, "optimistically upgraded" by conflict resolution — not a pin; `strictly` is the pinning form. Maven's plain `<version>` is likewise a soft requirement that mediation may override. |
+    #[must_use]
+    pub fn bare_version(self) -> BareVersion {
+        match self {
+            Ecosystem::Rust => BareVersion::Caret,
+            Ecosystem::Go | Ecosystem::CSharp | Ecosystem::Jvm => BareVersion::Minimum,
+            Ecosystem::Npm
+            | Ecosystem::Python
+            | Ecosystem::Php
+            | Ecosystem::Dart
+            | Ecosystem::Elixir => BareVersion::Exact,
+        }
+    }
+
+    /// Whether a version written with no operator pins exactly one release.
+    ///
+    /// The question a rewriter asks most often, and the one with the sharpest
+    /// consequence: where a bare version is an exact pin, replacing a floating
+    /// constraint with a concrete release destroys the range the author asked
+    /// for. Shorthand for [`Self::bare_version`], which carries the full reading
+    /// and the reasoning behind it.
+    #[must_use]
+    pub fn bare_version_is_exact(self) -> bool {
+        matches!(self.bare_version(), BareVersion::Exact)
     }
 
     /// The page a person would open to read about `name`.
@@ -249,6 +312,63 @@ mod tests {
         ] {
             assert_eq!(ecosystem.docs_url("a", "1.0.0"), None, "{ecosystem:?}");
         }
+    }
+
+    /// Every variant states how its resolver reads a bare version, so adding an
+    /// ecosystem forces the decision rather than inheriting a default. The
+    /// expected value is spelled out per variant on purpose: a loop asserting
+    /// only "it returns something" would pass with every answer wrong, and a
+    /// wrong answer here silently rewrites a manifest into a different
+    /// constraint.
+    #[test]
+    fn every_ecosystem_states_how_it_reads_a_bare_version() {
+        let expected = [
+            // `serde = "1.0"` is `^1.0` — the Cargo book says so outright.
+            (Ecosystem::Rust, BareVersion::Caret),
+            // A `require` line is the lowest version the module needs; MVS takes
+            // the highest such requirement across the graph.
+            (Ecosystem::Go, BareVersion::Minimum),
+            // node-semver: a full version is a comparator with an implicit `=`.
+            (Ecosystem::Npm, BareVersion::Exact),
+            // Poetry's "exact requirements" are the bare form; PEP 508 has none.
+            (Ecosystem::Python, BareVersion::Exact),
+            // Composer: "this version and this version only".
+            (Ecosystem::Php, BareVersion::Exact),
+            // pub's traditional syntax: `1.2.3` is "only the given version".
+            (Ecosystem::Dart, BareVersion::Exact),
+            // NuGet's range table: `1.0` is `x >= 1.0`, minimum inclusive.
+            (Ecosystem::CSharp, BareVersion::Minimum),
+            // A Hex requirement with no operator is an equality requirement.
+            (Ecosystem::Elixir, BareVersion::Exact),
+            // A plain Gradle version is `require`: a minimum, upgradable by
+            // conflict resolution.
+            (Ecosystem::Jvm, BareVersion::Minimum),
+        ];
+        assert_eq!(expected.len(), ALL.len(), "every variant must be listed");
+        for (ecosystem, reading) in expected {
+            assert_eq!(ecosystem.bare_version(), reading, "{ecosystem:?}");
+        }
+    }
+
+    /// The shorthand and the full reading cannot drift apart: one is defined in
+    /// terms of the other, and this pins that they stay that way.
+    #[test]
+    fn the_exactness_shorthand_agrees_with_the_full_reading() {
+        for ecosystem in ALL {
+            assert_eq!(
+                ecosystem.bare_version_is_exact(),
+                ecosystem.bare_version() == BareVersion::Exact,
+                "{ecosystem:?}"
+            );
+        }
+        // The two ecosystems the distinction was drawn for: Cargo reads a bare
+        // version as a range, npm as one release.
+        assert!(!Ecosystem::Rust.bare_version_is_exact());
+        assert!(Ecosystem::Npm.bare_version_is_exact());
+        // And the one that is neither: a bare NuGet version floats upward, but
+        // without an upper bound, so it is not a pin either.
+        assert!(!Ecosystem::CSharp.bare_version_is_exact());
+        assert_eq!(Ecosystem::CSharp.bare_version(), BareVersion::Minimum);
     }
 
     #[test]
