@@ -909,7 +909,9 @@ pub async fn run_fix(args: FixArgs) -> anyhow::Result<ExitCode> {
             continue;
         };
         report_inherited_skips(manifest, &report);
-        planned.push(fix::plan(manifest, &report.results, args.all)?);
+        let plan = fix::plan(manifest, &report.results, args.all)?;
+        report_declined_fixes(manifest, &plan.declined);
+        planned.push(plan);
     }
 
     let mut total = 0;
@@ -930,8 +932,21 @@ pub async fn run_fix(args: FixArgs) -> anyhow::Result<ExitCode> {
             total += 1;
         }
     }
+    let declined: usize = planned.iter().map(|plan| plan.declined.len()).sum();
     if total == 0 {
-        println!("Everything is already up to date.");
+        // "Everything is already up to date" is only true when nothing was left
+        // behind. Saying it over a declined update is the contradiction with
+        // `check` that this whole path exists to remove, so the count of what was
+        // left alone takes over the line and points at the notes that explain it.
+        if declined == 0 {
+            println!("Everything is already up to date.");
+        } else {
+            println!(
+                "Nothing to rewrite. {declined} available update{} left alone; \
+                 see the notes above.",
+                if declined == 1 { "" } else { "s" }
+            );
+        }
     } else if !args.dry_run {
         println!(
             "\nUpdated {total} dependenc{}.",
@@ -992,14 +1007,7 @@ fn report_inherited_skips(manifest: &Path, report: &ManifestReport) {
         .results
         .iter()
         .filter(|result| {
-            result.item.source == PackageSource::Inherited
-                && matches!(
-                    result.status,
-                    DependencyStatus::PatchAvailable
-                        | DependencyStatus::UpdateAvailable
-                        | DependencyStatus::Outdated
-                        | DependencyStatus::Vulnerable
-                )
+            result.item.source == PackageSource::Inherited && result.status.has_update()
         })
         .map(|result| result.item.name.as_str())
         .collect();
@@ -1015,6 +1023,29 @@ fn report_inherited_skips(manifest: &Path, report: &ManifestReport) {
         if names.len() == 1 { "it" } else { "them" },
         root.display()
     );
+}
+
+/// Say which available updates this manifest's own constraints refused, and why.
+///
+/// The sibling of [`report_inherited_skips`], for the other way `fix` can decline
+/// an upgrade `check` just reported: there the version string lives in another
+/// file, here it lives in a constraint that a concrete version would not
+/// reproduce — a wildcard, a dist-tag, a two-bound range. Both are silent skips,
+/// and silence is what makes the two commands look like they disagree.
+///
+/// stderr, like its sibling: a note is not part of the record of what `fix`
+/// changed, and piping stdout must not swallow it or mix it into that record.
+fn report_declined_fixes(manifest: &Path, declined: &[fix::Declined]) {
+    for item in declined {
+        eprintln!(
+            "note: left {} = {} alone in {}: {} is available, but {}",
+            item.name,
+            item.constraint,
+            manifest.display(),
+            item.target,
+            item.reason.explain()
+        );
+    }
 }
 
 /// Read whole-template overrides from `<root>/dependable-templates/`.
