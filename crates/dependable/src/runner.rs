@@ -496,7 +496,8 @@ fn check_policy_is_enforceable(
             "fail_on_severity"
         };
         anyhow::bail!(
-            "`[policy] {key}` requires vulnerability scanning, which is disabled;              drop `--no-vuln` (or re-enable `[vulnerability] enabled`), or remove the CVSS rule"
+            "`[policy] {key}` requires vulnerability scanning, which is disabled; drop \
+             `--no-vuln` (or re-enable `[vulnerability] enabled`), or remove the CVSS rule"
         );
     }
     Ok(())
