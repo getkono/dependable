@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/getkono/dependable/compare/dependable-tui-v0.1.3...dependable-tui-v0.1.4) - 2026-09-01
+
+### Added
+
+- *(core)* report a manifest we recognise but cannot read
+
+### Fixed
+
+- *(fetch)* resolve an unread build script against its build root
+
 ## [0.1.3](https://github.com/getkono/dependable/compare/dependable-tui-v0.1.2...dependable-tui-v0.1.3) - 2026-08-29
 
 ### Added
