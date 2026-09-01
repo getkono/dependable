@@ -26,6 +26,16 @@ fn run(args: &[&str]) -> String {
     String::from_utf8(output.stdout).expect("utf-8 output")
 }
 
+/// The warnings a run printed, which is where an unread manifest is reported.
+fn run_stderr(args: &[&str]) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_dependable"))
+        .args(args)
+        .output()
+        .expect("run dependable");
+    assert!(output.status.success(), "list failed");
+    String::from_utf8(output.stderr).expect("utf-8 stderr")
+}
+
 fn list_json(path: &Path, extra: &[&str]) -> Value {
     let mut args = vec!["list", path.to_str().unwrap(), "--format", "json"];
     args.extend_from_slice(extra);
@@ -289,4 +299,30 @@ fn the_workspace_root_declares_rather_than_inherits() {
         assert_eq!(declaration["direct"], false, "{name}");
         assert_eq!(declaration["inherited"], false, "{name}");
     }
+}
+
+/// A notice about a manifest that could not be read is advice to enable
+/// something, and `[jvm] enabled = false` has already answered it.
+///
+/// `check`, `fix`, and `report` all gate the notice on the configured ecosystems;
+/// `list` read no config at all, so it warned every time — about the one thing the
+/// user had explicitly turned off.
+#[test]
+fn a_disabled_ecosystem_is_not_warned_about() {
+    let kotlin = fixture("sample-kotlin");
+    let kotlin = kotlin.to_str().expect("utf-8 path");
+    let config = fixture("jvm-disabled.toml");
+    let config = config.to_str().expect("utf-8 path");
+
+    let default = run_stderr(&["list", kotlin, "--format", "json"]);
+    assert!(
+        default.contains("legacy/build.gradle") || default.contains("legacy\\build.gradle"),
+        "an unread Gradle build is worth saying so about: {default}"
+    );
+
+    let disabled = run_stderr(&["list", kotlin, "--format", "json", "--config", config]);
+    assert!(
+        !disabled.contains("build.gradle"),
+        "`[jvm] enabled = false` is an answer, not a question: {disabled}"
+    );
 }
