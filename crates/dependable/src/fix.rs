@@ -118,7 +118,9 @@ fn plan_fixes(content: &str, results: &[CheckResult], all: bool) -> (String, Vec
 /// can't be rewritten to a single version without changing their meaning: a
 /// comma-separated range (Cargo `>=1.0, <2.0`), a space-separated range
 /// (npm/pubspec `>=1.0.0 <2.0.0`), a `||` alternation (`^1 || ^2`), a dist-tag
-/// (`latest`), or a wildcard (`*`, `1.x`, `1.*`).
+/// (`latest`), a wildcard (`*`, `1.x`, `1.*`), or anything carrying an `@`
+/// (a Composer stability flag such as `@dev` or `^1.0@beta`, an npm alias such
+/// as `npm:pkg@1.0.0`).
 fn rewrite_constraint(original: &str, new_version: &str) -> Option<String> {
     let trimmed = original.trim();
     if trimmed.contains(',') {
@@ -133,6 +135,16 @@ fn rewrite_constraint(original: &str, new_version: &str) -> Option<String> {
     // clause (range upper bound or alternative) we'd silently drop — leave it be.
     let rest = &trimmed[prefix.len()..];
     if rest.contains([' ', '\t', '|']) {
+        return None;
+    }
+    // An `@` never belongs to a version: it introduces a Composer stability flag
+    // (`@dev`, `2.8.*@dev`, `^1.0@beta`) or an npm alias target (`npm:pkg@1.0.0`).
+    // A stability flag qualifies the *range* — `@dev` alone means "any version, dev
+    // stability" — and this layer cannot reconstruct it, so substituting a concrete
+    // release drops the flag and, for a bare `@dev`, collapses the range to an exact
+    // pin. That is the harm of #87, so take the same call already taken for a
+    // dist-tag and decline.
+    if rest.contains('@') {
         return None;
     }
     // A dist-tag / channel name (`latest`, `next`, `beta`, …) starts with a letter
@@ -156,21 +168,19 @@ fn rewrite_constraint(original: &str, new_version: &str) -> Option<String> {
 }
 
 /// Whether `rest` — a constraint with its leading operator prefix already
-/// stripped — floats over a range of versions rather than naming one.
+/// stripped, and already known to carry no `@` — floats over a range of versions
+/// rather than naming one.
 ///
-/// A wildcard segment is not always the whole dot-segment: Composer appends a
-/// stability flag to the constraint (`2.8.*@dev`), which qualifies the range
-/// rather than forming part of a version, so it is cut off before the segments
-/// are read. `*` and `+` are then matched by their leading character too, since
-/// neither can legitimately begin a version segment — semver build metadata and
-/// Go's `+incompatible` attach their `+` to the end of a numeric segment
-/// (`0+incompatible`), never the start. `x`/`X` stay an exact whole-segment
-/// match, because a letter *can* legitimately lead a segment inside a prerelease
-/// or build identifier (`1.0.0-alpha+exp.sha.5114f85`).
+/// A wildcard segment is not always the whole dot-segment, so `*` and `+` are
+/// matched by their leading character too: neither can legitimately begin a
+/// version segment — semver build metadata and Go's `+incompatible` attach their
+/// `+` to the end of a numeric segment (`0+incompatible`), never the start.
+/// `x`/`X` stay an exact whole-segment match, because a letter *can* legitimately
+/// lead a segment inside a prerelease or build identifier
+/// (`1.0.0-alpha+exp.sha.5114f85`). A Composer stability flag (`2.8.*@dev`) needs
+/// no handling here: `rewrite_constraint` declines every `@` form before asking.
 fn is_wildcard(rest: &str) -> bool {
-    let versionish = rest.split('@').next().unwrap_or(rest);
-    versionish
-        .split('.')
+    rest.split('.')
         .any(|segment| matches!(segment, "x" | "X") || segment.starts_with(['*', '+']))
 }
 
@@ -287,11 +297,33 @@ mod tests {
         assert_eq!(rewrite_constraint("^2.8.*@dev", "7.0.0"), None);
     }
 
+    /// A Composer stability flag qualifies the range, and nothing in a rewritten
+    /// constraint can carry it: `format!("{prefix}{new_version}")` emits the
+    /// operator prefix and the version, never the flag. So a flag hung off a plain
+    /// version used to pass every guard and be rewritten flag-free — `">=2.8@dev"`
+    /// became `">=7.0.0"`, and the unbounded `"@dev"` ("any version, dev
+    /// stability") became the exact pin `"7.0.0"`: issue #87's harm again, reached
+    /// without a wildcard. An `@` never belongs to a version, so decline the lot.
+    #[test]
+    fn rewrite_declines_a_stability_flag_on_a_plain_version() {
+        // The bare flag: a range over every version, collapsed to a pin.
+        assert_eq!(rewrite_constraint("@dev", "7.0.0"), None);
+        // Flag on an operator-led constraint, and on a bare version.
+        assert_eq!(rewrite_constraint(">=2.8@dev", "7.0.0"), None);
+        assert_eq!(rewrite_constraint("2.8@dev", "7.0.0"), None);
+        assert_eq!(rewrite_constraint("^1.0@beta", "7.0.0"), None);
+        // npm's alias form carries an `@` too. The dist-tag guard caught it only
+        // incidentally, because `npm:` happens to start with a letter; now it is
+        // declined for the reason that actually applies.
+        assert_eq!(rewrite_constraint("npm:pkg@1.0.0", "7.0.0"), None);
+    }
+
     /// The other side of the guard: every concrete form the shipped parsers
     /// actually emit must stay rewritable. A wildcard test that also swallowed
     /// build metadata, a Go pseudo-version, or a prerelease identifier would
     /// silently stop `fix` from working on ordinary dependencies, so each shape
-    /// is asserted by name.
+    /// is asserted by name. None of them contains an `@`, which is what makes
+    /// declining every `@` form safe.
     #[test]
     fn rewrite_leaves_every_concrete_version_form_rewritable() {
         // Go: a pseudo-version and the `+incompatible` marker.
