@@ -16,6 +16,12 @@ use crate::output::posix;
 
 /// The identifier of the JSON document's shape. Consumers can pin on it; any
 /// incompatible change to the shape takes a new version.
+///
+/// The *shape* — which fields exist and what type each holds. The token sets inside
+/// those fields are open and always have been: `source` already falls back to
+/// `"unknown"` for a variant this function does not name, so a consumer that matched
+/// exhaustively on them was never safe. Adding a token (`"locked"`) therefore stays
+/// within `v1`; removing a field, renaming one, or changing one's type would not.
 const SCHEMA: &str = "dependable.list/v1";
 
 /// One discovered manifest: its identity and the dependencies it declares.
@@ -237,13 +243,18 @@ struct DependencyDto<'a> {
     locked: Option<&'a str>,
     registry: Option<&'a str>,
     /// Whether this dependency's version is declared somewhere other than its own
-    /// entry: a Cargo `workspace = true` resolved against the root, a Gradle
-    /// `[versions]` alias, a shared Maven `<properties>` value.
+    /// entry *but still in a manifest*: a Cargo `workspace = true` resolved against
+    /// the root, a Gradle `[versions]` alias, a shared Maven `<properties>` value.
     ///
     /// True for every entry whose `source` is `inherited`, so the two fields can no
     /// longer contradict each other on the same object. Also true where the root's
     /// declaration supplied a `path` or `git` source, which replaces `source`
     /// outright and would otherwise lose the fact that it was inherited at all.
+    ///
+    /// False for `"source": "locked"`, and deliberately: a lockfile pin was not
+    /// inherited from anything, because nothing declared it. The point of the field
+    /// is to send a consumer to the file where the version can be bumped, and for a
+    /// locked entry there is no such file.
     inherited: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     features: Option<&'a [String]>,
@@ -278,6 +289,7 @@ fn source_token(source: PackageSource) -> &'static str {
         PackageSource::Local => "local",
         PackageSource::Git => "git",
         PackageSource::Inherited => "inherited",
+        PackageSource::Locked => "locked",
         _ => "unknown",
     }
 }
@@ -305,6 +317,10 @@ fn annotation(item: &Item) -> &'static str {
         // would otherwise render as a bare `—` that reads like a parse failure. A
         // resolved one falls through to its section, so a `dev` dep still says so.
         PackageSource::Inherited if item.version_constraint.is_empty() => " (unresolved)",
+        // `Locked` deliberately has no arm. A lockfile pin states a version, so it is
+        // not unresolved, and it is not a source a reader of a table needs told about
+        // — what a reader wants to know is that it is not a declared direct
+        // dependency, which is exactly what its `kind` says below.
         _ => match item.kind {
             DependencyKind::Dev => " (dev)",
             DependencyKind::Build => " (build)",
