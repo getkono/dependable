@@ -137,6 +137,7 @@ impl Parser for PomXmlParser {
             kind: ManifestKind::PomXml,
             items,
             alternate_registries: Vec::new(),
+            notices: profile_notice(project).into_iter().collect(),
         })
     }
 }
@@ -349,6 +350,41 @@ fn references(value: &str) -> impl Iterator<Item = &str> {
             }
         }
     })
+}
+
+/// Say that a `<profiles>` block was seen and its dependencies were not read.
+///
+/// A profile applies conditionally — on a JDK version, an activated property, an
+/// operating system — so its dependencies are not this project's as written, and
+/// parsing them would state as fact something that holds only under a condition
+/// this file does not evaluate. Staying out is the decision; staying *silent*
+/// about it is not, because a POM that declares every one of its dependencies
+/// inside a profile then lists as `(0 dependencies)`, which reads as complete and
+/// is not.
+fn profile_notice(project: roxmltree::Node<'_, '_>) -> Option<String> {
+    let profiles = child(project, "profiles")?;
+    let count = profiles
+        .descendants()
+        .filter(|node| {
+            node.is_element()
+                && node.tag_name().name() == "dependency"
+                && node
+                    .parent()
+                    .is_some_and(|list| list.tag_name().name() == "dependencies")
+        })
+        .count();
+    if count == 0 {
+        return None;
+    }
+    Some(format!(
+        "{count} {} declared inside <profiles> {} not listed: a profile applies conditionally, so its dependencies are not this project's as written",
+        if count == 1 {
+            "dependency"
+        } else {
+            "dependencies"
+        },
+        if count == 1 { "is" } else { "are" },
+    ))
 }
 
 /// The first direct child element named `tag`.
@@ -769,6 +805,13 @@ mod tests {
         assert!(PomXmlParser.parse("<project><dependencies>").is_err());
     }
 
+    #[test]
+    fn a_pom_without_dependencies_yields_none() {
+        let m = parse(&pom("  <artifactId>solo</artifactId>\n"));
+        assert!(m.items.is_empty());
+        assert!(m.notices.is_empty());
+    }
+
     /// A comment splits the version into two text nodes. Reading only the first
     /// states `1.0` — a version this file never declares, which would then be
     /// fetched and evaluated as if it were the real constraint.
@@ -968,9 +1011,48 @@ mod tests {
         );
     }
 
+    /// Not parsing conditional dependencies is the decision; not *saying so* would
+    /// leave a POM that declares all of them in a profile listing as empty.
     #[test]
-    fn a_pom_without_dependencies_yields_none() {
-        let m = parse(&pom("  <artifactId>solo</artifactId>\n"));
-        assert!(m.items.is_empty());
+    fn a_profiles_block_holding_dependencies_is_announced() {
+        let content = pom("  <profiles>\n\
+             \x20   <profile>\n\
+             \x20     <id>native</id>\n\
+             \x20     <dependencies>\n\
+             \x20       <dependency>\n\
+             \x20         <groupId>g</groupId>\n\
+             \x20         <artifactId>a</artifactId>\n\
+             \x20         <version>1.0.0</version>\n\
+             \x20       </dependency>\n\
+             \x20       <dependency>\n\
+             \x20         <groupId>g</groupId>\n\
+             \x20         <artifactId>b</artifactId>\n\
+             \x20         <version>2.0.0</version>\n\
+             \x20       </dependency>\n\
+             \x20     </dependencies>\n\
+             \x20   </profile>\n\
+             \x20 </profiles>\n");
+        let m = parse(&content);
+        assert!(m.items.is_empty(), "a profile dependency is conditional");
+        assert_eq!(m.notices.len(), 1, "{:?}", m.notices);
+        assert!(
+            m.notices[0].contains("2 dependencies declared inside <profiles>"),
+            "{:?}",
+            m.notices
+        );
+    }
+
+    /// A profile that declares no dependency of its own has nothing to announce.
+    #[test]
+    fn a_profile_without_dependencies_says_nothing() {
+        let content = pom("  <profiles>\n\
+             \x20   <profile>\n\
+             \x20     <id>release</id>\n\
+             \x20     <properties>\n\
+             \x20       <skip.tests>true</skip.tests>\n\
+             \x20     </properties>\n\
+             \x20   </profile>\n\
+             \x20 </profiles>\n");
+        assert!(parse(&content).notices.is_empty());
     }
 }

@@ -626,6 +626,14 @@ pub async fn run_list(args: ListArgs) -> anyhow::Result<ExitCode> {
         // versions of one crate, and `pick_locked` chooses among them *by the declared
         // constraint*. Resolving second would hand it an empty constraint and pick the
         // highest — reporting `syn 2.0` locked against a member that inherits `syn = "1"`.
+        // What the parser saw and declined to read. On stderr rather than in the
+        // listing, so the same words reach a reader whichever `--format` they
+        // chose, and no machine-readable document changes shape — the same place
+        // `check` puts a manifest-level warning.
+        for notice in &parsed.notices {
+            eprintln!("warning: {} — {notice}", manifest.display());
+        }
+
         let inherited = workspace_source(manifest, kind, &content)
             .map(|(_, declarations)| {
                 resolve_workspace_inheritance(&mut parsed.items, &declarations)

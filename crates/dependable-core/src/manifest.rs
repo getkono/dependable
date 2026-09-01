@@ -16,6 +16,18 @@ pub struct ParsedManifest {
     pub items: Vec<Item>,
     /// Alternate registry declarations (Rust `[registries.*]`).
     pub alternate_registries: Vec<AlternateRegistryDecl>,
+    /// What the parser saw and deliberately did not read, in the parser's own
+    /// words, ready to print.
+    ///
+    /// Not errors and not warnings *about* the dependencies in
+    /// [`items`](Self::items): each one names a construct this parser declines to
+    /// interpret, so that a list which reads as complete and is not says so.
+    /// A Maven `<profiles>` block holding dependencies is the motivating case —
+    /// excluding conditional dependencies is defensible, printing
+    /// `(0 dependencies)` for a POM that declares twelve of them is not.
+    ///
+    /// Empty for every parser that has nothing to declare, which is most of them.
+    pub notices: Vec<String>,
 }
 
 /// A declared alternate registry (Rust only).
