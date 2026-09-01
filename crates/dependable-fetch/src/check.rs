@@ -824,7 +824,10 @@ fn evaluate_item(
                 .collect();
             let constraint = to_semver_constraint(&item.version_constraint, ecosystem);
             let eval = check_version(&constraint, &candidates, item.locked_version.as_deref());
-            CheckResult::from_evaluation(item.clone(), in_native_versions(eval, &translated))
+            CheckResult::from_evaluation(
+                item.clone(),
+                in_native_versions(eval, &translated, ecosystem),
+            )
         }
         Some(Err(e)) => CheckResult::new(item.clone(), DependencyStatus::Error(e.clone())),
         None => CheckResult::new(
@@ -873,33 +876,77 @@ fn to_semver_versions(versions: &[String], ecosystem: Ecosystem) -> Vec<(String,
 ///
 /// Several natives can translate to one semver — Maven reads `1.0` and `1.0.0` as
 /// the same version, and NuGet drops a fourth segment, so `8.0.32` and `8.0.32.1`
-/// are one version to compare and two artifacts to name. Ties are broken by taking
-/// the **last** match: the sort that produced this list compares translations, so a
-/// tie group holds the registry's own listing order, and every registry this
-/// translates for lists oldest-first (`maven-metadata.xml` opens with the first
-/// release ever published; NuGet's registration pages are ascending). Taking the
-/// first would report `8.0.32` as the newest `MySql.Data` and have `--fix` write
-/// it, with `8.0.32.1` published and available. A translated version with no
+/// are one version to compare and two artifacts to name. Which of them is reported,
+/// written by `--fix`, and sent to OSV is decided by comparing them, **never** by
+/// their position in the list: see [`native_for`]. A translated version with no
 /// surviving native (which nothing produces today) is left as it was rather than
 /// dropped.
-fn in_native_versions(mut eval: Evaluation, translated: &[(String, String)]) -> Evaluation {
+fn in_native_versions(
+    mut eval: Evaluation,
+    translated: &[(String, String)],
+    ecosystem: Ecosystem,
+) -> Evaluation {
     eval.latest_compatible = eval
         .latest_compatible
-        .map(|v| native_for(&v, translated).unwrap_or(v));
+        .map(|v| native_for(&v, translated, ecosystem).unwrap_or(v));
     eval.latest_available = eval
         .latest_available
-        .map(|v| native_for(&v, translated).unwrap_or(v));
+        .map(|v| native_for(&v, translated, ecosystem).unwrap_or(v));
     eval
 }
 
 /// The native string whose translation is `semver`, or `None` when none matches.
-fn native_for(semver: &str, translated: &[(String, String)]) -> Option<String> {
+///
+/// Several natives can translate alike, and this picks the newest of them by
+/// **comparing** them rather than by taking the one the list happens to end with.
+/// The list position carries no information to take:
+///
+/// - PyPI's `releases` object is a `HashMap`, whose iteration order is randomized
+///   per process, and the sort that follows compares translations and is stable —
+///   so a tie group such as `psycopg2-binary`'s `2.7.6`/`2.7.6.1` keeps whatever
+///   arbitrary order it was built in.
+/// - NuGet appends remote registration pages in the order their fetches complete.
+///   `AWSSDK.Core` has 24 remote pages and its `4.0.7` group straddles a boundary,
+///   so a positional answer reports `4.0.7.1` as the newest whenever the later page
+///   lands first — the stale-revision defect this whole pairing exists to fix.
+///
+/// The natives in one group differ by exactly what the translation discarded, so
+/// that is what decides: [`discarded_precision`] ranks a NuGet revision segment and
+/// a PEP 440 epoch or fourth segment, and the native string breaks what remains, so
+/// the comparison is **total** and one answer comes out of any input order.
+fn native_for(
+    semver: &str,
+    translated: &[(String, String)],
+    ecosystem: Ecosystem,
+) -> Option<String> {
     let wanted = SemverVersion::parse(semver).ok()?;
     translated
         .iter()
-        .rev()
-        .find(|(candidate, _)| SemverVersion::parse(candidate).is_ok_and(|parsed| parsed == wanted))
+        .filter(|(candidate, _)| {
+            SemverVersion::parse(candidate).is_ok_and(|parsed| parsed == wanted)
+        })
+        .max_by(|(_, a), (_, b)| {
+            discarded_precision(a, ecosystem)
+                .cmp(&discarded_precision(b, ecosystem))
+                .then_with(|| a.cmp(b))
+        })
         .map(|(_, native)| native.clone())
+}
+
+/// What [`to_semver_versions`]'s translation discarded from a native version, as a
+/// comparison key — the only thing that separates two natives translating alike.
+///
+/// Maven is absent on purpose: its translation drops only its release aliases and
+/// its separators, and Maven's own order reads `1.0`, `1.0.0`, and `1.0.0.Final` as
+/// one and the same version, so there is nothing left to rank and the tie falls to
+/// the native string. Every other ecosystem publishes semver already, so its
+/// natives are their own translations and no two of them can collide.
+fn discarded_precision(native: &str, ecosystem: Ecosystem) -> Vec<u64> {
+    match ecosystem {
+        Ecosystem::Python => dependable_core::semver::python::discarded_precision(native),
+        Ecosystem::CSharp => dependable_core::semver::nuget::discarded_precision(native),
+        _ => Vec::new(),
+    }
 }
 
 /// Drop the candidates that are a *different build* of a release rather than a
@@ -1346,6 +1393,26 @@ mod tests {
         )
     }
 
+    /// A NuGet package declared in a `.csproj` at `version`.
+    fn csharp_item(package: &str, version: &str) -> Item {
+        item_of(
+            ManifestKind::Csproj,
+            &format!(
+                "<Project><ItemGroup>\
+                 <PackageReference Include=\"{package}\" Version=\"{version}\" />\
+                 </ItemGroup></Project>"
+            ),
+        )
+    }
+
+    /// A PyPI distribution pinned in a `requirements.txt` at `version`.
+    fn python_item(distribution: &str, version: &str) -> Item {
+        item_of(
+            ManifestKind::RequirementsTxt,
+            &format!("{distribution}=={version}\n"),
+        )
+    }
+
     /// Evaluate `item` against `versions` (newest-first, as a registry returns them).
     fn evaluated(
         item: &Item,
@@ -1446,15 +1513,10 @@ mod tests {
 
     /// Maven reads `1.0` and `1.0.0` as one version and NuGet folds `8.0.32.1`
     /// into `8.0.32`, so two natives can translate to one semver — and the tie has
-    /// to be broken by a rule.
+    /// to be broken by comparing them.
     ///
-    /// The versions arrive sorted by their *translation*, and both that sort and
-    /// `check_version`'s are stable, so a tie group is still in the order the
-    /// registry listed it — which is oldest-first for Maven Central's
-    /// `maven-metadata.xml` and for NuGet's registration pages alike. The newest
-    /// spelling is therefore the **last** match, not the first: taking the first
-    /// told a `MySql.Data` project the newest release was `8.0.32` and had
-    /// `fix --all` write it, with `8.0.32.1` published.
+    /// Taking the first told a `MySql.Data` project the newest release was `8.0.32`
+    /// and had `fix --all` write it, with `8.0.32.1` published.
     #[test]
     fn the_newest_native_wins_when_two_translate_to_one_version() {
         let item = jvm_item("org.example:lib", "0.9");
@@ -1481,6 +1543,76 @@ mod tests {
             UnstableFilter::Exclude,
         );
         assert_eq!(result.latest_available.as_deref(), Some("8.0.32.1"));
+    }
+
+    /// Every ordering of a candidate list has to give the same answer, because no
+    /// registry this translates for supplies a dependable one.
+    ///
+    /// PyPI's `releases` is a JSON object read into a `HashMap`, whose iteration
+    /// order is randomized per process, and the sort that follows compares
+    /// translations and is stable — so `psycopg2-binary`'s `2.7.6`/`2.7.6.1` stays
+    /// in whatever arbitrary order it was built in. NuGet appends remote
+    /// registration pages as their fetches complete, and `AWSSDK.Core`'s `4.0.7`
+    /// group straddles a page boundary. A positional tie-break made the reported
+    /// version, the string `--fix` writes, and the version sent to OSV differ from
+    /// run to run.
+    #[test]
+    fn the_newest_native_of_a_group_does_not_depend_on_the_order_it_arrives_in() {
+        // Every permutation, so nothing positional can pass by luck.
+        fn orderings(items: &[&'static str]) -> Vec<Vec<&'static str>> {
+            if items.is_empty() {
+                return vec![Vec::new()];
+            }
+            let mut out = Vec::new();
+            for i in 0..items.len() {
+                let mut rest = items.to_vec();
+                let head = rest.remove(i);
+                for tail in orderings(&rest) {
+                    let mut one = vec![head];
+                    one.extend(tail);
+                    out.push(one);
+                }
+            }
+            out
+        }
+
+        let cases: [(Ecosystem, Item, &[&str], &str); 4] = [
+            (
+                Ecosystem::Jvm,
+                jvm_item("org.example:lib", "0.9"),
+                &["1.0", "1.0.0", "0.9"],
+                "1.0.0",
+            ),
+            (
+                Ecosystem::CSharp,
+                csharp_item("MySql.Data", "8.0.31"),
+                &["8.0.32", "8.0.32.1", "8.0.31"],
+                "8.0.32.1",
+            ),
+            (
+                // `AWSSDK.Core`, whose group straddles a registration-page boundary.
+                Ecosystem::CSharp,
+                csharp_item("AWSSDK.Core", "4.0.6"),
+                &["4.0.7", "4.0.7.1", "4.0.7.2", "4.0.6"],
+                "4.0.7.2",
+            ),
+            (
+                Ecosystem::Python,
+                python_item("psycopg2-binary", "2.7.5"),
+                &["2.7.6", "2.7.6.1", "2.7.5"],
+                "2.7.6.1",
+            ),
+        ];
+        for (ecosystem, item, versions, expected) in cases {
+            for order in orderings(versions) {
+                let result = evaluated(&item, &order, ecosystem, UnstableFilter::Exclude);
+                assert_eq!(
+                    result.latest_available.as_deref(),
+                    Some(expected),
+                    "{ecosystem:?} {order:?}"
+                );
+            }
+        }
     }
 
     /// A flavour is which artifact, not which release: moving an Android project
@@ -1568,6 +1700,31 @@ mod tests {
             UnstableFilter::Exclude,
         );
         assert_eq!(result.latest_available.as_deref(), Some("2.0"));
+    }
+
+    /// A flavour spelled with two words has to partition the list like any other,
+    /// or the filter built on it never runs at all.
+    ///
+    /// `com.google.inject:guice` publishes `2.0` beside `2.0-no_aop` — one release,
+    /// two builds, the second without the AOP support that pulls in cglib/ASM.
+    /// Reading only the last token made the word (`aop`) and the release key
+    /// (`2.0.no`) disagree, so every such variant sat alone in a group of one, no
+    /// flavour was ever found to partition anything, and this filter early-returned
+    /// on every list whose flavours are spelled with more than one word.
+    #[test]
+    fn a_flavour_spelled_with_two_words_still_partitions_the_candidates() {
+        let item = jvm_item("org.example:lib", "2.0-no_aop");
+        let result = evaluated(
+            &item,
+            &["3.0-with_aop", "3.0-no_aop", "2.0-with_aop", "2.0-no_aop"],
+            Ecosystem::Jvm,
+            UnstableFilter::Exclude,
+        );
+        assert_eq!(
+            result.latest_available.as_deref(),
+            Some("3.0-no_aop"),
+            "the no-AOP build is not upgraded onto the AOP one"
+        );
     }
 
     /// `-incubating` is a release channel, not a build variant: an Apache project
