@@ -298,25 +298,35 @@ fn child<'a>(node: roxmltree::Node<'a, 'a>, tag: &str) -> Option<roxmltree::Node
 /// An element's text content and the byte span of the text itself, trimmed of the
 /// whitespace a pretty-printed POM puts around it.
 ///
-/// The span is dropped where the source text and the unescaped text cannot be the
-/// same bytes — a character reference, or text split across several nodes — because
-/// an offset into one is not an offset into the other. An empty element yields
-/// nothing: it states no value, which is not the same as stating one this parser
-/// resolved.
+/// **Every** text node is concatenated, because that is the value Maven reads.
+/// `<version>1.0<!--patched--\>.0</version>` is one version, `1.0.0`, split in two
+/// by a comment; taking only the first node would report `1.0` — a version the file
+/// never states, then dutifully fetched and evaluated against. The span is the
+/// separate question, and it is dropped wherever the source bytes and the value
+/// cannot be the same bytes: a character reference (`1.0&#46;0`), a `CDATA`
+/// section, or text interrupted like this. An empty element yields nothing: it
+/// states no value, which is not the same as stating one this parser resolved.
 fn text_of(node: roxmltree::Node<'_, '_>) -> Option<Located> {
     let mut texts = node.children().filter(roxmltree::Node::is_text);
-    let text = texts.next()?;
-    let raw = text.text()?;
-    let value = raw.trim();
+    let first = texts.next()?;
+    let raw = first.text()?;
+    let mut joined = raw.to_owned();
+    let mut single = true;
+    for rest in texts {
+        single = false;
+        joined.push_str(rest.text().unwrap_or_default());
+    }
+    let value = joined.trim();
     if value.is_empty() {
         return None;
     }
-    let range = text.range();
-    let faithful = texts.next().is_none() && range.len() == raw.len();
+    let range = first.range();
+    let faithful = single && range.len() == raw.len();
     let start = range.start + (raw.len() - raw.trim_start().len());
+    let len = value.len();
     Some(Located {
         value: value.to_owned(),
-        span: faithful.then(|| start..start + value.len()),
+        span: faithful.then(|| start..start + len),
     })
 }
 
@@ -695,6 +705,51 @@ mod tests {
     #[test]
     fn malformed_xml_is_a_structural_error() {
         assert!(PomXmlParser.parse("<project><dependencies>").is_err());
+    }
+
+    /// A comment splits the version into two text nodes. Reading only the first
+    /// states `1.0` — a version this file never declares, which would then be
+    /// fetched and evaluated as if it were the real constraint.
+    #[test]
+    fn a_version_interrupted_by_a_comment_is_read_whole() {
+        let content = pom("  <dependencies>\n\
+             \x20   <dependency>\n\
+             \x20     <groupId>g</groupId>\n\
+             \x20     <artifactId>a</artifactId>\n\
+             \x20     <version>1.0<!--patched-->.0</version>\n\
+             \x20   </dependency>\n\
+             \x20 </dependencies>\n");
+        let m = parse(&content);
+        let item = find(&m, "g:a");
+        assert_eq!(
+            item.version_constraint, "1.0.0",
+            "every text node is the value Maven reads"
+        );
+        assert!(
+            !item.is_rewritable(),
+            "the source bytes are not the value's bytes, so there is nothing to rewrite"
+        );
+    }
+
+    /// The sibling cases: an escaped character and a `CDATA` section both state the
+    /// whole version, and neither offers bytes a rewrite could replace.
+    #[test]
+    fn an_escaped_or_wrapped_version_is_read_whole_and_never_rewritten() {
+        for spelling in ["1.0&#46;0", "<![CDATA[1.0.0]]>"] {
+            let content = pom(&format!(
+                "  <dependencies>\n\
+                 \x20   <dependency>\n\
+                 \x20     <groupId>g</groupId>\n\
+                 \x20     <artifactId>a</artifactId>\n\
+                 \x20     <version>{spelling}</version>\n\
+                 \x20   </dependency>\n\
+                 \x20 </dependencies>\n"
+            ));
+            let m = parse(&content);
+            let item = find(&m, "g:a");
+            assert_eq!(item.version_constraint, "1.0.0", "{spelling}");
+            assert!(!item.is_rewritable(), "{spelling}");
+        }
     }
 
     /// Eight hops is what the constant says, so eight hops has to resolve.
