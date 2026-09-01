@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use dependable_core::Item;
+use dependable_core::{Item, ManifestKind};
 use moka::future::Cache;
 
 use crate::registries::PackageMetadata;
@@ -56,13 +56,21 @@ pub fn metadata_cache() -> MetadataCache {
         .build()
 }
 
-/// Caches a workspace root's `[workspace.dependencies]`, keyed by the root's path.
+/// Caches a workspace root's central declarations, keyed by the root's path **and** the
+/// kind it was parsed as.
 ///
 /// A monorepo asks the same question once per member — "what does the root declare" —
 /// and the answer is one file read plus a full `toml_edit` parse of bytes that have not
 /// changed. Without this, a 500-crate workspace pays for both 500 times over. The `Arc`
 /// is what makes a hit free rather than a clone of every declaration.
-pub type WorkspaceCache = Cache<PathBuf, Arc<Vec<Item>>>;
+///
+/// The kind is in the key because the path alone does not determine the parser: a name
+/// can be a candidate root for more than one kind
+/// ([`WorkspaceRoots::root_names`](dependable_core::WorkspaceRoots::root_names) pairs
+/// each name with its own), and a root cached under one member's kind would then be
+/// served to a member of the other. That failure is order-dependent — whichever kind was
+/// checked first wins — and so shows up intermittently rather than in a test.
+pub type WorkspaceCache = Cache<(PathBuf, ManifestKind), Arc<Vec<Item>>>;
 
 /// A fresh workspace-declaration cache with a 5-minute TTL, matching the versions cache:
 /// a root edited mid-run is a rare enough thing to be worth one stale answer, and a
@@ -273,6 +281,38 @@ mod tests {
         assert_eq!(
             cache.get("npm", "right-pad").await,
             Some(vec!["1.0.1".into()])
+        );
+    }
+
+    /// A root's path does not say which parser read it: one name can be a candidate root
+    /// for two kinds, and serving one kind's parse to a member of the other is a wrong
+    /// answer that depends on which member was checked first. Keying on the pair is what
+    /// keeps that from being possible.
+    #[tokio::test]
+    async fn a_root_cached_under_one_kind_is_not_served_to_another() {
+        let cache = workspace_cache();
+        let root = PathBuf::from("/repo/package.json");
+
+        cache
+            .insert(
+                (root.clone(), ManifestKind::PackageJson),
+                Arc::new(Vec::new()),
+            )
+            .await;
+
+        assert!(
+            cache
+                .get(&(root.clone(), ManifestKind::CargoToml))
+                .await
+                .is_none(),
+            "a different kind read the same path and must parse it itself"
+        );
+        assert!(
+            cache
+                .get(&(root, ManifestKind::PackageJson))
+                .await
+                .is_some(),
+            "the kind that wrote the entry still hits"
         );
     }
 

@@ -33,7 +33,10 @@ pub struct AlternateRegistryDecl {
 /// Distinguishes manifest files. Every variant has a parser; the mapping to
 /// [`Ecosystem`] is many-to-one, since several manifest formats can belong to one
 /// registry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Hash` because a kind is part of a cache key: a path alone does not say which parser
+/// read it, and two kinds can name the same file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ManifestKind {
     CargoToml,

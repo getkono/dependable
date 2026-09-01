@@ -505,8 +505,8 @@ impl Checker {
     /// difference that the answer is on local disk, so it only ever showed up as CPU. A
     /// 500-crate workspace parsed one root manifest 500 times.
     ///
-    /// Locating the root is still done per manifest: it is the walk that produces the key
-    /// this is cached on, and it is the cheap half.
+    /// Locating the root is still done per manifest: it is the walk that produces the
+    /// `(path, kind)` key this is cached on, and it is the cheap half.
     async fn workspace_source(
         &self,
         path: &Path,
@@ -515,16 +515,17 @@ impl Checker {
     ) -> Option<(PathBuf, Arc<Vec<Item>>)> {
         let (root, root_kind, root_content) =
             crate::discover::workspace_root_of(path, kind, manifest)?;
-        if let Some(hit) = self.workspace_cache.get(&root).await {
+        // Keyed on the kind as well as the path: the same file can be a candidate root
+        // for two kinds, and the declarations are whatever that kind's parser saw.
+        let key = (root.clone(), root_kind);
+        if let Some(hit) = self.workspace_cache.get(&key).await {
             return Some((root, hit));
         }
         let declarations = Arc::new(crate::discover::workspace_declarations(
             root_kind,
             &root_content,
         ));
-        self.workspace_cache
-            .insert(root.clone(), declarations.clone())
-            .await;
+        self.workspace_cache.insert(key, declarations.clone()).await;
         Some((root, declarations))
     }
 
