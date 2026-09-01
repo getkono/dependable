@@ -19,7 +19,7 @@ use std::path::Path;
 
 use anyhow::Context;
 use dependable_fetch::core::{BareVersion, Ecosystem, ManifestKind};
-use dependable_fetch::{CheckResult, DependencyStatus};
+use dependable_fetch::{CheckResult, DependencyKind, DependencyStatus};
 
 /// A single applied (or would-be-applied) version change.
 #[derive(Debug, Clone)]
@@ -151,6 +151,14 @@ fn plan_fixes(
         // recorded span is `0/0/0` — which `apply_edits`' bounds check passes trivially,
         // splicing the new version into byte 0 of line 0 of this file.
         if !item.is_rewritable() {
+            continue;
+        }
+        // An override is a version this manifest deliberately forces onto the resolved
+        // tree — very often a security pin holding a transitive dependency above a
+        // vulnerable release. Reporting that a newer version exists is useful; rewriting
+        // the pin to it defeats the reason the entry was written, so `fix` declines the
+        // whole kind rather than trying to guess which overrides are safe to move.
+        if item.kind == DependencyKind::Override {
             continue;
         }
         let updatable = matches!(
@@ -397,6 +405,57 @@ fn apply_edits(content: &str, edits: &[Edit]) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An override forces a version onto the resolved tree — frequently a security pin.
+    /// `fix --all` used to rewrite it to the newest release, undoing the pin; combined
+    /// with a `>`-scoped pnpm key it rewrote it to an unrelated package's newest release.
+    #[test]
+    fn fix_all_leaves_an_override_alone() {
+        let content = r#"{
+  "dependencies": {
+    "monolog": "^2.0"
+  },
+  "overrides": {
+    "minimist": "1.2.6"
+  }
+}
+"#;
+        let results = results_for(
+            ManifestKind::PackageJson,
+            content,
+            &[("minimist", "1.2.8"), ("monolog", "2.9.1")],
+        );
+        assert_eq!(results.len(), 2, "the fixture must produce two items");
+        assert!(
+            results
+                .iter()
+                .any(|r| r.item.kind == DependencyKind::Override),
+            "the fixture must produce an override item"
+        );
+
+        let (updated, records) = plan_fixes(
+            content,
+            &results,
+            true,
+            Some(ManifestKind::PackageJson.ecosystem()),
+        )
+        .expect("the plan applies");
+
+        // The override is declined; its non-override neighbour is still fixed, so this
+        // asserts the guard rather than a `--all` path that happens to do nothing.
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.name.as_str())
+                .collect::<Vec<_>>(),
+            ["monolog"],
+            "{records:?}"
+        );
+        assert!(
+            updated.contains(r#""minimist": "1.2.6""#),
+            "the override was rewritten: {updated}"
+        );
+    }
 
     /// Every ecosystem, so a guard that is ecosystem-independent is asserted
     /// against all of them rather than against a convenient one — and so a new

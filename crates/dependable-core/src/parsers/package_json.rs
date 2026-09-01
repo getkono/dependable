@@ -4,6 +4,8 @@
 //! positions, then resolves npm version aliases. Only the version portion of an
 //! alias is recorded for `--fix` (so `npm:left-pad@1.3.0` rewrites just `1.3.0`).
 
+use std::collections::HashMap;
+
 use super::Parser;
 use super::json_scan::{JsonStringValue, scan_strings};
 use super::position::{line_starts, offset_to_line_col};
@@ -26,10 +28,12 @@ pub struct PackageJsonParser;
 impl Parser for PackageJsonParser {
     fn parse(&self, content: &str) -> Result<ParsedManifest, ParseError> {
         let starts = line_starts(content);
+        let entries = scan_strings(content);
+        let declared = direct_dependencies(&entries);
         let mut items = Vec::new();
-        for entry in scan_strings(content) {
+        for entry in &entries {
             if let Some((key, kind)) = dependency_key(&entry.path) {
-                items.push(build_item(key, kind, &entry, &starts));
+                items.push(build_item(key, kind, entry, &starts, &declared));
             }
         }
         Ok(ParsedManifest {
@@ -38,6 +42,22 @@ impl Parser for PackageJsonParser {
             alternate_registries: Vec::new(),
         })
     }
+}
+
+/// The constraint each `*dependencies` section declares, by package name.
+///
+/// The lookup table an npm `"$name"` override value is resolved against; a later
+/// section wins, which is the order npm itself reads them in.
+fn direct_dependencies(entries: &[JsonStringValue]) -> HashMap<&str, &str> {
+    entries
+        .iter()
+        .filter_map(|entry| match entry.path.as_slice() {
+            [section, dep] if DEP_SECTIONS.iter().any(|(name, _)| name == section) => {
+                Some((dep.as_str(), entry.value.as_str()))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// Return the dependency name and its kind if `path` points at a dependency entry: a
@@ -82,10 +102,19 @@ fn is_override_section(section: &str) -> bool {
 ///
 /// Yarn `resolutions` keys carry a path (`parent/child`, `**/lodash`) and npm's nested
 /// form uses `"."` to mean "the parent entry itself", which names no new package.
+///
+/// pnpm scopes an override to the parent that pulls the package in by joining the two
+/// with `>`: `"foo@2>bar"` forces a version onto **bar**, not onto `foo`. The overridden
+/// package is therefore the *last* `>`-separated segment; reading the first named an
+/// unrelated package, which `--fix` then rewrote the pin to that package's latest
+/// version.
 fn override_name(key: &str) -> Option<&str> {
     if key == "." {
         return None;
     }
+    // The parent selectors in front of the last `>` scope the override; only the segment
+    // after it names the package being overridden.
+    let key = key.rsplit('>').next().unwrap_or(key).trim();
     // Segment first, then strip the version. Doing it the other way round cut `**/@scope/pkg`
     // at the scope's own `@`, because that `@` is not at the start of the *key*.
     //
@@ -112,9 +141,59 @@ fn override_name(key: &str) -> Option<&str> {
     (!name.is_empty() && name != "*" && name != "**").then_some(name)
 }
 
+/// An npm override value that references one of this manifest's own direct
+/// dependencies rather than stating a range.
+///
+/// `{"dependencies": {"semver": "^7.5.0"}, "overrides": {"semver": "$semver"}}` is
+/// npm's documented way to say "force the version I already depend on". It is not a
+/// constraint, and handing it to the version checker produced
+/// `unparseable constraint: unexpected character '$'` on a perfectly valid manifest —
+/// the same shape `csproj.rs` already declines to read as a version in `$(MSBuildProp)`.
+///
+/// Returns the referenced package name.
+fn override_reference(value: &str) -> Option<&str> {
+    let name = value.strip_prefix('$')?;
+    (!name.is_empty() && !name.contains(char::is_whitespace)).then_some(name)
+}
+
 /// Build an [`Item`] for one dependency entry, resolving aliases and recording the
 /// version sub-span for `--fix`.
-fn build_item(key: &str, kind: DependencyKind, entry: &JsonStringValue, starts: &[usize]) -> Item {
+fn build_item(
+    key: &str,
+    kind: DependencyKind,
+    entry: &JsonStringValue,
+    starts: &[usize],
+    declared: &HashMap<&str, &str>,
+) -> Item {
+    if kind == DependencyKind::Override
+        && let Some(referenced) = override_reference(&entry.value)
+    {
+        // Resolved, the reference *is* the referenced dependency's constraint, so the
+        // entry is checked against exactly the version the manifest forces. Unresolved,
+        // the manifest names a dependency it does not declare: real package, unreadable
+        // version, and nothing to ask a registry for.
+        return match declared.get(referenced) {
+            Some(constraint) => {
+                let (line, col) = offset_to_line_col(starts, entry.content_start);
+                Item {
+                    name: key.to_owned(),
+                    version_constraint: (*constraint).to_owned(),
+                    source: PackageSource::Registry,
+                    // The span holds `$semver`, not the constraint being checked, so it
+                    // reports its position and declines its width — the same way an
+                    // escaped value does — and no rewriter can splice a version over
+                    // the reference.
+                    version_line: line,
+                    version_col_start: col,
+                    version_col_end: col,
+                    registry: None,
+                    locked_version: None,
+                    kind,
+                }
+            }
+            None => skip_item(key, PackageSource::Unresolved, kind),
+        };
+    }
     let value = &entry.value;
     match resolve(key, value) {
         Resolved::Skip(source) => skip_item(key, source, kind),
@@ -387,5 +466,82 @@ mod tests {
         assert_eq!(override_name("parent/@scope/pkg"), Some("@scope/pkg"));
         assert_eq!(override_name("@scope/pkg@^1"), Some("@scope/pkg"));
         assert_eq!(override_name("."), None);
+    }
+
+    /// npm's documented `$name` override value means "use the version of my own direct
+    /// dependency", not a version range. It reached the version checker verbatim and
+    /// came back `unparseable constraint: unexpected character '$'` — a hard error on a
+    /// valid manifest.
+    #[test]
+    fn a_dollar_override_resolves_to_the_dependency_it_names() {
+        let content = r#"{
+  "dependencies": { "semver": "^7.5.0" },
+  "overrides": { "semver": "$semver" }
+}"#;
+        let m = parse(content);
+        let overridden = m
+            .items
+            .iter()
+            .find(|i| i.kind == DependencyKind::Override)
+            .expect("an override item");
+        assert_eq!(overridden.name, "semver");
+        assert_eq!(overridden.version_constraint, "^7.5.0");
+        assert_eq!(overridden.source, PackageSource::Registry);
+        // The recorded span holds `$semver`, not the constraint, so it must not be
+        // offered to `--fix` as a place to write a version.
+        assert!(!overridden.is_rewritable());
+    }
+
+    /// A reference to something the manifest never declares is unresolvable, not a
+    /// parse error: the package is real, its intended version simply cannot be read.
+    #[test]
+    fn a_dollar_override_naming_nothing_declared_is_unresolvable() {
+        let content = r#"{ "overrides": { "semver": "$semver" } }"#;
+        let m = parse(content);
+        let overridden = m.items.first().expect("an override item");
+        assert_eq!(overridden.name, "semver");
+        assert_eq!(overridden.source, PackageSource::Unresolved);
+        assert!(!overridden.is_checkable());
+    }
+
+    /// The reference form is npm's, and only inside an override map. A `$` elsewhere is
+    /// left exactly as it was read.
+    #[test]
+    fn a_dollar_is_only_a_reference_inside_an_override() {
+        assert_eq!(override_reference("$semver"), Some("semver"));
+        assert_eq!(override_reference("$@scope/pkg"), Some("@scope/pkg"));
+        assert_eq!(override_reference("$"), None);
+        assert_eq!(override_reference("^7.5.0"), None);
+
+        let content = r#"{ "dependencies": { "weird": "$semver" } }"#;
+        let m = parse(content);
+        assert_eq!(find(&m, "weird").version_constraint, "$semver");
+    }
+
+    /// A pnpm override key scoped to a parent (`foo@2>bar`) pins **bar**. Reading the
+    /// first segment named `foo`, so the entry was checked against an unrelated
+    /// package's version list — and `fix --all` would then have rewritten a pin on `bar`
+    /// to whatever `foo`'s newest release happened to be.
+    #[test]
+    fn a_scoped_override_key_names_the_package_after_the_last_arrow() {
+        assert_eq!(override_name("foo@2>bar"), Some("bar"));
+        assert_eq!(override_name("foo>bar"), Some("bar"));
+        assert_eq!(override_name("a>b>c"), Some("c"));
+        assert_eq!(
+            override_name("@scope/pkg@1>@scope/other"),
+            Some("@scope/other")
+        );
+        assert_eq!(override_name("foo"), Some("foo"));
+    }
+
+    /// The same key read end to end through the parser, so the defect is falsified where
+    /// it was observed rather than only at the helper.
+    #[test]
+    fn a_scoped_pnpm_override_is_checked_as_the_package_it_pins() {
+        let content = r#"{ "pnpm": { "overrides": { "foo@2>bar": "3.0.0" } } }"#;
+        let m = parse(content);
+        let names: Vec<&str> = m.items.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, vec!["bar"], "got {names:?}");
+        assert_eq!(find(&m, "bar").kind, DependencyKind::Override);
     }
 }

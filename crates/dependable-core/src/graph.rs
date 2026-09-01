@@ -190,6 +190,16 @@ pub struct WalkOptions<'a> {
 
 /// Default appearance budget for one walk — far above any real dependency forest, and
 /// far below the point at which an exponential walk stops looking like a hang.
+///
+/// # Where the number comes from
+/// The two bounds it has to sit between. Above: the largest lockfiles in the wild run
+/// to a few tens of thousands of packages, and a deduped walk emits one appearance per
+/// edge, so a forest an order of magnitude past the worst real case still finishes
+/// whole — no honest tree is ever cut by this. Below: an appearance is a few pointer
+/// derefs and a `Vec` push, so a million of them is well under a second, which keeps a
+/// walk that *is* exponential looking like a bounded operation rather than a hang.
+/// A user cannot override it: raising it only buys a longer wait before the same
+/// prefix, and the prefix is reported as one ([`Tree::truncated`]).
 pub const DEFAULT_MAX_VISITS: usize = 1_000_000;
 
 /// Hard recursion ceiling, independent of [`WalkOptions::max_depth`].
@@ -197,6 +207,17 @@ pub const DEFAULT_MAX_VISITS: usize = 1_000_000;
 /// The walk is recursive, so depth costs stack. No real dependency chain approaches
 /// this; a cyclic graph cannot reach it (back-edges are cut), but a synthesized or
 /// corrupt lockfile can, and overflowing the stack aborts the process.
+///
+/// # Where the number comes from
+/// A stack budget, not a graph property. One frame here carries the node index, the
+/// child iterator, and the path bookkeeping — on the order of a hundred bytes — so 512
+/// frames is tens of kilobytes, comfortably inside the smallest stack this walk runs
+/// on (a non-main thread's default, which is where a checker's tasks execute). Real
+/// dependency chains are an order of magnitude shorter: the deepest transitive chains
+/// observed in published lockfiles are in the low tens. Overrunning the ceiling is
+/// therefore evidence of a corrupt or synthesized lockfile, and the walk reports the
+/// prefix ([`Tree::truncated`]) rather than aborting the process. Not user-tunable,
+/// because raising it trades a reported prefix for a stack overflow.
 pub const MAX_WALK_DEPTH: usize = 512;
 
 /// What one [`DependencyGraph::walk`] did.

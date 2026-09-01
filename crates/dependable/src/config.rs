@@ -47,9 +47,25 @@ pub struct Config {
     /// By construction this is the same value [`load_policy`] returns — same
     /// figment, same key — so there is one schema and no way for the two to
     /// disagree.
+    ///
+    /// Declared in every build, and typed as the policy schema only where the
+    /// `report` feature can enforce it. `deny_unknown_fields` on this struct means an
+    /// absent field is a *rejected* field: with the declaration behind the feature, a
+    /// `--no-default-features` build failed to load any config carrying `[policy]` at
+    /// all, exiting 2 on "unknown field: found `policy`" — and the warning path that
+    /// exists precisely to say "this build cannot enforce your policy" was never
+    /// reached. The feature gates what is done with the block, not whether it is a
+    /// known key.
     #[cfg(feature = "report")]
     #[serde(default)]
     pub policy: Policy,
+    /// The `[policy]` block, unread.
+    ///
+    /// See the `report` build's field above: the key stays known so the file still
+    /// loads, and [`crate::runner`] warns that the gate is not enforced.
+    #[cfg(not(feature = "report"))]
+    #[serde(default)]
+    pub policy: figment::value::Dict,
 }
 
 impl Config {
@@ -348,6 +364,45 @@ pub fn load_policy(path: &Path) -> Result<PolicySource, Box<figment::Error>> {
 #[must_use]
 pub fn has_policy_table(path: &Path) -> bool {
     Figment::from(Toml::file(path)).find_value("policy").is_ok()
+}
+
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+
+    fn write(name: &str, content: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir()
+            .join("dependable-config-schema-tests")
+            .join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create the scratch directory");
+        let path = dir.join("dependable.toml");
+        std::fs::write(&path, content).expect("write the config");
+        path
+    }
+
+    /// `[policy]` is a known key in every build, enforced or not.
+    ///
+    /// `deny_unknown_fields` turns "not declared" into "rejected", so declaring the
+    /// field only under the `report` feature made a `--no-default-features` build exit 2
+    /// on any config carrying a policy block — including the configs the very warning
+    /// about unenforced policies exists to serve.
+    #[test]
+    fn a_policy_block_loads_whether_or_not_this_build_enforces_it() {
+        let path = write("policy_present", "[policy]\nmax_cvss = 7.0\n");
+        let config = load_config(&path).expect("a config carrying `[policy]` must load");
+        // The rest of the file is still read, so this is not a blanket "ignore
+        // everything" escape hatch.
+        assert!(config.rust.enabled);
+    }
+
+    /// The other half of `deny_unknown_fields`: a key nothing declares is still a hard
+    /// error, in both builds.
+    #[test]
+    fn an_undeclared_key_is_still_rejected() {
+        let path = write("unknown_key", "[nonsense]\nvalue = 1\n");
+        assert!(load_config(&path).is_err());
+    }
 }
 
 #[cfg(all(test, feature = "report"))]

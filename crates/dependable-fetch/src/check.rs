@@ -14,8 +14,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use dependable_core::{
     CheckResult, DependencyStatus, Ecosystem, Evaluation, Item, LockfileKind, ManifestKind,
-    PackageSource, UnstableFilter, apply_lockfile, check_version, parse, parse_lockfile_kind,
-    resolve_workspace_inheritance, to_semver_constraint,
+    PackageSource, UnstableFilter, apply_lockfile, check_version_for, parse, parse_lockfile_kind,
+    resolve_workspace_inheritance,
 };
 use futures::stream::{self, StreamExt};
 use semver::Version as SemverVersion;
@@ -105,6 +105,16 @@ pub struct ManifestCheck {
     /// was found" and "nothing was looked for" alike, and a `--fail-on vulnerable` gate
     /// reading the first when the second is true reports a clean build it never checked.
     pub vulnerability_scan_failed: bool,
+    /// Whether any registry lookup failed for a reason other than the package not
+    /// existing.
+    ///
+    /// The difference a gate turns on. A 404 is a per-dependency fact — a private or
+    /// internal package, one served by a registry this run does not route to, a deleted
+    /// package — and it says nothing about the dependencies that *were* resolved. A
+    /// timeout, a refused connection, a 5xx, or an undecodable response is the registry
+    /// declining to answer, and a `--fail-on` promise cannot be kept from answers that
+    /// were never given.
+    pub registry_unreachable: bool,
     /// The manifest whose `[workspace.dependencies]` govern this one — itself, when it
     /// declares its own `[workspace]`, else the nearest ancestor that does.
     ///
@@ -198,7 +208,11 @@ struct FetchTask {
 }
 
 /// The result of one fetch task: `(name, cache_key, versions-or-error)`.
-type FetchOutcome = (String, String, Result<Vec<String>, String>);
+///
+/// The error is still typed here, and only stringified once
+/// [`Checker::fetch_all`] has read whether it was the registry answering "no such
+/// package" or the registry not answering at all.
+type FetchOutcome = (String, String, Result<Vec<String>, FetchError>);
 
 /// Fetched versions (or a per-package error message), keyed by `(cache_key, name)`.
 ///
@@ -615,7 +629,7 @@ impl Checker {
             }
         }
 
-        let fetched = self.fetch_all(tasks).await;
+        let (fetched, registry_unreachable) = self.fetch_all(tasks).await;
         let mut results: Vec<CheckResult> = parsed
             .items
             .iter()
@@ -649,6 +663,7 @@ impl Checker {
             results,
             warnings,
             vulnerability_scan_failed,
+            registry_unreachable,
             workspace_root: workspace.map(|(root, _)| root),
         };
 
@@ -723,7 +738,14 @@ impl Checker {
     /// request. The concurrency inside a single manifest is safe — its tasks are
     /// already deduplicated by `(cache_key, name)` before they get here. Anyone
     /// parallelising the *manifest* loop must add coalescing here first.
-    async fn fetch_all(&self, tasks: Vec<FetchTask>) -> FetchedMap {
+    /// Fetch every task's version list, returning the results and whether any lookup
+    /// failed for a reason other than the package not existing.
+    ///
+    /// A 404 is an answer: the package is private, internal, deleted, or served by a
+    /// registry this run does not route to. Anything else — a timeout, a refused
+    /// connection, a 5xx, a response that would not decode — is the registry declining
+    /// to answer, and a gate cannot be honoured from answers that were never given.
+    async fn fetch_all(&self, tasks: Vec<FetchTask>) -> (FetchedMap, bool) {
         let total = tasks.len();
         self.emit(ProgressEvent::Started { total });
 
@@ -756,8 +778,7 @@ impl Checker {
                     let result =
                         crate::retry::with_retry(|| task.fetcher.fetch_versions(&task.name))
                             .await
-                            .map(|fetched| fetched.versions)
-                            .map_err(|e| e.to_string());
+                            .map(|fetched| fetched.versions);
                     let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
                     if let Some(p) = &progress {
                         p(ProgressEvent::Advanced {
@@ -772,6 +793,7 @@ impl Checker {
             .collect()
             .await;
 
+        let mut registry_unreachable = false;
         for (name, cache_key, result) in fetched {
             if let Ok(versions) = &result {
                 self.versions_cache
@@ -781,11 +803,16 @@ impl Checker {
                     disk.put(&cache_key, &name, versions).await;
                 }
             }
-            out.insert((cache_key, name), result);
+            if let Err(e) = &result
+                && !matches!(e, FetchError::NotFound(_))
+            {
+                registry_unreachable = true;
+            }
+            out.insert((cache_key, name), result.map_err(|e| e.to_string()));
         }
 
         self.emit(ProgressEvent::Finished);
-        out
+        (out, registry_unreachable)
     }
 
     fn emit(&self, event: ProgressEvent) {
@@ -855,6 +882,10 @@ fn evaluate_item(
     if !item.is_checkable() {
         let status = match item.source {
             PackageSource::Git => DependencyStatus::Git,
+            // A real package whose declared version could not be read from the
+            // manifest. Nothing to fetch, and nothing that would justify calling it
+            // current.
+            PackageSource::Unresolved => DependencyStatus::Undetermined,
             _ => DependencyStatus::Local,
         };
         return CheckResult::new(item.clone(), status);
@@ -877,8 +908,16 @@ fn evaluate_item(
                 .iter()
                 .map(|(semver, _)| semver.clone())
                 .collect();
-            let constraint = to_semver_constraint(&item.version_constraint, ecosystem);
-            let eval = check_version(&constraint, &candidates, item.locked_version.as_deref());
+            // Translation happens inside `check_version_for`, which is what keeps a
+            // dialect this crate could not read (`[4.0,4.9`, `LATEST`, `!=2.31.0`)
+            // apart from a manifest that declared no constraint at all. The first is
+            // `Undetermined`; only the second is `*`.
+            let eval = check_version_for(
+                &item.version_constraint,
+                ecosystem,
+                &candidates,
+                item.locked_version.as_deref(),
+            );
             CheckResult::from_evaluation(
                 item.clone(),
                 in_native_versions(eval, &translated, ecosystem),
@@ -1392,6 +1431,110 @@ impl CheckerBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every ecosystem's default fetcher has to scope its cache key when it is pointed
+    /// somewhere other than the public registry.
+    ///
+    /// The on-disk cache records only `(key, name)`, so a fetcher that reports no
+    /// registry root writes a mirror's version list under the public registry's key and
+    /// a later default run reads it back as its own — the name guard cannot catch it,
+    /// because the name matches. `MavenCentralFetcher` landed after the scoping did and
+    /// was the one impl that never got `registry_root`, so a `[jvm] registry` mirror's
+    /// answers were cached as Maven Central's. Driving all nine here means the tenth
+    /// implementation cannot repeat it.
+    #[test]
+    fn every_default_fetcher_scopes_a_non_default_registry() {
+        use crate::registries::{
+            CratesIoFetcher, GoProxyFetcher, HexFetcher, MavenCentralFetcher, NpmFetcher,
+            NuGetFetcher, PackagistFetcher, PubDevFetcher, PyPiFetcher,
+        };
+
+        const MIRROR: &str = "https://nexus.corp.example/repository/proxy";
+        let client = reqwest::Client::new();
+        let mirrors: Vec<(Ecosystem, Arc<dyn RegistryFetcher>)> = vec![
+            (
+                Ecosystem::Rust,
+                Arc::new(CratesIoFetcher::with_registry(client.clone(), MIRROR, None)),
+            ),
+            (
+                Ecosystem::Go,
+                Arc::new(GoProxyFetcher::with_proxy(client.clone(), MIRROR)),
+            ),
+            (
+                Ecosystem::Npm,
+                Arc::new(NpmFetcher::with_registry(client.clone(), MIRROR)),
+            ),
+            (
+                Ecosystem::Python,
+                Arc::new(PyPiFetcher::with_registry(client.clone(), MIRROR)),
+            ),
+            (
+                Ecosystem::Php,
+                Arc::new(PackagistFetcher::with_registry(client.clone(), MIRROR)),
+            ),
+            (
+                Ecosystem::Dart,
+                Arc::new(PubDevFetcher::with_registry(client.clone(), MIRROR)),
+            ),
+            (
+                Ecosystem::CSharp,
+                Arc::new(NuGetFetcher::with_registry(client.clone(), MIRROR)),
+            ),
+            (
+                Ecosystem::Elixir,
+                Arc::new(HexFetcher::with_registry(client.clone(), MIRROR)),
+            ),
+            (
+                Ecosystem::Jvm,
+                Arc::new(MavenCentralFetcher::with_registry(client.clone(), MIRROR)),
+            ),
+        ];
+        for (ecosystem, fetcher) in &mirrors {
+            assert_ne!(
+                default_cache_key(fetcher.as_ref(), *ecosystem),
+                ecosystem.osv_name(),
+                "{ecosystem:?} caches a mirror's answers under the public registry's key"
+            );
+        }
+
+        // The default registry keeps the bare key, so existing cache entries stay valid.
+        let defaults: Vec<(Ecosystem, Arc<dyn RegistryFetcher>)> = vec![
+            (
+                Ecosystem::Rust,
+                Arc::new(CratesIoFetcher::new(client.clone())),
+            ),
+            (Ecosystem::Go, Arc::new(GoProxyFetcher::new(client.clone()))),
+            (Ecosystem::Npm, Arc::new(NpmFetcher::new(client.clone()))),
+            (
+                Ecosystem::Python,
+                Arc::new(PyPiFetcher::new(client.clone())),
+            ),
+            (
+                Ecosystem::Php,
+                Arc::new(PackagistFetcher::new(client.clone())),
+            ),
+            (
+                Ecosystem::Dart,
+                Arc::new(PubDevFetcher::new(client.clone())),
+            ),
+            (
+                Ecosystem::CSharp,
+                Arc::new(NuGetFetcher::new(client.clone())),
+            ),
+            (Ecosystem::Elixir, Arc::new(HexFetcher::new(client.clone()))),
+            (
+                Ecosystem::Jvm,
+                Arc::new(MavenCentralFetcher::new(client.clone())),
+            ),
+        ];
+        for (ecosystem, fetcher) in &defaults {
+            assert_eq!(
+                default_cache_key(fetcher.as_ref(), *ecosystem),
+                ecosystem.osv_name(),
+                "{ecosystem:?} rescoped its own default registry"
+            );
+        }
+    }
     use dependable_core::parse;
 
     /// The single item declared by `manifest`. Built through the parser because

@@ -38,11 +38,20 @@ pub struct ManifestReport {
 pub struct ScanIntegrity {
     /// The vulnerability scan was asked for and did not complete.
     pub vulnerability_scan_failed: bool,
-    /// How many dependencies could not be resolved against their registry at all.
+    /// A registry lookup failed for a reason other than the package not existing.
     ///
-    /// Such a dependency has no status to gate on: it is not up to date, not outdated,
-    /// and not known-clean. Counting them is what lets `--fail-on` refuse to certify a
-    /// run whose facts it never obtained.
+    /// This, and not the count below, is what a `--fail-on` gate cannot be honoured
+    /// through: the registry declined to answer, so the run has no facts about the
+    /// dependencies it asked about.
+    pub registry_unreachable: bool,
+    /// How many dependencies came back with no status at all.
+    ///
+    /// Reported, never gated on. With [`registry_unreachable`](Self::registry_unreachable)
+    /// clear, every one of these is a registry answering that the package does not
+    /// exist — a private or internal package, one served by a registry this run does not
+    /// route to, a deleted package. That is a permanent fact about that dependency and
+    /// says nothing about the ones that did resolve, so it must not turn a whole gate
+    /// into a failure; it is said plainly on stderr instead.
     pub unresolved: usize,
 }
 
@@ -72,6 +81,9 @@ pub struct Summary {
     pub outdated: usize,
     pub vulnerable: usize,
     pub error: usize,
+    /// Real packages whose declared version this run could not read — an
+    /// untranslatable constraint, or a reference to something never declared.
+    pub undetermined: usize,
     pub local: usize,
     pub git: usize,
 }
@@ -95,6 +107,7 @@ impl Summary {
                     DependencyStatus::Outdated => s.outdated += 1,
                     DependencyStatus::Vulnerable => s.vulnerable += 1,
                     DependencyStatus::Error(_) => s.error += 1,
+                    DependencyStatus::Undetermined => s.undetermined += 1,
                     DependencyStatus::Local => s.local += 1,
                     DependencyStatus::Git => s.git += 1,
                     _ => {}

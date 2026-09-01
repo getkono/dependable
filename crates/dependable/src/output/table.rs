@@ -107,6 +107,8 @@ fn status_cell(result: &CheckResult) -> String {
             Style::new().yellow()
         }
         DependencyStatus::Outdated | DependencyStatus::Error(_) => Style::new().red(),
+        // Not green: an unreadable constraint is not evidence of currency.
+        DependencyStatus::Undetermined => Style::new().yellow(),
         DependencyStatus::Vulnerable => Style::new().red().bold(),
         DependencyStatus::Local | DependencyStatus::Git => Style::new().dimmed(),
         _ => Style::new(),
@@ -143,6 +145,9 @@ fn print_totals(summary: &Summary) {
     }
     if summary.error > 0 {
         parts.push(format!("{} error", summary.error));
+    }
+    if summary.undetermined > 0 {
+        parts.push(format!("{} undetermined", summary.undetermined));
     }
     let skipped = summary.local + summary.git;
     if skipped > 0 {
