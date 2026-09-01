@@ -74,7 +74,10 @@ pub struct Discovered {
 #[must_use]
 pub fn discover(root: &Path, max_depth: usize, enabled: impl Fn(Ecosystem) -> bool) -> Discovered {
     let mut found = Discovered::default();
-    walk(root, max_depth, &enabled, &mut found);
+    // Canonicalized once here rather than per unreadable file: it is the bound the
+    // supersession walk stops at, and it is the same answer every time.
+    let scan_root = std::fs::canonicalize(root).ok();
+    walk(root, scan_root.as_deref(), max_depth, &enabled, &mut found);
     found.manifests.sort();
     found.notices.sort_by(|a, b| a.path.cmp(&b.path));
     found
@@ -82,6 +85,7 @@ pub fn discover(root: &Path, max_depth: usize, enabled: impl Fn(Ecosystem) -> bo
 
 fn walk(
     dir: &Path,
+    scan_root: Option<&Path>,
     depth_left: usize,
     enabled: &dyn Fn(Ecosystem) -> bool,
     found: &mut Discovered,
@@ -100,12 +104,12 @@ fn walk(
             {
                 continue;
             }
-            walk(&path, depth_left - 1, enabled, found);
+            walk(&path, scan_root, depth_left - 1, enabled, found);
         } else if ManifestKind::detect(&path).is_some() {
             found.manifests.push(path);
         } else if let Some(unreadable) = unreadable_manifest(&path)
             && enabled(unreadable.ecosystem)
-            && !is_superseded(dir, unreadable)
+            && !is_superseded(dir, scan_root, unreadable)
         {
             found.notices.push(LockfileNotice {
                 path,
@@ -128,41 +132,63 @@ fn unreadable_manifest(path: &Path) -> Option<&'static UnreadableManifest> {
 ///
 /// The search walks **up** from `dir`, because supersession is build-root scoped
 /// and not directory-local: one `<root>/gradle/libs.versions.toml` serves every
-/// subproject of a Gradle build, and a subproject has no `gradle/` directory. It
-/// stops at the first directory holding a build-root marker (having checked that
-/// directory), and at a repository boundary — a `.git`, the same bound
-/// [`find_lockfile`] uses — so a project never adopts the catalog of an unrelated
-/// checkout above it.
+/// subproject of a Gradle build, and a subproject has no `gradle/` directory.
+///
+/// Three bounds stop the walk, and every one of them is load-bearing:
+///
+/// - `scan_root`, the canonicalized directory the scan was asked about. Nothing
+///   above it was searched, so nothing above it may answer for what is inside it —
+///   and without this bound a checkout with no `.git` (a source tarball, a
+///   `git archive`, a vendored copy) walks to `/` once per unreadable file.
+/// - The first directory holding a build-root marker, having checked that
+///   directory, so one build never adopts the catalog of another beside it.
+/// - A `.git`, the same repository boundary [`find_lockfile`] uses.
+///
+/// An ancestor's catalog counts only when that ancestor declares subprojects
+/// (`subproject_markers`): a repository-root catalog with no `settings.gradle` is a
+/// single-project build, and a `tools/build.gradle` under it is a separate build
+/// whose dependencies really are unread. A catalog in the unreadable file's *own*
+/// directory needs no such evidence.
 ///
 /// `dir` is canonicalized first, for the reason [`nearest_workspace_root`]
 /// documents: [`Path::parent`] is lexical, so walking up from a relative `.` yields
 /// `""`, which every later `join` resolves against the current directory instead of
-/// against an ancestor. A directory that cannot be canonicalized is answered from
-/// itself alone.
-fn is_superseded(dir: &Path, unreadable: &UnreadableManifest) -> bool {
+/// against an ancestor. A directory that cannot be canonicalized — or a scan whose
+/// root cannot be, which leaves the walk with no bound to respect — is answered
+/// from itself alone.
+fn is_superseded(dir: &Path, scan_root: Option<&Path>, unreadable: &UnreadableManifest) -> bool {
     let holds = |dir: &Path| {
         unreadable
             .superseded_by
             .iter()
             .any(|relative| dir.join(relative).is_file())
     };
-    let Ok(canonical) = std::fs::canonicalize(dir) else {
+    let (Ok(canonical), Some(scan_root)) = (std::fs::canonicalize(dir), scan_root) else {
         return holds(dir);
     };
     let mut cur = canonical.as_path();
+    let mut own_directory = true;
     loop {
-        if holds(cur) {
+        let governs = own_directory
+            || unreadable
+                .subproject_markers
+                .iter()
+                .any(|marker| cur.join(marker).is_file());
+        if governs && holds(cur) {
             return true;
         }
         let at_root = unreadable
             .build_root_markers
             .iter()
             .any(|marker| cur.join(marker).is_file());
-        if at_root || cur.join(".git").exists() {
+        if at_root || cur == scan_root || cur.join(".git").exists() {
             return false;
         }
         match cur.parent() {
-            Some(parent) => cur = parent,
+            Some(parent) => {
+                cur = parent;
+                own_directory = false;
+            }
             None => return false,
         }
     }
@@ -866,6 +892,56 @@ mod tests {
             paths,
             [root.join("other/app/build.gradle").as_path()],
             "`other/` is its own build and declares no catalog"
+        );
+    }
+
+    /// Nothing above the scanned directory was searched, so nothing above it may
+    /// answer for what is inside it.
+    ///
+    /// The walk used to stop only at a build root, a `.git`, or `/` — so in a
+    /// checkout with no `.git` (a source tarball, a `git archive`, a vendored copy)
+    /// it ran to the filesystem root once per unreadable file, and adopted whatever
+    /// it found on the way.
+    #[test]
+    fn a_catalog_above_the_scan_root_answers_for_nothing_inside_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = dir.path();
+        write(&outside.join("settings.gradle"), "include(\":app\")\n");
+        write(&outside.join("gradle/libs.versions.toml"), "[versions]\n");
+        write(
+            &outside.join("scanned/app/build.gradle"),
+            "dependencies {}\n",
+        );
+
+        let scanned = outside.join("scanned");
+        let notices = manifest_notices(&scanned, 3, |_| true);
+        let paths: Vec<&Path> = notices.iter().map(|n| n.path.as_path()).collect();
+        assert_eq!(
+            paths,
+            [scanned.join("app/build.gradle").as_path()],
+            "the catalog is outside the directory the user asked about"
+        );
+    }
+
+    /// A catalog is a build root, but a build root is not automatically a *parent*:
+    /// a single-project build declares no subprojects, so its catalog speaks for its
+    /// own directory and nothing below it.
+    #[test]
+    fn a_single_project_catalog_does_not_answer_for_a_build_beside_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        write(&root.join(".git/HEAD"), "ref: refs/heads/main\n");
+        // No `settings.gradle`: one project, at the root, with a catalog.
+        write(&root.join("gradle/libs.versions.toml"), "[versions]\n");
+        write(&root.join("build.gradle"), "dependencies {}\n");
+        write(&root.join("tools/build.gradle"), "dependencies {}\n");
+
+        let notices = manifest_notices(root, 3, |_| true);
+        let paths: Vec<&Path> = notices.iter().map(|n| n.path.as_path()).collect();
+        assert_eq!(
+            paths,
+            [root.join("tools/build.gradle").as_path()],
+            "`tools/` is not a subproject of anything, and its dependencies are unread"
         );
     }
 
