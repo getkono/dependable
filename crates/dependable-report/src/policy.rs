@@ -20,7 +20,7 @@ use std::path::PathBuf;
 
 use dependable_core::result::{Advisory, Severity};
 use dependable_core::semver::normalize::normalize_version;
-use dependable_core::semver::{nuget, python};
+use dependable_core::semver::{maven, nuget, python};
 use dependable_core::{CheckResult, Ecosystem};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -34,7 +34,8 @@ const SEVERITY_TOKENS: &str = "none, low, medium (moderate), high, critical";
 /// The ecosystem words a `ecosystem = "..."` key accepts, for error messages.
 const ECOSYSTEM_TOKENS: &str = "rust (cargo, crates.io), go (golang), \
 npm (node, js, javascript), python (pypi, pip), php (composer, packagist), \
-dart (pub, flutter), csharp (c#, dotnet, nuget), elixir (hex, mix)";
+dart (pub, flutter), csharp (c#, dotnet, nuget), elixir (hex, mix), \
+jvm (maven, kotlin, java)";
 
 /// The CI gating rules read from the `[policy]` block of `.dependable.toml`.
 ///
@@ -857,6 +858,7 @@ fn parse_version(raw: &str, ecosystem: Ecosystem) -> Option<semver::Version> {
     let normalized = match ecosystem {
         Ecosystem::Python => python::pep440_to_semver(raw)?,
         Ecosystem::CSharp => nuget::nuget_to_semver(raw)?,
+        Ecosystem::Jvm => maven::maven_to_semver(raw)?,
         _ => normalize_version(raw),
     };
     semver::Version::parse(&normalized).ok()
@@ -952,6 +954,7 @@ fn parse_ecosystem(raw: &str) -> Option<Ecosystem> {
         "dart" | "pub" | "flutter" => Some(Ecosystem::Dart),
         "csharp" | "c#" | "dotnet" | "nuget" => Some(Ecosystem::CSharp),
         "elixir" | "hex" | "mix" => Some(Ecosystem::Elixir),
+        "jvm" | "maven" | "kotlin" | "java" => Some(Ecosystem::Jvm),
         _ => None,
     }
 }
@@ -1179,6 +1182,8 @@ reason = "CVE-2023-xxxx fix"
             ("packagist", Ecosystem::Php),
             ("flutter", Ecosystem::Dart),
             ("mix", Ecosystem::Elixir),
+            ("kotlin", Ecosystem::Jvm),
+            ("Maven", Ecosystem::Jvm),
         ];
         for (word, expected) in cases {
             let parsed = policy(&format!(

@@ -38,6 +38,13 @@ Or download a prebuilt binary for your platform from the
 | Dart / Flutter | `pubspec.yaml` | pub.dev | `pubspec.lock` | 🧪 Experimental |
 | C# / .NET | `*.csproj`, `Directory.Packages.props` | NuGet | — | 🧪 Experimental |
 | Elixir | `mix.exs` | Hex | `mix.lock` | 🧪 Experimental |
+| Kotlin / Java | `gradle/libs.versions.toml` | Maven Central | — | 🧪 Experimental |
+
+Kotlin / Java coverage is the **declarative** half of a Gradle build: the version
+catalog. A build script (`build.gradle`, `build.gradle.kts`) is a program, and reading
+one means running your build — so a build script found without a catalog beside it is
+reported as unread rather than silently skipped, and a handful of catalog entries never
+gets presented as a whole dependency list.
 
 ### Lockfiles
 
@@ -74,6 +81,30 @@ reporting your dependencies as unlocked. A project with both is read from
 
 V2 reporting features and other deferred work are tracked as GitHub issues; see
 [`docs/SCOPE.md`](docs/SCOPE.md) for the finalized scope and deferral plan.
+
+### Not yet supported
+
+Three languages come up often enough to answer here. Each is absent for a different
+reason, and one of them is closer than it looks:
+
+- **Gradle build scripts and `pom.xml`** — the JVM's declarative half ships (see the
+  table above); the rest does not. A `build.gradle.kts` is a program, and its ground
+  truth needs `./gradlew dependencies` — a JVM daemon executing your build. `pom.xml` is
+  data and is readable in principle, but its versions are frequently `${properties}`
+  inherited through a parent chain, which is a resolution step of its own.
+- **Swift** — SwiftPM has no canonical registry: packages are git URLs and versions are
+  git tags, and `Package.swift` is executable Swift. `Package.resolved` is readable, so
+  locked versions and vulnerability scanning are feasible, but "outdated" is not.
+- **C / C++** — there is no canonical registry (vcpkg is a git repository of ports whose
+  versions are pinned by one baseline commit), vcpkg's `version-string` scheme is
+  unordered by design, and OSV publishes no advisory data for vcpkg or ConanCenter. This
+  one is declined rather than deferred.
+
+[`docs/ECOSYSTEM-CANDIDATES.md`](docs/ECOSYSTEM-CANDIDATES.md) gives the full reasoning,
+the bar an ecosystem has to clear, what would change these answers, and the languages
+that would clear it today but have no demand signal yet — Ruby among them. If you want
+one of those, [open an issue](https://github.com/getkono/dependable/issues) with the
+`ecosystem` label.
 
 ## How it fits alongside your other tools
 

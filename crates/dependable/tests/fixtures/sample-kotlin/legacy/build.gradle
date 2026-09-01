@@ -1,0 +1,7 @@
+// A project that declares its dependencies in the build script itself, with no
+// version catalog. Nothing here is readable without running Gradle, which is the
+// case the notice exists for.
+dependencies {
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation(someComputedCoordinate())
+}

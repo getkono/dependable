@@ -3,9 +3,9 @@
 
 use dependable_fetch::registries::fetch_features;
 use dependable_fetch::{
-    CratesIoFetcher, GoProxyFetcher, HexFetcher, JsrFetcher, NpmFetcher, NuGetFetcher, OsvClient,
-    OsvQuery, PackagistFetcher, PubDevFetcher, PyPiFetcher, RegistryFetcher, ScopedRegistry,
-    build_client,
+    CratesIoFetcher, GoProxyFetcher, HexFetcher, JsrFetcher, MavenCentralFetcher, NpmFetcher,
+    NuGetFetcher, OsvClient, OsvQuery, PackagistFetcher, PubDevFetcher, PyPiFetcher,
+    RegistryFetcher, ScopedRegistry, build_client,
 };
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -442,6 +442,84 @@ async fn live_hex_phoenix_has_versions() {
         "blank version in {:?}",
         fetched.versions
     );
+}
+
+#[tokio::test]
+async fn maven_central_fetch_reads_metadata_and_sorts() {
+    let server = MockServer::start().await;
+    let body = r#"<?xml version="1.0" encoding="UTF-8"?>
+<metadata>
+  <groupId>com.google.guava</groupId>
+  <artifactId>guava</artifactId>
+  <versioning>
+    <release>33.0.0-jre</release>
+    <versions>
+      <version>32.1.3-jre</version>
+      <version>33.0.0-jre</version>
+      <version>32.0.0-android</version>
+      <version>34.0.0-SNAPSHOT</version>
+    </versions>
+  </versioning>
+</metadata>"#;
+    // The coordinate's group is the directory chain, which is the whole reason a
+    // Maven package fits `fetch_versions`' one-name shape.
+    Mock::given(method("GET"))
+        .and(path("/com/google/guava/guava/maven-metadata.xml"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let fetcher = MavenCentralFetcher::with_registry(build_client().unwrap(), server.uri());
+    let fetched = fetcher
+        .fetch_versions("com.google.guava:guava")
+        .await
+        .unwrap();
+    assert_eq!(
+        fetched.versions,
+        vec![
+            "34.0.0-SNAPSHOT",
+            "33.0.0-jre",
+            "32.1.3-jre",
+            "32.0.0-android"
+        ]
+    );
+    assert_eq!(fetched.latest_tag.as_deref(), Some("33.0.0-jre"));
+    // No metadata endpoint exists for Maven Central, so the default answers.
+    assert!(
+        fetcher
+            .fetch_metadata("com.google.guava:guava")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn maven_central_missing_artifact_is_not_found() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/org/example/absent/maven-metadata.xml"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+
+    let fetcher = MavenCentralFetcher::with_registry(build_client().unwrap(), server.uri());
+    let error = fetcher
+        .fetch_versions("org.example:absent")
+        .await
+        .expect_err("404");
+    assert!(error.to_string().contains("not found"), "{error}");
+}
+
+#[tokio::test]
+#[ignore = "hits the network (Maven Central)"]
+async fn live_maven_central_guava_has_versions() {
+    let fetcher = MavenCentralFetcher::new(build_client().unwrap());
+    let fetched = fetcher
+        .fetch_versions("com.google.guava:guava")
+        .await
+        .unwrap();
+    assert!(!fetched.versions.is_empty());
 }
 
 #[tokio::test]

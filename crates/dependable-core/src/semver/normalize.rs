@@ -86,31 +86,47 @@ const PYTHON_PRERELEASE: &[&str] = &[
 /// Whether `version` looks like a pre-release / unstable version for `ecosystem`.
 ///
 /// A version that parses as semver answers for itself — that is the definition, and it
-/// is exact in both directions. The marker list is the fallback for the many ecosystem
-/// versions that are *not* semver (PEP 440, NuGet's four-part versions, Go's `v` prefix),
-/// where a substring is the best available signal.
+/// is exact in both directions. The substring test alone was wrong both ways:
+/// `1.0.0-M1` and `1.0.0-unstable.3` are pre-releases carrying no listed marker, and
+/// `1.2.3+build-rc` is a *stable* release whose build metadata happens to contain one.
 ///
-/// The substring test alone was wrong both ways: `1.0.0-M1` and `1.0.0-unstable.3` are
-/// pre-releases carrying no listed marker, and `1.2.3+build-rc` is a *stable* release
-/// whose build metadata happens to contain one.
+/// The marker list is the fallback for the many ecosystem versions that are *not*
+/// semver (PEP 440, NuGet's four-part versions, Go's `v` prefix), where a substring is
+/// the best available signal, plus Python's implicit forms (`1.0a1`, `1.0b2`, `1.0rc1`).
+///
+/// The JVM needs both exceptions. Maven separates a qualifier with a dot as readily as
+/// with a hyphen (`6.0.0.M1`, `8.0.0.Beta1`, `5.3.0.RC1`) and abbreviates the word
+/// (`2.0-M1`, `2.0-CR1`, `2.0-a1`), none of which the marker list spells, so
+/// [`maven::is_prerelease`](crate::semver::maven::is_prerelease) is consulted; and it
+/// treats a trailing word as a build variant rather than a preview, so `32.1.3-android`
+/// — which *is* semver with a pre-release segment — is a release, and the semver
+/// reading is skipped there. Before both, the default `Exclude` filter offered a beta
+/// as the latest stable release.
 #[must_use]
 pub fn is_prerelease(version: &str, ecosystem: Ecosystem) -> bool {
-    if let Ok(parsed) = ::semver::Version::parse(version.trim_start_matches('v')) {
+    // The semver reading is skipped for the JVM: `32.1.3-android` parses as semver with
+    // a pre-release segment, but under Maven's order that trailing word is a build
+    // variant of a release. Maven's tokenizer, consulted below, is the authority there.
+    if !matches!(ecosystem, Ecosystem::Jvm)
+        && let Ok(parsed) = ::semver::Version::parse(version.trim_start_matches('v'))
+    {
         return !parsed.pre.is_empty();
     }
     let lower = version.to_ascii_lowercase();
     if UNIVERSAL_PRERELEASE.iter().any(|m| lower.contains(m)) {
         return true;
     }
-    if ecosystem == Ecosystem::Python {
-        if PYTHON_PRERELEASE.iter().any(|m| lower.contains(m)) {
-            return true;
+    match ecosystem {
+        Ecosystem::Python => {
+            PYTHON_PRERELEASE.iter().any(|m| lower.contains(m))
+                || python_implicit_prerelease(&lower)
         }
-        if python_implicit_prerelease(&lower) {
-            return true;
-        }
+        // Maven's qualifiers are tokens, not suffixes, so they are recognized by the
+        // tokenizer that already models Maven's order rather than by substring — which
+        // would read `9.4.51.v20230217` (a dated build of a release) as unstable.
+        Ecosystem::Jvm => crate::semver::maven::is_prerelease(version),
+        _ => false,
     }
-    false
 }
 
 /// Detect PEP 440 implicit pre-release segments: `a`/`b` followed by a digit, or
@@ -159,6 +175,7 @@ pub fn to_semver_constraint(constraint: &str, ecosystem: Ecosystem) -> String {
         Ecosystem::Python => crate::semver::python::pep440_constraint_to_semver(constraint),
         Ecosystem::CSharp => crate::semver::nuget::nuget_constraint_to_semver(constraint),
         Ecosystem::Elixir => crate::semver::elixir::hex_constraint_to_semver(constraint),
+        Ecosystem::Jvm => crate::semver::maven::maven_constraint_to_semver(constraint),
         _ => normalize_constraint(constraint),
     }
 }
@@ -262,6 +279,40 @@ mod tests {
         for v in ["1.2.3+build-rc", "1.2.3+alpha", "1.0.0", "10.20.30"] {
             assert!(!is_prerelease(v, Ecosystem::Rust), "{v}");
         }
+    }
+
+    /// The marker list is hyphen-prefixed; Maven's qualifiers are not. Under the
+    /// default `Exclude` filter this offered `8.0.0.Beta1` as Hibernate's latest
+    /// release and `7.1.0.M1` as Spring's.
+    #[test]
+    fn jvm_specific_prereleases() {
+        for v in ["6.0.0.M1", "8.0.0.Beta1", "5.3.0.RC1", "2.0-M1", "2.0-a1"] {
+            assert!(is_prerelease(v, Ecosystem::Jvm), "{v}");
+            // Nothing in the universal list matches these, which is the defect.
+            assert!(!is_prerelease(v, Ecosystem::Rust), "{v}");
+        }
+        // `-SNAPSHOT` is the one form the universal list already covered.
+        assert!(is_prerelease("1.0-SNAPSHOT", Ecosystem::Jvm));
+        for v in [
+            "6.4.4.Final",
+            "5.3.9.RELEASE",
+            "9.4.51.v20230217",
+            "32.1.3-android",
+        ] {
+            assert!(!is_prerelease(v, Ecosystem::Jvm), "{v}");
+        }
+    }
+
+    /// Under the default filter, the newest *release* is what a JVM project is
+    /// offered — the whole list is not thrown away just because a beta tops it.
+    #[test]
+    fn the_default_filter_keeps_a_jvm_release_over_a_beta() {
+        let out = UnstableFilter::Exclude.filter(
+            &vers(&["8.0.0.Beta1", "6.6.0.Final", "6.4.4.Final"]),
+            Some("6.4.4.Final"),
+            Ecosystem::Jvm,
+        );
+        assert_eq!(out, vers(&["6.6.0.Final", "6.4.4.Final"]));
     }
 
     #[test]

@@ -52,8 +52,9 @@ pub use check::{CheckError, Checker, CheckerBuilder, ManifestCheck, ProgressEven
 
 // Manifest discovery (filesystem; shared by every frontend).
 pub use discover::{
-    LockfileNotice, find_lockfile, find_manifests, locate_lockfile, lockfile_notices,
-    nearest_workspace_root, workspace_declarations, workspace_root_of, workspace_source,
+    Discovered, LockfileNotice, discover, find_lockfile, find_manifests, locate_lockfile,
+    lockfile_notices, manifest_notices, nearest_workspace_root, workspace_declarations,
+    workspace_root_of, workspace_source,
 };
 
 // Workspace dependency graph (offline; reads Cargo.lock / manifests).
@@ -67,9 +68,9 @@ pub use error::FetchError;
 pub use osv::{OsvClient, OsvQuery};
 pub use registries::npm::ScopedRegistry;
 pub use registries::{
-    CratesIoFetcher, FetchedVersions, GoProxyFetcher, HexFetcher, JsrFetcher, NpmFetcher,
-    NuGetFetcher, Owner, OwnerKind, PackageMetadata, PackagistFetcher, PubDevFetcher, PyPiFetcher,
-    RegistryFetcher,
+    CratesIoFetcher, FetchedVersions, GoProxyFetcher, HexFetcher, JsrFetcher, MavenCentralFetcher,
+    NpmFetcher, NuGetFetcher, Owner, OwnerKind, PackageMetadata, PackagistFetcher, PubDevFetcher,
+    PyPiFetcher, RegistryFetcher,
 };
 
 // Re-export the core types a consumer needs, so depending on `dependable-fetch`

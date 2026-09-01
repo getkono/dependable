@@ -131,14 +131,16 @@ V1 is "done" when `dependable check .` runs end-to-end on a real Cargo project a
 
 ## 3. Deferred work
 
-### A1 — Deferred ecosystems (9)
+### A1 — Deferred ecosystems (9) — delivered
 
-Each ecosystem ships as one unit: manifest parser + registry fetcher + lockfile parser (where applicable) + any version-format conversion. All target **V1.1**.
+Kept as the record of what each ecosystem cost to add. Each shipped as one unit: manifest
+parser + registry fetcher + lockfile parser (where applicable) + any version-format
+conversion, all against **V1.1**.
 
-> **Status update:** Go, npm/JS-TS, Deno/JSR, pnpm, PHP, and Python are now implemented
-> end-to-end (marked 🧪 Experimental until battle-tested); Dart, C#/.NET, and Elixir remain
-> in progress. See the **Supported languages** table in [`README.md`](../README.md) for the
-> current, authoritative per-language status.
+> **Status:** all nine are implemented end-to-end. The **Supported languages** table in
+> [`README.md`](../README.md) is authoritative for per-language status; this table is
+> history, not a plan. For ecosystems *not* on that list — Swift, Kotlin/Java/Scala,
+> C/C++ and others — see A6 below.
 
 | Ecosystem | Parser crate | Manifest(s) | Lockfile | Registry endpoint | Version conversion | OSV name | PRD |
 |---|---|---|---|---|---|---|---|
@@ -213,6 +215,22 @@ today.
 | Q7 | Dart SDK constraint | folded into Dart (skip it) | V1.1 |
 | Q8 | `no_std` core target | **Drop the requirement** — `dependable-core` stays `std` (`HashMap`/`String`); no real embedded/WASM demand to justify the `hashbrown`/`alloc` friction | won't-do |
 
+### A6 — Evaluated, not admitted
+
+Languages that are absent by decision rather than by oversight.
+[`ECOSYSTEM-CANDIDATES.md`](ECOSYSTEM-CANDIDATES.md) states the bar an ecosystem has to
+clear — a declarative manifest, an addressable version literal, a canonical registry, a
+total version order, and a populated OSV ecosystem — scores each candidate against it,
+and records a falsifiable trigger for revisiting.
+
+| Candidate | Disposition | Fails on |
+|---|---|---|
+| Kotlin / Java / Scala | **Admitted, declarative slices only** — Gradle version catalogs and literal-version `pom.xml`; build scripts and parent-POM resolution are out | manifest-is-a-program (partial) |
+| Swift | **Partial** — `Package.resolved` gives locked versions and OSV scanning; "outdated" and `fix` are not reachable | no canonical registry; executable manifest |
+| C / C++ | **Not admitted** | no canonical registry; `version-string` is unordered by design; OSV publishes no vcpkg/ConanCenter data |
+| Ruby, Julia, Haskell, OCaml, R | **Feasible, awaiting demand** — would clear the bar; no demand signal yet | — |
+| CocoaPods, Zig, Perl, Lua, Nim | **Blocked** | no published OSV ecosystem; Zig also has no canonical registry |
+
 ---
 
 ## 4. Milestone rollup
@@ -223,3 +241,7 @@ today.
   editor integration (LSP / VSCode extension over `dependable-fetch`; see
   [`INTEGRATIONS.md`](INTEGRATIONS.md)).
 - **V3:** PDF automation, full license-compatibility graph, and the PRD §9 supply-chain non-goals.
+
+New ecosystems are not milestoned in advance. A candidate is admitted when it clears the
+bar in [`ECOSYSTEM-CANDIDATES.md`](ECOSYSTEM-CANDIDATES.md) (A6) and someone has asked for
+it; the admitted work is tracked under the `ecosystem` label.

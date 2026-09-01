@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 dependable-core.workspace = true
 semver.workspace = true
+roxmltree.workspace = true
 reqwest.workspace = true
 tokio = { workspace = true, features = ["fs"] }
 moka.workspace = true

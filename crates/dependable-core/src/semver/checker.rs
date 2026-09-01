@@ -71,8 +71,10 @@ pub fn check_version(constraint: &str, versions: &[String], locked_at: Option<&s
         // A constraint we cannot read is not an upgrade recommendation. It used to fall
         // through as `UpdateAvailable`, which reads as "a newer version is waiting for
         // you" — the one message a dependency whose requirement was never understood
-        // must not send. npm-native ranges (`^1 || ^2`, `>=1.0.0 <2.0.0`, `1.x`) all
-        // land here.
+        // must not send. npm-native ranges the `semver` crate has no dialect for
+        // (`^1 || ^2`, `>=1.0.0 <2.0.0`) land here. Wildcards do not: `1.x` and `1.*`
+        // are requirements the crate parses, so they stay real evaluations and reach
+        // the fix layer, where the wildcard guard declines to pin them.
         Err(e) => {
             return Evaluation {
                 status: DependencyStatus::Error(format!("unparseable constraint: {e}")),
@@ -261,5 +263,17 @@ mod tests {
         let versions = vec!["0.2.3".to_string(), "0.2.9".to_string()];
         let ev = check_version("^0.2.3", &versions, Some("0.2.3"));
         assert_eq!(ev.status, DependencyStatus::PatchAvailable);
+    }
+
+    /// The reachability witness for issue #87: a wildcard constraint really does
+    /// reach the fix layer as an upgradable dependency, so the guard there is not
+    /// dead code. `1.x` allows `1.9.0` but not `2.0.0`, so the newest release sits
+    /// outside the range and the item is reported as an available update.
+    #[test]
+    fn wildcard_constraint_is_reported_as_upgradable() {
+        let e = check_version("1.x", &vers(&["1.0.0", "1.9.0", "2.0.0"]), None);
+        assert_eq!(e.status, DependencyStatus::UpdateAvailable);
+        assert_eq!(e.latest_compatible.as_deref(), Some("1.9.0"));
+        assert_eq!(e.latest_available.as_deref(), Some("2.0.0"));
     }
 }
