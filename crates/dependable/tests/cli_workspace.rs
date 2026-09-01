@@ -202,7 +202,11 @@ fn a_constraint_the_root_never_declared_is_attributed_to_nobody() {
     let doc = check_json(&dir, &["check", "--manifest", member.to_str().unwrap()]);
 
     let tokio = result(&doc, "crates/app/Cargo.toml", "tokio");
-    assert_eq!(tokio["status"], "LOCAL", "nothing to check: {tokio}");
+    assert_eq!(
+        tokio["status"], "UNDETERMINED",
+        "the root declares no version, so nothing is known — `tokio` is on crates.io, \
+         and calling it LOCAL would say it is not: {tokio}"
+    );
     assert!(
         tokio["inherited_from"].is_null(),
         "the root declares no tokio: {tokio}"

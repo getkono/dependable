@@ -1045,7 +1045,12 @@ async fn a_member_is_checked_against_the_workspace_roots_constraint() {
         .iter()
         .find(|r| r.item.name == "serde")
         .expect("serde is declared");
-    assert_eq!(serde.status, DependencyStatus::Local);
+    assert_eq!(
+        serde.status,
+        DependencyStatus::Undetermined,
+        "no root was found, so no version was read — not `Local`, which would say \
+         serde has no registry"
+    );
     assert!(serde.item.version_constraint.is_empty());
     assert!(detached.workspace_root.is_none());
 }
@@ -1147,6 +1152,6 @@ async fn an_inherited_name_the_root_never_declared_is_reported() {
         "both declarations are still reported"
     );
     for result in &check.results {
-        assert_eq!(result.status, DependencyStatus::Local);
+        assert_eq!(result.status, DependencyStatus::Undetermined);
     }
 }
