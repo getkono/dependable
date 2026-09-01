@@ -114,14 +114,48 @@ impl CheckResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DependencyStatus {
+    /// The best available version is already the one in use.
     UpToDate,
+    /// A newer patch release exists within the declared constraint.
     PatchAvailable,
+    /// A newer release exists within the declared constraint.
     UpdateAvailable,
+    /// A newer release exists outside the declared constraint.
     Outdated,
+    /// A known advisory affects the version in use.
     Vulnerable,
+    /// The registry was asked and the request failed; the text is what it said.
     Error(String),
+    /// There is no registry behind this dependency: a `path` entry, a Maven
+    /// `<scope>system</scope>` jar. Nothing was looked up because there is
+    /// nowhere to look.
     Local,
+    /// A git dependency, tracked by revision rather than by version.
     Git,
+    /// Whether this dependency is current **could not be determined**, and no
+    /// claim is made either way.
+    ///
+    /// Distinct from all three of its neighbours, and the distinction is the
+    /// point:
+    ///
+    /// - [`Local`](Self::Local) says *there is no registry for this*. Applied to
+    ///   a package that is on one, it is a false statement.
+    /// - [`Error`](Self::Error) says *the registry was asked and it failed*.
+    ///   Nothing was asked here.
+    /// - [`UpToDate`](Self::UpToDate) says *this is current*, which is precisely
+    ///   what was not established.
+    ///
+    /// Two situations produce it. The manifest names a real package but states no
+    /// version this tool can resolve — a Maven POM deferring to `<parent>`,
+    /// `<dependencyManagement>`, or a property it does not declare, or a Cargo
+    /// member inheriting a name its workspace root never declares. Or the
+    /// ecosystem publishes no registry to compare a version against at all, so
+    /// currency is not merely unread but unknowable.
+    ///
+    /// A run is expected to say *why* alongside it: the check that produces one
+    /// emits a manifest-level warning naming the dependencies involved, because a
+    /// status word on its own does not tell a reader what to fix.
+    Undetermined,
 }
 
 impl DependencyStatus {
@@ -137,6 +171,7 @@ impl DependencyStatus {
             DependencyStatus::Error(_) => "error",
             DependencyStatus::Local => "local",
             DependencyStatus::Git => "git",
+            DependencyStatus::Undetermined => "undetermined",
         }
     }
 
@@ -152,6 +187,7 @@ impl DependencyStatus {
             DependencyStatus::Error(_) => "ERROR",
             DependencyStatus::Local => "LOCAL",
             DependencyStatus::Git => "GIT",
+            DependencyStatus::Undetermined => "UNDETERMINED",
         }
     }
 }
@@ -796,6 +832,29 @@ mod tests {
         assert_eq!(Advisory::max_cvss(&[]), None);
         assert_eq!(Advisory::max_severity(&[]), None);
         assert_eq!(Advisory::unrated_count(&[]), 0);
+    }
+
+    /// The tokens are what a CI consumer matches on, so they are pinned here.
+    /// `UNDETERMINED` in particular must never collapse into `LOCAL`: one says
+    /// there is no registry for this package, the other says nothing was read
+    /// about a package that has one.
+    #[test]
+    fn status_labels_and_tokens_are_stable_and_distinct() {
+        let cases = [
+            (DependencyStatus::UpToDate, "up to date", "OK"),
+            (DependencyStatus::Local, "local", "LOCAL"),
+            (DependencyStatus::Git, "git", "GIT"),
+            (
+                DependencyStatus::Undetermined,
+                "undetermined",
+                "UNDETERMINED",
+            ),
+        ];
+        for (status, label, token) in &cases {
+            assert_eq!(status.label(), *label);
+            assert_eq!(status.token(), *token);
+        }
+        assert_ne!(DependencyStatus::Undetermined, DependencyStatus::Local);
     }
 
     #[test]
