@@ -68,6 +68,14 @@ pub struct CheckArgs {
     /// any pattern is kept. `*` and `?` do not cross `/`, `**` does.
     #[arg(long, conflicts_with = "manifest")]
     pub manifest_glob: Vec<String>,
+    /// Only use manifests belonging to this ecosystem. Repeatable; a manifest in
+    /// any of the named ecosystems is kept.
+    ///
+    /// It narrows discovery and never widens it: naming an ecosystem that
+    /// `.dependable.toml` has switched off does not switch it back on, and it
+    /// registers no fetcher that was not already there.
+    #[arg(long, value_enum, conflicts_with = "manifest")]
+    pub ecosystem: Vec<EcosystemArg>,
     /// Config file path.
     #[arg(long, default_value = ".dependable.toml")]
     pub config: PathBuf,
@@ -128,6 +136,14 @@ pub struct ListArgs {
     /// any pattern is kept. `*` and `?` do not cross `/`, `**` does.
     #[arg(long, conflicts_with = "manifest")]
     pub manifest_glob: Vec<String>,
+    /// Only use manifests belonging to this ecosystem. Repeatable; a manifest in
+    /// any of the named ecosystems is kept.
+    ///
+    /// It narrows discovery and never widens it: naming an ecosystem that
+    /// `.dependable.toml` has switched off does not switch it back on, and it
+    /// registers no fetcher that was not already there.
+    #[arg(long, value_enum, conflicts_with = "manifest")]
+    pub ecosystem: Vec<EcosystemArg>,
     /// Config file path. `list` reads only the per-ecosystem `enabled` flags from
     /// it, so that an ecosystem you have switched off is not warned about; it does
     /// not read registry or network settings.
@@ -192,6 +208,14 @@ pub struct FixArgs {
     /// any pattern is kept. `*` and `?` do not cross `/`, `**` does.
     #[arg(long, conflicts_with = "manifest")]
     pub manifest_glob: Vec<String>,
+    /// Only use manifests belonging to this ecosystem. Repeatable; a manifest in
+    /// any of the named ecosystems is kept.
+    ///
+    /// It narrows discovery and never widens it: naming an ecosystem that
+    /// `.dependable.toml` has switched off does not switch it back on, and it
+    /// registers no fetcher that was not already there.
+    #[arg(long, value_enum, conflicts_with = "manifest")]
+    pub ecosystem: Vec<EcosystemArg>,
     #[arg(long, default_value = ".dependable.toml")]
     pub config: PathBuf,
     /// Update all, including beyond the declared constraint.
@@ -370,5 +394,108 @@ impl From<UnstableFilter> for dependable_fetch::UnstableFilter {
             UnstableFilter::IncludeAlways => dependable_fetch::UnstableFilter::IncludeAlways,
             UnstableFilter::IncludeIfCurrent => dependable_fetch::UnstableFilter::IncludeIfCurrent,
         }
+    }
+}
+
+/// An ecosystem nameable on the command line via `--ecosystem`.
+///
+/// A CLI-local mirror of [`dependable_fetch::Ecosystem`]. `ValueEnum` is clap's
+/// trait and `Ecosystem` is a foreign type here, so the orphan rule rules out
+/// implementing one for the other; deriving `ValueEnum` upstream instead would
+/// put clap into `dependable-core`, which is deliberately IO-free and
+/// frontend-agnostic. The [`From`] impl below is the only bridge, and the unit
+/// test beside it pins that every ecosystem crosses it.
+///
+/// The accepted spellings are the canonical lowercase names and nothing else.
+/// Aliases (`kotlin`, `java`, `deno`, `nuget`) are deliberately absent: every
+/// accepted string is a permanent compatibility surface, and an alias would
+/// outlive the variant it names if an ecosystem later splits — `deno` would go
+/// on meaning [`Npm`](Ecosystem::Npm) after a Deno variant existed. Aliases are
+/// additive and cheap to add later; they are not removable.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum EcosystemArg {
+    Rust,
+    Go,
+    Npm,
+    Python,
+    Php,
+    Dart,
+    // Spelled out because clap's default kebab-casing renders `CSharp` as
+    // `c-sharp`, which is not a name anybody types. A `///` here would render
+    // that reasoning beside the value in `--help`, where it is noise.
+    #[value(name = "csharp")]
+    CSharp,
+    Elixir,
+    Jvm,
+}
+
+impl From<EcosystemArg> for dependable_fetch::Ecosystem {
+    fn from(value: EcosystemArg) -> Self {
+        match value {
+            EcosystemArg::Rust => dependable_fetch::Ecosystem::Rust,
+            EcosystemArg::Go => dependable_fetch::Ecosystem::Go,
+            EcosystemArg::Npm => dependable_fetch::Ecosystem::Npm,
+            EcosystemArg::Python => dependable_fetch::Ecosystem::Python,
+            EcosystemArg::Php => dependable_fetch::Ecosystem::Php,
+            EcosystemArg::Dart => dependable_fetch::Ecosystem::Dart,
+            EcosystemArg::CSharp => dependable_fetch::Ecosystem::CSharp,
+            EcosystemArg::Elixir => dependable_fetch::Ecosystem::Elixir,
+            EcosystemArg::Jvm => dependable_fetch::Ecosystem::Jvm,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use dependable_fetch::Ecosystem;
+
+    /// Every ecosystem, spelled out. [`Ecosystem`] is `#[non_exhaustive]`, so a
+    /// manual list is the strongest guard available — the same one
+    /// `dependable-core`'s own `ALL` uses.
+    const ALL: [Ecosystem; 9] = [
+        Ecosystem::Rust,
+        Ecosystem::Go,
+        Ecosystem::Npm,
+        Ecosystem::Python,
+        Ecosystem::Php,
+        Ecosystem::Dart,
+        Ecosystem::CSharp,
+        Ecosystem::Elixir,
+        Ecosystem::Jvm,
+    ];
+
+    /// Adding an ecosystem without adding its `--ecosystem` value would leave a
+    /// supported ecosystem unfilterable, and — worse — leave `--ecosystem` unable
+    /// to say so. A missing variant fails here rather than at a user's prompt.
+    #[test]
+    fn every_ecosystem_can_be_named_on_the_command_line() {
+        let nameable: Vec<Ecosystem> = EcosystemArg::value_variants()
+            .iter()
+            .map(|arg| Ecosystem::from(*arg))
+            .collect();
+        assert_eq!(nameable, ALL.to_vec());
+    }
+
+    /// The one value whose derived spelling is wrong: clap kebab-cases `CSharp`
+    /// to `c-sharp`. Asserted on the value clap advertises, not on the variant.
+    #[test]
+    fn csharp_is_spelled_the_way_it_is_typed() {
+        let names: Vec<String> = EcosystemArg::value_variants()
+            .iter()
+            .map(|arg| {
+                arg.to_possible_value()
+                    .expect("no variant is skipped")
+                    .get_name()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "rust", "go", "npm", "python", "php", "dart", "csharp", "elixir", "jvm"
+            ]
+        );
     }
 }
