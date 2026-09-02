@@ -42,4 +42,6 @@ pub use parsers::{
     parse_package_name, parse_project, parse_workspace, resolve_workspace_inheritance,
 };
 pub use result::{CheckResult, DependencyStatus};
-pub use semver::{Evaluation, UnstableFilter, check_version, is_prerelease, to_semver_constraint};
+pub use semver::{
+    Evaluation, UnstableFilter, check_version, exact_pin, is_prerelease, to_semver_constraint,
+};

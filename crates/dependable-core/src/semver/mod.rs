@@ -5,9 +5,11 @@ pub mod elixir;
 pub mod maven;
 pub mod normalize;
 pub mod nuget;
+pub mod pin;
 pub mod python;
 
 pub use checker::{Evaluation, check_version, to_version_req};
 pub use normalize::{
     UnstableFilter, is_prerelease, normalize_constraint, normalize_version, to_semver_constraint,
 };
+pub use pin::exact_pin;
