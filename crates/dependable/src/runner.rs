@@ -624,7 +624,7 @@ pub async fn run_list(args: ListArgs) -> anyhow::Result<ExitCode> {
         let Some(kind) = ManifestKind::detect(manifest) else {
             continue;
         };
-        let _ = report_lockfile_notices(manifest);
+        let dependencies_unread = report_lockfile_notices(manifest);
         let content = std::fs::read_to_string(manifest)
             .with_context(|| format!("reading {}", manifest.display()))?;
         let mut parsed = match parse(kind, &content) {
@@ -679,6 +679,7 @@ pub async fn run_list(args: ListArgs) -> anyhow::Result<ExitCode> {
             version_inherited,
             role: meta.role,
             lockfile,
+            dependencies_unread,
             inherited,
             items: parsed.items,
             features: BTreeMap::new(),

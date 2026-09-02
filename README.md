@@ -411,6 +411,14 @@ that declares only central versions — a virtual Cargo workspace root,
 `pnpm-workspace.yaml`, `Directory.Packages.props` — has `"role": "workspace"` and no
 name of its own.
 
+`dependencies_unread` says whether the file that *is* that project's dependency list
+went unread, so an empty `dependencies` array says nothing about it — today only a
+`Package.swift` with no readable `Package.resolved` beside it. `lockfile: null` is not
+the same question, since `--no-lock-file` produces that too, and a `Package.resolved`
+that records no pins leaves `dependencies_unread` false because the project really
+does declare nothing. The table output heads such a project `(dependency list unread)`
+in place of a count, in the same words `check` uses.
+
 Values a single manifest cannot supply are resolved from the repository and marked as
 such: `version_inherited` for a Cargo `version.workspace = true`, `inherited` for a
 constraint taken from `[workspace.dependencies]`, and `lockfile` for the lockfile that
@@ -419,8 +427,11 @@ supplied the locked versions — a workspace keeps one at its root, above its me
 A dependency's `source` is today `registry`, `jsr`, `git`, `local` (a `path` entry),
 `inherited`, or `locked`, plus `unknown` for anything this list does not name. That
 list is open, not closed: a new ecosystem may add a token to it within
-`dependable.list/v1`, which pins the document's *shape* — which fields exist and what
-type each holds — and not the token sets inside those fields. Match the ones you care
+`dependable.list/v1`. What that version pins is what a consumer may rely on remaining
+true — no field is removed, renamed, or retyped without a new version — and not the
+token sets inside those fields, nor a promise that no field is ever *added*. A key you
+never read cannot break you, and bumping the version for one would break every
+consumer pinning `v1` in order to protect none of them. Match the tokens you care
 about and let the rest fall through to a default; `unknown` is why exhaustive matching
 on `source` was never safe. `inherited` means the version is declared elsewhere in a
 manifest — a Cargo `dep.workspace = true` resolved against the workspace root, a
