@@ -143,6 +143,7 @@ dependable check . --format json  # machine-readable output (also: text)
 dependable check . --fail-on vulnerable   # exit non-zero for CI
 dependable check . --annotations always   # GitHub Actions annotations + job summary
 dependable check . --manifest-glob 'services/*/Cargo.toml'  # one slice of a monorepo
+dependable check . --ecosystem rust               # one ecosystem of a polyglot repo
 dependable list .                 # every project and what it declares (offline)
 dependable tree .                 # render the dependency tree (Rust)
 dependable fix . --dry-run        # preview in-place upgrades
@@ -267,6 +268,29 @@ conflicts with `--manifest`, which names one file and skips discovery altogether
 
 It is available on `fix` for a reason: without it, `dependable fix` would rewrite
 manifests that the matching `dependable check` deliberately left out.
+
+To work on part of a *polyglot* repository, filter by ecosystem instead:
+
+```bash
+dependable check . --ecosystem rust
+dependable list . --ecosystem npm --ecosystem rust --format json
+dependable fix . --ecosystem rust --dry-run
+```
+
+`--ecosystem` narrows discovery to the manifests belonging to the ecosystems you
+name — `rust`, `go`, `npm`, `python`, `php`, `dart`, `csharp`, `elixir`, `jvm`. It
+names the *ecosystem*, not a filename, so `--ecosystem npm` covers `package.json`,
+`deno.json`, and `pnpm-workspace.yaml` alike. The flag is repeatable and a manifest
+in any named ecosystem is kept, it is available on `check`, `list`, and `fix` for
+the same reason `--manifest-glob` is, and it conflicts with `--manifest`. When it
+selects nothing, `dependable` says which ecosystems it searched and which it found
+instead, and still exits 0 — an unused ecosystem must not fail a per-ecosystem CI
+matrix job.
+
+It only ever **narrows** a run. Naming an ecosystem that `.dependable.toml` has
+switched off does not switch it back on: `check --ecosystem jvm` under
+`[jvm] enabled = false` discovers the manifests and then reports them as skipped,
+exactly as it does without the flag.
 
 #### Inherited versions
 
