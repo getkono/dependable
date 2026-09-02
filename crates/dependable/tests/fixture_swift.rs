@@ -1006,3 +1006,117 @@ fn the_check_heading_says_the_list_went_unread_rather_than_counting_zero() {
         "a resolved project with no pins declares none, and says so: {empty}"
     );
 }
+
+/// The same claim, in the same words, in the command whose entire job is to say
+/// what a project declares. `list` counted the items it held, so a Swift project
+/// with no readable `Package.resolved` was headed "(0 dependencies)" — an inventory
+/// reporting an empty inventory for a list it never opened.
+#[test]
+fn the_list_heading_says_the_list_went_unread_rather_than_counting_zero() {
+    let unread_dir = scratch("swift_list_heading_unread");
+    std::fs::copy(
+        fixture("sample-swift/Package.swift"),
+        unread_dir.join("Package.swift"),
+    )
+    .unwrap();
+
+    let empty_dir = scratch("swift_list_heading_empty");
+    std::fs::copy(
+        fixture("sample-swift/Package.swift"),
+        empty_dir.join("Package.swift"),
+    )
+    .unwrap();
+    std::fs::write(
+        empty_dir.join("Package.resolved"),
+        r#"{"pins":[],"version":2}"#,
+    )
+    .unwrap();
+
+    let unread = run(&["list", unread_dir.to_str().unwrap()]);
+    let empty = run(&["list", empty_dir.to_str().unwrap()]);
+    assert!(unread.status.success(), "an unread list is not a failure");
+    assert!(empty.status.success());
+
+    let unread_out = String::from_utf8_lossy(&unread.stdout);
+    assert!(
+        !unread_out.contains("(0 dependencies)"),
+        "nothing was counted because nothing was read: {unread_out}"
+    );
+    assert!(
+        unread_out.contains("Swift (dependency list unread)"),
+        "the heading has to say so, in check's words: {unread_out}"
+    );
+    // The heading *joins* the warning, it does not replace it: the reason the list
+    // went unread is still named, and still on stderr where every `--format` sees it.
+    let unread_err = String::from_utf8_lossy(&unread.stderr);
+    assert!(
+        unread_err.contains("warning:"),
+        "the warning naming the cause must survive: {unread_err}"
+    );
+
+    // And a project that really is resolved and really has no pins still counts.
+    let empty_out = String::from_utf8_lossy(&empty.stdout);
+    assert!(
+        empty_out.contains("Swift (0 dependencies)"),
+        "a resolved project with no pins declares none, and says so: {empty_out}"
+    );
+}
+
+/// The machine-readable half. Before this the two documents below were identical
+/// apart from the root path, so no consumer of `list --format json` could tell a
+/// project that declares nothing from one whose dependency list was never opened.
+/// `lockfile: null` does not answer it — `--no-lock-file` produces that too.
+#[test]
+fn list_json_distinguishes_an_unread_dependency_list_from_an_empty_one() {
+    let unread_dir = scratch("swift_list_json_unread");
+    std::fs::copy(
+        fixture("sample-swift/Package.swift"),
+        unread_dir.join("Package.swift"),
+    )
+    .unwrap();
+
+    let empty_dir = scratch("swift_list_json_empty");
+    std::fs::copy(
+        fixture("sample-swift/Package.swift"),
+        empty_dir.join("Package.swift"),
+    )
+    .unwrap();
+    std::fs::write(
+        empty_dir.join("Package.resolved"),
+        r#"{"pins":[],"version":2}"#,
+    )
+    .unwrap();
+
+    let document = |dir: &Path| {
+        let output = run(&["list", dir.to_str().unwrap(), "--format", "json"]);
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mut doc: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("list emits JSON");
+        // The one field that legitimately differs between the two runs, removed so
+        // the comparison below is about the projects and not about scratch paths.
+        doc.as_object_mut().expect("an object").remove("root");
+        doc
+    };
+
+    let unread = document(&unread_dir);
+    let empty = document(&empty_dir);
+    assert_ne!(
+        unread, empty,
+        "an unread list and an empty one were indistinguishable, which is the defect"
+    );
+
+    assert_eq!(unread["projects"][0]["dependencies_unread"], true);
+    assert_eq!(empty["projects"][0]["dependencies_unread"], false);
+
+    // Both counts are still zero — which is exactly why the field has to exist.
+    assert_eq!(unread["summary"]["dependencies"], 0);
+    assert_eq!(empty["summary"]["dependencies"], 0);
+
+    // An added field stays within v1; a consumer pinning the version keeps working.
+    assert_eq!(unread["schema"], "dependable.list/v1");
+    assert_eq!(empty["schema"], "dependable.list/v1");
+}
