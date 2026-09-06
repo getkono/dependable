@@ -50,10 +50,33 @@ struct Settings {
     osv_url: String,
 }
 
+/// Read a `DEPENDABLE_*` switch by its **value**, not merely by its presence.
+///
+/// `std::env::var_os(..).is_some()` reads `DEPENDABLE_NO_VULN=0`, `=false`, and the
+/// empty string an unset GitHub Actions expression expands to as "yes, turn the scan
+/// off" — so a workflow writing `DEPENDABLE_NO_VULN: ${{ inputs.no-vuln }}` disabled
+/// vulnerability scanning on every run, silently, whether or not the input was set. A
+/// switch that cannot be spelled `off` is a switch that cannot be left alone.
+///
+/// Unset, empty, `0`, `false`, `no` and `off` are all off; anything else is on.
+fn env_flag(name: &str) -> bool {
+    flag_is_on(std::env::var(name).ok().as_deref())
+}
+
+/// [`env_flag`]'s decision, without the environment — the half that is testable.
+fn flag_is_on(raw: Option<&str>) -> bool {
+    raw.is_some_and(|raw| {
+        !matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "no" | "off"
+        )
+    })
+}
+
 fn resolve_check_settings(args: &CheckArgs, cfg: &Config) -> Settings {
-    let env_no_vuln = std::env::var_os("DEPENDABLE_NO_VULN").is_some();
-    let env_no_cache = std::env::var_os("DEPENDABLE_NO_CACHE").is_some();
-    let env_ghsa = std::env::var_os("DEPENDABLE_INCLUDE_GHSA").is_some();
+    let env_no_vuln = env_flag("DEPENDABLE_NO_VULN");
+    let env_no_cache = env_flag("DEPENDABLE_NO_CACHE");
+    let env_ghsa = env_flag("DEPENDABLE_INCLUDE_GHSA");
     let env_concurrency = std::env::var("DEPENDABLE_CONCURRENCY")
         .ok()
         .and_then(|s| s.parse::<usize>().ok());
@@ -357,6 +380,7 @@ pub async fn run_check(args: CheckArgs) -> anyhow::Result<ExitCode> {
     let cfg =
         load_config(&args.config).with_context(|| format!("reading {}", args.config.display()))?;
     let settings = resolve_check_settings(&args, &cfg);
+    check_fail_on_is_enforceable(settings.fail_on, settings.check_vuln)?;
     // Both policy steps run before discovery, so a misconfigured gate costs a
     // parse rather than a full network check.
     #[cfg(feature = "report")]
@@ -503,6 +527,35 @@ fn check_policy_is_enforceable(
     Ok(())
 }
 
+/// `--fail-on vulnerable` needs vulnerability scanning to mean anything.
+///
+/// The whole content of that gate is the advisory lists, and with scanning off every one
+/// of them is empty — indistinguishable from "nothing was found". No result is ever
+/// `Vulnerable`, so the gate cannot fail, and the run exits 0 with nothing on stderr:
+/// `[vulnerability] enabled = false` (or a stray `DEPENDABLE_NO_VULN`) silently disarms
+/// the setting the shipped Action defaults to. This is
+/// [`check_policy_is_enforceable`]'s rule applied to the other gate — a gate is either
+/// enforceable or it is a configuration error — and the message keeps its shape.
+///
+/// `--fail-on any` is deliberately *not* covered. Its promise is not the advisory list:
+/// it fails on every status that is not up to date, so it is refutable by the run that
+/// was actually performed, and refusing it would reject the ordinary offline
+/// `--no-vuln --fail-on any` freshness check. It is the narrower gate — the one whose
+/// entire subject matter is the scan — that goes vacuous.
+///
+/// # Errors
+///
+/// When `--fail-on vulnerable` is armed and vulnerability scanning is disabled.
+fn check_fail_on_is_enforceable(fail_on: FailOn, check_vuln: bool) -> anyhow::Result<()> {
+    if fail_on == FailOn::Vulnerable && !check_vuln {
+        anyhow::bail!(
+            "`--fail-on vulnerable` requires vulnerability scanning, which is disabled; drop \
+             `--no-vuln` (or re-enable `[vulnerability] enabled`), or gate on something else"
+        );
+    }
+    Ok(())
+}
+
 /// The effective `[policy]` block: the config file's, with `DEPENDABLE_*`
 /// overrides applied. `None` means nothing is gated.
 ///
@@ -518,8 +571,9 @@ fn resolve_policy(config: &Path) -> anyhow::Result<Option<dependable_report::pol
     use dependable_fetch::core::result::Severity;
     use dependable_report::policy::Policy;
 
-    // The kill switch, mirroring `DEPENDABLE_NO_VULN`: presence is enough.
-    if std::env::var_os("DEPENDABLE_NO_POLICY").is_some() {
+    // The kill switch, mirroring `DEPENDABLE_NO_VULN`: read by value, so `=0`, `=false`
+    // and the empty string an unset workflow expression expands to leave the policy on.
+    if env_flag("DEPENDABLE_NO_POLICY") {
         return Ok(None);
     }
 
@@ -1424,10 +1478,17 @@ fn expand_env(content: &str) -> String {
 /// `--fail-on vulnerable`.
 ///
 /// The carve-out is for that answer alone. A dependency this run failed to evaluate by
-/// itself — a constraint written in a dialect that did not parse — reached no registry,
-/// so there is no fact standing in for its status and the gate is as unanswerable as it
-/// ever was. Exempting those too let `{"lodash": "^^^bogus"}` pass
-/// `--fail-on vulnerable` under a note blaming a registry that was never asked.
+/// itself — a value nobody could read as a version requirement — reached no registry, so
+/// there is no fact standing in for its status and the gate is as unanswerable as it
+/// ever was. Exempting those too let `{"lodash": "^^^bogus"}` pass `--fail-on vulnerable`
+/// under a note blaming a registry that was never asked.
+///
+/// A constraint this crate simply has no front-end for is not one of those. It is
+/// [`DependencyStatus::Undetermined`], it carries no [`ErrorOrigin`], and it is counted
+/// nowhere here: an ordinary `"react": "^15 || ^16"` or a Dart `any` is the manifest
+/// being right and this tool being incomplete, and failing a build over that punishes
+/// the user for our gap. [`note_undetermined`] says so on stderr, and `--fail-on any`
+/// still fails on it.
 fn gate_is_answerable(reports: &[ManifestReport], fail_on: FailOn) -> Result<(), String> {
     if fail_on == FailOn::None {
         return Ok(());
@@ -1578,6 +1639,44 @@ fn exit_code(reports: &[ManifestReport], fail_on: FailOn, quiet: bool) -> ExitCo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `DEPENDABLE_*` switch is read by its value. Presence alone let
+    /// `DEPENDABLE_NO_VULN: ${{ inputs.no-vuln }}` — an expression that expands to the
+    /// empty string when the input is unset — turn vulnerability scanning off for every
+    /// run of the shipped Action, with nothing said about it anywhere.
+    #[test]
+    fn a_kill_switch_can_be_spelled_off() {
+        for raw in ["1", "true", "yes", "on", "anything"] {
+            assert!(flag_is_on(Some(raw)), "{raw}");
+        }
+        for raw in ["", " ", "0", "false", "FALSE", "no", "off", " off "] {
+            assert!(!flag_is_on(Some(raw)), "{raw:?}");
+        }
+        assert!(!flag_is_on(None));
+    }
+
+    /// `--fail-on vulnerable` with scanning off cannot fail: every advisory list is
+    /// empty, nothing is ever `Vulnerable`, and the run exits 0 having checked nothing.
+    /// That is the shipped Action's default gate, disarmed by a config key.
+    #[test]
+    fn a_vulnerability_gate_with_no_scan_is_a_configuration_error() {
+        let err = check_fail_on_is_enforceable(FailOn::Vulnerable, false)
+            .expect_err("an unenforceable gate must not be accepted");
+        assert!(
+            format!("{err}").contains("requires vulnerability scanning"),
+            "{err}"
+        );
+        // With the scan on it is an ordinary gate.
+        assert!(check_fail_on_is_enforceable(FailOn::Vulnerable, true).is_ok());
+        // The other settings promise things the run can still establish without a scan,
+        // so an offline freshness check keeps working.
+        for fail_on in [FailOn::None, FailOn::Outdated, FailOn::Any] {
+            assert!(
+                check_fail_on_is_enforceable(fail_on, false).is_ok(),
+                "{fail_on:?}"
+            );
+        }
+    }
 
     #[test]
     fn cargo_home_prefers_explicit_env_then_dot_cargo() {

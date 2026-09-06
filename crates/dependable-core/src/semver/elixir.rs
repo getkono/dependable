@@ -14,10 +14,13 @@
 
 /// Convert a Hex version requirement into a `semver::VersionReq`-compatible string.
 ///
-/// A constraint that cannot be translated is returned **unchanged** so it fails to parse
-/// downstream and the dependency is reported as an error. Returning an empty string
-/// instead made it `*`, which matches every version — a constraint nobody could read
-/// became a dependency that was always up to date.
+/// A constraint that cannot be translated returns the **empty string**, which is the one
+/// signal [`try_to_semver_constraint`](crate::semver::try_to_semver_constraint) reads as
+/// a failed translation — so the dependency is reported `undetermined` and claims
+/// nothing about its own currency. Returning the constraint verbatim instead, as this
+/// did, hid the failure from that guard entirely: a non-empty result is taken as a
+/// successful translation, so `!= 1.0.0` was passed on as a range and hard-failed the
+/// whole run rather than being recorded as a dialect this crate cannot express.
 #[must_use]
 pub fn hex_constraint_to_semver(constraint: &str) -> String {
     let unions: Vec<&str> = constraint.split(" or ").map(str::trim).collect();
@@ -37,7 +40,7 @@ pub fn hex_constraint_to_semver(constraint: &str) -> String {
             best = Some((bound, converted));
         }
     }
-    best.map_or_else(|| constraint.to_string(), |(_, converted)| converted)
+    best.map_or_else(String::new, |(_, converted)| converted)
 }
 
 /// The lowest version a converted clause admits, used only to rank union branches.
@@ -146,18 +149,21 @@ mod tests {
         );
     }
 
-    /// An untranslatable constraint used to collapse to the empty string, which
-    /// `VersionReq` reads as `*` — so a requirement nobody could parse matched every
-    /// version and the dependency was always up to date. Returning it unchanged makes it
-    /// fail to parse downstream, which is reported as an error.
+    /// An untranslatable constraint must come back as the empty string — the one signal
+    /// `try_to_semver_constraint` reads as a failed translation, which makes the
+    /// dependency `undetermined`.
+    ///
+    /// Returning the constraint verbatim, as this used to, is invisible to that guard: a
+    /// non-empty result is taken as a *successful* translation, so `!= 1.0.0` — an
+    /// ordinary Hex exclusion — was passed on as though it were a semver range and hard
+    /// failed the whole run instead.
     #[test]
-    fn an_untranslatable_constraint_is_not_widened_to_star() {
-        for constraint in ["~> not.a.version", "@@@", ">= banana"] {
-            let converted = hex_constraint_to_semver(constraint);
-            assert_ne!(converted, "", "{constraint} collapsed to `*`");
-            assert!(
-                ::semver::VersionReq::parse(&converted).is_err(),
-                "{constraint} -> {converted} must not parse"
+    fn an_untranslatable_constraint_signals_failure_rather_than_echoing_itself() {
+        for constraint in ["~> not.a.version", "@@@", ">= banana", "!= 1.0.0"] {
+            assert_eq!(
+                hex_constraint_to_semver(constraint),
+                "",
+                "{constraint} was not reported as a failed translation"
             );
         }
     }
