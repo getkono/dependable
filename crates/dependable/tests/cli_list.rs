@@ -280,6 +280,40 @@ fn a_path_override_is_not_treated_as_inherited() {
     assert_eq!(util["constraint"], Value::Null);
 }
 
+/// A Cargo root that is also a package inherits its scalars from its **own**
+/// `[workspace.package]` table — the table is legal there, and the crate declaring
+/// `version.workspace = true` is the same file that holds it. A walk that excludes the
+/// asking manifest never finds it, and reports the version as unknown while still
+/// flagging it inherited: the inventory says both "there is no version" and "the version
+/// came from somewhere else". Dependency inheritance already resolves this case; the
+/// scalar axis has to agree.
+#[test]
+fn a_root_that_is_also_a_package_inherits_its_version_from_itself() {
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    std::fs::write(
+        tmp.path().join("Cargo.toml"),
+        r#"
+[workspace]
+
+[workspace.package]
+version = "9.9.9"
+
+[package]
+name = "selfroot"
+version.workspace = true
+
+[dependencies]
+serde = "1"
+"#,
+    )
+    .expect("write manifest");
+
+    let doc = list_json(tmp.path(), &[]);
+    let root = project(&doc, "selfroot");
+    assert_eq!(root["version"], "9.9.9");
+    assert_eq!(root["version_inherited"], true);
+}
+
 /// The root's `[workspace.dependencies]` are central declarations, not dependencies of
 /// the root — and it inherits nothing, because it is what everything else inherits from.
 #[test]
