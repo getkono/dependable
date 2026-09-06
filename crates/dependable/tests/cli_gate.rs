@@ -54,6 +54,8 @@ fn registry(routes: Vec<(String, Response)>) -> String {
     use std::io::{BufRead as _, BufReader, Write as _};
     use std::net::TcpListener;
 
+    let mut routes = routes;
+    routes.push((OSV_BATCH_PATH.to_string(), clean_advisory_batch()));
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind a loopback port");
     let addr = listener.local_addr().expect("read the bound port");
     std::thread::spawn(move || {
@@ -98,6 +100,22 @@ fn registry(routes: Vec<(String, Response)>) -> String {
     format!("http://{addr}")
 }
 
+/// Where the fixture serves OSV's `querybatch`.
+const OSV_BATCH_PATH: &str = "/v1/querybatch";
+
+/// A `querybatch` answer in which no version is affected.
+///
+/// The scan has to actually *run* here: `--fail-on vulnerable` is unenforceable with
+/// scanning off, so a fixture that turned it off could not exercise the gate at all —
+/// and turning it off is precisely the configuration error the guard now rejects.
+///
+/// `querybatch` promises one result per query and the client rejects a short body as a
+/// truncated answer rather than a clean bill, so the fixture serves more empty results
+/// than any manifest here has dependencies; the extras are ignored.
+fn clean_advisory_batch() -> Response {
+    json(format!("{{\"results\":[{}]}}", ["{}"; 64].join(",")))
+}
+
 /// An npm abbreviated packument: the version keys and the `latest` dist-tag are all the
 /// version checker reads.
 fn packument(name: &str, versions: &[&str], latest: &str) -> Response {
@@ -120,7 +138,8 @@ fn write_config(dir: &Path, base: &str) -> PathBuf {
         format!(
             "[npm]\nregistry = \"{base}\"\n\n[python]\nregistry = \"{base}/pypi\"\n\n\
              [go]\nregistry = \"{base}\"\n\n[jvm]\nregistry = \"{base}\"\n\n\
-             [vulnerability]\nenabled = false\n"
+             [dart]\nregistry = \"{base}\"\n\n\
+             [vulnerability]\nenabled = true\nosv_batch_url = \"{base}{OSV_BATCH_PATH}\"\n"
         ),
     )
     .unwrap();
@@ -130,13 +149,19 @@ fn write_config(dir: &Path, base: &str) -> PathBuf {
 /// Point npm at one base and Go at another, so a run reaches two registries that can
 /// fail independently. The single-base [`write_config`] cannot express that, and it is
 /// exactly the shape #112 is about.
+///
+/// Scanning stays on and points at the npm base, exactly as [`write_config`] does:
+/// `--fail-on vulnerable` with scanning switched off is a refused configuration, not a
+/// registry failure, and it is the *registry* that has to decline here. Every
+/// [`registry`] serves [`OSV_BATCH_PATH`] itself, so the route is there and cannot
+/// collide with a package path.
 fn write_split_config(dir: &Path, npm: &str, go: &str) -> PathBuf {
     let config = dir.join(".dependable.toml");
     fs::write(
         &config,
         format!(
             "[npm]\nregistry = \"{npm}\"\n\n[go]\nregistry = \"{go}\"\n\n\
-             [vulnerability]\nenabled = false\n"
+             [vulnerability]\nenabled = true\nosv_batch_url = \"{npm}{OSV_BATCH_PATH}\"\n"
         ),
     )
     .unwrap();
@@ -151,9 +176,9 @@ fn check(dir: &Path, config: &Path, args: &[&str]) -> Output {
         .arg("--config")
         .arg(config)
         .arg("--no-cache")
-        .arg("--no-vuln")
         .args(args);
     command.env_remove("DEPENDABLE_FAIL_ON");
+    command.env_remove("DEPENDABLE_NO_VULN");
     // A user `.npmrc` would override the configured registry and send the run at the
     // real npm.
     command.env("HOME", dir);
@@ -470,6 +495,203 @@ fn a_metadata_document_listing_no_versions_is_not_exempt_from_the_gate() {
     assert!(
         !stderr.contains("not found in its registry"),
         "an answered-but-empty document was reported as a 404:\n{stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The ranges npm, Composer and Dart document
+// ---------------------------------------------------------------------------
+
+/// A union, a space-separated range, a hyphen range and a stability flag are ordinary,
+/// valid declarations. Every one of them reached `VersionReq::parse` verbatim, failed,
+/// and was recorded as a dependency the run could not evaluate — and the new
+/// `unevaluated` gate turns a single one of those into exit 2 for the whole repository,
+/// under the `fail-on: vulnerable` the shipped Action defaults to. On `master` the same
+/// manifest exited 0.
+#[test]
+fn the_ordinary_npm_ranges_no_longer_make_a_repository_unanswerable() {
+    let dir = workdir("gate_npm_range_dialects");
+    let base = registry(vec![
+        (
+            "/react".to_string(),
+            packument("react", &["16.8.0", "16.14.0", "18.3.1"], "18.3.1"),
+        ),
+        (
+            "/lodash".to_string(),
+            packument("lodash", &["4.17.20", "4.17.21"], "4.17.21"),
+        ),
+        (
+            "/express".to_string(),
+            packument("express", &["4.18.2", "4.19.2"], "4.19.2"),
+        ),
+        (
+            "/symfony".to_string(),
+            packument("symfony", &["6.4.0"], "6.4.0"),
+        ),
+    ]);
+    let config = write_config(&dir, &base);
+    fs::write(
+        dir.join("package.json"),
+        "{\"name\":\"app\",\"dependencies\":{\"react\":\"^15.0.0 || ^16.0.0\",\"lodash\":\
+         \">=4.17.20 <5.0.0\",\"express\":\"4.18.2 - 4.19.2\",\"symfony\":\"6.4.*@dev\"}}\n",
+    )
+    .unwrap();
+
+    let output = check(&dir, &config, &["--fail-on", "vulnerable"]);
+    let (stdout, stderr, code) = outcome(&output);
+
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        !stderr.contains("could not be evaluated"),
+        "a documented range was read as unevaluable:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("unparseable constraint") && !stdout.contains("undetermined"),
+        "stdout: {stdout}"
+    );
+    // All four are real evaluations. The union resolves to its highest branch, so
+    // `react`'s newest admissible release is 16.14.0 and the 18.3.1 outside it is an
+    // available update; the other three are already at the newest release they admit.
+    assert!(stdout.contains("Totals: 3 up to date"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("^15.0.0 || ^16.0.0") && stdout.contains("update available"),
+        "stdout: {stdout}"
+    );
+}
+
+/// Dart spells "no constraint" as `any`, and `pubspec.yaml` carries an explicit clause to
+/// accept it — so the tool read a value in one module and hard-failed the whole run on it
+/// in another.
+#[test]
+fn a_dart_any_constraint_is_read_as_no_constraint() {
+    let dir = workdir("gate_dart_any");
+    let base = registry(vec![(
+        "/api/packages/meta".to_string(),
+        json("{\"versions\":[{\"version\":\"1.15.0\"},{\"version\":\"1.16.0\"}]}"),
+    )]);
+    let config = write_config(&dir, &base);
+    fs::write(
+        dir.join("pubspec.yaml"),
+        "name: my_app\ndependencies:\n  meta: any\n",
+    )
+    .unwrap();
+
+    let output = check(&dir, &config, &["--fail-on", "vulnerable"]);
+    let (stdout, stderr, code) = outcome(&output);
+
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        !stderr.contains("could not be evaluated"),
+        "`any` was read as unevaluable:\n{stderr}"
+    );
+    assert!(stdout.contains("up to date"), "stdout: {stdout}");
+}
+
+/// A dist-tag names a channel, not a range. It is `undetermined` — noted, outside the
+/// vulnerability and staleness gates, and still failing `--fail-on any`, which is the
+/// setting that promises every constraint was established.
+#[test]
+fn a_dist_tag_is_undetermined_rather_than_unevaluated() {
+    let dir = workdir("gate_dist_tag");
+    let base = registry(vec![(
+        "/express".to_string(),
+        packument("express", &["4.19.2"], "4.19.2"),
+    )]);
+    let config = write_config(&dir, &base);
+    fs::write(
+        dir.join("package.json"),
+        "{\"name\":\"app\",\"dependencies\":{\"express\":\"next\"}}\n",
+    )
+    .unwrap();
+
+    let output = check(&dir, &config, &["--fail-on", "vulnerable"]);
+    let (stdout, stderr, code) = outcome(&output);
+
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("undetermined"), "stdout: {stdout}");
+    assert!(
+        stderr.contains("note: 1 dependency has a declared version this run could not read"),
+        "stderr: {stderr}"
+    );
+
+    // `--fail-on any` is where "everything must be established" lives, and it still fires.
+    let strict = check(&dir, &config, &["--fail-on", "any"]);
+    let (_, strict_stderr, strict_code) = outcome(&strict);
+    assert_eq!(strict_code, 1, "stderr: {strict_stderr}");
+}
+
+// ---------------------------------------------------------------------------
+// A gate whose entire subject matter was switched off
+// ---------------------------------------------------------------------------
+
+/// `--fail-on vulnerable` is the whole of a claim about advisories, and with scanning off
+/// every advisory list is empty — so nothing is ever `Vulnerable`, the gate cannot fail,
+/// and the run exits 0 having checked nothing. `[policy]` already refuses this exact
+/// configuration one function away; the `--fail-on` gate did not.
+#[test]
+fn a_vulnerability_gate_with_no_scan_is_refused_rather_than_passed() {
+    let dir = workdir("gate_vacuous_vulnerable");
+    let base = registry(vec![(
+        "/express".to_string(),
+        packument("express", &["4.19.2"], "4.19.2"),
+    )]);
+    let config = write_config(&dir, &base);
+    fs::write(
+        dir.join("package.json"),
+        "{\"name\":\"app\",\"dependencies\":{\"express\":\"^4.19.0\"}}\n",
+    )
+    .unwrap();
+
+    let output = check(&dir, &config, &["--fail-on", "vulnerable", "--no-vuln"]);
+    let (stdout, stderr, code) = outcome(&output);
+
+    assert_eq!(code, 2, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stderr.contains("requires vulnerability scanning, which is disabled"),
+        "stderr: {stderr}"
+    );
+
+    // An offline freshness check promises nothing about advisories and still runs.
+    let offline = check(&dir, &config, &["--fail-on", "outdated", "--no-vuln"]);
+    let (_, offline_stderr, offline_code) = outcome(&offline);
+    assert_eq!(offline_code, 0, "stderr: {offline_stderr}");
+}
+
+// ---------------------------------------------------------------------------
+// An override that references a workspace dependency
+// ---------------------------------------------------------------------------
+
+/// A `$name` override takes the referenced entry's raw manifest value, which is whatever
+/// `package.json` allows a dependency to be. Reading it as a registry range sent
+/// `"my-lib": "workspace:*"` to npm as the literal constraint `workspace:*`, which
+/// `VersionReq` cannot parse — so an ordinary pnpm workspace shape took the whole run to
+/// exit 2.
+#[test]
+fn an_override_referencing_a_workspace_dependency_is_not_sent_to_a_registry() {
+    let dir = workdir("gate_override_workspace_referent");
+    let base = registry(vec![(
+        "/express".to_string(),
+        packument("express", &["4.19.2"], "4.19.2"),
+    )]);
+    let config = write_config(&dir, &base);
+    fs::write(
+        dir.join("package.json"),
+        "{\"name\":\"app\",\"dependencies\":{\"my-lib\":\"workspace:*\",\"express\":\
+         \"^4.19.0\"},\"overrides\":{\"my-lib\":\"$my-lib\"}}\n",
+    )
+    .unwrap();
+
+    let output = check(&dir, &config, &["--fail-on", "vulnerable"]);
+    let (stdout, stderr, code) = outcome(&output);
+
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        !stdout.contains("unparseable constraint") && !stdout.contains("not found"),
+        "a workspace referent was asked of npm:\n{stdout}"
+    );
+    assert!(
+        !stderr.contains("could not be evaluated"),
+        "stderr: {stderr}"
     );
 }
 

@@ -166,9 +166,186 @@ pub fn normalize_constraint(constraint: &str) -> String {
     }
 }
 
+/// Composer's stability flags. They qualify which *stability* of a release the
+/// constraint admits, never which versions, so `2.8.*@dev` admits exactly what
+/// `2.8.*` admits and a bare `@dev` admits everything.
+const STABILITY_FLAGS: &[&str] = &["dev", "alpha", "beta", "rc", "stable"];
+
+/// Strip a trailing Composer stability flag, returning the range that carries it.
+fn strip_stability_flag(constraint: &str) -> &str {
+    match constraint.rsplit_once('@') {
+        Some((range, flag))
+            if STABILITY_FLAGS
+                .iter()
+                .any(|known| flag.eq_ignore_ascii_case(known)) =>
+        {
+            range.trim()
+        }
+        _ => constraint,
+    }
+}
+
+/// Translate a range written in the npm / Composer / Dart / Cargo dialect into a
+/// `semver::VersionReq`-compatible string, returning the input unchanged when there
+/// is nothing to translate.
+///
+/// The `semver` crate parses Cargo's spelling of a range and only Cargo's, so the
+/// ordinary forms the other three ecosystems document — a `||` union, comparators
+/// separated by spaces rather than commas, npm's hyphen range, a Composer stability
+/// flag, Dart's `any` — all reached `VersionReq::parse` verbatim and failed. Those are
+/// *valid* constraints this crate simply had no front-end for, and treating them as
+/// unreadable input made a dependency the manifest declares correctly the reason a
+/// whole run could not answer its gate.
+///
+/// Only a translation that itself parses is adopted. Anything else is handed back
+/// untouched for [`check_version`](crate::semver::check_version) to classify, which is
+/// what keeps a dist-tag (`latest`, `next`) and genuine garbage (`^^^bogus`)
+/// distinguishable from each other downstream.
+#[must_use]
+pub fn normalize_range_constraint(constraint: &str) -> String {
+    let trimmed = constraint.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    // A dist-tag names a channel rather than a range. `check_version` resolves the one
+    // that tracks the newest release; the rest have no range reading at all.
+    if trimmed == "latest" {
+        return trimmed.to_owned();
+    }
+    let core = strip_stability_flag(trimmed);
+    // A bare `@dev` is "any version, dev stability" — the stability half is not a
+    // version constraint, and what is left constrains nothing.
+    if core.is_empty() {
+        return "*".to_owned();
+    }
+    // Dart spells "no constraint" as `any`, and `pubspec.yaml` accepts it deliberately.
+    // `*` is the same statement in a spelling `VersionReq` reads.
+    if core.eq_ignore_ascii_case("any") || core == "x" || core == "X" {
+        return "*".to_owned();
+    }
+    translate_union(core).unwrap_or_else(|| normalize_constraint(constraint))
+}
+
+/// Pick one branch of a `||` union: the one admitting the highest versions.
+///
+/// `VersionReq` has no union, so a branch has to be chosen. The highest lower bound
+/// is the same choice [`hex_constraint_to_semver`](crate::semver::elixir::hex_constraint_to_semver)
+/// and [`maven_constraint_to_semver`](crate::semver::maven::maven_constraint_to_semver)
+/// already make, and for the reason they give: a union is written to widen what is
+/// accepted, so resolving it to the oldest branch reports every release above that
+/// branch as out of range.
+fn translate_union(core: &str) -> Option<String> {
+    let mut best: Option<((u64, u64, u64), String)> = None;
+    for branch in core.split("||") {
+        let branch = branch.trim();
+        if branch.is_empty() {
+            continue;
+        }
+        let Some(translated) = translate_conjunction(branch) else {
+            continue;
+        };
+        let Ok(req) = ::semver::VersionReq::parse(&translated) else {
+            continue;
+        };
+        let bound = lower_bound(&req);
+        if best
+            .as_ref()
+            .is_none_or(|(best_bound, _)| bound > *best_bound)
+        {
+            best = Some((bound, translated));
+        }
+    }
+    best.map(|(_, translated)| translated)
+}
+
+/// The lowest version a requirement admits, used only to rank union branches.
+fn lower_bound(req: &::semver::VersionReq) -> (u64, u64, u64) {
+    use ::semver::Op;
+    req.comparators
+        .iter()
+        .filter(|c| {
+            matches!(
+                c.op,
+                Op::Greater | Op::GreaterEq | Op::Exact | Op::Caret | Op::Tilde
+            )
+        })
+        .map(|c| (c.major, c.minor.unwrap_or(0), c.patch.unwrap_or(0)))
+        .max()
+        .unwrap_or((0, 0, 0))
+}
+
+/// Translate one branch of a union: an intersection of comparators, which npm and
+/// Composer separate with spaces and Cargo with commas, or npm's hyphen range.
+fn translate_conjunction(branch: &str) -> Option<String> {
+    if let Some((low, high)) = branch.split_once(" - ") {
+        return hyphen_range(low.trim(), high.trim());
+    }
+    let mut parts: Vec<String> = Vec::new();
+    let mut pending_op: Option<&str> = None;
+    for token in branch.split([',', ' ', '\t']).filter(|t| !t.is_empty()) {
+        // `>= 1.2.3` writes the operator and the version as two tokens.
+        if token
+            .chars()
+            .all(|c| matches!(c, '>' | '<' | '=' | '^' | '~' | '!'))
+        {
+            pending_op = Some(token);
+            continue;
+        }
+        let version = normalize_constraint(token);
+        parts.push(match pending_op.take() {
+            Some(op) => format!("{op}{version}"),
+            None => version,
+        });
+    }
+    (!parts.is_empty() && pending_op.is_none()).then(|| parts.join(", "))
+}
+
+/// npm's hyphen range: `1.2.3 - 2.3.4` admits both endpoints.
+///
+/// A partial upper bound bounds the segment it stops at rather than padding with
+/// zeros — npm reads `1.2.3 - 2.3` as every `2.3.x`, so padding it to `<=2.3.0`
+/// would exclude releases the author accepted.
+fn hyphen_range(low: &str, high: &str) -> Option<String> {
+    if high.contains(char::is_whitespace) {
+        return None;
+    }
+    let low = normalize_version(low);
+    ::semver::Version::parse(&low).ok()?;
+    let high = high.strip_prefix(['v', 'V']).unwrap_or(high);
+    let nums: Vec<u64> = high
+        .split('.')
+        .map(|s| s.parse().ok())
+        .collect::<Option<_>>()?;
+    let upper = match nums.as_slice() {
+        [major] => format!("<{}.0.0", major.checked_add(1)?),
+        [major, minor] => format!("<{major}.{}.0", minor.checked_add(1)?),
+        [major, minor, patch] => format!("<={major}.{minor}.{patch}"),
+        _ => return None,
+    };
+    Some(format!(">={low}, {upper}"))
+}
+
+/// Whether `constraint` names something — a channel, a branch alias — rather than
+/// stating a range badly.
+///
+/// The two have to be told apart because they call for opposite answers. `^^^bogus`
+/// is not a constraint at all and the run should say so; npm's `next`, Composer's
+/// `dev-master`, and a Git branch alias are ordinary declarations in dialects this
+/// crate has no front-end for, and failing a build over one punishes the user for a
+/// gap that is ours. A name is spelled the way a name is spelled: it opens with a
+/// letter and carries no comparison operator anywhere.
+#[must_use]
+pub fn is_dialect_tag(constraint: &str) -> bool {
+    let c = constraint.trim();
+    c.starts_with(|ch: char| ch.is_ascii_alphabetic())
+        && c.chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/'))
+}
+
 /// Convert a constraint into a `semver::VersionReq`-compatible string for the
-/// given ecosystem. Python uses PEP 440 translation; every other ecosystem is
-/// already semver-compatible and only needs [`normalize_constraint`].
+/// given ecosystem. Python, NuGet, Hex and Maven translate in dedicated modules;
+/// every other ecosystem writes a dialect close enough to Cargo's that
+/// [`normalize_range_constraint`] covers it.
 #[must_use]
 pub fn to_semver_constraint(constraint: &str, ecosystem: Ecosystem) -> String {
     match ecosystem {
@@ -176,27 +353,35 @@ pub fn to_semver_constraint(constraint: &str, ecosystem: Ecosystem) -> String {
         Ecosystem::CSharp => crate::semver::nuget::nuget_constraint_to_semver(constraint),
         Ecosystem::Elixir => crate::semver::elixir::hex_constraint_to_semver(constraint),
         Ecosystem::Jvm => crate::semver::maven::maven_constraint_to_semver(constraint),
-        _ => normalize_constraint(constraint),
+        _ => normalize_range_constraint(constraint),
     }
 }
 
 /// Convert a constraint for `semver`, or `None` when the ecosystem's dialect could
 /// not be expressed as a `semver::VersionReq`.
 ///
-/// Three of the four translators signal failure by dropping everything they could
-/// not read: [`maven_constraint_to_semver`](crate::semver::maven::maven_constraint_to_semver)
+/// All four dedicated translators signal failure the same way — by returning an empty
+/// string. [`maven_constraint_to_semver`](crate::semver::maven::maven_constraint_to_semver)
 /// and [`nuget_constraint_to_semver`](crate::semver::nuget::nuget_constraint_to_semver)
-/// return an empty string for an unreadable version or a malformed interval, and
-/// [`pep440_constraint_to_semver`](crate::semver::python::pep440_constraint_to_semver)
-/// does the same once every clause has been dropped. An empty result is therefore
-/// ambiguous on its own: it means "the author declared no constraint" *and* "we
-/// could not read the constraint the author declared", and the checker treating the
-/// second as the first turned it into `*` — which resolves to the newest release and
-/// reports `up to date`, the one answer a constraint that was never understood must
-/// not give.
+/// do so for an unreadable version, a malformed interval, or a wildcard shape they do
+/// not recognise; [`pep440_constraint_to_semver`](crate::semver::python::pep440_constraint_to_semver)
+/// does so once every clause has been dropped; and
+/// [`hex_constraint_to_semver`](crate::semver::elixir::hex_constraint_to_semver) does so
+/// when no union branch converted. An empty result is therefore ambiguous on its own:
+/// it means "the author declared no constraint" *and* "we could not read the constraint
+/// the author declared", and the checker treating the second as the first turned it
+/// into `*` — which resolves to the newest release and reports `up to date`, the one
+/// answer a constraint that was never understood must not give.
 ///
-/// The two are told apart by what went in: an empty result from a **non-empty**
-/// input is a failed translation, and nothing else produces one.
+/// The two are told apart by what went in: an empty result from a **non-empty** input
+/// is a failed translation. That reading is only sound because every translator's
+/// failure path is spelled this one way — three of them used to widen to `"*"` or echo
+/// their input verbatim instead, which is a failure this guard cannot see and which
+/// produces exactly the confident `up to date` it exists to prevent.
+///
+/// The remaining ecosystems have no dedicated translator and never signal failure here:
+/// [`normalize_range_constraint`] hands an untranslatable range back unchanged, and
+/// [`check_version`](crate::semver::check_version) classifies it.
 #[must_use]
 pub fn try_to_semver_constraint(constraint: &str, ecosystem: Ecosystem) -> Option<String> {
     let translated = to_semver_constraint(constraint, ecosystem);
@@ -256,6 +441,19 @@ mod tests {
         list.iter().map(|s| (*s).to_string()).collect()
     }
 
+    /// Assert that `constraint` translates to something `VersionReq` actually accepts.
+    ///
+    /// `is_some()` alone was the false assurance that let this whole class of defect
+    /// ship: a translation is only a translation if the result parses, and every witness
+    /// below returned `Some` while failing `VersionReq::parse` downstream.
+    fn assert_translates(constraint: &str, ecosystem: Ecosystem) -> ::semver::VersionReq {
+        let translated = try_to_semver_constraint(constraint, ecosystem)
+            .unwrap_or_else(|| panic!("{ecosystem:?} `{constraint}` translated to nothing"));
+        ::semver::VersionReq::parse(&translated).unwrap_or_else(|e| {
+            panic!("{ecosystem:?} `{constraint}` translated to `{translated}`, which is not a requirement: {e}")
+        })
+    }
+
     /// Every ecosystem's spelling of "any version", plus the ordinary forms around it.
     /// A translator that drops one of these hands the checker an empty string, which
     /// [`try_to_semver_constraint`] then reports as a constraint it could not read —
@@ -291,11 +489,126 @@ mod tests {
             (Ecosystem::Dart, "any"),
         ];
         for (ecosystem, constraint) in cases {
-            let translated = try_to_semver_constraint(constraint, *ecosystem);
-            assert!(
-                translated.is_some(),
-                "{ecosystem:?} `{constraint}` translated to nothing"
+            assert_translates(constraint, *ecosystem);
+        }
+    }
+
+    /// The ranges npm, Composer and Dart document, none of which the `semver` crate
+    /// parses on its own.
+    ///
+    /// Every one of these used to reach `VersionReq::parse` verbatim and fail, which the
+    /// checker recorded as a dependency the run could not evaluate — and a single one of
+    /// those makes the whole repository unanswerable under the shipped Action's default
+    /// `fail-on: vulnerable`. They are valid constraints; the gap was ours.
+    #[test]
+    fn the_documented_range_dialects_translate_into_something_that_parses() {
+        let v = |s: &str| ::semver::Version::parse(s).expect(s);
+        // (ecosystem, constraint, versions it must admit, versions it must not)
+        let cases: &[(Ecosystem, &str, &[&str], &[&str])] = &[
+            (
+                Ecosystem::Npm,
+                ">=16.8.0 <19.0.0",
+                &["16.8.0", "18.3.1"],
+                &["16.7.0", "19.0.0"],
+            ),
+            (
+                Ecosystem::Npm,
+                "^15.0.0 || ^16.0.0",
+                &["16.8.0"],
+                &["17.0.0"],
+            ),
+            (
+                Ecosystem::Npm,
+                "1.2.3 - 2.3.4",
+                &["1.2.3", "2.0.0", "2.3.4"],
+                &["1.2.2", "2.3.5"],
+            ),
+            // A partial upper bound bounds the segment it stops at: `2.3` is every 2.3.x.
+            (
+                Ecosystem::Npm,
+                "1.2.3 - 2.3",
+                &["2.3.9"],
+                &["1.2.2", "2.4.0"],
+            ),
+            (Ecosystem::Npm, ">= 1.2.3", &["1.2.3", "9.0.0"], &["1.2.2"]),
+            // Dart's `any` is "no constraint", which is what `*` says.
+            (Ecosystem::Dart, "any", &["0.0.1", "9.9.9"], &[]),
+            // A Composer stability flag qualifies stability, not versions.
+            (Ecosystem::Php, "2.8.*@dev", &["2.8.0", "2.8.9"], &["2.9.0"]),
+            (Ecosystem::Php, "@dev", &["0.1.0", "9.9.9"], &[]),
+            (
+                Ecosystem::Php,
+                "^1.0 || ^2.0",
+                &["2.4.0"],
+                &["3.0.0", "0.9.0"],
+            ),
+        ];
+        for (ecosystem, constraint, admits, rejects) in cases {
+            let req = assert_translates(constraint, *ecosystem);
+            for version in *admits {
+                assert!(
+                    req.matches(&v(version)),
+                    "`{constraint}` rejected {version}"
+                );
+            }
+            for version in *rejects {
+                assert!(
+                    !req.matches(&v(version)),
+                    "`{constraint}` admitted {version}"
+                );
+            }
+        }
+    }
+
+    /// A dialect this crate cannot express must reach the checker as a failed
+    /// translation — an empty result — or as a name the checker recognises as a name.
+    /// Either way the dependency is `undetermined`, which claims nothing; what it must
+    /// never be is a range that silently means something else.
+    #[test]
+    fn a_dialect_with_no_front_end_is_never_mistaken_for_a_range() {
+        // Failed translations: the translator drops everything it could not read.
+        for (ecosystem, constraint) in [
+            (Ecosystem::Elixir, "!= 1.0.0"),
+            (Ecosystem::Python, "!=2.31.0"),
+        ] {
+            assert_eq!(
+                try_to_semver_constraint(constraint, ecosystem),
+                None,
+                "{ecosystem:?} `{constraint}`"
             );
+        }
+        // Names: handed back untouched, and recognised as names rather than as ranges
+        // somebody got wrong.
+        for (ecosystem, constraint) in [
+            (Ecosystem::Npm, "next"),
+            (Ecosystem::Npm, "beta"),
+            (Ecosystem::Npm, "canary"),
+            (Ecosystem::Php, "dev-master"),
+        ] {
+            let translated = try_to_semver_constraint(constraint, ecosystem)
+                .expect("a name is handed back, not dropped");
+            assert!(
+                ::semver::VersionReq::parse(&translated).is_err(),
+                "{ecosystem:?} `{constraint}` must not be read as a range"
+            );
+            assert!(is_dialect_tag(&translated), "{ecosystem:?} `{constraint}`");
+        }
+        // `latest` is the one name with a range reading, and the checker owns it.
+        assert_eq!(
+            try_to_semver_constraint("latest", Ecosystem::Npm).as_deref(),
+            Some("latest")
+        );
+    }
+
+    /// The other side of [`is_dialect_tag`]: operators that announce a range and then do
+    /// not spell one are not names, and must stay a hard error.
+    #[test]
+    fn garbage_wearing_range_operators_is_not_a_name() {
+        for constraint in ["^^^bogus", ">=<1.0.0", "~~", "1.2.3", "*", "@dev"] {
+            assert!(!is_dialect_tag(constraint), "{constraint}");
+        }
+        for constraint in ["next", "dev-master", "latest", "release/2.x"] {
+            assert!(is_dialect_tag(constraint), "{constraint}");
         }
     }
 

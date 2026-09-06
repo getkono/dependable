@@ -101,6 +101,13 @@ pub fn maven_to_semver(version: &str) -> Option<String> {
 ///
 /// A union (`(,1.0],[1.2,)`) is not expressible in `semver::VersionReq`; the last
 /// (newest-allowing) interval is kept, matching the Hex translation.
+///
+/// Anything else returns the **empty string**, the signal
+/// [`try_to_semver_constraint`](crate::semver::try_to_semver_constraint) reads as a
+/// failed translation. A `+` wildcard in a shape this does not recognise used to widen
+/// to `"*"`, which matches every version and so reports the newest release as satisfying
+/// a constraint nobody read — a confident `up to date` is the worst available answer for
+/// a constraint that was never understood.
 #[must_use]
 pub fn maven_constraint_to_semver(constraint: &str) -> String {
     let c = constraint.trim();
@@ -112,7 +119,7 @@ pub fn maven_constraint_to_semver(constraint: &str) -> String {
         return "*".to_string();
     }
     if c.contains('+') {
-        return wildcard_range(c).unwrap_or_else(|| "*".to_string());
+        return wildcard_range(c).unwrap_or_default();
     }
     if c.starts_with('[') || c.starts_with('(') {
         return interval_range(c).unwrap_or_default();
