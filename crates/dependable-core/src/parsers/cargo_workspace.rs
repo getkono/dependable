@@ -97,7 +97,9 @@ pub fn resolve_workspace_inheritance(items: &mut [Item], declarations: &[Item]) 
     for item in items {
         // Only an entry that says it inherits, and has nothing of its own to say, can be
         // resolved. A `path` dependency sharing a name with a root declaration is not
-        // inheriting — Cargo uses the path — and must not be rewritten here.
+        // inheriting — Cargo uses the path — and must not be rewritten here. Nor is a
+        // `Locked` entry, whose version a lockfile already supplied and which claims no
+        // root above it; the `!=` covers it, and should keep covering it.
         if item.source != PackageSource::Inherited || !item.version_constraint.is_empty() {
             continue;
         }

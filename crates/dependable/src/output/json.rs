@@ -89,6 +89,10 @@ pub fn render(reports: &[ManifestReport]) -> anyhow::Result<()> {
                 kind: result.item.kind.token(),
                 vulnerabilities: &result.current_vulnerabilities,
                 locked_at: result.item.locked_version.as_deref(),
+                // `Inherited` only. A `PackageSource::Locked` entry has no position
+                // either, but its version came from a lockfile and no manifest
+                // declares it, so naming the workspace root as the file to edit would
+                // point a consumer at a declaration that is not there.
                 inherited_from: (result.item.source == PackageSource::Inherited
                     && !result.item.version_constraint.is_empty())
                 .then(|| workspace_root.clone())
