@@ -560,11 +560,26 @@ per ecosystem, so future registries (npm, PyPI, Go, …) are additive.
 
 That last case matters for CI. If you arm `--fail-on` (or a `[policy]` severity
 rule) and the run cannot establish what the gate needs — the vulnerability scan did
-not complete, or dependencies could not be resolved against their registry —
-`dependable` exits `2` and says so, rather than exiting `0`. A gate that reports
-success on the run it could not perform is worse than no gate at all. With no gate
-armed, an unreachable registry is still reported per dependency and the run exits
-`0`, because nothing was promised.
+not complete, or a registry never answered — `dependable` exits `2` and says so,
+rather than exiting `0`. A gate that reports success on the run it could not perform
+is worse than no gate at all. With no gate armed, an unreachable registry is still
+reported per dependency and the run exits `0`, because nothing was promised.
+
+A registry that *did* answer is a different thing. A package it reports as
+non-existent — an unpublished internal package, one served by a registry this run
+does not route to, a deleted package — is a permanent per-dependency fact, not a
+failure of the run: it appears in the table and in `--format json`, the run says on
+stderr how many were skipped, and the exit code is `0`. The same goes for a
+dependency whose declared version this run could not read, which is reported
+`undetermined`: `--fail-on vulnerable` promises something about vulnerabilities and
+`--fail-on outdated` something about staleness, and neither is a promise that every
+constraint was parseable. `--fail-on any` is that promise, and it fails on both.
+
+Arming a gate the run cannot enforce is a configuration error, caught before any
+network access: `--fail-on vulnerable` with vulnerability scanning switched off
+(`--no-vuln`, or `[vulnerability] enabled = false`) exits `2`, as a `[policy]`
+severity rule already did. Every advisory list would be empty and the gate could
+never fail — a gate is either enforceable or it is a mistake.
 
 `.dependable.toml` is validated: an unknown key or a wrong-typed value is an error,
 not a silent fallback to defaults. One mistyped character used to reset

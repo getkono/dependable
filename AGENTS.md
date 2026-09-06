@@ -1,9 +1,10 @@
 # dependable
 
 Open-source CLI + Rust library for checking dependency versions and known
-vulnerabilities. Ten ecosystems ship — Rust, npm, PyPI, Go, Deno/JSR, pnpm,
-Packagist, pub.dev, NuGet and Hex — with Rust, npm and Python marked stable and the
-rest experimental; see [`README.md`](README.md) for the support table and
+vulnerabilities. Eleven ecosystems ship — Rust, npm, PyPI, Go, Deno/JSR, pnpm,
+Packagist, pub.dev, NuGet, Hex and Kotlin/Java on Maven Central — with Rust, npm and
+Python marked stable and the rest experimental. The table in
+[`README.md`](README.md) is authoritative for what ships and at what maturity; see
 [`docs/SCOPE.md`](docs/SCOPE.md) for what is deferred and why.
 
 ## Workspace
