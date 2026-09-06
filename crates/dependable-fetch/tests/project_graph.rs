@@ -245,9 +245,9 @@ fn version_of<'g>(graph: &'g DependencyGraph, name: &str) -> Option<&'g str> {
 /// Asserted per node, with the exact spelling of each, because the two facts worth
 /// protecting are both about *which* string comes back:
 ///
-/// - `guava` must be `32.1.3-jre` and never the translated `32.1.3`. Maven Central
-///   publishes `32.1.3-jre` and `32.1.3-android` and nothing called `32.1.3`, so
-///   the translation names no artifact at all.
+/// - `guava` must be `32.1.3-jre`, the variant Maven Central actually publishes
+///   alongside `32.1.3-android`. Truncating it to `32.1.3` would name no artifact
+///   at all, so the declared spelling is what a node carries.
 /// - `kotlin-stdlib` and `kotlin-reflect` share one `[versions]` alias, which
 ///   reaches them as a *resolved* `Inherited` item. Those are checkable and so
 ///   report the alias's version; an alias no `[versions]` entry defines would not.
@@ -290,6 +290,79 @@ fn a_manifest_only_graph_reports_the_versions_the_manifest_settled() {
             .iter()
             .any(|n| n.name.contains("jackson-databind")),
     );
+}
+
+/// A Maven version does not have to have three segments, and a two-segment one is
+/// exact: `junit:junit` is published as `4.12` and there is no `4.12.0`. It still
+/// resolves nothing, because a `Node::version` is read as written by everything
+/// downstream of it — the renderers, the JSON and DOT emitters, the OSV query, and
+/// the TUI's lookup — and `Version::parse("4.12")` fails. `check_version` treats a
+/// current version it cannot parse as *no* current version, falls back to the
+/// newest release, and answers `UpToDate`, which is a green `ok` for a dependency
+/// three releases behind. That is #96's failure verbatim, so the string never
+/// enters the graph.
+///
+/// The three-segment entry beside it is the control: same file, same code path,
+/// and it does resolve.
+#[test]
+fn a_two_segment_catalog_version_is_exact_and_still_resolves_nothing() {
+    let dir = TempDir::new().expect("tempdir");
+    write(
+        &dir.path().join("gradle/libs.versions.toml"),
+        r#"
+[versions]
+junit = "4.12"
+okhttp = "4.12.0"
+
+[libraries]
+junit = { module = "junit:junit", version.ref = "junit" }
+okhttp = { module = "com.squareup.okhttp3:okhttp", version.ref = "okhttp" }
+"#,
+    );
+
+    let built = build_project_graph(
+        &dir.path().join("gradle/libs.versions.toml"),
+        &WorkspaceGraphOptions::default(),
+    )
+    .expect("graph");
+
+    assert_eq!(version_of(&built.graph, "junit:junit"), None);
+    assert_eq!(
+        version_of(&built.graph, "com.squareup.okhttp3:okhttp"),
+        Some("4.12.0")
+    );
+}
+
+/// NuGet's single-version interval is the one spelling in that ecosystem which
+/// names exactly one release, and until now nothing above `pin.rs` exercised it —
+/// the committed C# fixture has no `[x.y.z]` reference at all, so the whole accept
+/// path was untested at graph level while the reject path was not.
+///
+/// `[1.0]` beside it is exact under NuGet's own reading and still resolves
+/// nothing, for the same reason a two-segment Maven version does.
+#[test]
+fn a_nuget_single_version_interval_resolves_and_a_two_segment_one_does_not() {
+    let dir = TempDir::new().expect("tempdir");
+    write(
+        &dir.path().join("App.csproj"),
+        r#"<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <PackageReference Include="Pinned" Version="[1.2.3]" />
+    <PackageReference Include="PinnedShort" Version="[1.0]" />
+    <PackageReference Include="Ranged" Version="[1.0,2.0)" />
+  </ItemGroup>
+</Project>"#,
+    );
+
+    let built = build_project_graph(
+        &dir.path().join("App.csproj"),
+        &WorkspaceGraphOptions::default(),
+    )
+    .expect("graph");
+
+    assert_eq!(version_of(&built.graph, "Pinned"), Some("1.2.3"));
+    assert_eq!(version_of(&built.graph, "PinnedShort"), None);
+    assert_eq!(version_of(&built.graph, "Ranged"), None);
 }
 
 /// The case #107 opened with, and the one this change does **not** close. NuGet
