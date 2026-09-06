@@ -907,11 +907,20 @@ pub async fn run_fix(args: FixArgs) -> anyhow::Result<ExitCode> {
     let engine = Engine::new(&settings, &cfg, true)?;
     let mut total = 0;
     let mut unchecked = 0;
+    // Counted beside `unchecked`, not folded into it. `unchecked` is a tally of
+    // rows, and a manifest whose dependency list went unread produces none — so a
+    // Swift project with no `Package.resolved`, the state Apple advises library
+    // packages to be in, left both this loop's counters at zero and reached the
+    // clean closing line below with nothing having been read at all.
+    let mut unread = 0;
     for manifest in &manifests {
         let Some(report) = engine.check_manifest(manifest).await? else {
             continue;
         };
         report_inherited_skips(manifest, &report);
+        if report.dependencies_unread {
+            unread += 1;
+        }
         unchecked += report
             .results
             .iter()
@@ -931,7 +940,7 @@ pub async fn run_fix(args: FixArgs) -> anyhow::Result<ExitCode> {
             total += 1;
         }
     }
-    if total == 0 && unchecked == 0 {
+    if total == 0 && unchecked == 0 && unread == 0 {
         println!("Everything is already up to date.");
     } else if total == 0 {
         // "Up to date" is a claim about versions that were compared against a
@@ -940,11 +949,35 @@ pub async fn run_fix(args: FixArgs) -> anyhow::Result<ExitCode> {
         // was established, and printing the clean line anyway turns "we did not
         // look" into "we looked and found nothing", which is the one thing a fix
         // run must never say.
-        println!(
-            "Nothing to rewrite. {unchecked} dependenc{} could not be checked for a newer \
-             version; see the warnings above.",
-            if unchecked == 1 { "y" } else { "ies" }
-        );
+        //
+        // The two reasons are worded apart because they are different facts: an
+        // undetermined dependency *was* read and could not be checked, while an
+        // unread dependency list was never read, so there is not even a list of
+        // dependencies to have failed to check.
+        let undetermined_phrase = |count: usize| {
+            format!(
+                "{count} dependenc{} could not be checked for a newer version",
+                if count == 1 { "y" } else { "ies" }
+            )
+        };
+        let unread_phrase = |count: usize, lead: &str| {
+            format!(
+                "{lead} dependency list for {count} manifest{} could not be read, so nothing \
+                 in {} was checked",
+                if count == 1 { "" } else { "s" },
+                if count == 1 { "it" } else { "them" }
+            )
+        };
+        let why = match (unchecked, unread) {
+            (0, unread) => unread_phrase(unread, "The"),
+            (unchecked, 0) => undetermined_phrase(unchecked),
+            (unchecked, unread) => format!(
+                "{}, and {}",
+                undetermined_phrase(unchecked),
+                unread_phrase(unread, "the")
+            ),
+        };
+        println!("Nothing to rewrite. {why}; see the warnings above.");
     } else if !args.dry_run {
         println!(
             "\nUpdated {total} dependenc{}.",
