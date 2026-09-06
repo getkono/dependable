@@ -102,6 +102,13 @@ impl Level {
 /// declared constraint is noise on a pull request. It still appears in the table
 /// and in the job summary's totals.
 ///
+/// `Undetermined` is excluded too, but for a different reason and with a
+/// different remedy. It is not a per-dependency finding a reviewer can act on —
+/// in a registryless ecosystem *every* row carries it — so annotating each one
+/// would spend the whole ten-per-step budget saying the same thing. The fact is
+/// instead carried by the job summary, in [`totals`] and in [`caveats`], and by
+/// [`unread_command`] where the dependency list itself went unread.
+///
 /// Levels are independent of `--fail-on`. Deriving the level from whether a
 /// finding trips the gate would make a vulnerability a warning under
 /// `--fail-on outdated`, and would silence everything under `--fail-on none`.
@@ -428,6 +435,42 @@ fn elision(level: Level, omitted: usize) -> String {
     )
 }
 
+/// The `title=` carried by the annotation for a manifest whose dependency list
+/// went unread. Distinct from [`Level::title`], because the subject is a file
+/// rather than a dependency.
+const UNREAD_TITLE: &str = "dependable: dependency list could not be read";
+
+/// The `::notice` for one manifest whose dependency list went unread.
+///
+/// Per **manifest**, not per dependency — it exists precisely because there is no
+/// dependency to emit one against, which is the same reason SARIF keys `DEP003`
+/// that way. Without it such a manifest reaches a pull request as no annotation
+/// at all, and no annotation is exactly what a clean project looks like.
+///
+/// No `line=`: the missing information is a file that is *not there*, so there is
+/// no line in the manifest to point at. The `file=` still names the manifest.
+fn unread_command(report: &ManifestReport, workspace: Option<&Path>, cwd: Option<&Path>) -> String {
+    let file = relative_file(&report.path, workspace, cwd);
+    let manifest = file
+        .clone()
+        .unwrap_or_else(|| report.path.display().to_string());
+    let mut properties = Vec::new();
+    if let Some(file) = &file {
+        properties.push(format!("file={}", escape_property(file)));
+    }
+    properties.push(format!("title={}", escape_property(UNREAD_TITLE)));
+    format!(
+        "::{} {}::{}",
+        Level::Notice.token(),
+        properties.join(","),
+        escape_data(&format!(
+            "The dependency list for {manifest} could not be read, so no dependency in it \
+             was checked. An empty result set for this manifest means nothing was looked at, \
+             not that nothing is wrong."
+        ))
+    )
+}
+
 /// Every line to write to stderr: the workflow commands, plus a plain elision
 /// note for each level that had to be capped.
 ///
@@ -445,12 +488,41 @@ pub fn annotations(
         .into_iter()
         .enumerate()
     {
+        // The unread-list notices lead the notice level and share its cap rather
+        // than getting one of their own: GitHub's ten-per-step limit is per
+        // level, so a second independent cap would let twenty notices be emitted
+        // of which ten silently never render. Leading, because they are the only
+        // thing this channel has to say about a manifest that produced no rows at
+        // all — everything behind them is still named in the job summary, which
+        // is not capped at ten.
+        let leading: Vec<String> = if level == Level::Notice {
+            reports
+                .iter()
+                .filter(|report| report.dependencies_unread)
+                .map(|report| unread_command(report, workspace, cwd))
+                .collect()
+        } else {
+            Vec::new()
+        };
         let findings = &grouped[slot];
-        for finding in findings.iter().take(MAX_ANNOTATIONS_PER_LEVEL) {
-            lines.push(command(finding, level));
+        let total = leading.len() + findings.len();
+        let mut emitted = 0;
+        for line in leading {
+            if emitted == MAX_ANNOTATIONS_PER_LEVEL {
+                break;
+            }
+            lines.push(line);
+            emitted += 1;
         }
-        if findings.len() > MAX_ANNOTATIONS_PER_LEVEL {
-            lines.push(elision(level, findings.len() - MAX_ANNOTATIONS_PER_LEVEL));
+        for finding in findings {
+            if emitted == MAX_ANNOTATIONS_PER_LEVEL {
+                break;
+            }
+            lines.push(command(finding, level));
+            emitted += 1;
+        }
+        if total > emitted {
+            lines.push(elision(level, total - emitted));
         }
     }
     lines
@@ -515,16 +587,96 @@ fn counted(count: usize, singular: &str, plural: &str) -> String {
 }
 
 /// The totals line, from the same [`Summary`] the table renderer uses.
-fn totals(reports: &[ManifestReport]) -> String {
-    let summary = Summary::of(reports);
+///
+/// `undetermined` is carried here for the same reason [`crate::output::table`]
+/// carries it: a dependency whose currency was never established is neither up
+/// to date nor outdated, so leaving it out of the line makes every one of them
+/// vanish into a row of zeros. A Swift project — every checkable pin of which is
+/// undetermined, because the ecosystem publishes no registry — would otherwise
+/// render as a fully checked project with nothing wrong.
+fn totals(summary: &Summary) -> String {
     format!(
-        "{} checked — {} vulnerable, {} outdated, {}, {} up to date.",
+        "{} checked — {} vulnerable, {} outdated, {}, {} undetermined, {} up to date.",
         counted(summary.total, "dependency", "dependencies"),
         summary.vulnerable,
         summary.outdated + summary.update_available,
         counted(summary.error, "error", "errors"),
+        summary.undetermined,
         summary.up_to_date + summary.patch_available
     )
+}
+
+/// The manifests whose dependency list went unread, named the way an annotation
+/// names them: repository-relative where that is possible, absolute otherwise.
+fn unread_manifests(
+    reports: &[ManifestReport],
+    workspace: Option<&Path>,
+    cwd: Option<&Path>,
+) -> Vec<String> {
+    reports
+        .iter()
+        .filter(|report| report.dependencies_unread)
+        .map(|report| {
+            relative_file(&report.path, workspace, cwd)
+                .unwrap_or_else(|| report.path.display().to_string())
+        })
+        .collect()
+}
+
+/// The coverage caveat: what this run did **not** establish, said in the one
+/// place a line of zeros would otherwise be read as denying it.
+///
+/// Every count in [`totals`] is a tally of rows that were read *and* compared
+/// against a registry. An undetermined row was read and never compared; an
+/// unread dependency list produced no rows at all. Both therefore land as zeros,
+/// and without this block the summary of a project nothing was established about
+/// is byte-identical to the summary of a genuinely clean one.
+///
+/// The manifests are named for the same reason SARIF's `DEP003` names them: the
+/// fact belongs to a file, not to a dependency, because there is no dependency
+/// to hang it on.
+///
+/// Empty when there is nothing to caveat, so a clean run is unchanged.
+fn caveats(
+    reports: &[ManifestReport],
+    summary: &Summary,
+    workspace: Option<&Path>,
+    cwd: Option<&Path>,
+) -> String {
+    let unread = unread_manifests(reports, workspace, cwd);
+    if summary.undetermined == 0 && unread.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("**Coverage caveat**\n\n");
+    if summary.undetermined > 0 {
+        let _ = writeln!(
+            out,
+            "- {} could not be checked for a newer version, so this run establishes \
+             nothing about their currency and the totals above do not claim it.",
+            counted(summary.undetermined, "dependency", "dependencies")
+        );
+    }
+    if !unread.is_empty() {
+        let mut list = unread
+            .iter()
+            .take(MAX_ROWS_PER_TABLE)
+            .map(|manifest| code_cell(manifest))
+            .collect::<Vec<String>>()
+            .join(", ");
+        if unread.len() > MAX_ROWS_PER_TABLE {
+            let _ = write!(list, ", … {} more", unread.len() - MAX_ROWS_PER_TABLE);
+        }
+        let _ = writeln!(
+            out,
+            "- The dependency list for {} could not be read, so no dependency in {} was \
+             checked. An empty result set for such a manifest means nothing was looked at, \
+             not that nothing is wrong: {list}.",
+            counted(unread.len(), "manifest", "manifests"),
+            if unread.len() == 1 { "it" } else { "them" }
+        );
+    }
+    out.push('\n');
+    out
 }
 
 /// The advisory cell: a Markdown link where there is a canonical page, else the
@@ -663,13 +815,29 @@ pub fn summary_markdown(
     cwd: Option<&Path>,
 ) -> String {
     let grouped = group(reports, workspace, cwd);
-    let head = format!("## dependable\n\n{}\n\n", totals(reports));
+    let summary = Summary::of(reports);
+    let head = format!(
+        "## dependable\n\n{}\n\n{}",
+        totals(&summary),
+        caveats(reports, &summary, workspace, cwd)
+    );
     let tables = tables(&grouped);
 
     if tables.is_empty() {
         // An empty summary is indistinguishable from a step that never ran, so
-        // say so explicitly.
-        let out = format!("{head}No outdated or vulnerable dependencies found.\n\n");
+        // say so explicitly — but only where the run actually established it.
+        // With an undetermined dependency, or a manifest whose dependency list
+        // went unread, there is nothing to have found: "no outdated or vulnerable
+        // dependencies found" would turn "we did not look" into "we looked and
+        // found nothing", and the caveat above is the whole of what can honestly
+        // be said. Every other surface already draws this line — the table
+        // heading, the HTML report, `manifests_unread` in JSON, `DEP003` in
+        // SARIF — and the job summary is the one a pull request actually shows.
+        let out = if summary.undetermined == 0 && summary.manifests_unread == 0 {
+            format!("{head}No outdated or vulnerable dependencies found.\n\n")
+        } else {
+            head
+        };
         return if out.len() <= budget {
             out
         } else {
@@ -815,6 +983,7 @@ mod tests {
             ecosystem: Ecosystem::Rust,
             results,
             workspace_root: None,
+            dependencies_unread: false,
         }
     }
 

@@ -65,9 +65,10 @@ fn check_format_sarif_emits_a_valid_log() {
     let driver = &runs[0]["tool"]["driver"];
     assert_eq!(driver["name"], "dependable");
     let rules = driver["rules"].as_array().expect("rules");
-    assert_eq!(rules.len(), 2);
+    assert_eq!(rules.len(), 3);
     assert_eq!(rules[0]["id"], "DEP001");
     assert_eq!(rules[1]["id"], "DEP002");
+    assert_eq!(rules[2]["id"], "DEP003");
 
     // `results` must be present even with nothing to report: an absent `results`
     // means the run produced none because it failed.

@@ -117,8 +117,11 @@ pub enum DependencyKind {
     /// Cargo's `[workspace.dependencies]`, pnpm catalogs, NuGet `PackageVersion`.
     /// Members opt in by name, so the declaration alone means nothing is depended on.
     Workspace,
-    /// A transitive dependency the manifest records explicitly (`go.mod`'s
-    /// `// indirect`). Not a direct dependency of the module.
+    /// A dependency that is not known to be a direct one: either recorded as
+    /// transitive (`go.mod`'s `// indirect`), or drawn from a flattened
+    /// resolution that marks direct and transitive pins alike (SwiftPM's
+    /// `Package.resolved`). Either way, calling it direct would be a claim the
+    /// file does not support.
     Indirect,
 }
 

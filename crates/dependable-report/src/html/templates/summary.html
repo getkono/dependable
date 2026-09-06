@@ -1,6 +1,16 @@
 {% import "macros.html" as m %}
 <section id="summary" class="card">
 <h2>1. Executive summary</h2>
+{%- if summary.manifests_unread %}
+<div class="notes" role="note">
+<p class="notes-head">Coverage caveat</p>
+<ul>
+<li>{{ summary.manifests_unread }} of the {{ summary.manifests }} manifest(s) here had no readable
+dependency list, so they contributed nothing to the counts below. Their sections in §3 say which.
+Nothing in this report speaks for them.</li>
+</ul>
+</div>
+{%- endif %}
 {%- if notes %}
 <div class="notes" role="note">
 <p class="notes-head">Notes from this run</p>

@@ -23,10 +23,12 @@ pub use graph::{
 };
 pub use item::{DependencyKind, Item, PackageSource};
 pub use lockfiles::{
-    LockedPackage, LockfileData, ResolvedLockfile, apply_lockfile, parse_bun_lock,
+    LockedPackage, LockfileData, ResolvedLockfile, apply_lockfile, lockfile_items, parse_bun_lock,
     parse_bun_lock_graph, parse_cargo_lock, parse_cargo_lock_graph, parse_composer_lock,
     parse_composer_lock_graph, parse_dart_pubspec_lock, parse_lockfile, parse_lockfile_kind,
     parse_mix_lock, parse_mix_lock_graph, parse_package_lock, parse_package_lock_graph,
+    parse_swift_package_resolved, swift_package_name, swift_package_name_variants,
+    swift_package_resolved_items,
 };
 pub use manifest::{
     AlternateRegistryDecl, LockfileKind, ManifestKind, ParsedManifest, UNREADABLE_MANIFESTS,
@@ -36,10 +38,10 @@ pub use npmrc::{NpmrcConfig, parse_npmrc};
 pub use parsers::{
     AutoTargets, CargoPackageManifest, CargoTarget, CargoTargetKind, CargoTomlParser,
     CfgDependencyTable, ComposerJsonParser, CsprojParser, DenoJsonParser, DependencySection,
-    GoModParser, GradleCatalogParser, MixExsParser, PackageField, PackageJsonParser, Parser,
-    PnpmWorkspaceParser, PomXmlParser, ProjectMeta, ProjectRole, PubspecYamlParser,
-    PyprojectTomlParser, RequirementsTxtParser, WorkspaceDecl, parse, parse_cargo_config,
-    parse_package_manifest, parse_package_name, parse_project, parse_workspace,
+    GoModParser, GradleCatalogParser, MixExsParser, PackageField, PackageJsonParser,
+    PackageSwiftParser, Parser, PnpmWorkspaceParser, PomXmlParser, ProjectMeta, ProjectRole,
+    PubspecYamlParser, PyprojectTomlParser, RequirementsTxtParser, WorkspaceDecl, parse,
+    parse_cargo_config, parse_package_manifest, parse_package_name, parse_project, parse_workspace,
     resolve_workspace_inheritance,
 };
 pub use result::{CheckResult, DependencyStatus};
