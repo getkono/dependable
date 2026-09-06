@@ -294,7 +294,7 @@ source = "registry+https://x"
         DependencyGraph::from_resolved(&resolved, &names, &["app".to_owned()])
     }
 
-    /// `ascii` output with any terminal styling removed.
+    /// `raw` with any terminal styling removed.
     ///
     /// [`label`] colours through `if_supports_color`, which asks the ambient
     /// environment whether stdout can take ANSI — and `FORCE_COLOR`, which a
@@ -303,8 +303,20 @@ source = "registry+https://x"
     /// tree, never on its colour, so a styled run must not fail them; stripping
     /// here is what states that, rather than leaving it to whatever the process
     /// happened to inherit.
-    fn plain(graph: &DependencyGraph, opts: &TreeOptions) -> String {
-        let raw = ascii(graph, opts);
+    ///
+    /// The contract is two escape forms, which is what `owo-colors` emits:
+    ///
+    /// - a CSI sequence, `ESC [` then parameter and intermediate bytes then a
+    ///   final byte in `@..=~` — dropped whole, final byte included;
+    /// - any other escape, treated as the two-character form `ESC` + one byte
+    ///   and dropped whole.
+    ///
+    /// A string escape (OSC, DCS, APC …) carries a payload terminated by BEL or
+    /// `ESC \\` rather than a single byte, so it is *not* in the contract: this
+    /// would drop its introducer and leave the payload as text. Nothing here
+    /// emits one; a styling path that starts to (a hyperlink, say) has to teach
+    /// this function about it.
+    fn strip_ansi(raw: &str) -> String {
         let mut out = String::with_capacity(raw.len());
         let mut chars = raw.chars();
         while let Some(c) = chars.next() {
@@ -312,8 +324,6 @@ source = "registry+https://x"
                 out.push(c);
                 continue;
             }
-            // Only CSI sequences (`ESC [ … final`) are ever emitted here, and a
-            // CSI's final byte is the first in `@..=~` after the `[`.
             if chars.next() != Some('[') {
                 continue;
             }
@@ -327,8 +337,42 @@ source = "registry+https://x"
     }
 
     #[test]
+    fn strip_ansi_drops_a_csi_sequence_whole() {
+        assert_eq!(
+            strip_ansi("\u{1b}[36;1mserde\u{1b}[0m v1.0.0"),
+            "serde v1.0.0"
+        );
+    }
+
+    /// A CSI whose final byte is not `m`: still terminated by the first byte in
+    /// `@..=~`, because parameter (`0x30..=0x3F`) and intermediate (`0x20..=0x2F`)
+    /// bytes all sort below that range.
+    #[test]
+    fn strip_ansi_ends_a_csi_at_a_final_byte_other_than_m() {
+        assert_eq!(strip_ansi("a\u{1b}[2Kb\u{1b}[1;31Hc"), "abc");
+    }
+
+    /// A two-character escape — `ESC c` (RIS) — loses both characters.
+    #[test]
+    fn strip_ansi_drops_a_two_character_escape() {
+        assert_eq!(strip_ansi("a\u{1b}cb"), "ab");
+    }
+
+    /// A lone trailing `ESC` has nothing after it: the iterator ends and the
+    /// escape is dropped rather than emitted as text.
+    #[test]
+    fn strip_ansi_drops_a_lone_trailing_escape() {
+        assert_eq!(strip_ansi("serde\u{1b}"), "serde");
+    }
+
+    #[test]
+    fn strip_ansi_leaves_unstyled_text_alone() {
+        assert_eq!(strip_ansi("├── serde v1.0.0 (*)"), "├── serde v1.0.0 (*)");
+    }
+
+    #[test]
     fn ascii_marks_workspace_and_dedupe() {
-        let out = plain(&sample(), &TreeOptions::default());
+        let out = strip_ansi(&ascii(&sample(), &TreeOptions::default()));
         assert!(out.contains("app v0.1.0 (workspace)"));
         assert!(out.contains("├── serde v1.0.0"));
         assert!(out.contains("└── ")); // last-child connector
@@ -360,7 +404,7 @@ source = "registry+https://x"
 
     #[test]
     fn ascii_points_a_member_at_its_own_tree() {
-        let out = plain(&workspace(), &TreeOptions::default());
+        let out = strip_ansi(&ascii(&workspace(), &TreeOptions::default()));
         assert!(
             out.contains("└── lib v0.1.0 (workspace) (see root)"),
             "under `app`, `lib` is a pointer rather than a copy; {out}"
@@ -383,7 +427,7 @@ source = "registry+https://x"
             collapse_roots: false,
             ..TreeOptions::default()
         };
-        let out = plain(&workspace(), &opts);
+        let out = strip_ansi(&ascii(&workspace(), &opts));
         assert!(!out.contains("(see root)"), "{out}");
         assert_eq!(out.matches("serde v1.0.0").count(), 2, "{out}");
     }
@@ -395,7 +439,7 @@ source = "registry+https://x"
             dedupe: true,
             ..TreeOptions::default()
         };
-        let out = plain(&sample(), &opts);
+        let out = strip_ansi(&ascii(&sample(), &opts));
         assert!(out.contains("app v0.1.0 (workspace)"));
         assert!(!out.contains("serde"));
     }
