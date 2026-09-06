@@ -958,12 +958,15 @@ pub async fn run_fix(args: FixArgs) -> anyhow::Result<ExitCode> {
     // *after* each write, the failing iteration also destroyed the record of what had
     // already changed.
     let mut planned = Vec::new();
+    let mut inherited = 0usize;
     for manifest in &manifests {
         let Some(report) = engine.check_manifest(manifest).await? else {
             continue;
         };
-        report_inherited_skips(manifest, &report);
-        planned.push(fix::plan(manifest, &report.results, args.all)?);
+        inherited += report_inherited_skips(manifest, &report);
+        let plan = fix::plan(manifest, &report.results, args.all)?;
+        report_declined_fixes(manifest, &plan.declined);
+        planned.push(plan);
     }
 
     let mut total = 0;
@@ -984,8 +987,32 @@ pub async fn run_fix(args: FixArgs) -> anyhow::Result<ExitCode> {
             total += 1;
         }
     }
+    let declined: usize = planned.iter().map(|plan| plan.declined.len()).sum();
+    // Every category this run emitted a note for, not just the constraint
+    // declines. An inherited dependency is left behind in exactly the sense the
+    // line below means, and counting only one of the two categories printed the
+    // clean line on stdout directly over an inherited-skip note on stderr.
+    let left_alone = declined + inherited;
     if total == 0 {
-        println!("Everything is already up to date.");
+        // "Everything is already up to date" is only true when nothing was left
+        // behind. Saying it over an update this run declined to write is the
+        // contradiction with `check` that this whole path exists to remove, so the
+        // count of what was left alone takes over the line and points at the notes
+        // that explain it.
+        //
+        // The notes are on stderr and this line is on stdout, so it says *where*:
+        // `dependable fix > fix.log` puts the summary in the log and the notes on
+        // the terminal, and "see the notes above" would name nothing the reader of
+        // either stream can find.
+        if left_alone == 0 {
+            println!("Everything is already up to date.");
+        } else {
+            println!(
+                "Nothing to rewrite. {left_alone} available update{} left alone; \
+                 see the notes on stderr.",
+                if left_alone == 1 { "" } else { "s" }
+            );
+        }
     } else if !args.dry_run {
         println!(
             "\nUpdated {total} dependenc{}.",
@@ -1038,29 +1065,29 @@ fn resolve_report_settings(args: &crate::cli::ReportArgs, cfg: &Config) -> Setti
 /// silently left alone by `fix`, because the version string is in the workspace root and
 /// there is no line here to rewrite. Without this the two commands appear to contradict
 /// each other, and nothing points at the file that can actually be changed.
-fn report_inherited_skips(manifest: &Path, report: &ManifestReport) {
+///
+/// Returns how many it named, because the summary line has to know. These never
+/// reach [`fix::plan`]'s declined list — the item is not rewritable, so the
+/// planner drops it before any constraint is consulted — and a summary counting
+/// only that list printed "Everything is already up to date." on stdout over the
+/// note this function had just written to stderr.
+#[must_use]
+fn report_inherited_skips(manifest: &Path, report: &ManifestReport) -> usize {
     let Some(root) = &report.workspace_root else {
-        return;
+        return 0;
     };
     let mut names: Vec<&str> = report
         .results
         .iter()
         .filter(|result| {
-            result.item.source == PackageSource::Inherited
-                && matches!(
-                    result.status,
-                    DependencyStatus::PatchAvailable
-                        | DependencyStatus::UpdateAvailable
-                        | DependencyStatus::Outdated
-                        | DependencyStatus::Vulnerable
-                )
+            result.item.source == PackageSource::Inherited && result.status.has_update()
         })
         .map(|result| result.item.name.as_str())
         .collect();
     names.sort_unstable();
     names.dedup();
     if names.is_empty() {
-        return;
+        return 0;
     }
     eprintln!(
         "note: {} inherits {} from the workspace; upgrade {} in {}",
@@ -1069,6 +1096,37 @@ fn report_inherited_skips(manifest: &Path, report: &ManifestReport) {
         if names.len() == 1 { "it" } else { "them" },
         root.display()
     );
+    names.len()
+}
+
+/// Say which available updates this manifest's own constraints refused, and why.
+///
+/// The sibling of [`report_inherited_skips`], for the other way `fix` can decline
+/// an upgrade `check` just reported: there the version string lives in another
+/// file, here it lives in a constraint that a concrete version would not
+/// reproduce — a wildcard, a dist-tag, a two-bound range. Both are silent skips,
+/// and silence is what makes the two commands look like they disagree.
+///
+/// stderr, like its sibling: a note is not part of the record of what `fix`
+/// changed, and piping stdout must not swallow it or mix it into that record.
+fn report_declined_fixes(manifest: &Path, declined: &[fix::Declined]) {
+    for item in declined {
+        // A decline usually knows the release it would have written, and naming it
+        // is half the note's value. [`fix::DeclineReason::NoTarget`] is the case
+        // that does not, and an empty or invented version there would be worse
+        // than an opening that claims less.
+        let available = match &item.target {
+            Some(target) => format!("{target} is available"),
+            None => "an update was reported".to_string(),
+        };
+        eprintln!(
+            "note: left {} = {} alone in {}: {available}, but {}",
+            item.name,
+            item.constraint,
+            manifest.display(),
+            item.reason.explain()
+        );
+    }
 }
 
 /// Read whole-template overrides from `<root>/dependable-templates/`.
