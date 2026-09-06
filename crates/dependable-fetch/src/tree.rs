@@ -238,7 +238,7 @@ fn collect_members(
     let mut walk = Walk {
         root_dir,
         excluded,
-        seen: HashSet::new(),
+        seen: HashMap::new(),
         members: Vec::new(),
         // The scan root is index 0, and a nested root can only be pushed after the
         // root that contains it — so a smaller index is always the outer scope.
@@ -259,8 +259,8 @@ struct Walk<'a> {
     root_dir: &'a Path,
     /// Absolute directories named in the scan root's `[workspace] exclude`.
     excluded: &'a HashSet<PathBuf>,
-    /// Every `[package] name` already recorded; a crate name yields one member.
-    seen: HashSet<String>,
+    /// `[package] name` -> index into `members`; a crate name yields one member.
+    seen: HashMap<String, usize>,
     members: Vec<Member>,
     scopes: Vec<Scope>,
 }
@@ -287,19 +287,44 @@ impl Walk<'_> {
         };
         if let Some(content) = manifest
             && let Some(name) = parse_package_name(&content)
-            && self.seen.insert(name.clone())
         {
-            self.members.push(Member {
-                name,
-                content,
-                scope,
-            });
+            match self.seen.get(&name).copied() {
+                // Two crates can share a `[package] name` across a nested-workspace
+                // boundary, and only one node can carry it. The outer scope wins: a
+                // nested root is only pushed after the root containing it, so a
+                // smaller index is the enclosing one. Between two crates in *sibling*
+                // nested workspaces neither encloses the other, and the smaller index
+                // is then the alphabetically earlier path — arbitrary, but fixed,
+                // which is the point. Without this the answer would follow whichever
+                // one the filesystem happened to hand back first.
+                Some(idx) => {
+                    if scope < self.members[idx].scope {
+                        self.members[idx] = Member {
+                            name,
+                            content,
+                            scope,
+                        };
+                    }
+                }
+                None => {
+                    self.seen.insert(name.clone(), self.members.len());
+                    self.members.push(Member {
+                        name,
+                        content,
+                        scope,
+                    });
+                }
+            }
         }
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
         };
-        for entry in entries.flatten() {
-            let path = entry.path();
+        // `read_dir` yields filesystem order, which can differ between machines holding
+        // identical contents. Descending in a fixed order is what makes the walk — and
+        // with it the duplicate-name rule above — reproducible.
+        let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+        paths.sort();
+        for path in paths {
             if !path.is_dir() || depth_left == 0 || self.excluded.contains(&path) {
                 continue;
             }

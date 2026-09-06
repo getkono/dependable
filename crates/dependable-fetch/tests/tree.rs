@@ -618,6 +618,77 @@ nested-dep.workspace = true
     );
 }
 
+/// Two crates can share a `[package] name` across a nested-workspace boundary, and
+/// the graph keys nodes by name, so only one of them survives. The outer one does —
+/// it is the crate the scan is actually about — and it does so whichever of the two
+/// the directory walk reaches first, since a version that depends on filesystem
+/// iteration order is not a resolution of anything.
+#[test]
+fn a_name_shared_across_a_nested_boundary_keeps_the_outer_crates_version() {
+    // The same two crates twice, with the directories named so the walk reaches the
+    // outer crate first in one layout and the nested crate first in the other.
+    let built_with = |outer_dir: &str, nested_dir: &str| {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        fs::write(
+            dir.join("Cargo.toml"),
+            r#"
+[workspace]
+resolver = "2"
+
+[workspace.package]
+version = "1.0.0"
+"#,
+        )
+        .unwrap();
+        let outer_member = dir.join(outer_dir);
+        fs::create_dir_all(&outer_member).unwrap();
+        fs::write(
+            outer_member.join("Cargo.toml"),
+            r#"
+[package]
+name = "dup"
+version.workspace = true
+"#,
+        )
+        .unwrap();
+        let nested = dir.join(nested_dir);
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(
+            nested.join("Cargo.toml"),
+            r#"
+[workspace]
+
+[workspace.package]
+version = "9.9.9"
+"#,
+        )
+        .unwrap();
+        let nested_member = nested.join("dup");
+        fs::create_dir_all(&nested_member).unwrap();
+        fs::write(
+            nested_member.join("Cargo.toml"),
+            r#"
+[package]
+name = "dup"
+version.workspace = true
+"#,
+        )
+        .unwrap();
+
+        let built = build_workspace_graph(dir, &WorkspaceGraphOptions::default()).unwrap();
+        assert_eq!(built.source, GraphSource::Manifests);
+        version_of(&built.graph, "dup").map(str::to_owned)
+    };
+
+    assert_eq!(built_with("aaa", "zzz").as_deref(), Some("1.0.0"));
+    assert_eq!(
+        built_with("zzz", "aaa").as_deref(),
+        Some("1.0.0"),
+        "and still the outer crate when the walk meets the nested one first"
+    );
+}
+
 /// Without a lockfile the graph is built from manifests alone, and a member's
 /// `dep.workspace = true` says nothing about what the crate *is*. The root's declaration
 /// does, and the root is already read here — so `centrally_declared` is classified from
