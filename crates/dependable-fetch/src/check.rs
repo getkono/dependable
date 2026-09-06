@@ -189,6 +189,36 @@ struct FetchTask {
     cache_key: String,
 }
 
+/// What the walk for a governing workspace root found — or that no walk ran.
+///
+/// `Option` could not say both, and the difference is load-bearing:
+/// [`Checker::check_manifest`] takes content with no file behind it and therefore
+/// never walks anything, while [`Checker::check_path`] walks and may legitimately
+/// come back empty. [`detached_inheritance`] asserts the second — "no root exists
+/// above this file" — which is false of the first, whose caller may be an IDE
+/// holding an open buffer of a member deep inside an ordinary workspace.
+enum WorkspaceContext {
+    /// No search was performed: there is no path to walk up from. Says nothing at
+    /// all about whether a root exists on disk.
+    Unsearched,
+    /// The walk ran and reached the top of the tree without finding a root.
+    NotFound,
+    /// The walk found this root, and these are the dependencies it declares.
+    Found(PathBuf, Arc<Vec<Item>>),
+}
+
+impl WorkspaceContext {
+    /// The root the walk found, for [`ManifestCheck::workspace_root`] — `None`
+    /// both when the walk found nothing and when no walk ran, because the field
+    /// reports a located root and neither case located one.
+    fn into_root(self) -> Option<PathBuf> {
+        match self {
+            Self::Found(root, _) => Some(root),
+            Self::Unsearched | Self::NotFound => None,
+        }
+    }
+}
+
 /// The result of one fetch task: `(name, cache_key, versions-or-error)`.
 type FetchOutcome = (String, String, Result<Vec<String>, String>);
 
@@ -230,10 +260,12 @@ impl Checker {
         // Content with no file behind it: the manifest's first lockfile is the
         // only thing it can be attributed to.
         let lockfile = lockfile.and_then(|lock| Some((*kind.lockfiles().first()?, lock)));
-        // No file, so no tree above it: a `dep.workspace = true` here stays unresolved
-        // and reports as it always has. [`Checker::check_path`] is the entry point that
-        // can answer the question.
-        self.check_inner(kind, manifest, lockfile, None).await
+        // No file, so nothing to walk upwards from: a `dep.workspace = true` here stays
+        // unresolved and reports as it always has. `Unsearched` and not `NotFound` —
+        // this call never looked, so it must not say what a look would have found.
+        // [`Checker::check_path`] is the entry point that can answer the question.
+        self.check_inner(kind, manifest, lockfile, WorkspaceContext::Unsearched)
+            .await
     }
 
     /// Check a manifest on disk: detect its kind, read it (and, when
@@ -494,7 +526,12 @@ impl Checker {
         // A member's `dep.workspace = true` states no version of its own; the constraint
         // is in the root above it. Only a path can find that root, which is why this
         // resolves here and not in `check_manifest`.
-        let workspace = self.workspace_source(path, kind, &manifest).await;
+        let workspace = match self.workspace_source(path, kind, &manifest).await {
+            Some((root, declarations)) => WorkspaceContext::Found(root, declarations),
+            // The walk ran and reached the top with nothing: that is a fact about the
+            // tree, and the one `detached_inheritance` is allowed to report.
+            None => WorkspaceContext::NotFound,
+        };
         self.check_inner(kind, &manifest, lockfile, workspace).await
     }
 
@@ -548,7 +585,7 @@ impl Checker {
         kind: ManifestKind,
         manifest: &str,
         lockfile: Option<(LockfileKind, &str)>,
-        workspace: Option<(PathBuf, Arc<Vec<Item>>)>,
+        workspace: WorkspaceContext,
     ) -> Result<ManifestCheck, CheckError> {
         let ecosystem = kind.ecosystem();
         let fetcher = self
@@ -566,12 +603,20 @@ impl Checker {
         // nothing in this file.
         let mut warnings = Vec::new();
         warnings.extend(std::mem::take(&mut parsed.notices));
-        if let Some((root, declarations)) = &workspace {
-            // The resolved names are the caller's business; the annotated items are ours.
-            let _ = resolve_workspace_inheritance(&mut parsed.items, declarations);
-            warnings.extend(undeclared_inheritance(&parsed.items, root));
-        } else {
-            warnings.extend(detached_inheritance(&parsed.items, kind));
+        match &workspace {
+            WorkspaceContext::Found(root, declarations) => {
+                // The resolved names are the caller's business; the annotated items are ours.
+                let _ = resolve_workspace_inheritance(&mut parsed.items, declarations);
+                warnings.extend(undeclared_inheritance(&parsed.items, root));
+            }
+            WorkspaceContext::NotFound => {
+                warnings.extend(detached_inheritance(&parsed.items, kind));
+            }
+            // Nothing was walked, so nothing is known about what sits above this
+            // content — least of all that there is nothing. The entry still reports
+            // `Undetermined`; what it does not do is explain that with a search that
+            // never ran.
+            WorkspaceContext::Unsearched => {}
         }
 
         // Apply the lockfile to annotate locked versions, dispatching on the file
@@ -635,7 +680,7 @@ impl Checker {
             ecosystem,
             results,
             warnings,
-            workspace_root: workspace.map(|(root, _)| root),
+            workspace_root: workspace.into_root(),
         };
 
         // Enrichment is a post-pass over the finished results, so it can equally
