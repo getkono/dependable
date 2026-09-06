@@ -178,6 +178,11 @@ fn excluded_dirs(root_dir: &Path, root_content: &str) -> HashSet<PathBuf> {
 /// actually governs it. The two tables travel together because a member's
 /// `version.workspace = true` and its `dep.workspace = true` name the *same* root;
 /// answering them from different manifests is the bug this type exists to prevent.
+///
+/// The [`Default`] scope — both tables empty — is what an *opaque* boundary gets:
+/// a root whose manifest cannot be read or parsed lends no authority at all, but
+/// still stops the enclosing root's from reaching past it.
+#[derive(Default)]
 struct Scope {
     /// `[workspace.package]`, the source of a member's `version.workspace = true`.
     package_defaults: BTreeMap<String, String>,
@@ -210,6 +215,40 @@ fn scope_of(content: &str) -> Scope {
     }
 }
 
+/// What a directory's `Cargo.toml` tells the walk about the subtree beneath it.
+///
+/// The distinction that matters is between *absent* and *unusable*. A directory
+/// with no manifest is plainly still governed by the enclosing workspace root; a
+/// directory whose manifest exists but cannot be read or parsed is not — it may
+/// well declare a `[workspace]`, and there is no way to tell. Collapsing the two
+/// into "not a workspace" is what would let a crate below an unreadable nested
+/// root inherit a version from a root with no authority over it.
+enum Boundary {
+    /// No `Cargo.toml` here. The enclosing scope still governs what is below.
+    Absent,
+    /// A `Cargo.toml` that was read and parses as TOML.
+    Manifest(String),
+    /// A `Cargo.toml` that exists but could not be read, or is not valid TOML.
+    Opaque,
+}
+
+/// Classify a directory's `Cargo.toml` into a [`Boundary`].
+///
+/// Anything other than "the file is not there" is [`Boundary::Opaque`]: a
+/// permission error, an unreadable device, a directory of that name, or a syntax
+/// error all leave the manifest's contents unknown, and unknown is not the same as
+/// empty.
+fn boundary_at(dir: &Path) -> Boundary {
+    match std::fs::read_to_string(dir.join("Cargo.toml")) {
+        // `CargoTomlParser` fails only when the TOML itself does not parse, which is
+        // exactly the question being asked here.
+        Ok(content) if CargoTomlParser.parse(&content).is_ok() => Boundary::Manifest(content),
+        Ok(_) => Boundary::Opaque,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Boundary::Absent,
+        Err(_) => Boundary::Opaque,
+    }
+}
+
 /// A crate manifest found under the scan root.
 struct Member {
     /// The crate's `[package] name`.
@@ -222,7 +261,8 @@ struct Member {
     /// The scan root is index 0. A crate inside a nested, independent workspace — a
     /// `fuzz/` or `examples/` directory with its own `[workspace]` table — points at
     /// that nested root instead, because Cargo resolves it against *that* one and the
-    /// scan root has no authority over it.
+    /// scan root has no authority over it. An unreadable or unparseable manifest in
+    /// between opens a scope too — an empty one, per [`Boundary::Opaque`].
     scope: usize,
 }
 
@@ -270,7 +310,7 @@ impl Walk<'_> {
     fn descend(&mut self, dir: &Path, depth_left: usize, scope: usize) {
         // Read once: the same text answers both "is this a workspace root?" and "is
         // this a crate?", and a `cargo fuzz` manifest is routinely both.
-        let manifest = std::fs::read_to_string(dir.join("Cargo.toml")).ok();
+        let manifest = boundary_at(dir);
         // A nested `[workspace]` is a workspace root in its own right. Cargo already
         // ignores such a subtree, so nobody lists it in `[workspace] exclude`, and the
         // walk still descends into it — but the outer root's tables have no authority
@@ -278,14 +318,26 @@ impl Walk<'_> {
         // instead. The scope is switched *before* this directory's own `[package]` is
         // read, so a manifest that is both a `[workspace]` and a `[package]` resolves
         // against itself.
-        let scope = match manifest.as_deref() {
-            Some(content) if dir != self.root_dir && parse_workspace(content).is_some() => {
+        let scope = match &manifest {
+            Boundary::Manifest(content)
+                if dir != self.root_dir && parse_workspace(content).is_some() =>
+            {
                 self.scopes.push(scope_of(content));
+                self.scopes.len() - 1
+            }
+            // A manifest that exists but cannot be read or parsed is an opaque
+            // boundary, not an absent one: it may declare a `[workspace]`, and nothing
+            // here can rule that out. Push an empty scope so the crates below it
+            // resolve their `workspace = true` fields to nothing, rather than silently
+            // borrowing an enclosing root's — a file that exists and cannot be read is
+            // not evidence that the outer root governs what is beneath it.
+            Boundary::Opaque if dir != self.root_dir => {
+                self.scopes.push(Scope::default());
                 self.scopes.len() - 1
             }
             _ => scope,
         };
-        if let Some(content) = manifest
+        if let Boundary::Manifest(content) = manifest
             && let Some(name) = parse_package_name(&content)
         {
             match self.seen.get(&name).copied() {

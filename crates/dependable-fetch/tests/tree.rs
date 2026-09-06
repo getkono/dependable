@@ -689,6 +689,82 @@ version.workspace = true
     );
 }
 
+/// The scope stack's guarantee has to hold for a nested root that cannot be read at
+/// all. A `Cargo.toml` with a TOML syntax error yields no `[workspace]` table — but
+/// "it does not parse" is not "it is not a workspace", and treating the two alike
+/// would hand every crate beneath it to the outer root, which is precisely the
+/// confidently-wrong number the scope stack exists to prevent. An unusable manifest
+/// is an opaque boundary: nothing is inherited across it, in either direction.
+#[test]
+fn a_crate_under_an_unparseable_nested_root_inherits_nothing() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    fs::write(
+        dir.join("Cargo.toml"),
+        r#"
+[workspace]
+resolver = "2"
+members = ["crates/a"]
+
+[workspace.package]
+version = "1.0.0"
+
+[workspace.dependencies]
+shared-dep = "1"
+"#,
+    )
+    .unwrap();
+    let member = dir.join("crates").join("a");
+    fs::create_dir_all(&member).unwrap();
+    fs::write(
+        member.join("Cargo.toml"),
+        r#"
+[package]
+name = "a"
+version.workspace = true
+"#,
+    )
+    .unwrap();
+    // An unterminated table header: the file exists, and no reader can say whether
+    // it declares a `[workspace]`.
+    let broken = dir.join("fuzz");
+    fs::create_dir_all(&broken).unwrap();
+    fs::write(broken.join("Cargo.toml"), "[workspace\n").unwrap();
+    let below = broken.join("crates").join("target-crate");
+    fs::create_dir_all(&below).unwrap();
+    fs::write(
+        below.join("Cargo.toml"),
+        r#"
+[package]
+name = "target-crate"
+version.workspace = true
+
+[dependencies]
+shared-dep.workspace = true
+"#,
+    )
+    .unwrap();
+
+    let built = build_workspace_graph(dir, &WorkspaceGraphOptions::default()).unwrap();
+    assert_eq!(built.source, GraphSource::Manifests);
+    let g = &built.graph;
+    assert_eq!(
+        version_of(g, "a"),
+        Some("1.0.0"),
+        "the outer root still governs its own members"
+    );
+    assert_eq!(
+        version_of(g, "target-crate"),
+        None,
+        "a crate under an unreadable root inherits no version, least of all the outer root's 1.0.0"
+    );
+    assert_eq!(
+        version_of(g, "shared-dep"),
+        None,
+        "and no dependency constraint either — the outer `[workspace.dependencies]` does not reach across"
+    );
+}
+
 /// Without a lockfile the graph is built from manifests alone, and a member's
 /// `dep.workspace = true` says nothing about what the crate *is*. The root's declaration
 /// does, and the root is already read here — so `centrally_declared` is classified from
