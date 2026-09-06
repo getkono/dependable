@@ -1106,10 +1106,12 @@ fn the_list_heading_says_the_list_went_unread_rather_than_counting_zero() {
     );
 }
 
-/// The machine-readable half. Before this the two documents below were identical
-/// apart from the root path, so no consumer of `list --format json` could tell a
+/// The machine-readable half. Before this the two documents below differed in one
+/// field only, `lockfile` — `null` against `"Package.resolved"` — and that field
+/// answers a different question, since `--no-lock-file` produces the same `null`
+/// for a project whose list was read perfectly well. Set it aside, as the
+/// comparison below does, and no consumer of `list --format json` could tell a
 /// project that declares nothing from one whose dependency list was never opened.
-/// `lockfile: null` does not answer it — `--no-lock-file` produces that too.
 #[test]
 fn list_json_distinguishes_an_unread_dependency_list_from_an_empty_one() {
     let unread_dir = scratch("swift_list_json_unread");
@@ -1140,9 +1142,21 @@ fn list_json_distinguishes_an_unread_dependency_list_from_an_empty_one() {
         );
         let mut doc: serde_json::Value =
             serde_json::from_slice(&output.stdout).expect("list emits JSON");
-        // The one field that legitimately differs between the two runs, removed so
-        // the comparison below is about the projects and not about scratch paths.
-        doc.as_object_mut().expect("an object").remove("root");
+        // Every field that differs between the two runs for a reason other than
+        // the one under test, removed so the comparison below discriminates on
+        // `dependencies_unread` alone. `root` is a scratch path. `lockfile` is the
+        // subtler one: it is `null` for the unread project only because there is no
+        // `Package.resolved` there to name, so leaving it in would satisfy the
+        // comparison whether or not `dependencies_unread` exists at all — which is
+        // precisely the confusion this test exists to refute.
+        let object = doc.as_object_mut().expect("an object");
+        object.remove("root");
+        for project in object["projects"].as_array_mut().expect("an array") {
+            project
+                .as_object_mut()
+                .expect("an object")
+                .remove("lockfile");
+        }
         doc
     };
 
