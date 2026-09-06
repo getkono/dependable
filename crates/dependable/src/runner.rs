@@ -25,7 +25,9 @@ use dependable_tui::TuiOptions;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use indicatif::{ProgressBar, ProgressStyle};
 
-use crate::cli::{CheckArgs, EcosystemArg, FailOn, FixArgs, ListArgs, TreeArgs, TuiArgs};
+use crate::cli::{
+    CheckArgs, EcosystemArg, FailOn, FixArgs, Format, ListArgs, TreeArgs, TuiArgs,
+};
 use crate::config::{Config, load_config};
 #[cfg(feature = "report")]
 use crate::config::{PolicySource, load_policy};
@@ -694,6 +696,17 @@ pub async fn run_list(args: ListArgs) -> anyhow::Result<ExitCode> {
     )?;
     if manifests.is_empty() {
         report_no_manifests(&ecosystems);
+        // An empty selection still owes a machine-readable format a document.
+        // Exiting 0 with byte-empty stdout is what `list --ecosystem csharp
+        // --format json | jq ...` sees in a per-ecosystem CI matrix, and `jq`
+        // fails to parse nothing — on precisely the ecosystems exit 0 was chosen
+        // to keep green. The stderr line above is not machine-readable.
+        //
+        // `table` and `text` keep returning early: a human handed an empty table
+        // wants the stderr line, not a blank one.
+        if matches!(args.format, Format::Json) {
+            output::list::render(args.format, &[], &root)?;
+        }
         return Ok(ExitCode::SUCCESS);
     }
     let mut reports = Vec::new();
