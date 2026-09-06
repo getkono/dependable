@@ -46,6 +46,12 @@ jobs:
         run: mise run lint
       - name: Test
         run: mise run test
+      # A second run with color forced on. The tree assertions match unstyled
+      # text, and `FORCE_COLOR` outranks the TTY check the default run relies on,
+      # so this is the leg that catches an assertion straddling a style boundary
+      # before it reaches a contributor whose shell exports the variable.
+      - name: Test (color forced)
+        run: mise run test:color
 
   # Run the hermetic test suite on Windows and macOS so those targets are
   # officially supported. Format/lint are platform-agnostic and stay on the Linux
