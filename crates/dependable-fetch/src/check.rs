@@ -113,6 +113,13 @@ pub struct UnreachableRegistry {
     /// `None` when the fetcher opts out of [`RegistryFetcher::registry_root`], whose
     /// trait default returns nothing. The ecosystem is then the whole of what can be
     /// said, and [`label`](Self::label) says exactly that rather than an empty string.
+    ///
+    /// **This is the configured root, verbatim, and it may carry credentials** — an
+    /// `.npmrc` `registry` line interpolates `${VAR}`, and `.dependable.toml` roots are
+    /// written by hand. Never render it, whole or in part, anywhere a person or a CI job
+    /// log can see: [`label`](Self::label) is the only safe rendering, and it exists so
+    /// that a second consumer does not have to reimplement the redaction. Use the field
+    /// for identity — comparison, keying, counting — not for display.
     pub root: Option<String>,
 }
 
