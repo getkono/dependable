@@ -27,6 +27,10 @@ struct SummaryDto {
     outdated: usize,
     vulnerable: usize,
     error: usize,
+    /// Declarations whose currency could not be established — a POM deferring to
+    /// its `<parent>`, an unresolved workspace inheritance. Additive, and
+    /// deliberately not folded into `error`: nothing failed, nothing was asked.
+    undetermined: usize,
 }
 
 #[derive(Serialize)]
@@ -94,6 +98,7 @@ pub fn render(reports: &[ManifestReport]) -> anyhow::Result<()> {
             outdated: summary.outdated,
             vulnerable: summary.vulnerable,
             error: summary.error,
+            undetermined: summary.undetermined,
         },
         results,
     };

@@ -70,6 +70,7 @@ impl Parser for PubspecYamlParser {
             kind: ManifestKind::PubspecYaml,
             items,
             alternate_registries: Vec::new(),
+            notices: Vec::new(),
         })
     }
 }

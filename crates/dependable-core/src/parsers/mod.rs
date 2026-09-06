@@ -20,6 +20,7 @@ pub mod json_scan;
 pub mod mix_exs;
 pub mod package_json;
 pub mod pnpm_workspace;
+pub mod pom_xml;
 pub mod position;
 pub mod project;
 pub mod pubspec_yaml;
@@ -42,6 +43,7 @@ pub use gradle_catalog::GradleCatalogParser;
 pub use mix_exs::MixExsParser;
 pub use package_json::PackageJsonParser;
 pub use pnpm_workspace::PnpmWorkspaceParser;
+pub use pom_xml::PomXmlParser;
 pub use project::{ProjectMeta, ProjectRole, parse_project};
 pub use pubspec_yaml::PubspecYamlParser;
 pub use pyproject_toml::PyprojectTomlParser;
@@ -68,5 +70,6 @@ pub fn parse(kind: ManifestKind, content: &str) -> Result<ParsedManifest, ParseE
         ManifestKind::Csproj => CsprojParser.parse(content),
         ManifestKind::MixExs => MixExsParser.parse(content),
         ManifestKind::GradleVersionCatalog => GradleCatalogParser.parse(content),
+        ManifestKind::PomXml => PomXmlParser.parse(content),
     }
 }

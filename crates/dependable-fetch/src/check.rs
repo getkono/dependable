@@ -189,6 +189,36 @@ struct FetchTask {
     cache_key: String,
 }
 
+/// What the walk for a governing workspace root found — or that no walk ran.
+///
+/// `Option` could not say both, and the difference is load-bearing:
+/// [`Checker::check_manifest`] takes content with no file behind it and therefore
+/// never walks anything, while [`Checker::check_path`] walks and may legitimately
+/// come back empty. [`detached_inheritance`] asserts the second — "no root exists
+/// above this file" — which is false of the first, whose caller may be an IDE
+/// holding an open buffer of a member deep inside an ordinary workspace.
+enum WorkspaceContext {
+    /// No search was performed: there is no path to walk up from. Says nothing at
+    /// all about whether a root exists on disk.
+    Unsearched,
+    /// The walk ran and reached the top of the tree without finding a root.
+    NotFound,
+    /// The walk found this root, and these are the dependencies it declares.
+    Found(PathBuf, Arc<Vec<Item>>),
+}
+
+impl WorkspaceContext {
+    /// The root the walk found, for [`ManifestCheck::workspace_root`] — `None`
+    /// both when the walk found nothing and when no walk ran, because the field
+    /// reports a located root and neither case located one.
+    fn into_root(self) -> Option<PathBuf> {
+        match self {
+            Self::Found(root, _) => Some(root),
+            Self::Unsearched | Self::NotFound => None,
+        }
+    }
+}
+
 /// The result of one fetch task: `(name, cache_key, versions-or-error)`.
 type FetchOutcome = (String, String, Result<Vec<String>, String>);
 
@@ -230,10 +260,12 @@ impl Checker {
         // Content with no file behind it: the manifest's first lockfile is the
         // only thing it can be attributed to.
         let lockfile = lockfile.and_then(|lock| Some((*kind.lockfiles().first()?, lock)));
-        // No file, so no tree above it: a `dep.workspace = true` here stays unresolved
-        // and reports as it always has. [`Checker::check_path`] is the entry point that
-        // can answer the question.
-        self.check_inner(kind, manifest, lockfile, None).await
+        // No file, so nothing to walk upwards from: a `dep.workspace = true` here stays
+        // unresolved and reports as it always has. `Unsearched` and not `NotFound` —
+        // this call never looked, so it must not say what a look would have found.
+        // [`Checker::check_path`] is the entry point that can answer the question.
+        self.check_inner(kind, manifest, lockfile, WorkspaceContext::Unsearched)
+            .await
     }
 
     /// Check a manifest on disk: detect its kind, read it (and, when
@@ -494,7 +526,12 @@ impl Checker {
         // A member's `dep.workspace = true` states no version of its own; the constraint
         // is in the root above it. Only a path can find that root, which is why this
         // resolves here and not in `check_manifest`.
-        let workspace = self.workspace_source(path, kind, &manifest).await;
+        let workspace = match self.workspace_source(path, kind, &manifest).await {
+            Some((root, declarations)) => WorkspaceContext::Found(root, declarations),
+            // The walk ran and reached the top with nothing: that is a fact about the
+            // tree, and the one `detached_inheritance` is allowed to report.
+            None => WorkspaceContext::NotFound,
+        };
         self.check_inner(kind, &manifest, lockfile, workspace).await
     }
 
@@ -548,7 +585,7 @@ impl Checker {
         kind: ManifestKind,
         manifest: &str,
         lockfile: Option<(LockfileKind, &str)>,
-        workspace: Option<(PathBuf, Arc<Vec<Item>>)>,
+        workspace: WorkspaceContext,
     ) -> Result<ManifestCheck, CheckError> {
         let ecosystem = kind.ecosystem();
         let fetcher = self
@@ -565,10 +602,21 @@ impl Checker {
         // `PackageSource::Inherited`, which is what keeps `--fix` off a span that means
         // nothing in this file.
         let mut warnings = Vec::new();
-        if let Some((root, declarations)) = &workspace {
-            // The resolved names are the caller's business; the annotated items are ours.
-            let _ = resolve_workspace_inheritance(&mut parsed.items, declarations);
-            warnings.extend(undeclared_inheritance(&parsed.items, root));
+        warnings.extend(std::mem::take(&mut parsed.notices));
+        match &workspace {
+            WorkspaceContext::Found(root, declarations) => {
+                // The resolved names are the caller's business; the annotated items are ours.
+                let _ = resolve_workspace_inheritance(&mut parsed.items, declarations);
+                warnings.extend(undeclared_inheritance(&parsed.items, root));
+            }
+            WorkspaceContext::NotFound => {
+                warnings.extend(detached_inheritance(&parsed.items, kind));
+            }
+            // Nothing was walked, so nothing is known about what sits above this
+            // content — least of all that there is nothing. The entry still reports
+            // `Undetermined`; what it does not do is explain that with a search that
+            // never ran.
+            WorkspaceContext::Unsearched => {}
         }
 
         // Apply the lockfile to annotate locked versions, dispatching on the file
@@ -580,6 +628,10 @@ impl Checker {
             && let Ok(data) = parse_lockfile_kind(lock_kind, lock)
         {
             apply_lockfile(&mut parsed.items, &data);
+        }
+
+        if let Some(warning) = deferred_versions(&parsed.items, kind) {
+            warnings.push(warning);
         }
 
         // Build the fetch task list, routing each checkable item to a fetcher:
@@ -628,7 +680,7 @@ impl Checker {
             ecosystem,
             results,
             warnings,
-            workspace_root: workspace.map(|(root, _)| root),
+            workspace_root: workspace.into_root(),
         };
 
         // Enrichment is a post-pass over the finished results, so it can equally
@@ -789,6 +841,79 @@ fn undeclared_inheritance(items: &[Item], root: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Name every entry that says it inherits when no governing root was found at all.
+///
+/// The sibling of [`undeclared_inheritance`], for the case where the walk upwards ran
+/// out before it found a root rather than finding one that declares the wrong things.
+/// A detached member — a `Cargo.toml` with `serde = { workspace = true }` and nothing
+/// above it — reports every such entry as [`DependencyStatus::Undetermined`], which
+/// `--fail-on any` treats as a failure; without this the run exits non-zero with
+/// nothing on stderr to say why.
+///
+/// Only Cargo, because `workspace = true` is the only spelling that promises a root:
+/// a POM deferring to its `<parent>` has no root to be missing and is
+/// [`deferred_versions`]' story to tell.
+fn detached_inheritance(items: &[Item], kind: ManifestKind) -> Vec<String> {
+    if kind != ManifestKind::CargoToml {
+        return Vec::new();
+    }
+    let mut seen = HashSet::new();
+    items
+        .iter()
+        .filter(|item| {
+            item.source == PackageSource::Inherited && item.version_constraint.is_empty()
+        })
+        .filter(|item| seen.insert(item.name.as_str()))
+        .map(|item| {
+            format!(
+                "`{}` is declared `workspace = true`, but no workspace root was found above this manifest, so no version was read for it and nothing was checked",
+                item.name,
+            )
+        })
+        .collect()
+}
+
+/// Say, once per manifest, that some of its entries state no version this file can
+/// resolve — and therefore that nothing was checked for them.
+///
+/// Without it the run is silent: those entries report as
+/// [`DependencyStatus::Undetermined`] in a table a reader may not be reading, and
+/// stderr says nothing at all. `undeclared_inheritance` above is the Cargo
+/// equivalent and stays separate, because a Cargo member inheriting a name its root
+/// never declared is a *broken* manifest, while a POM deferring to its `<parent>` is
+/// an ordinary, valid, extremely common one — the same status, two different things
+/// to tell the reader.
+fn deferred_versions(items: &[Item], kind: ManifestKind) -> Option<String> {
+    let source = match kind {
+        ManifestKind::PomXml => {
+            "a `<parent>`, `<dependencyManagement>`, or a property this file does not declare"
+        }
+        _ => return None,
+    };
+    let mut names: Vec<&str> = items
+        .iter()
+        .filter(|item| {
+            item.source == PackageSource::Inherited && item.version_constraint.is_empty()
+        })
+        .map(|item| item.name.as_str())
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    if names.is_empty() {
+        return None;
+    }
+    let (subject, verb, object) = if names.len() == 1 {
+        ("dependency", "takes its version", "it")
+    } else {
+        ("dependencies", "take their version", "them")
+    };
+    Some(format!(
+        "{} {subject} {verb} from {source}, so no version was read for {object} and nothing was checked: {}",
+        names.len(),
+        names.join(", ")
+    ))
+}
+
 /// Evaluate one parsed item against the fetched version lists, applying the
 /// configured pre-release filter before classification.
 fn evaluate_item(
@@ -800,6 +925,18 @@ fn evaluate_item(
     if !item.is_checkable() {
         let status = match item.source {
             PackageSource::Git => DependencyStatus::Git,
+            // An entry that defers its version elsewhere and found nothing there is
+            // a real package on a real registry whose version this run never read.
+            // `Local` would say the opposite — that there is no registry for it —
+            // which of `spring-boot-starter-web` is simply false, and is the wrong
+            // token for a CI consumer to read.
+            PackageSource::Inherited => DependencyStatus::Undetermined,
+            // A coordinate this manifest could not state is the same shape of
+            // ignorance reached through the name instead of the version: nothing was
+            // asked, so nothing is known. `Local` would again say the wrong thing —
+            // that there is no registry behind the entry, rather than that this file
+            // never said which package it is.
+            PackageSource::Unidentified => DependencyStatus::Undetermined,
             _ => DependencyStatus::Local,
         };
         return CheckResult::new(item.clone(), status);

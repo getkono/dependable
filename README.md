@@ -38,13 +38,21 @@ Or download a prebuilt binary for your platform from the
 | Dart / Flutter | `pubspec.yaml` | pub.dev | `pubspec.lock` | 🧪 Experimental |
 | C# / .NET | `*.csproj`, `Directory.Packages.props` | NuGet | — | 🧪 Experimental |
 | Elixir | `mix.exs` | Hex | `mix.lock` | 🧪 Experimental |
-| Kotlin / Java | `gradle/libs.versions.toml` | Maven Central | — | 🧪 Experimental |
+| Kotlin / Java | `gradle/libs.versions.toml`, `pom.xml` | Maven Central | — | 🧪 Experimental |
 
-Kotlin / Java coverage is the **declarative** half of a Gradle build: the version
-catalog. A build script (`build.gradle`, `build.gradle.kts`) is a program, and reading
-one means running your build — so a build script found without a catalog beside it is
-reported as unread rather than silently skipped, and a handful of catalog entries never
-gets presented as a whole dependency list.
+Kotlin / Java coverage is the **declarative** half of a JVM build. For Gradle that is
+the version catalog: a build script (`build.gradle`, `build.gradle.kts`) is a program,
+and reading one means running your build — so a build script found without a catalog
+beside it is reported as unread rather than silently skipped, and a handful of catalog
+entries never gets presented as a whole dependency list.
+
+A Maven `pom.xml` is data throughout, so its `<dependencies>` are read directly, with
+`${property}` resolved against the `<properties>` of the same file. What a POM defers
+to its `<parent>`, to `<dependencyManagement>`, or to an imported BOM is **not**
+resolved — doing so correctly can mean fetching the parent POM from a registry, which
+is a resolution engine rather than a parser. Those dependencies are still listed, with
+no version and nothing claimed about them, so a POM that inherits some of its versions
+is never presented as depending on only the rest.
 
 ### Lockfiles
 

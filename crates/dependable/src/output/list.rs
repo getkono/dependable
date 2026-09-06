@@ -175,7 +175,8 @@ fn json(reports: &[ProjectReport], root: &Path) -> anyhow::Result<()> {
                     source: source_token(item.source),
                     locked: item.locked_version.as_deref(),
                     registry: item.registry.as_deref(),
-                    inherited: report.inherited.contains(&item.name),
+                    inherited: item.source == PackageSource::Inherited
+                        || report.inherited.contains(&item.name),
                     features: report.features.get(&item.name).map(Vec::as_slice),
                     license: report.licenses.get(&item.name).map(String::as_str),
                 })
@@ -235,7 +236,14 @@ struct DependencyDto<'a> {
     source: &'static str,
     locked: Option<&'a str>,
     registry: Option<&'a str>,
-    /// Whether the constraint came from the workspace root rather than this manifest.
+    /// Whether this dependency's version is declared somewhere other than its own
+    /// entry: a Cargo `workspace = true` resolved against the root, a Gradle
+    /// `[versions]` alias, a shared Maven `<properties>` value.
+    ///
+    /// True for every entry whose `source` is `inherited`, so the two fields can no
+    /// longer contradict each other on the same object. Also true where the root's
+    /// declaration supplied a `path` or `git` source, which replaces `source`
+    /// outright and would otherwise lose the fact that it was inherited at all.
     inherited: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     features: Option<&'a [String]>,
@@ -270,6 +278,7 @@ fn source_token(source: PackageSource) -> &'static str {
         PackageSource::Local => "local",
         PackageSource::Git => "git",
         PackageSource::Inherited => "inherited",
+        PackageSource::Unidentified => "unidentified",
         _ => "unknown",
     }
 }
@@ -297,6 +306,9 @@ fn annotation(item: &Item) -> &'static str {
         // would otherwise render as a bare `—` that reads like a parse failure. A
         // resolved one falls through to its section, so a `dev` dep still says so.
         PackageSource::Inherited if item.version_constraint.is_empty() => " (unresolved)",
+        // The version beside it may be perfectly clear; what this file never stated is
+        // which package it belongs to, so nothing was fetched under that name.
+        PackageSource::Unidentified => " (unidentified)",
         _ => match item.kind {
             DependencyKind::Dev => " (dev)",
             DependencyKind::Build => " (build)",

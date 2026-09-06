@@ -70,6 +70,7 @@ impl Parser for CargoTomlParser {
             kind: ManifestKind::CargoToml,
             items,
             alternate_registries,
+            notices: Vec::new(),
         })
     }
 }

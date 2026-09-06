@@ -416,6 +416,10 @@ fn status_style(status: &DependencyStatus) -> Style {
         }
         DependencyStatus::Outdated => theme::fg(Token::Critical),
         DependencyStatus::Vulnerable => theme::bold(Token::Critical),
+        // Nothing was established about this dependency, which is not the same as
+        // there being nothing to establish — it reads as a gap, not as a skip.
+        DependencyStatus::Undetermined => theme::fg(Token::Warn),
+        // `Local`, `Git`, `Error`, and any status a later release adds.
         _ => theme::fg(Token::Muted),
     }
 }

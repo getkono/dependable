@@ -109,6 +109,10 @@ fn status_cell(result: &CheckResult) -> String {
         DependencyStatus::Outdated | DependencyStatus::Error(_) => Style::new().red(),
         DependencyStatus::Vulnerable => Style::new().red().bold(),
         DependencyStatus::Local | DependencyStatus::Git => Style::new().dimmed(),
+        // Not dimmed with the deliberately-skipped rows beside it: this one is a
+        // gap in the report rather than a row there was nothing to say about, and
+        // `--fail-on any` fails the build over it.
+        DependencyStatus::Undetermined => Style::new().yellow(),
         _ => Style::new(),
     };
     format!(
@@ -147,6 +151,11 @@ fn print_totals(summary: &Summary) {
     let skipped = summary.local + summary.git;
     if skipped > 0 {
         parts.push(format!("{skipped} skipped"));
+    }
+    // Counted separately from `skipped`: a path dependency was passed over on
+    // purpose, an undetermined one is a version this run failed to read.
+    if summary.undetermined > 0 {
+        parts.push(format!("{} undetermined", summary.undetermined));
     }
     if parts.is_empty() {
         parts.push("nothing to check".to_string());

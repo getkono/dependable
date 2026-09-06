@@ -55,6 +55,11 @@ pub struct Summary {
     pub error: usize,
     pub local: usize,
     pub git: usize,
+    /// [`DependencyStatus::Undetermined`] count: declarations whose currency this
+    /// run could not establish. Kept apart from [`local`](Self::local) and
+    /// [`git`](Self::git), which are deliberately skipped and therefore clean,
+    /// because these were not skipped on purpose — nothing was learned about them.
+    pub undetermined: usize,
 }
 
 impl Summary {
@@ -78,6 +83,7 @@ impl Summary {
                     DependencyStatus::Error(_) => s.error += 1,
                     DependencyStatus::Local => s.local += 1,
                     DependencyStatus::Git => s.git += 1,
+                    DependencyStatus::Undetermined => s.undetermined += 1,
                     _ => {}
                 }
             }

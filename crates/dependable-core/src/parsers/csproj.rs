@@ -67,6 +67,7 @@ impl Parser for CsprojParser {
             kind: ManifestKind::Csproj,
             items,
             alternate_registries: Vec::new(),
+            notices: Vec::new(),
         })
     }
 }

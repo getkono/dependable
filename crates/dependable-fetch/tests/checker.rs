@@ -1045,9 +1045,27 @@ async fn a_member_is_checked_against_the_workspace_roots_constraint() {
         .iter()
         .find(|r| r.item.name == "serde")
         .expect("serde is declared");
-    assert_eq!(serde.status, DependencyStatus::Local);
+    assert_eq!(
+        serde.status,
+        DependencyStatus::Undetermined,
+        "no root was found, so no version was read — not `Local`, which would say \
+         serde has no registry"
+    );
     assert!(serde.item.version_constraint.is_empty());
     assert!(detached.workspace_root.is_none());
+    // And it says nothing about a root, because it never went looking for one. The
+    // same buffer on disk (above) resolves against a root one directory up, so a
+    // content-only check claiming "no workspace root was found above this manifest"
+    // would contradict `check_path` about the very same file — the shape an IDE
+    // checking an open buffer hits every keystroke.
+    assert!(
+        detached
+            .warnings
+            .iter()
+            .all(|w| !w.contains("no workspace root was found")),
+        "no search ran, so nothing may be reported about what one would have found: {:?}",
+        detached.warnings
+    );
 }
 
 /// A root declaring a crate by `path` lends the member a path dependency, not a registry
@@ -1147,6 +1165,6 @@ async fn an_inherited_name_the_root_never_declared_is_reported() {
         "both declarations are still reported"
     );
     for result in &check.results {
-        assert_eq!(result.status, DependencyStatus::Local);
+        assert_eq!(result.status, DependencyStatus::Undetermined);
     }
 }

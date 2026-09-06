@@ -26,6 +26,7 @@ impl Parser for RequirementsTxtParser {
             kind: ManifestKind::RequirementsTxt,
             items,
             alternate_registries: Vec::new(),
+            notices: Vec::new(),
         })
     }
 }

@@ -23,9 +23,13 @@ pub struct Summary {
     pub manifests: usize,
     /// Every declared dependency across every manifest.
     pub total: usize,
-    /// Dependencies that could actually be checked against a registry:
-    /// [`Self::total`] minus the path and git dependencies. The only honest
-    /// denominator for an "up to date" percentage.
+    /// Dependencies whose currency this run actually established:
+    /// [`Self::total`] minus the path and git dependencies, and minus the ones
+    /// whose version could not be read at all. The only honest denominator for an
+    /// "up to date" percentage — an
+    /// [`Undetermined`](DependencyStatus::Undetermined) dependency is neither up to
+    /// date nor behind, so counting it below the line would quietly depress the
+    /// percentage on every parent-inheriting POM.
     pub checkable: usize,
     /// [`DependencyStatus::UpToDate`] count.
     pub up_to_date: usize,
@@ -43,6 +47,10 @@ pub struct Summary {
     pub local: usize,
     /// [`DependencyStatus::Git`] count.
     pub git: usize,
+    /// [`DependencyStatus::Undetermined`] count: dependencies this run could not
+    /// establish anything about. Excluded from [`Self::checkable`], and kept apart
+    /// from [`Self::local`] and [`Self::git`], which were skipped deliberately.
+    pub undetermined: usize,
     /// Distinct `(dependency, advisory ID)` pairs — one per row a vulnerability
     /// table would print. The same advisory affecting three packages counts three
     /// times here and once in [`Self::distinct_advisories`].
@@ -157,9 +165,17 @@ impl Summary {
     ///
     /// `None` when nothing is checkable, so a renderer can print "n/a" rather
     /// than dividing by zero and emitting `NaN%`.
+    ///
+    /// `None` too when anything went [`Undetermined`](DependencyStatus::Undetermined).
+    /// Such a dependency is rightly outside the denominator — an unread version is no
+    /// evidence of currency — but a headline "100% up to date" over a run that read
+    /// half the manifest is a stronger claim than the run can make, and it is the one
+    /// figure a reader takes away. A run that could not read everything has no single
+    /// number for how current it is; the status counts beside it still say exactly
+    /// what was and was not read.
     #[must_use]
     pub fn up_to_date_percent(&self) -> Option<f64> {
-        if self.checkable == 0 {
+        if self.checkable == 0 || self.undetermined > 0 {
             return None;
         }
         #[allow(clippy::cast_precision_loss)]
@@ -209,6 +225,7 @@ impl Report {
                     DependencyStatus::Error(_) => summary.error += 1,
                     DependencyStatus::Local => summary.local += 1,
                     DependencyStatus::Git => summary.git += 1,
+                    DependencyStatus::Undetermined => summary.undetermined += 1,
                     // `DependencyStatus` is `#[non_exhaustive]`; an unrecognized
                     // status still counts toward the total and nothing else.
                     _ => {}
@@ -239,7 +256,7 @@ impl Report {
             }
         }
 
-        summary.checkable = summary.total - summary.local - summary.git;
+        summary.checkable = summary.total - summary.local - summary.git - summary.undetermined;
         summary.distinct_advisories = seen_advisories.len();
         summary.withdrawn_advisories = withdrawn.len();
         // The same key the HTML pie chart sorts its slices by, so the chart and
@@ -300,13 +317,14 @@ mod tests {
                 ("broken", DependencyStatus::Error("502".into())),
                 ("mine", DependencyStatus::Local),
                 ("forked", DependencyStatus::Git),
+                ("unread", DependencyStatus::Undetermined),
             ]),
         )]);
 
         let summary = report.summary();
 
         assert_eq!(summary.manifests, 1);
-        assert_eq!(summary.total, 8);
+        assert_eq!(summary.total, 9);
         assert_eq!(summary.up_to_date, 1);
         assert_eq!(summary.patch_available, 1);
         assert_eq!(summary.update_available, 1);
@@ -315,9 +333,40 @@ mod tests {
         assert_eq!(summary.error, 1);
         assert_eq!(summary.local, 1);
         assert_eq!(summary.git, 1);
-        // Path and git dependencies have no registry verdict, so they are not
-        // part of the denominator.
+        assert_eq!(summary.undetermined, 1);
+        // Path and git dependencies have no registry verdict, and an undetermined
+        // one produced none, so none of the three is part of the denominator — an
+        // unread version is neither up to date nor behind, and counting it below
+        // the line would depress the percentage on every parent-inheriting POM.
         assert_eq!(summary.checkable, 6);
+    }
+
+    /// A run that read half the manifest is not a run that is 100% up to date.
+    ///
+    /// The undetermined dependency stays out of the denominator — an unread version
+    /// is not evidence of currency — and the percentage is withheld rather than
+    /// rendered, because "100%" of a run that never read one of two dependencies is
+    /// the wrong headline for the one figure a reader remembers.
+    #[test]
+    fn an_undetermined_dependency_is_outside_the_up_to_date_denominator() {
+        let report = report(vec![ManifestResults::new(
+            PathBuf::from("pom.xml"),
+            Ecosystem::Jvm,
+            results(&[
+                ("serde", DependencyStatus::UpToDate),
+                ("tokio", DependencyStatus::Undetermined),
+            ]),
+        )]);
+
+        let summary = report.summary();
+
+        assert_eq!(summary.checkable, 1);
+        assert_eq!(summary.undetermined, 1);
+        assert_eq!(
+            summary.up_to_date_percent(),
+            None,
+            "no single number describes a run that could not read everything"
+        );
     }
 
     #[test]
