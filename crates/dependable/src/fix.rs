@@ -274,6 +274,14 @@ fn rewrite_constraint(
         // — the floor is raised, which is what `fix` does to every other
         // constraint, and the author's upper bound survives.
         //
+        // That last guarantee belongs to the default path. Under `--all` the
+        // target is `latest_available` rather than `latest_compatible`, so
+        // `serde = "1.*"` becomes `serde = "3.4.0"` and the author's upper bound
+        // does *not* survive. Deliberate: `--all` is documented as updating
+        // "beyond the declared constraint" and already does exactly this to
+        // `^1.0`, so carving wildcards out of it would make one flag mean two
+        // things.
+        //
         // Every other combination changes what the constraint admits (#87, #92):
         //
         // - [`BareVersion::Exact`] collapses the range to one release: npm's
