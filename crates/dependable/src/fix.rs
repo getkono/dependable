@@ -1147,6 +1147,67 @@ mod tests {
         assert!(declined.is_empty(), "{declined:?}");
     }
 
+    /// `--overrides` *without* `--all`, which is the combination the README
+    /// recommends first and the one every other test here reaches only to watch
+    /// it decline. The write path for it was unpinned: each of the two cases
+    /// passing `all = false, overrides = true` ends in a decline, and every case
+    /// that produces a record passes `all = true`.
+    ///
+    /// A range-form override is the honest fixture for "advances within its
+    /// constraint": `^1.0.0` admits `1.9.0` and refuses `2.0.0`, so the target
+    /// this run picks is visible in the result rather than assumed. Written with
+    /// `latest_available` deliberately *past* `latest_compatible` — with the two
+    /// equal, an `--all` path that ignored the compatible target would pass this
+    /// test unchanged.
+    #[test]
+    fn an_override_advances_within_its_range_without_all() {
+        let content = r#"{
+  "overrides": {
+    "lodash": "^1.0.0"
+  }
+}
+"#;
+        let mut results = results_for(ManifestKind::PackageJson, content, &[("lodash", "1.9.0")]);
+        assert_eq!(results.len(), 1, "the fixture must produce one item");
+        assert_eq!(results[0].item.kind, DependencyKind::Override);
+        assert!(
+            !results[0].item.is_pinned(),
+            "a range-form override must not be a pin, or the pin guard answers first"
+        );
+        results[0].latest_available = Some("2.0.0".to_string());
+
+        let (updated, records, declined) = plan_fixes(
+            content,
+            &results,
+            false,
+            true,
+            Some(ManifestKind::PackageJson.ecosystem()),
+        )
+        .expect("the plan applies");
+
+        assert!(
+            updated.contains(r#""lodash": "^1.9.0""#),
+            "the override was not advanced without `--all`: {updated}"
+        );
+        assert!(
+            !updated.contains("2.0.0"),
+            "`--overrides` alone reached past the constraint: {updated}"
+        );
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| (
+                    record.name.as_str(),
+                    record.from.as_str(),
+                    record.to.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            [("lodash", "^1.0.0", "^1.9.0")],
+            "{records:?}"
+        );
+        assert!(declined.is_empty(), "{declined:?}");
+    }
+
     /// A pnpm key scopes an override to the parent that pulls the package in:
     /// `"foo@2>bar"` forces a version onto **bar**. The rewrite must land on that
     /// entry's own value span — the defect the kind guard originally hid was a
