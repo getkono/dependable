@@ -91,6 +91,7 @@ hooks {
             ["fmt"] = fmt
             ["clippy"] = clippy
             ["test"] = test
+            ["test-color"] = testColor
         }
     }
     ["fix"] {
