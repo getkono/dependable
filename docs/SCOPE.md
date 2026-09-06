@@ -23,8 +23,11 @@ end-to-end and establishes the type model + traits that later ecosystems plug in
 | `dependable-tui` | library | The interactive terminal UI (ratatui): the dependency forest, recursive drill-down, glob search, and the package detail pane. Holds no IO of its own — it drives `dependable-fetch`. |
 | `dependable` | application | CLI: `check` / `list` / `tree` / `fix` / `tui`, with `table` / `json` / `text` output, `.dependable.toml` + `DEPENDABLE_*` config, and `--fail-on` CI exit codes. A bare `dependable` in a terminal opens the TUI. |
 
-`dependable-report` (the V2 crate) is scaffolded — the crate and its module slots
-exist, but it renders nothing yet and ships no user-visible command.
+`dependable-report` **ships**: HTML reports, SARIF v2.1.0, the SPDX license
+evaluator, and the `[policy]` engine, all reachable from the CLI (`dependable report`,
+`check --format sarif`, and a `[policy]` block in `.dependable.toml`). It is a library
+only — the scaffolded `dependable-report` binary was removed rather than published as
+a command that printed "not implemented yet" and exited 2.
 
 ### 1a. Dependency tree (`tree`) — Rust, offline
 
@@ -170,7 +173,10 @@ Cross-cutting enablers (also V1.1): extend `Ecosystem`/`ManifestKind` enums + `d
 | License visibility + allowlist | `list --licenses`; `[policy] allowed_licenses` over a documented SPDX subset. Go, JSR, NuGet, and pub.dev publish no registry license | registry fields | §6.4, §8 D6 |
 | PDF export | `--pdf` via headless chromium (HTML stays self-contained) — **V3** | system chromium | §6.1, §8 D4 |
 
-### A3 — V1.1 / future polish (non-goals that are real future work)
+### A3 — V1.1 polish (**all shipped**)
+
+Kept for the record of what each item covered; every row below is in the product
+today.
 
 | Item | What it covers | PRD |
 |---|---|---|

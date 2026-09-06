@@ -50,6 +50,13 @@ fn ascii(graph: &DependencyGraph, opts: &TreeOptions) -> String {
         }
         write_node(&mut out, graph, root, "", true, true);
     }
+    // A tree that ran out of budget is a prefix, and a prefix that does not say so reads
+    // as the whole graph. `--no-dedupe` on a large lockfile is how a reader gets here.
+    if tree.truncated {
+        out.push_str(
+            "\n(tree truncated: too many paths to draw — narrow it with --depth, or drop --no-dedupe)\n",
+        );
+    }
     out
 }
 
@@ -134,6 +141,13 @@ struct FlatGraph {
     edges: Vec<(usize, usize)>,
     /// Compact ids of the roots.
     roots: Vec<usize>,
+    /// Whether the walk ran out of budget, so this graph is a prefix of the real one.
+    ///
+    /// The ASCII renderer prints a notice for this; JSON and DOT have to carry it too,
+    /// and they are the formats whose consumer cannot eyeball the difference. A
+    /// truncated machine-readable graph that does not say so is byte-indistinguishable
+    /// from a complete one.
+    truncated: bool,
 }
 
 fn flatten(graph: &DependencyGraph, opts: &TreeOptions) -> FlatGraph {
@@ -171,6 +185,7 @@ fn flatten(graph: &DependencyGraph, opts: &TreeOptions) -> FlatGraph {
         order,
         edges,
         roots,
+        truncated: tree.truncated,
     }
 }
 
@@ -189,6 +204,10 @@ struct GraphDto<'a> {
     roots: Vec<usize>,
     nodes: Vec<NodeDto<'a>>,
     edges: Vec<EdgeDto>,
+    /// Additive: `true` when the walk ran out of budget and this graph is a prefix of
+    /// the real one. Always present, so a consumer can require it rather than infer
+    /// completeness from its absence.
+    truncated: bool,
 }
 
 #[derive(Serialize)]
@@ -230,6 +249,7 @@ fn json(graph: &DependencyGraph, opts: &TreeOptions) -> anyhow::Result<String> {
         roots: flat.roots,
         nodes,
         edges,
+        truncated: flat.truncated,
     };
     Ok(serde_json::to_string_pretty(&dto)?)
 }
@@ -240,6 +260,13 @@ fn dot(graph: &DependencyGraph, opts: &TreeOptions) -> String {
     let mut out = String::from(
         "digraph dependencies {\n  rankdir=LR;\n  node [shape=box, fontname=\"monospace\"];\n",
     );
+    // A graph attribute rather than only a comment, so a tool reading the DOT — and not
+    // just a person reading the file — can see that this is a prefix of the real graph.
+    if flat.truncated {
+        out.push_str(
+            "  // tree truncated: too many paths to draw — narrow it with --depth, or drop --no-dedupe\n  dependable_truncated=true;\n",
+        );
+    }
     for (id, &orig) in flat.order.iter().enumerate() {
         let n = &graph.nodes()[orig];
         let label = if n.version.is_empty() {
@@ -367,6 +394,62 @@ source = "registry+https://x"
         let out = ascii(&sample(), &opts);
         assert!(out.contains("app v0.1.0 (workspace)"));
         assert!(!out.contains("serde"));
+    }
+
+    /// A chain longer than the walk's hard recursion ceiling, so every renderer sees a
+    /// tree that stopped short.
+    fn deep_chain() -> DependencyGraph {
+        const DEPTH: usize = 600;
+        let mut lock = String::new();
+        for n in 0..DEPTH {
+            lock.push_str("[[package]]\n");
+            let _ = writeln!(lock, "name = \"c{n}\"");
+            lock.push_str("version = \"1.0.0\"\n");
+            if n > 0 {
+                lock.push_str("source = \"registry+https://x\"\n");
+            }
+            if n + 1 < DEPTH {
+                let _ = writeln!(lock, "dependencies = [\"c{}\"]", n + 1);
+            }
+            lock.push('\n');
+        }
+        let resolved = parse_cargo_lock_graph(&lock).unwrap();
+        let names = ["c0".to_owned()].into_iter().collect();
+        DependencyGraph::from_resolved(&resolved, &names, &["c0".to_owned()])
+    }
+
+    /// The ASCII renderer says a truncated walk is truncated. So must the machine
+    /// formats — they are the ones whose consumer cannot see the difference, and a JSON
+    /// graph that stopped short used to be byte-indistinguishable from a complete one.
+    #[test]
+    fn every_format_reports_a_truncated_walk() {
+        let graph = deep_chain();
+        let opts = TreeOptions::default();
+        assert!(
+            flatten(&graph, &opts).truncated,
+            "the fixture must actually truncate, or the assertions below prove nothing"
+        );
+
+        let ascii = ascii(&graph, &opts);
+        assert!(ascii.contains("(tree truncated"), "{ascii}");
+
+        let json = json(&graph, &opts).unwrap();
+        assert!(json.contains("\"truncated\": true"), "{json}");
+
+        let dot = dot(&graph, &opts);
+        assert!(dot.contains("dependable_truncated=true;"), "{dot}");
+        assert!(dot.contains("// tree truncated"), "{dot}");
+    }
+
+    /// And a complete walk says so too, rather than leaving the key out — a consumer
+    /// must be able to require the flag, not infer completeness from its absence.
+    #[test]
+    fn a_complete_walk_reports_itself_complete() {
+        let json = json(&sample(), &TreeOptions::default()).unwrap();
+        assert!(json.contains("\"truncated\": false"), "{json}");
+
+        let dot = dot(&sample(), &TreeOptions::default());
+        assert!(!dot.contains("dependable_truncated"), "{dot}");
     }
 
     #[test]

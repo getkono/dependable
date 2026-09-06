@@ -43,13 +43,24 @@ struct Entry {
 /// key is a local workspace package.
 ///
 /// # Errors
-/// Never fails: a lockfile that does not parse yields no packages, which callers
-/// treat as "no resolved graph" rather than an error that hides the project.
+/// Returns [`ParseError::Structural`] for a lockfile v1 (npm 6) document, whose graph
+/// lives under a top-level `dependencies` tree this parser does not read. Returning an
+/// empty graph for one made "this format is not supported" indistinguishable from "this
+/// project has no dependencies"; the caller reports the former and falls back.
 pub fn parse_package_lock_graph(content: &str) -> Result<ResolvedLockfile, ParseError> {
     let mut entries: HashMap<String, Entry> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
+    // A v1 lockfile records resolved versions under `dependencies.<name>.version`; v2/v3
+    // keep that tree too, but always alongside a `packages` object.
+    let mut legacy_versions = false;
 
     for entry in scan_strings(content) {
+        let Some((section, _key, rest)) = split_path(&entry.path) else {
+            continue;
+        };
+        if section == "dependencies" && matches!(rest, [field] if field == "version") {
+            legacy_versions = true;
+        }
         let Some(("packages", key, rest)) = split_path(&entry.path) else {
             continue;
         };
@@ -67,6 +78,13 @@ pub fn parse_package_lock_graph(content: &str) -> Result<ResolvedLockfile, Parse
             [table, dep] if DEP_TABLES.contains(&table.as_str()) => slot.deps.push(dep.clone()),
             _ => {}
         }
+    }
+
+    if order.is_empty() && legacy_versions {
+        return Err(ParseError::Structural(
+            "package-lock.json lockfileVersion 1 has no `packages` map;              run `npm install` with npm 7 or newer to upgrade it"
+                .to_owned(),
+        ));
     }
 
     // Index install paths before resolving, so edges can be looked up in one pass.
@@ -104,6 +122,7 @@ pub fn parse_package_lock_graph(content: &str) -> Result<ResolvedLockfile, Parse
                 .iter()
                 .filter_map(|dep| {
                     let target = resolve_install_path(key, dep, &index)?;
+                    let target = follow_link(target, &order, &entries, &index);
                     let (target_name, target_version) = &identity[target];
                     Some(reference(target_name, Some(target_version.as_str())))
                 })
@@ -140,8 +159,55 @@ fn source_of(key: &str, entry: &Entry) -> Option<String> {
     {
         return Some(resolved.to_owned());
     }
+    // A workspace link stub lives under `node_modules/` but is the member, not an
+    // install from the registry; calling it one puts a versionless npm package in the
+    // graph beside the real member.
+    if is_link_stub(key, entry) {
+        return None;
+    }
     // The root ("") and workspace packages ("packages/app") are local.
     key.contains("node_modules/").then(|| NPM_SOURCE.to_owned())
+}
+
+/// Whether this entry is npm's `node_modules/<name>` stub for a workspace member.
+///
+/// npm records a member twice: the stub, whose `resolved` is the member's path in the
+/// repository and which carries no version of its own, and the member itself under that
+/// path. `link: true` marks it, but the scan yields only string values and that is a
+/// boolean — a relative `resolved` with no version identifies the same thing.
+fn is_link_stub(key: &str, entry: &Entry) -> bool {
+    if !key.contains("node_modules/") || entry.version.is_some() {
+        return false;
+    }
+    entry.resolved.as_deref().is_some_and(|resolved| {
+        !resolved.contains("://") && !resolved.starts_with("git+") && !resolved.is_empty()
+    })
+}
+
+/// Resolve a link stub to the workspace member it points at.
+///
+/// The stub declares no dependencies, so an edge that stops there severs the member's
+/// entire subtree from the graph — and because the stub has no version, the edge was
+/// emitted as a bare name, which resolves to whichever candidate came first in document
+/// order. That is the stub, every time: npm writes `node_modules/*` before `packages/*`.
+fn follow_link(
+    i: usize,
+    order: &[String],
+    entries: &HashMap<String, Entry>,
+    index: &HashMap<&str, usize>,
+) -> usize {
+    let key = &order[i];
+    let Some(entry) = entries.get(key) else {
+        return i;
+    };
+    if !is_link_stub(key, entry) {
+        return i;
+    }
+    let Some(resolved) = entry.resolved.as_deref() else {
+        return i;
+    };
+    let path = resolved.trim_start_matches("./");
+    index.get(path).copied().unwrap_or(i)
 }
 
 /// The package name implied by a `packages` key, for entries that declare none.
@@ -359,5 +425,51 @@ mod tests {
     fn survives_a_lockfile_with_no_packages_map() {
         let resolved = parse_package_lock_graph(r#"{"lockfileVersion": 1}"#).unwrap();
         assert!(resolved.packages.is_empty());
+    }
+
+    /// A v1 lockfile keeps its graph somewhere this parser does not read. Reporting an
+    /// empty graph made "unsupported format" look exactly like "no dependencies", so the
+    /// caller had nothing to tell the user and nothing to fall back from.
+    #[test]
+    fn a_v1_lockfile_is_reported_as_unsupported() {
+        let lock = r#"{
+  "name": "app",
+  "lockfileVersion": 1,
+  "dependencies": {
+    "lodash": { "version": "4.17.21", "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz" }
+  }
+}"#;
+        assert!(parse_package_lock_graph(lock).is_err());
+    }
+
+    /// npm writes a workspace member twice: a versionless stub under `node_modules/` and
+    /// the member itself. Edges used to stop at the stub — which has no dependencies —
+    /// so the member's whole subtree vanished from the graph.
+    #[test]
+    fn a_workspace_link_stub_resolves_to_the_member() {
+        let lock = r#"{
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "root", "version": "1.0.0", "dependencies": { "app": "*" } },
+    "node_modules/app": { "resolved": "packages/app", "link": true },
+    "node_modules/lodash": { "version": "4.17.21" },
+    "packages/app": { "name": "app", "version": "2.0.0", "dependencies": { "lodash": "^4.0.0" } }
+  }
+}"#;
+        let resolved = parse_package_lock_graph(lock).expect("v3 lockfile");
+        let root = resolved
+            .packages
+            .iter()
+            .find(|p| p.name == "root")
+            .expect("root");
+        // The root's edge must reach the member at its real version, not the stub.
+        assert_eq!(root.dependencies, vec!["app 2.0.0".to_string()]);
+
+        let app = resolved
+            .packages
+            .iter()
+            .find(|p| p.name == "app" && p.version == "2.0.0")
+            .expect("member");
+        assert_eq!(app.dependencies, vec!["lodash 4.17.21".to_string()]);
     }
 }

@@ -44,6 +44,7 @@ pub mod discover;
 pub mod error;
 pub mod osv;
 pub mod registries;
+mod retry;
 pub mod tree;
 
 // High-level entry point (recommended for embedding).
@@ -77,10 +78,10 @@ pub use registries::{
 // parsers, `check_version`, ...).
 pub use dependable_core as core;
 pub use dependable_core::{
-    CheckResult, DependencyGraph, DependencyKind, DependencyStatus, Ecosystem, Evaluation, Item,
-    LockfileKind, ManifestKind, Node, NodeKind, PackageSource, ParseError, ParsedManifest,
-    PathPredicate, Placement, Tree, TreeNode, TreeOptions, UnstableFilter, Visit, Visitor,
-    WalkOptions, WorkspaceDecl, resolve_workspace_inheritance,
+    CheckResult, DependencyGraph, DependencyKind, DependencyStatus, Ecosystem, ErrorOrigin,
+    Evaluation, Item, LockfileKind, ManifestKind, Node, NodeKind, PackageSource, ParseError,
+    ParsedManifest, PathPredicate, Placement, Tree, TreeNode, TreeOptions, UnstableFilter, Visit,
+    Visitor, WalkOptions, WalkStats, WorkspaceDecl, resolve_workspace_inheritance,
 };
 
 /// One-import convenience for consumers: `use dependable_fetch::prelude::*;`.
@@ -106,5 +107,9 @@ pub fn build_client() -> Result<reqwest::Client, reqwest::Error> {
             std::env::consts::OS
         ))
         .timeout(Duration::from_secs(10))
+        // Separate from the total timeout: a host that accepts the connection and then
+        // stalls is a different failure from one that never answers at all, and without
+        // this a black-holed address spends the entire request budget on the handshake.
+        .connect_timeout(Duration::from_secs(5))
         .build()
 }

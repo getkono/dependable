@@ -37,6 +37,26 @@ impl Parser for CargoTomlParser {
             }
         }
 
+        // [target.<predicate>.dependencies] and its dev/build siblings.
+        //
+        // A cfg-gated table is an ordinary dependency table that Cargo only applies to
+        // some targets; the crates in it are fetched, resolved, and vulnerable exactly
+        // like any other. Skipping them reported a manifest whose only dependency sits
+        // under `[target.'cfg(unix)'.dependencies]` as having none at all — silence that
+        // reads as a clean bill of health.
+        if let Some(targets) = root.get("target").and_then(|i| i.as_table_like()) {
+            for (_predicate, entry) in targets.iter() {
+                let Some(entry) = entry.as_table_like() else {
+                    continue;
+                };
+                for &(section, kind) in DEP_SECTIONS {
+                    if let Some(table) = entry.get(section).and_then(|i| i.as_table_like()) {
+                        collect_dependencies(table, kind, &starts, &mut items);
+                    }
+                }
+            }
+        }
+
         // [workspace.dependencies]
         if let Some(deps) = root
             .get("workspace")
@@ -434,5 +454,45 @@ mod tests {
         assert!(parse_cargo_config("[registries.corp\nindex = \"x\"", None).is_empty());
         // No `[registries]` table at all.
         assert!(parse_cargo_config("[net]\nretry = 2\n", None).is_empty());
+    }
+
+    /// A cfg-gated table is a real dependency table. The manifest below used to parse to
+    /// zero items, so `check` printed "nothing to check" for a project with dependencies.
+    #[test]
+    fn target_gated_dependency_tables_are_collected() {
+        let content = concat!(
+            "[dependencies]\n",
+            "serde = \"1\"\n\n",
+            "[target.'cfg(unix)'.dependencies]\n",
+            "nix = \"0.29\"\n\n",
+            "[target.'cfg(windows)'.dependencies]\n",
+            "windows-sys = \"0.59\"\n\n",
+            "[target.x86_64-pc-windows-msvc.dev-dependencies]\n",
+            "winapi = \"0.3\"\n\n",
+            "[target.'cfg(target_os = \"linux\")'.build-dependencies]\n",
+            "cc = \"1\"\n",
+        );
+        let m = CargoTomlParser.parse(content).expect("valid TOML");
+
+        for name in ["serde", "nix", "windows-sys", "winapi", "cc"] {
+            let it = find(&m, name);
+            assert_eq!(it.name, name);
+        }
+        assert_eq!(find(&m, "winapi").kind, DependencyKind::Dev);
+        assert_eq!(find(&m, "cc").kind, DependencyKind::Build);
+        assert_eq!(find(&m, "nix").kind, DependencyKind::Normal);
+    }
+
+    /// The recorded span has to point at the cfg-gated line, not at a top-level one, or
+    /// `--fix` would rewrite the wrong dependency.
+    #[test]
+    fn a_target_gated_version_records_its_own_position() {
+        let content =
+            "[dependencies]\nserde = \"1\"\n\n[target.'cfg(unix)'.dependencies]\nnix = \"0.29\"\n";
+        let m = CargoTomlParser.parse(content).expect("valid TOML");
+        let nix = find(&m, "nix");
+        assert!(nix.is_rewritable());
+        let line = content.lines().nth(nix.version_line).unwrap();
+        assert_eq!(&line[nix.version_col_start..nix.version_col_end], "0.29");
     }
 }

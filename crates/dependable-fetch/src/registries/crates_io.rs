@@ -188,6 +188,10 @@ impl ApiOwner {
 }
 
 impl RegistryFetcher for CratesIoFetcher {
+    fn registry_root(&self) -> Option<&str> {
+        Some(&self.base_url)
+    }
+
     fn fetch_versions<'a>(
         &'a self,
         name: &'a str,
@@ -210,7 +214,14 @@ impl RegistryFetcher for CratesIoFetcher {
                 });
             }
             let body = resp.text().await?;
-            Ok(parse_index(&body))
+            parse_index(&body).map_err(|error| match error {
+                // The package name is only known here, at the call site.
+                FetchError::Decode { detail, .. } => FetchError::Decode {
+                    package: name.to_owned(),
+                    detail,
+                },
+                other => other,
+            })
         }
         .boxed()
     }
@@ -302,20 +313,37 @@ impl RegistryFetcher for CratesIoFetcher {
 /// Parse the newline-delimited JSON index body into versions, newest-first, with
 /// yanked releases filtered out. The newest version's declared feature flags are
 /// attached for `list --features`.
-fn parse_index(body: &str) -> FetchedVersions {
+fn parse_index(body: &str) -> Result<FetchedVersions, FetchError> {
+    let mut malformed = 0usize;
     let mut entries: Vec<IndexLine> = body
         .lines()
         .filter(|line| !line.trim().is_empty())
-        .filter_map(|line| serde_json::from_str::<IndexLine>(line).ok())
+        .filter_map(|line| match serde_json::from_str::<IndexLine>(line) {
+            Ok(entry) => Some(entry),
+            Err(_) => {
+                malformed += 1;
+                None
+            }
+        })
         .filter(|line| !line.yanked)
         .collect();
+    // A partially corrupt body is the dangerous case, not a wholly broken one: dropping
+    // the bad lines leaves a plausible-looking but *short* version list, and if the
+    // newest release was among them the dependency reports up to date. A body we cannot
+    // read in full is an error, so the caller retries or reports rather than believing it.
+    if malformed > 0 {
+        return Err(FetchError::Decode {
+            package: String::new(),
+            detail: format!("{malformed} malformed line(s) in the sparse index response"),
+        });
+    }
     entries.sort_by(|a, b| cmp_vers_desc(&a.vers, &b.vers));
     let features = entries
         .first()
         .map(IndexLine::feature_names)
         .unwrap_or_default();
     let versions: Vec<String> = entries.into_iter().map(|line| line.vers).collect();
-    FetchedVersions::new(versions).with_features(features)
+    Ok(FetchedVersions::new(versions).with_features(features))
 }
 
 /// Order two version strings newest-first, falling back to reverse lexical order
@@ -361,7 +389,7 @@ mod tests {
             "{\"name\":\"x\",\"vers\":\"1.1.0\",\"yanked\":true}\n",
             "{\"name\":\"x\",\"vers\":\"1.2.0\",\"yanked\":false}\n",
         );
-        let fetched = parse_index(body);
+        let fetched = parse_index(body).expect("a well-formed index body");
         assert_eq!(fetched.versions, vec!["1.2.0", "1.0.0"]);
         assert_eq!(fetched.latest_tag.as_deref(), Some("1.2.0"));
         assert!(fetched.features.is_empty()); // no features declared
@@ -373,9 +401,32 @@ mod tests {
             "{\"name\":\"x\",\"vers\":\"1.0.0\",\"yanked\":false,\"features\":{\"legacy\":[]}}\n",
             "{\"name\":\"x\",\"vers\":\"2.0.0\",\"yanked\":false,\"features\":{\"default\":[\"std\"],\"derive\":[\"x-derive\"]},\"features2\":{\"rc\":[\"dep:rc\"]}}\n",
         );
-        let fetched = parse_index(body);
+        let fetched = parse_index(body).expect("a well-formed index body");
         assert_eq!(fetched.versions, vec!["2.0.0", "1.0.0"]);
         // Newest version (2.0.0) only, merging `features` + `features2`, sorted.
         assert_eq!(fetched.features, vec!["default", "derive", "rc"]);
+    }
+
+    /// A partially corrupt body is the dangerous case: dropping the unreadable lines
+    /// leaves a plausible-looking but short version list, and if the newest release was
+    /// among them the dependency reports up to date.
+    #[test]
+    fn a_malformed_index_line_is_an_error_not_a_shorter_list() {
+        let body = concat!(
+            "{\"name\":\"serde\",\"vers\":\"1.0.0\",\"yanked\":false}\n",
+            "{\"name\":\"serde\",\"vers\":\"1.2.0\",\"yank\n",
+        );
+        assert!(
+            parse_index(body).is_err(),
+            "a truncated line was silently dropped"
+        );
+    }
+
+    /// Blank lines are not corruption; the index body ends with one.
+    #[test]
+    fn blank_lines_are_not_treated_as_corruption() {
+        let body = "{\"name\":\"serde\",\"vers\":\"1.0.0\",\"yanked\":false}\n\n";
+        let fetched = parse_index(body).expect("a trailing newline is not a malformed line");
+        assert_eq!(fetched.versions, vec!["1.0.0"]);
     }
 }

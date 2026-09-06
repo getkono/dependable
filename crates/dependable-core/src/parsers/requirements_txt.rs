@@ -114,6 +114,21 @@ pub(crate) fn parse_pep508_spec(spec: &str) -> Option<(String, &str, usize)> {
         return None;
     }
 
+    // PEP 508 allows the specifier in parentheses — `flask (>=2.0)` — which is the form
+    // PEP 621 metadata round-trips into. Left in place the parens ended up inside the
+    // constraint, which `VersionReq` then rejected.
+    if bytes.get(pos) == Some(&b'(')
+        && let Some(close) = spec[pos + 1..].find(')')
+    {
+        let inner = &spec[pos + 1..pos + 1 + close];
+        let lead = inner.len() - inner.trim_start().len();
+        let constraint = inner.trim();
+        if constraint.is_empty() {
+            return Some((name.to_string(), "", spec.len()));
+        }
+        return Some((name.to_string(), constraint, pos + 1 + lead));
+    }
+
     // Constraint runs to a `;` environment marker or the end.
     let rest = &spec[pos..];
     let region = rest.split(';').next().unwrap_or(rest);
@@ -180,5 +195,30 @@ mod tests {
         let m = parse(content);
         assert_eq!(find(&m, "numpy").version_constraint, "");
         assert!(find(&m, "numpy").is_checkable());
+    }
+
+    /// PEP 508 permits the specifier in parentheses. The parens used to land inside the
+    /// constraint, producing `(>=2.0)` — which does not parse, so the dependency was
+    /// misreported rather than checked.
+    #[test]
+    fn parenthesized_specifiers_are_unwrapped() {
+        let (name, constraint, offset) = parse_pep508_spec("flask (>=2.0)").unwrap();
+        assert_eq!(name, "flask");
+        assert_eq!(constraint, ">=2.0");
+        assert_eq!(&"flask (>=2.0)"[offset..offset + constraint.len()], ">=2.0");
+
+        let (name, constraint, _) = parse_pep508_spec("requests[security] (>=2.0,<3)").unwrap();
+        assert_eq!(name, "requests");
+        assert_eq!(constraint, ">=2.0,<3");
+
+        // Parens with an environment marker outside them.
+        let (_, constraint, _) =
+            parse_pep508_spec("flask (>=2.0) ; python_version < \"3.8\"").unwrap();
+        assert_eq!(constraint, ">=2.0");
+
+        // Empty parens are a bare requirement.
+        let (name, constraint, _) = parse_pep508_spec("flask ()").unwrap();
+        assert_eq!(name, "flask");
+        assert_eq!(constraint, "");
     }
 }

@@ -75,7 +75,7 @@ pub struct CheckArgs {
     /// `include-if-current`. Overrides `[global] unstable`.
     #[arg(long, value_enum)]
     pub unstable: Option<UnstableFilter>,
-    /// Ignore `Cargo.lock`.
+    /// Ignore the lockfile, checking declared constraints only..
     #[arg(long)]
     pub no_lock_file: bool,
     /// Skip vulnerability scanning.
@@ -90,9 +90,14 @@ pub struct CheckArgs {
     /// Output format.
     #[arg(long, value_enum, default_value_t = CheckFormat::Table)]
     pub format: CheckFormat,
-    /// Exit non-zero when results match this level.
-    #[arg(long, value_enum, default_value_t = FailOn::None)]
-    pub fail_on: FailOn,
+    /// Exit non-zero when results match this level. Overrides `[global] fail_on`.
+    ///
+    /// `Option` so that an explicit `--fail-on none` is distinguishable from the flag
+    /// being absent. With a plain default the two were the same value, so the documented
+    /// precedence — CLI over config — silently inverted for that one setting: a config
+    /// saying `fail_on = "any"` could not be turned off from the command line.
+    #[arg(long, value_enum)]
+    pub fail_on: Option<FailOn>,
     /// GitHub Actions annotations and job summary: `auto` (default, on under
     /// the runner), `always`, or `never`.
     #[arg(long, value_enum, default_value_t = AnnotationMode::Auto)]
@@ -109,9 +114,6 @@ pub struct CheckArgs {
     /// Verbose logging (HTTP request details).
     #[arg(short, long)]
     pub verbose: bool,
-    /// Restrict to ecosystem(s) (reserved; V1 only checks Rust).
-    #[arg(long)]
-    pub ecosystem: Option<String>,
 }
 
 #[derive(Args)]
@@ -198,6 +200,12 @@ pub struct FixArgs {
     /// Print what would change without writing.
     #[arg(long)]
     pub dry_run: bool,
+    /// Ignore the on-disk registry cache (always fetch fresh).
+    #[arg(long)]
+    pub no_cache: bool,
+    /// Skip vulnerability scanning, so a vulnerable dependency is not upgraded for it.
+    #[arg(long)]
+    pub no_vuln: bool,
     #[arg(long, default_value_t = 3)]
     pub depth: usize,
     #[arg(long)]

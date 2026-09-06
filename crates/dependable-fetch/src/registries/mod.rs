@@ -248,6 +248,16 @@ pub trait RegistryFetcher: Send + Sync {
         let _ = name;
         futures::future::ready(Ok(None)).boxed()
     }
+
+    /// The registry root this fetcher talks to, for cache scoping.
+    ///
+    /// Two runs against different indexes must not share cached answers: a private
+    /// mirror and the public registry publish different version lists for the same
+    /// package name, and an entry that records only `(ecosystem, name)` lets one serve
+    /// the other. Returning `None` opts out of scoping entirely.
+    fn registry_root(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// Fetch the declared license of each of `names` from one registry, concurrently.

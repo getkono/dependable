@@ -40,7 +40,7 @@ inputs:
     default: 'auto'
   version:
     description: >-
-      Release tag to install, such as v0.1.4, or latest. Pinning a tag skips the
+      Release tag to install, such as v0.1.3, or latest. Pinning a tag skips the
       releases API call, so a workflow with no contents read permission must pin.
     required: false
     default: 'latest'

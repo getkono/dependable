@@ -19,6 +19,9 @@ name = "dependable"
 path = "src/main.rs"
 
 [dependencies]
+# The `fix` command writes through a temporary file in the manifest's own directory
+# and renames it into place, so an interrupted write cannot truncate a manifest.
+tempfile.workspace = true
 dependable-fetch.workspace = true
 dependable-tui.workspace = true
 dependable-report = { workspace = true, optional = true }
