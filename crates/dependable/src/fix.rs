@@ -367,9 +367,14 @@ fn plan_fixes(
         // action the note points at.
         //
         // Ahead of the `forced` guard below, and so this is also the reason an
-        // `overrides` entry written as an explicit pin (`=1.2.3`) reports: `--all`
-        // is the flag that would move it, and `--overrides` on its own would still
-        // leave it exactly where it is. Every note names a flag that acts.
+        // `overrides` entry written as an explicit pin (`=1.2.3`) reports the pin:
+        // `--overrides` on its own would still leave it exactly where it is, so
+        // the flag worth naming is the next one that has to be lifted, not one
+        // that finishes the job. For that entry it takes both, and the notes
+        // disclose them one at a time — with `--all` the pin guard passes and the
+        // `forced` guard below names `--overrides` in turn. Each note is true at
+        // the moment it is printed, which is what
+        // `an_override_that_is_also_a_pin_reports_the_pin` walks through.
         if item.is_pinned() && !all {
             declined.push(Declined {
                 name: item.name.clone(),
