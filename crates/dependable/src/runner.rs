@@ -303,6 +303,7 @@ impl Engine {
 /// Returns whether any notice means the project's dependency list itself went
 /// unread, which the caller has to carry into the exit code: a run that knows
 /// nothing about a project must not report it clean.
+#[must_use]
 fn report_lockfile_notices(manifest: &Path) -> bool {
     let Some(kind) = ManifestKind::detect(manifest) else {
         return false;
@@ -624,7 +625,7 @@ pub async fn run_list(args: ListArgs) -> anyhow::Result<ExitCode> {
         let Some(kind) = ManifestKind::detect(manifest) else {
             continue;
         };
-        let _ = report_lockfile_notices(manifest);
+        let dependencies_unread = report_lockfile_notices(manifest);
         let content = std::fs::read_to_string(manifest)
             .with_context(|| format!("reading {}", manifest.display()))?;
         let mut parsed = match parse(kind, &content) {
@@ -679,6 +680,7 @@ pub async fn run_list(args: ListArgs) -> anyhow::Result<ExitCode> {
             version_inherited,
             role: meta.role,
             lockfile,
+            dependencies_unread,
             inherited,
             items: parsed.items,
             features: BTreeMap::new(),
