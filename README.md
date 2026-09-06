@@ -635,6 +635,29 @@ success on the run it could not perform is worse than no gate at all. With no ga
 armed, an unreachable registry is still reported per dependency and the run exits
 `0`, because nothing was promised.
 
+The refusal names the registries that declined, not just the fact that one did:
+
+```console
+$ dependable check --fail-on vulnerable
+error: cannot honour --fail-on: the Go registry did not answer
+```
+
+```console
+$ dependable check --fail-on vulnerable
+error: cannot honour --fail-on: the Go and npm registries did not answer
+```
+
+A run reaches more than one registry — a polyglot repository has one per ecosystem,
+a `deno.json` reaches npm and JSR, and a `Cargo.toml` reaches crates.io alongside any
+alternate registry its dependencies name — so a registry that is not the ecosystem's
+default one is named beside it (`the npm (jsr.io) registry did not answer`). Only the
+host and port are printed, never the configured URL, because a registry root may carry
+credentials and this line lands in CI job output.
+
+A registry that answered `404` (or, for a Go proxy, `410`) *answered*: a private,
+internal or deleted package is a per-dependency fact, reported in the table and noted
+on stderr, and it does not make a gate unanswerable.
+
 `.dependable.toml` is validated: an unknown key or a wrong-typed value is an error,
 not a silent fallback to defaults. One mistyped character used to reset
 `[global] fail_on` to `none` and disarm the gate with nothing on stderr.
