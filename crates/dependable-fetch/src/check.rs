@@ -2535,9 +2535,14 @@ mod tests {
         );
     }
 
-    /// `buffer_unordered` completes in arrival order, so the collection is sorted before
-    /// it leaves `fetch_all`. Unsorted, the gate's sentence reorders itself between two
-    /// runs of the same repository.
+    /// The ordering key itself: ecosystem name, then root, with equal entries adjacent so
+    /// a plain `dedup` is total.
+    ///
+    /// This exercises `unreachable_sort_key`, not `fetch_all`'s use of it — the sort and
+    /// the dedup are applied here, in the test's own body, over a hand-built vector. That
+    /// the collection actually leaves `fetch_all` in this order is a separate claim, and
+    /// `a_deno_manifest_orders_both_declining_registries_by_root` in `tests/checker.rs`
+    /// is what holds it.
     #[test]
     fn unreachable_registries_sort_by_ecosystem_then_root() {
         let mut registries = vec![
