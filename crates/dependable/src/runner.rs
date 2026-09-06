@@ -25,7 +25,7 @@ use dependable_tui::TuiOptions;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use indicatif::{ProgressBar, ProgressStyle};
 
-use crate::cli::{CheckArgs, FailOn, FixArgs, ListArgs, TreeArgs, TuiArgs};
+use crate::cli::{CheckArgs, EcosystemArg, FailOn, FixArgs, Format, ListArgs, TreeArgs, TuiArgs};
 use crate::config::{Config, load_config};
 #[cfg(feature = "report")]
 use crate::config::{PolicySource, load_policy};
@@ -394,15 +394,17 @@ pub async fn run_check(args: CheckArgs) -> anyhow::Result<ExitCode> {
     #[cfg(not(feature = "report"))]
     warn_policy_ignored(&args.config);
 
+    let ecosystems = requested_ecosystems(&args.ecosystem);
     let manifests = collect_manifests(
         args.manifest.as_deref(),
         args.path.as_deref(),
         settings.depth,
         &args.manifest_glob,
+        &ecosystems,
         &|ecosystem| cfg.ecosystem_enabled(ecosystem),
     )?;
     if manifests.is_empty() {
-        eprintln!("No supported manifests found.");
+        report_no_manifests(&ecosystems);
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -681,15 +683,28 @@ pub async fn run_list(args: ListArgs) -> anyhow::Result<ExitCode> {
     // replaced by defaults that enable all of them.
     let cfg =
         load_config(&args.config).with_context(|| format!("reading {}", args.config.display()))?;
+    let ecosystems = requested_ecosystems(&args.ecosystem);
     let manifests = collect_manifests(
         args.manifest.as_deref(),
         args.path.as_deref(),
         args.depth,
         &args.manifest_glob,
+        &ecosystems,
         &|ecosystem| cfg.ecosystem_enabled(ecosystem),
     )?;
     if manifests.is_empty() {
-        eprintln!("No supported manifests found.");
+        report_no_manifests(&ecosystems);
+        // An empty selection still owes a machine-readable format a document.
+        // Exiting 0 with byte-empty stdout is what `list --ecosystem csharp
+        // --format json | jq ...` sees in a per-ecosystem CI matrix, and `jq`
+        // fails to parse nothing — on precisely the ecosystems exit 0 was chosen
+        // to keep green. The stderr line above is not machine-readable.
+        //
+        // `table` and `text` keep returning early: a human handed an empty table
+        // wants the stderr line, not a blank one.
+        if matches!(args.format, Format::Json) {
+            output::list::render(args.format, &[], &root)?;
+        }
         return Ok(ExitCode::SUCCESS);
     }
     let mut reports = Vec::new();
@@ -939,15 +954,17 @@ pub async fn run_fix(args: FixArgs) -> anyhow::Result<ExitCode> {
         registry: cfg.rust.registry.clone(),
         osv_url: cfg.vulnerability.osv_batch_url.clone(),
     };
+    let ecosystems = requested_ecosystems(&args.ecosystem);
     let manifests = collect_manifests(
         args.manifest.as_deref(),
         args.path.as_deref(),
         settings.depth,
         &args.manifest_glob,
+        &ecosystems,
         &|ecosystem| cfg.ecosystem_enabled(ecosystem),
     )?;
     if manifests.is_empty() {
-        eprintln!("No supported manifests found.");
+        report_no_manifests(&ecosystems);
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -1227,10 +1244,13 @@ pub async fn run_report(args: crate::cli::ReportArgs) -> anyhow::Result<ExitCode
         Some(&root),
         settings.depth,
         &[],
+        &[],
         &|ecosystem| cfg.ecosystem_enabled(ecosystem),
     )?;
     if manifests.is_empty() {
-        eprintln!("No supported manifests found.");
+        // `report` has no `--ecosystem`, so there is never a specific line to
+        // print instead.
+        report_no_manifests(&[]);
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -1310,34 +1330,72 @@ fn lockfile_notes(manifest: &Path) -> Vec<String> {
 }
 
 /// The manifests a command should act on: the one named by `--manifest`, else the
-/// depth-limited walk of `path`, narrowed by any `--manifest-glob` patterns.
+/// depth-limited walk of `path`, narrowed by any `--ecosystem` values and then by
+/// any `--manifest-glob` patterns.
 ///
-/// The globs filter *after* the walk rather than pruning inside it: `path` still
-/// roots the scan and `--depth` still bounds it, so the three compose instead of
+/// Both filters run *after* the walk rather than pruning inside it: `path` still
+/// roots the scan and `--depth` still bounds it, so they compose instead of
 /// competing, and there stays exactly one walk implementation — in
 /// `dependable-fetch`, which knows nothing about globs.
+///
+/// `ecosystems` empty means unrestricted. When it is not, it does two distinct
+/// things, and both are required for the flag to mean what it says:
+///
+/// - It narrows the returned set. `dependable_fetch::discover` documents that its
+///   `enabled` predicate "gates the notices only — discovery still returns every
+///   manifest it recognizes, and narrowing that set stays the caller's job", so
+///   composing the request into that predicate alone would suppress warnings and
+///   change nothing a command actually reads.
+/// - It is composed into that predicate all the same, so `--ecosystem rust` does
+///   not also print advice about the Gradle build it just excluded.
+///
+/// The filter re-derives each manifest's ecosystem from its path. Discovery only
+/// ever returns paths [`ManifestKind::detect`] recognized, so the `None` arm is
+/// unreachable in practice; a path that somehow failed to detect is dropped,
+/// because an ecosystem nothing can name is not one of the ones asked for.
+///
+/// The ecosystem filter runs **before** the glob filter so that the glob's
+/// "matched nothing" line counts only the manifests still in play.
 fn collect_manifests(
     manifest: Option<&Path>,
     path: Option<&Path>,
     depth: usize,
     globs: &[String],
+    ecosystems: &[Ecosystem],
     enabled: &dyn Fn(Ecosystem) -> bool,
 ) -> anyhow::Result<Vec<PathBuf>> {
     if let Some(manifest) = manifest {
         // `--manifest` names one exact file and bypasses discovery entirely, so
-        // there is no discovered set for a glob to filter. clap rejects the
-        // combination rather than letting one of them be silently ignored.
+        // there is no discovered set for a glob or an ecosystem to filter. clap
+        // rejects both combinations rather than letting one be silently ignored.
         return Ok(vec![manifest.to_path_buf()]);
     }
     let root = path.map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    let requested = |ecosystem: Ecosystem| ecosystems.is_empty() || ecosystems.contains(&ecosystem);
     // One walk for both answers. Manifests we recognise but cannot read produce
     // nothing for the walk to return, so this is the only point at which their
     // absence can be reported at all.
-    let found = dependable_fetch::discover(&root, depth, enabled);
+    let found = dependable_fetch::discover(&root, depth, |ecosystem| {
+        enabled(ecosystem) && requested(ecosystem)
+    });
     for notice in &found.notices {
         eprintln!("warning: {notice}");
     }
-    let found = found.manifests;
+    let mut found = found.manifests;
+    if !ecosystems.is_empty() {
+        let kept: Vec<PathBuf> = found
+            .iter()
+            .filter(|manifest| {
+                ManifestKind::detect(manifest)
+                    .is_some_and(|kind| ecosystems.contains(&kind.ecosystem()))
+            })
+            .cloned()
+            .collect();
+        if kept.is_empty() {
+            eprintln!("{}", no_ecosystem_match(ecosystems, &found, depth));
+        }
+        found = kept;
+    }
     if globs.is_empty() {
         return Ok(found);
     }
@@ -1359,6 +1417,87 @@ fn collect_manifests(
         );
     }
     Ok(kept)
+}
+
+/// The ecosystems `--ecosystem` asked for, as the core type. Empty means
+/// unrestricted, which is what an absent flag produces.
+///
+/// Deduplicated, in first-named order. clap's `Vec<T>` keeps every repeat, so
+/// `--ecosystem rust --ecosystem rust` arrived as two values and
+/// [`no_ecosystem_match`] read them back as `no manifest for Rust, Rust`.
+/// Selection never cared — it is a `contains` — so this is the diagnostic alone.
+/// Dedupe by membership rather than by sorting: [`Ecosystem`] is `Eq` and not
+/// `Ord`, and the order the user named them in is the order to say them back.
+fn requested_ecosystems(args: &[EcosystemArg]) -> Vec<Ecosystem> {
+    let mut requested: Vec<Ecosystem> = Vec::new();
+    for ecosystem in args.iter().copied().map(Ecosystem::from) {
+        if !requested.contains(&ecosystem) {
+            requested.push(ecosystem);
+        }
+    }
+    requested
+}
+
+/// Why an `--ecosystem` filter came back empty: what was asked for, how much was
+/// searched, and which ecosystems were there instead.
+///
+/// This *replaces* the generic "No supported manifests found." rather than joining
+/// it — see [`report_no_manifests`]. Naming what was found is the whole point: the
+/// two answers a user needs to tell apart are "this repository has no Rust in it"
+/// and "the filter removed everything", and the generic line says neither.
+fn no_ecosystem_match(requested: &[Ecosystem], searched: &[PathBuf], depth: usize) -> String {
+    // Discovery returns a sorted list, so first-seen order is deterministic.
+    // `Ecosystem` is `Eq` but not `Ord`, so dedupe by membership rather than sort.
+    let mut present: Vec<Ecosystem> = Vec::new();
+    for kind in searched.iter().filter_map(|m| ManifestKind::detect(m)) {
+        let ecosystem = kind.ecosystem();
+        if !present.contains(&ecosystem) {
+            present.push(ecosystem);
+        }
+    }
+    let count = searched.len();
+    let plural = if count == 1 { "" } else { "s" };
+    let asked = ecosystem_names(requested);
+    if present.is_empty() {
+        format!("no manifest for {asked} (searched {count} manifest{plural} up to --depth {depth})")
+    } else {
+        format!(
+            "no manifest for {asked} (searched {count} manifest{plural} up to --depth {depth}; found {})",
+            ecosystem_names(&present)
+        )
+    }
+}
+
+/// Ecosystems as a human-readable list, in the order given.
+fn ecosystem_names(ecosystems: &[Ecosystem]) -> String {
+    ecosystems
+        .iter()
+        .map(|ecosystem| ecosystem.display_name())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The line a command prints when discovery came back with nothing to do.
+///
+/// Silent whenever an `--ecosystem` filter was in force, which is what
+/// `ecosystems` non-empty tests — not whether that filter is what emptied the
+/// set. The two come apart: `--ecosystem rust --manifest-glob 'nope/*'` over a
+/// repository that does contain Rust is emptied by the glob, which printed its
+/// own line, while [`collect_manifests`]' ecosystem explanation never ran. The
+/// generic line is suppressed there too, and deliberately: the glob line is the
+/// specific answer in that case, and "No supported manifests found." is a
+/// falsehood in a repository full of manifests some filter removed. The
+/// predicate is the coarse one because a caller cannot tell the two apart
+/// without [`collect_manifests`] reporting back which filter emptied the set,
+/// and that return type is deliberately still `Vec<PathBuf>`.
+///
+/// Either way the exit code is 0 — an empty selection is an answer, not a tool
+/// error, and a per-ecosystem CI matrix job must not fail on the ecosystems a
+/// repository does not use.
+fn report_no_manifests(ecosystems: &[Ecosystem]) {
+    if ecosystems.is_empty() {
+        eprintln!("No supported manifests found.");
+    }
 }
 
 /// Compile `--manifest-glob` patterns into a matcher over manifest paths, with
@@ -1727,14 +1866,25 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample-monorepo")
     }
 
-    fn matched(globs: &[&str]) -> Vec<String> {
+    /// A polyglot fixture: `services/api/Cargo.toml` beside `services/sync/go.mod`,
+    /// so an ecosystem filter has something of another ecosystem to remove.
+    fn polyglot() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample-polyglot")
+    }
+
+    /// The manifests `collect_manifests` keeps under both filters, relative to
+    /// `root` and `/`-separated so an assertion does not depend on the platform.
+    fn matched_under(root: &Path, globs: &[&str], ecosystems: &[Ecosystem]) -> Vec<String> {
         let globs: Vec<String> = globs.iter().map(|g| (*g).to_string()).collect();
-        let root = monorepo();
-        collect_manifests(None, Some(&root), 4, &globs, &|_| true)
+        collect_manifests(None, Some(root), 4, &globs, ecosystems, &|_| true)
             .expect("the patterns are valid")
             .iter()
-            .map(|m| output::posix(&relative_to(&root, m)))
+            .map(|m| output::posix(&relative_to(root, m)))
             .collect()
+    }
+
+    fn matched(globs: &[&str]) -> Vec<String> {
+        matched_under(&monorepo(), globs, &[])
     }
 
     #[test]
@@ -1776,14 +1926,67 @@ mod tests {
         assert!(matched(&["apps/*/Cargo.toml"]).is_empty());
     }
 
+    /// A flag repeated is one request, not two. clap's `Vec<T>` keeps every
+    /// repeat, so `--ecosystem rust --ecosystem rust` reached the empty-selection
+    /// line as `no manifest for Rust, Rust`. Selection was never affected — it is
+    /// a `contains` — so this is the diagnostic alone.
+    #[test]
+    fn a_repeated_ecosystem_is_named_once() {
+        use crate::cli::EcosystemArg;
+
+        assert_eq!(
+            requested_ecosystems(&[EcosystemArg::Rust, EcosystemArg::Rust]),
+            vec![Ecosystem::Rust]
+        );
+        assert_eq!(
+            ecosystem_names(&requested_ecosystems(&[
+                EcosystemArg::Npm,
+                EcosystemArg::Rust,
+                EcosystemArg::Npm,
+            ])),
+            "npm, Rust",
+            "first-named order survives, and nothing is said twice"
+        );
+        // An absent flag is still the unrestricted answer.
+        assert!(requested_ecosystems(&[]).is_empty());
+    }
+
+    /// Both filters at once, which nothing else exercises: `--ecosystem` and
+    /// `--manifest-glob` intersect rather than override, whichever is narrower.
+    ///
+    /// This pins the *set*, and the set alone cannot pin the order the two run
+    /// in — an intersection is commutative, so both orders return this. What the
+    /// order changes is the diagnostic each filter prints, which is asserted end
+    /// to end in `tests/cli_ecosystem.rs`.
+    #[test]
+    fn an_ecosystem_and_a_glob_narrow_the_same_set() {
+        let root = polyglot();
+        assert_eq!(
+            matched_under(&root, &["services/*/*"], &[]),
+            vec!["services/api/Cargo.toml", "services/sync/go.mod"],
+            "the glob alone keeps both services"
+        );
+        assert_eq!(
+            matched_under(&root, &["services/*/*"], &[Ecosystem::Rust]),
+            vec!["services/api/Cargo.toml"],
+            "adding the ecosystem removes the Go module the glob had kept"
+        );
+        assert!(
+            matched_under(&root, &["services/sync/go.mod"], &[Ecosystem::Rust]).is_empty(),
+            "and a glob naming only an excluded manifest keeps nothing"
+        );
+    }
+
     #[test]
     fn an_explicit_manifest_is_returned_whatever_the_patterns() {
         // clap rejects the combination, so this only documents that the glob
         // never silently filters away a file the user named outright.
         let named = PathBuf::from("some/other/Cargo.toml");
         assert_eq!(
-            collect_manifests(Some(&named), None, 3, &["nope/*".to_string()], &|_| true)
-                .expect("the pattern is valid"),
+            collect_manifests(Some(&named), None, 3, &["nope/*".to_string()], &[], &|_| {
+                true
+            })
+            .expect("the pattern is valid"),
             vec![named]
         );
     }
@@ -1792,8 +1995,15 @@ mod tests {
     fn an_unparseable_pattern_is_an_error_not_an_empty_result() {
         let root = monorepo();
         assert!(
-            collect_manifests(None, Some(&root), 4, &["services/[".to_string()], &|_| true)
-                .is_err()
+            collect_manifests(
+                None,
+                Some(&root),
+                4,
+                &["services/[".to_string()],
+                &[],
+                &|_| true
+            )
+            .is_err()
         );
     }
 

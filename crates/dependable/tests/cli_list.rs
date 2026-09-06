@@ -326,3 +326,45 @@ fn a_disabled_ecosystem_is_not_warned_about() {
         "`[jvm] enabled = false` is an answer, not a question: {disabled}"
     );
 }
+
+/// An empty selection is exit 0 — and under `--format json` it is still a
+/// document.
+///
+/// `list --ecosystem csharp --format json | jq '.summary.projects'` is the shape
+/// this flag exists for: one shard per ecosystem in a CI matrix. Returning
+/// before the document was built made every shard whose ecosystem the repository
+/// does not use exit 0 with byte-empty stdout, so `jq` failed to parse — on
+/// precisely the ecosystems exit 0 was chosen to keep green. The stderr line
+/// saying what was searched is not machine-readable.
+///
+/// `table` and `text` are unchanged: a human handed an empty table wants the
+/// stderr line, not a blank one.
+#[test]
+fn an_empty_selection_is_an_empty_document_not_empty_stdout() {
+    let npm = fixture("sample-npm");
+
+    let filtered = list_json(&npm, &["--ecosystem", "rust"]);
+    assert_eq!(filtered["schema"], "dependable.list/v1");
+    assert_eq!(filtered["summary"]["projects"], 0);
+    assert_eq!(filtered["summary"]["dependencies"], 0);
+    assert_eq!(filtered["summary"]["by_ecosystem"], serde_json::json!({}));
+    assert!(
+        filtered["projects"]
+            .as_array()
+            .expect("projects array")
+            .is_empty()
+    );
+
+    // The other way a selection empties: the glob path, which prints its own
+    // diagnostic and reached the same byte-empty stdout.
+    let globbed = list_json(&npm, &["--manifest-glob", "nope/*"]);
+    assert_eq!(globbed["summary"]["projects"], 0);
+
+    let path = npm.to_str().expect("utf-8 path");
+    for format in ["table", "text"] {
+        assert!(
+            run(&["list", path, "--format", format, "--ecosystem", "rust"]).is_empty(),
+            "{format} says nothing on stdout when nothing was selected"
+        );
+    }
+}
