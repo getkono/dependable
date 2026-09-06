@@ -518,6 +518,71 @@ fn a_group_this_file_cannot_resolve_is_still_listed() {
     assert_eq!(doc["summary"]["undetermined"], 2, "{}", doc["summary"]);
 }
 
+/// The multi-module idiom states a version *and* a coordinate this file cannot
+/// spell, and the two are read independently.
+///
+/// Forcing the version to unknown because the coordinate did not resolve threw away
+/// a `2.0.13` written in plain sight: `list` showed the entry with no version at
+/// all, and the run then explained the blank with a `<parent>` notice — false twice,
+/// because the version was stated and no parent is involved. Under `--fail-on any`
+/// that pointed the reader at a parent POM that does not exist.
+#[test]
+fn a_version_beside_an_unnameable_coordinate_is_read_and_reported() {
+    let dir = pom_dir(
+        "maven_unnameable_with_version",
+        "  <dependencies>\n    \
+         <dependency>\n      \
+         <groupId>${project.groupId}</groupId>\n      \
+         <artifactId>app-core</artifactId>\n      \
+         <version>2.0.13</version>\n    \
+         </dependency>\n    \
+         <dependency>\n      \
+         <groupId>org.springframework.boot</groupId>\n      \
+         <artifactId>spring-boot-starter-web</artifactId>\n    \
+         </dependency>\n  \
+         </dependencies>\n",
+    );
+
+    let listed = run(&dir, &["list", "."]);
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        stdout.contains("2.0.13"),
+        "the version is written in the file and must appear: {stdout}"
+    );
+
+    let stderr = String::from_utf8_lossy(&listed.stderr);
+    assert!(
+        stderr.contains("coordinate") && stderr.contains("${project.groupId}:app-core"),
+        "the unread coordinate gets its own notice: {stderr}"
+    );
+
+    // `check` still declines to claim a status for it — nothing was fetched under a
+    // name no registry has heard of — but reports the version it read.
+    let doc = check_json(&dir, &[]);
+    let core = status_of(&doc, "${project.groupId}:app-core");
+    assert_eq!(core["status"], "UNDETERMINED", "{core}");
+    assert_eq!(core["current"], "2.0.13", "{core}");
+    // The entry whose version really does come from the `<parent>` keeps that story,
+    // and keeps it to itself.
+    let checked = run(&dir, &["check", "."]);
+    let stderr = String::from_utf8_lossy(&checked.stderr);
+    assert!(
+        parent_story(&stderr).contains("spring-boot-starter-web"),
+        "{stderr}"
+    );
+    assert!(!parent_story(&stderr).contains("app-core"), "{stderr}");
+}
+
+/// The one stderr line that blames a `<parent>` / `<dependencyManagement>` /
+/// undeclared property, or the empty string when the run emitted none.
+fn parent_story(stderr: &str) -> String {
+    stderr
+        .lines()
+        .find(|line| line.contains("takes its version from") || line.contains("take their version"))
+        .unwrap_or_default()
+        .to_owned()
+}
+
 /// The `system` scope survives a version this parser had to reconstruct.
 ///
 /// A comment inside `<version>` costs the entry its byte-faithful span, and the

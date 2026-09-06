@@ -931,6 +931,12 @@ fn evaluate_item(
             // which of `spring-boot-starter-web` is simply false, and is the wrong
             // token for a CI consumer to read.
             PackageSource::Inherited => DependencyStatus::Undetermined,
+            // A coordinate this manifest could not state is the same shape of
+            // ignorance reached through the name instead of the version: nothing was
+            // asked, so nothing is known. `Local` would again say the wrong thing —
+            // that there is no registry behind the entry, rather than that this file
+            // never said which package it is.
+            PackageSource::Unidentified => DependencyStatus::Undetermined,
             _ => DependencyStatus::Local,
         };
         return CheckResult::new(item.clone(), status);
