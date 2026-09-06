@@ -301,9 +301,14 @@ pub fn find_lockfile(manifest: &Path, kind: ManifestKind) -> Option<(PathBuf, Lo
 /// otherwise hand `../other` that workspace's `[workspace.dependencies]`, and no `.git`
 /// check catches it, because the boundary is tested against the current directory too.
 ///
-/// The returned path is therefore absolute and symlink-resolved, whatever `manifest` was
-/// spelled as. A manifest that cannot be canonicalized (it was deleted between discovery
-/// and here) belongs to no workspace.
+/// The returned path is therefore absolute whatever `manifest` was spelled as, and the
+/// *directory* it was found in is symlink-resolved. A multi-segment candidate's own
+/// segments are not: the walk joins the candidate onto an already-canonical directory
+/// without resolving it again, so two members reaching one physical root through two
+/// spellings of a symlinked segment would key a cache twice — a duplicate parse, not a
+/// wrong answer, and no shipped candidate has more than one segment today. A manifest
+/// that cannot be canonicalized (it was deleted between discovery and here) belongs to
+/// no workspace.
 #[must_use]
 pub fn nearest_workspace_root(
     manifest: &Path,

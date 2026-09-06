@@ -219,9 +219,15 @@ pub struct WorkspaceRoots {
     /// paired kind is also not necessarily the kind that went looking — an ecosystem may
     /// keep its central declarations in a format none of its members are written in.
     ///
-    /// A candidate is a *path*, not just a file name: Gradle's is
-    /// `gradle/libs.versions.toml`, and the `dir.join()` the walk performs already
-    /// resolves the separator.
+    /// A candidate is a *path*, not just a file name, and the `dir.join()` the walk
+    /// performs already resolves the separator. A Gradle descriptor would name
+    /// `gradle/libs.versions.toml` — illustrative of a descriptor a future ecosystem
+    /// would write, not one that exists, since [`ManifestKind::GradleVersionCatalog`]
+    /// declares no roots today and no shipped candidate has more than one segment.
+    ///
+    /// Only the directory a candidate is joined onto is symlink-resolved; the
+    /// candidate's own segments are not, so two members reaching one physical root by
+    /// two spellings of a symlinked segment would parse it twice rather than share it.
     pub root_names: &'static [(&'static str, ManifestKind)],
     /// Whether a manifest may be its own root. Cargo's root-that-is-also-a-package
     /// writes `serde.workspace = true` against its own table, so walking past
