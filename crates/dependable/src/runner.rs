@@ -25,9 +25,7 @@ use dependable_tui::TuiOptions;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use indicatif::{ProgressBar, ProgressStyle};
 
-use crate::cli::{
-    CheckArgs, EcosystemArg, FailOn, FixArgs, Format, ListArgs, TreeArgs, TuiArgs,
-};
+use crate::cli::{CheckArgs, EcosystemArg, FailOn, FixArgs, Format, ListArgs, TreeArgs, TuiArgs};
 use crate::config::{Config, load_config};
 #[cfg(feature = "report")]
 use crate::config::{PolicySource, load_policy};
@@ -1423,8 +1421,21 @@ fn collect_manifests(
 
 /// The ecosystems `--ecosystem` asked for, as the core type. Empty means
 /// unrestricted, which is what an absent flag produces.
+///
+/// Deduplicated, in first-named order. clap's `Vec<T>` keeps every repeat, so
+/// `--ecosystem rust --ecosystem rust` arrived as two values and
+/// [`no_ecosystem_match`] read them back as `no manifest for Rust, Rust`.
+/// Selection never cared — it is a `contains` — so this is the diagnostic alone.
+/// Dedupe by membership rather than by sorting: [`Ecosystem`] is `Eq` and not
+/// `Ord`, and the order the user named them in is the order to say them back.
 fn requested_ecosystems(args: &[EcosystemArg]) -> Vec<Ecosystem> {
-    args.iter().copied().map(Ecosystem::from).collect()
+    let mut requested: Vec<Ecosystem> = Vec::new();
+    for ecosystem in args.iter().copied().map(Ecosystem::from) {
+        if !requested.contains(&ecosystem) {
+            requested.push(ecosystem);
+        }
+    }
+    requested
 }
 
 /// Why an `--ecosystem` filter came back empty: what was asked for, how much was
@@ -1904,6 +1915,31 @@ mod tests {
     #[test]
     fn a_pattern_matching_nothing_yields_nothing_rather_than_everything() {
         assert!(matched(&["apps/*/Cargo.toml"]).is_empty());
+    }
+
+    /// A flag repeated is one request, not two. clap's `Vec<T>` keeps every
+    /// repeat, so `--ecosystem rust --ecosystem rust` reached the empty-selection
+    /// line as `no manifest for Rust, Rust`. Selection was never affected — it is
+    /// a `contains` — so this is the diagnostic alone.
+    #[test]
+    fn a_repeated_ecosystem_is_named_once() {
+        use crate::cli::EcosystemArg;
+
+        assert_eq!(
+            requested_ecosystems(&[EcosystemArg::Rust, EcosystemArg::Rust]),
+            vec![Ecosystem::Rust]
+        );
+        assert_eq!(
+            ecosystem_names(&requested_ecosystems(&[
+                EcosystemArg::Npm,
+                EcosystemArg::Rust,
+                EcosystemArg::Npm,
+            ])),
+            "npm, Rust",
+            "first-named order survives, and nothing is said twice"
+        );
+        // An absent flag is still the unrestricted answer.
+        assert!(requested_ecosystems(&[]).is_empty());
     }
 
     /// Both filters at once, which nothing else exercises: `--ecosystem` and
