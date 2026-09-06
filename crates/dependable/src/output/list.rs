@@ -278,6 +278,7 @@ fn source_token(source: PackageSource) -> &'static str {
         PackageSource::Local => "local",
         PackageSource::Git => "git",
         PackageSource::Inherited => "inherited",
+        PackageSource::Unidentified => "unidentified",
         _ => "unknown",
     }
 }
@@ -305,6 +306,9 @@ fn annotation(item: &Item) -> &'static str {
         // would otherwise render as a bare `—` that reads like a parse failure. A
         // resolved one falls through to its section, so a `dev` dep still says so.
         PackageSource::Inherited if item.version_constraint.is_empty() => " (unresolved)",
+        // The version beside it may be perfectly clear; what this file never stated is
+        // which package it belongs to, so nothing was fetched under that name.
+        PackageSource::Unidentified => " (unidentified)",
         _ => match item.kind {
             DependencyKind::Dev => " (dev)",
             DependencyKind::Build => " (build)",

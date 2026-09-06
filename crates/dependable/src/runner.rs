@@ -644,14 +644,6 @@ pub async fn run_list(args: ListArgs) -> anyhow::Result<ExitCode> {
             }
         };
 
-        // A member writing `dep.workspace = true` states no version of its own; the
-        // constraint lives in the workspace root. Same resolution `check` and `fix` get,
-        // so an inventory and a check never disagree about what a member depends on.
-        //
-        // Before the lockfile, and in that order for a reason: a lockfile can hold several
-        // versions of one crate, and `pick_locked` chooses among them *by the declared
-        // constraint*. Resolving second would hand it an empty constraint and pick the
-        // highest — reporting `syn 2.0` locked against a member that inherits `syn = "1"`.
         // What the parser saw and declined to read. On stderr rather than in the
         // listing, so the same words reach a reader whichever `--format` they
         // chose, and no machine-readable document changes shape — the same place
@@ -660,6 +652,14 @@ pub async fn run_list(args: ListArgs) -> anyhow::Result<ExitCode> {
             eprintln!("warning: {} — {notice}", manifest.display());
         }
 
+        // A member writing `dep.workspace = true` states no version of its own; the
+        // constraint lives in the workspace root. Same resolution `check` and `fix` get,
+        // so an inventory and a check never disagree about what a member depends on.
+        //
+        // Before the lockfile, and in that order for a reason: a lockfile can hold several
+        // versions of one crate, and `pick_locked` chooses among them *by the declared
+        // constraint*. Resolving second would hand it an empty constraint and pick the
+        // highest — reporting `syn 2.0` locked against a member that inherits `syn = "1"`.
         let inherited = workspace_source(manifest, kind, &content)
             .map(|(_, declarations)| {
                 resolve_workspace_inheritance(&mut parsed.items, &declarations)

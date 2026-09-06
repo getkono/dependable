@@ -230,6 +230,12 @@ fn mix(content: &str) -> ProjectMeta {
 /// [`pom_xml`](super::pom_xml)); the bare `artifactId` is reported rather than a
 /// coordinate that would be half guessed. A `<version>` that is a property
 /// (`${revision}`) is likewise not a literal this file states.
+///
+/// The element's text is read by [`pom_xml::text_of`](super::pom_xml::text_of) and
+/// not by `Node::text`, so this reader and the dependency reader agree on what an
+/// element says: `Node::text` returns the *first* text node only, which makes
+/// `<version>1.0<!-- patched -->.0</version>` read `1.0` here and `1.0.0` there —
+/// one file, one element, two answers, and one of them a version nobody wrote.
 fn pom(content: &str) -> ProjectMeta {
     let Ok(doc) = roxmltree::Document::parse(content) else {
         return unnamed();
@@ -239,10 +245,9 @@ fn pom(content: &str) -> ProjectMeta {
         project
             .children()
             .find(|child| child.is_element() && child.tag_name().name() == tag)
-            .and_then(|child| child.text())
-            .map(str::trim)
-            .filter(|text| !text.is_empty() && !text.contains('$'))
-            .map(str::to_owned)
+            .and_then(super::pom_xml::text_of)
+            .map(|located| located.value)
+            .filter(|text| !text.contains('$'))
     };
     let name = field("artifactId").map(|artifact| match field("groupId") {
         Some(group) => format!("{group}:{artifact}"),
@@ -468,6 +473,46 @@ mod tests {
             parse_project(ManifestKind::PomXml, "<not xml").role,
             ProjectRole::Unnamed
         );
+    }
+
+    /// One element, one rule. `Node::text` stops at the first text node, so a
+    /// `<version>` a comment or a character reference splits in two used to read as
+    /// its first half here while the dependency reader read it whole — the project
+    /// then claimed version `1.0` of itself while a sibling POM depending on it read
+    /// `1.0.0`, and a monorepo could not match the two.
+    #[test]
+    fn a_split_element_reads_the_same_here_as_in_the_dependency_reader() {
+        let split = parse_project(
+            ManifestKind::PomXml,
+            "<project>\n  <groupId>org.exa<!--split-->mple</groupId>\n  \
+             <artifactId>demo</artifactId>\n  \
+             <version>1.0<!--patched-->.0</version>\n</project>\n",
+        );
+        assert_eq!(split.name.as_deref(), Some("org.example:demo"));
+        assert_eq!(split.literal_version(), Some("1.0.0"));
+
+        // And the dependency reader, over the same shape, agrees.
+        let items = crate::parsers::parse(
+            ManifestKind::PomXml,
+            "<project>\n  <dependencies>\n    <dependency>\n      \
+             <groupId>org.exa<!--split-->mple</groupId>\n      \
+             <artifactId>demo</artifactId>\n      \
+             <version>1.0<!--patched-->.0</version>\n    \
+             </dependency>\n  </dependencies>\n</project>\n",
+        )
+        .expect("the POM parses")
+        .items;
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name, "org.example:demo");
+        assert_eq!(items[0].version_constraint, "1.0.0");
+
+        // A character reference is read whole by both too.
+        let entity = parse_project(
+            ManifestKind::PomXml,
+            "<project>\n  <artifactId>demo</artifactId>\n  \
+             <version>1.0&#46;0</version>\n</project>\n",
+        );
+        assert_eq!(entity.literal_version(), Some("1.0.0"));
     }
 
     #[test]
