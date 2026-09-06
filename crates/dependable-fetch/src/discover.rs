@@ -426,8 +426,16 @@ pub fn workspace_source(
 /// could not.
 ///
 /// A manifest that will not parse declares nothing, which is the same answer as a
-/// manifest with no such table — neither is worth failing a whole check over, and neither
-/// is a kind that has no central declarations to offer.
+/// manifest with no such table — neither is worth failing a whole check over.
+///
+/// `content` is parsed as `root_kind` unconditionally. There is no short-circuit for a
+/// kind whose [`ManifestKind::workspace_roots`] is `None`: such a kind has no workspace
+/// *indirection*, which is a fact about members of that kind looking upward, not about
+/// whether the file in hand holds central declarations — a `package.json` carrying a
+/// `catalog` block holds them and answers with them. Passing a member's kind rather than
+/// the root's therefore reads the wrong file's shape instead of answering nothing, and
+/// the compiler cannot tell the two apart. Take `root_kind` from [`workspace_root_of`]
+/// or [`nearest_workspace_root`], which return it beside the root they located.
 #[must_use]
 pub fn workspace_declarations(root_kind: ManifestKind, content: &str) -> Vec<Item> {
     parse(root_kind, content)
