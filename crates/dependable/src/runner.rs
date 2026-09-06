@@ -1833,14 +1833,25 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample-monorepo")
     }
 
-    fn matched(globs: &[&str]) -> Vec<String> {
+    /// A polyglot fixture: `services/api/Cargo.toml` beside `services/sync/go.mod`,
+    /// so an ecosystem filter has something of another ecosystem to remove.
+    fn polyglot() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample-polyglot")
+    }
+
+    /// The manifests `collect_manifests` keeps under both filters, relative to
+    /// `root` and `/`-separated so an assertion does not depend on the platform.
+    fn matched_under(root: &Path, globs: &[&str], ecosystems: &[Ecosystem]) -> Vec<String> {
         let globs: Vec<String> = globs.iter().map(|g| (*g).to_string()).collect();
-        let root = monorepo();
-        collect_manifests(None, Some(&root), 4, &globs, &[], &|_| true)
+        collect_manifests(None, Some(root), 4, &globs, ecosystems, &|_| true)
             .expect("the patterns are valid")
             .iter()
-            .map(|m| output::posix(&relative_to(&root, m)))
+            .map(|m| output::posix(&relative_to(root, m)))
             .collect()
+    }
+
+    fn matched(globs: &[&str]) -> Vec<String> {
+        matched_under(&monorepo(), globs, &[])
     }
 
     #[test]
@@ -1880,6 +1891,32 @@ mod tests {
     #[test]
     fn a_pattern_matching_nothing_yields_nothing_rather_than_everything() {
         assert!(matched(&["apps/*/Cargo.toml"]).is_empty());
+    }
+
+    /// Both filters at once, which nothing else exercises: `--ecosystem` and
+    /// `--manifest-glob` intersect rather than override, whichever is narrower.
+    ///
+    /// This pins the *set*, and the set alone cannot pin the order the two run
+    /// in — an intersection is commutative, so both orders return this. What the
+    /// order changes is the diagnostic each filter prints, which is asserted end
+    /// to end in `tests/cli_ecosystem.rs`.
+    #[test]
+    fn an_ecosystem_and_a_glob_narrow_the_same_set() {
+        let root = polyglot();
+        assert_eq!(
+            matched_under(&root, &["services/*/*"], &[]),
+            vec!["services/api/Cargo.toml", "services/sync/go.mod"],
+            "the glob alone keeps both services"
+        );
+        assert_eq!(
+            matched_under(&root, &["services/*/*"], &[Ecosystem::Rust]),
+            vec!["services/api/Cargo.toml"],
+            "adding the ecosystem removes the Go module the glob had kept"
+        );
+        assert!(
+            matched_under(&root, &["services/sync/go.mod"], &[Ecosystem::Rust]).is_empty(),
+            "and a glob naming only an excluded manifest keeps nothing"
+        );
     }
 
     #[test]
