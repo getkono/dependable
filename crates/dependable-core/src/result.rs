@@ -144,9 +144,16 @@ impl CheckResult {
 /// found" and "unparseable constraint" are both prose, and reading provenance out of
 /// prose is what folded them together. A registry answering that a package does not
 /// exist is a permanent per-dependency fact that must not fail a whole build — gating on
-/// it turned every repository with one unpublished internal package into exit 2. A
-/// constraint this run could not read reached no registry at all: nothing was
+/// it turned every repository with one unpublished internal package into exit 2. Input
+/// that is not a version requirement at all reached no registry: nothing was
 /// established, and certifying the build over it is the gate lying.
+///
+/// The line is drawn at what the *manifest* says, not at what this crate happens to
+/// support. A constraint that is a perfectly good declaration in a dialect with no
+/// front-end here is [`DependencyStatus::Undetermined`] and carries no origin at all —
+/// failing a build over that punishes the user for a gap that is ours, and
+/// `--fail-on any` already fails on it for anyone who wants every constraint
+/// established. An `Error` is reserved for what nobody could read as a requirement.
 ///
 /// `#[non_exhaustive]`: match with a wildcard arm so new origins are additive.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -161,8 +168,12 @@ pub enum ErrorOrigin {
     /// A registry request that produced no answer — a timeout, a refused connection, a
     /// 5xx, an undecodable response, a document listing no versions at all.
     Unanswered,
-    /// A failure this run reached without a registry ever being asked: a constraint
-    /// written in a dialect that did not parse, or a fetch whose result never arrived.
+    /// A failure this run reached without a registry ever being asked: input that is not
+    /// a version requirement at all (`^^^bogus` — operators announcing a range that is
+    /// never spelled), or a fetch whose result never arrived.
+    ///
+    /// Deliberately *not* a constraint this crate merely has no front-end for. That is
+    /// [`DependencyStatus::Undetermined`], which is outside the gate.
     Local,
 }
 
@@ -178,14 +189,23 @@ pub enum DependencyStatus {
     Outdated,
     Vulnerable,
     Error(String),
-    /// A real package whose declared version this run could not read: the
-    /// constraint is written in a dialect that did not translate, or it refers to
-    /// something the manifest never declares.
+    /// A real package whose declared version this run could not read: the constraint is
+    /// written in a dialect that did not translate, it names a channel or a branch
+    /// instead of a range, or it refers to something the manifest never declares.
     ///
-    /// Distinct from [`Self::Error`], which is the registry or the fetch failing,
-    /// and deliberately distinct from [`Self::UpToDate`]: an unreadable constraint
-    /// is not evidence that a dependency is current, and reporting it as current
-    /// is what disarms `--fail-on outdated`.
+    /// Deliberately distinct from [`Self::UpToDate`]: an unreadable constraint is not
+    /// evidence that a dependency is current, and reporting it as current is what
+    /// disarms `--fail-on outdated`.
+    ///
+    /// Deliberately distinct from [`Self::Error`] too, and the distinction is a policy,
+    /// not a shade of meaning. `Error` is the registry failing, the fetch failing, or
+    /// input nobody could read as a requirement — a run that could not do its job.
+    /// `Undetermined` is a constraint the *manifest* got right and this crate has no
+    /// front-end for, which is a gap here rather than a defect there. So it does not
+    /// count toward the run's unevaluated tally, does not trip `--fail-on vulnerable`
+    /// (which promises something about vulnerabilities) or `--fail-on outdated` (which
+    /// promises something about staleness), and does trip `--fail-on any`, which is the
+    /// setting that promises everything was established.
     Undetermined,
     Local,
     Git,

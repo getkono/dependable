@@ -871,16 +871,19 @@ fn parse_version(raw: &str, ecosystem: Ecosystem) -> Option<semver::Version> {
 /// not zero. Counting it as zero would make the gate blind to exactly the churn it
 /// exists to catch.
 ///
-/// Crossing out of `0.x` counts the crossing itself plus each major after it, so
-/// `0.1 -> 1.0` is one and `0.1 -> 3.0` is three. Previously this branch subtracted the
-/// majors alone, which made the measure *shrink* when a dependency was further behind:
-/// `0.1 -> 0.9` scored 8, and the moment upstream shipped `1.0` the same project scored
-/// 1 and a `max_major_behind = 2` gate it had been failing began to pass.
+/// Crossing out of `0.x` counts the majors past `0` alone, so `0.1 -> 1.0` is one and
+/// `0.1 -> 3.0` is three.
 ///
 /// # Limitation
-/// The 0.x releases skipped on the way out of the line are not counted, because the set
-/// of published versions is not available here — only the two endpoints are. For a
-/// dependency whose upstream has since crossed 1.0, this is therefore a lower bound.
+/// The measure is **not monotonic across that crossing**, and this rewrite did not make
+/// it so: it is a restatement of the same truth table, identical on every input. The
+/// 0.x releases skipped on the way out of the line are not counted, because the set of
+/// published versions is not available here — only the two endpoints are. So a
+/// dependency at `0.1.0` scores 8 against an upstream `0.9.0` and 1 against `1.0.0`, and
+/// a `max_major_behind = 2` gate it had been failing starts passing the moment upstream
+/// ships `1.0.0` — further behind, measured as closer. Repairing that needs the
+/// published version set this function is not given, which is a design change rather
+/// than a repair; it is filed rather than attempted here.
 fn major_distance(current: &semver::Version, latest: &semver::Version) -> u64 {
     match (current.major, latest.major) {
         // Both on the 0.x line: the minor is the breaking axis.
@@ -1880,17 +1883,24 @@ reason = "CVE-2023-xxxx fix"
         assert!(outcome.has_violations());
     }
 
-    /// Being further behind must never measure as being closer. `0.1 -> 0.9` scored 8
-    /// while `0.1 -> 1.0` scored 1, so shipping `1.0.0` un-failed the gate.
+    /// The measure, stated as it actually behaves. Under `0.x` the minor is the breaking
+    /// axis; past `1.0` the major is; and across the crossing only the majors past `0`
+    /// are counted — so `0.1 -> 0.9` is 8 while `0.1 -> 1.0` is 1, and being further
+    /// behind measures as being closer. That is a known limitation, recorded on
+    /// [`major_distance`] and filed, not something this test claims is fixed.
     #[test]
-    fn crossing_out_of_zero_x_does_not_shrink_the_distance() {
+    fn major_distance_counts_the_breaking_axis_of_each_version_line() {
         let v = |s: &str| semver::Version::parse(s).unwrap();
         assert_eq!(major_distance(&v("0.1.0"), &v("0.9.0")), 8);
         assert_eq!(major_distance(&v("0.1.0"), &v("1.0.0")), 1);
         assert_eq!(major_distance(&v("0.1.0"), &v("3.0.0")), 3);
-        // Monotonic in the major once past 1.0.
+        // Monotonic in the major once past 1.0 — and, as the limitation says, *not*
+        // across the crossing: 8 for `0.9.0` against 1 for the `1.0.0` that follows it.
         assert!(
             major_distance(&v("0.1.0"), &v("3.0.0")) > major_distance(&v("0.1.0"), &v("1.0.0"))
+        );
+        assert!(
+            major_distance(&v("0.1.0"), &v("0.9.0")) > major_distance(&v("0.1.0"), &v("1.0.0"))
         );
         assert_eq!(major_distance(&v("1.0.0"), &v("3.0.0")), 2);
         assert_eq!(major_distance(&v("4.0.0"), &v("1.0.0")), 0);

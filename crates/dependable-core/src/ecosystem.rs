@@ -18,6 +18,12 @@ pub enum BareVersion {
     /// `1.9.0` is `>=1.9.0, <2.0.0`.
     Caret,
     /// An inclusive minimum with no upper bound: `1.9.0` is `>=1.9.0`.
+    ///
+    /// A floor, not a preference: the resolver may pick any release at or above
+    /// it and never one below. An ecosystem whose bare version merely *suggests*
+    /// a release — one a resolver is free to satisfy with something older, as
+    /// Maven's nearest-wins mediation is — is not this reading, and no reading
+    /// here yet describes it.
     Minimum,
 }
 
@@ -109,7 +115,7 @@ impl Ecosystem {
     /// | Dart | [`Exact`](BareVersion::Exact) | pub's traditional-syntax table reads `1.2.3` as "only the given version", and the docs steer authors to `^1.2.3` precisely because the bare form is that restrictive. |
     /// | CSharp | [`Minimum`](BareVersion::Minimum) | NuGet's range table: `1.0` is `x ≥ 1.0`, "minimum version, inclusive". `[1.0]` is how an exact match is written. |
     /// | Elixir | [`Exact`](BareVersion::Exact) | A Hex requirement with no operator is an equality requirement: `Version.match?("2.0.1", "2.0.0")` is false. Floating needs `~>`. |
-    /// | Jvm | [`Minimum`](BareVersion::Minimum) | A plain Gradle version string is a *required* version — the minimum, "optimistically upgraded" by conflict resolution — not a pin; `strictly` is the pinning form. Maven's plain `<version>` is likewise a soft requirement that mediation may override. |
+    /// | Jvm | [`Minimum`](BareVersion::Minimum) | Answered for the Gradle version catalogs this variant currently reaches, and only those: a plain Gradle version string is a *required* version — the minimum, "optimistically upgraded" by conflict resolution — not a pin; `strictly` is the pinning form. Maven's plain `<version>` is **not** settled by this row. It is a soft requirement — a preference nearest-wins mediation may satisfy with an *older* release — which is not a floor and so not [`Minimum`](BareVersion::Minimum); the reading it needs is unresolved, and has to be settled before a `pom.xml` parser reaches this variant. |
     #[must_use]
     pub fn bare_version(self) -> BareVersion {
         match self {
