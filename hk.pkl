@@ -26,7 +26,15 @@ local test = new Step {
 // `supports-color`, so this is a second configuration rather than a repeat: it is what
 // catches an assertion that matches unstyled text and would otherwise pass here and
 // fail for whoever runs the suite from a terminal that exports the variable.
+//
+// `depends` on the plain run, because hk schedules steps in parallel up to `HK_JOBS`
+// and cargo drops its build lock before any test binary starts: two concurrent runs
+// share one target directory, and the integration tests keep fixed-name scratch
+// fixtures under `CARGO_TARGET_TMPDIR` that they wipe on entry, so they would delete
+// each other's. Serializing is enough — `FORCE_COLOR` is in no fingerprint, so the
+// second run rebuilds nothing and costs only its own test execution.
 local testColor = new Step {
+    depends = List("test")
     check = "cargo test --workspace"
     env {
         ["FORCE_COLOR"] = "3"

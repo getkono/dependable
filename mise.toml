@@ -34,8 +34,15 @@ run = "cargo test --workspace"
 # terminal they happen to be run from. `FORCE_COLOR` outranks the TTY check in
 # `supports-color`, which is what makes this a real second configuration rather
 # than a repeat of the first.
+#
+# It `depends` on `test` rather than running beside it: both invocations share one
+# Cargo target directory, and the CLI integration tests keep fixed-name scratch
+# fixtures under `CARGO_TARGET_TMPDIR` that they wipe on entry, so two concurrent
+# runs delete each other's. `FORCE_COLOR` is in no fingerprint, so the serialized
+# second run rebuilds nothing and costs only its own test execution.
 [tasks."test:color"]
 description = "Run the test suite with terminal color forced on"
+depends = ["test"]
 run = "cargo test --workspace"
 env = { FORCE_COLOR = "3" }
 
