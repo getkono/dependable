@@ -667,8 +667,12 @@ a `deno.json` reaches npm and JSR, and a `Cargo.toml` reaches crates.io alongsid
 alternate registry its dependencies name — so a registry that is not the ecosystem's
 default one is named beside it (`the npm (jsr.io) registry did not answer`). This line
 prints only the host and port, never the configured URL, because a registry root may
-carry credentials and the line lands in CI job output. (The per-dependency error text in
-the table is a separate matter: it carries whatever the HTTP client put in its message.)
+carry credentials and the line lands in CI job output. Where host and port cannot be
+recovered with confidence — a root whose path contains an `@`, which an ordinary Nexus
+npm proxy path does — the reduction says *less* rather than guessing, and the line falls
+back to the bare ecosystem name (`the npm registry did not answer`), indistinguishable
+from a fetcher that names no root at all. (The per-dependency error text in the table is
+a separate matter: it carries whatever the HTTP client put in its message.)
 
 A registry that answered `404` (or, for a Go proxy, `410`) *answered*: a private,
 internal or deleted package is a per-dependency fact, reported in the table and noted

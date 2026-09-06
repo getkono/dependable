@@ -191,6 +191,14 @@ fn unreachable_sort_key(registry: &UnreachableRegistry) -> (&str, &str) {
 /// authority candidate is taken first, and an `@` surviving *outside* it means the string
 /// cannot be split into userinfo and host with any confidence — the root is then dropped
 /// rather than guessed at.
+///
+/// That question is asked **unconditionally**, before the candidate is split at all, and
+/// not only when the candidate holds no `@` of its own. Both halves can hold one:
+/// `https://ci:AbC@dEf/ghi@nexus.internal/npm` is a token containing `@` *and* a path
+/// containing `@`, and splitting its candidate at the last `@` yields `dEf` — part of the
+/// token, and a host the run never contacted. Whenever this returns `Some`, the whole
+/// string's `@`s lie inside the authority, so what survives is a host and port and never
+/// a fragment of userinfo.
 fn authority_of(root: &str) -> Option<String> {
     let after_scheme = root.split_once("://").map_or(root, |(_, rest)| rest);
     // The authority is everything before the path, query or fragment.
@@ -202,14 +210,21 @@ fn authority_of(root: &str) -> Option<String> {
         .unwrap_or(after_scheme.len());
     let (candidate, rest) = after_scheme.split_at(end);
 
+    // An `@` surviving past the authority is checked *before* the split, not as a guard
+    // on its `None` arm. Either it is a path containing `@`, or it is userinfo containing
+    // a delimiter, and nothing here can tell them apart — so the root is dropped whether
+    // or not the candidate also holds an `@`. Asking only when the candidate holds none
+    // would let `https://ci:AbC@dEf/ghi@nexus.internal/npm` split at the embedded `@` and
+    // print `dEf`, a fragment of the token. Say the ecosystem's name alone instead.
+    if rest.contains('@') {
+        return None;
+    }
+
     let host = match candidate.rsplit_once('@') {
         // Userinfo, correctly delimited. The *last* `@` wins: a password may legally
-        // contain one, and only the tail is the host.
+        // contain one, and only the tail is the host — but only once the check above has
+        // established that the authority holds every `@` in the string.
         Some((_, host)) => host,
-        // No `@` in the authority, but one further on. Either that is a path containing
-        // `@`, or it is a password containing `/`, and nothing here can tell them apart.
-        // Say the ecosystem's name alone rather than risk saying a secret.
-        None if rest.contains('@') => return None,
         None => candidate,
     };
     let host = host.trim();
@@ -2460,6 +2475,38 @@ mod tests {
         // `evil.example`. Reading the backslash as part of the authority named
         // `real.internal` — a host the run never contacted.
         assert_eq!(authority_of("http://evil.example\\@real.internal/x"), None);
+
+        // An `@` past the authority drops the root *whether or not* the authority holds
+        // one of its own. Asked only when the authority holds none — as a guard on the
+        // `None` arm of the split below — every one of these reduced to a fragment of
+        // the credential instead: `ss`, `dEf`, `s`, `s`, `s`, `en`, `host.example:pw`.
+        assert_eq!(
+            authority_of("https://user:p@ss/word@nexus.internal/x"),
+            None
+        );
+        assert_eq!(
+            authority_of("https://ci:AbC@dEf/ghi@nexus.internal/npm"),
+            None
+        );
+        assert_eq!(authority_of("https://ci:p@s?s@nexus.internal/x"), None);
+        assert_eq!(authority_of("https://ci:p@s#s@nexus.internal/x"), None);
+        assert_eq!(authority_of("https://ci:p@s\\s@nexus.internal/x"), None);
+        assert_eq!(authority_of("https://ci:tok@en/@nexus.internal/npm"), None);
+        // Not only a fragment: `host.example:pw` is a host the run never contacted, with
+        // the password glued to it as a port.
+        assert_eq!(
+            authority_of("https://user@host.example:pw/x@real.internal/y"),
+            None
+        );
+        assert_eq!(
+            UnreachableRegistry::new(
+                Ecosystem::Npm,
+                Some("https://ci:AbC@dEf/ghi@nexus.internal/npm".to_owned())
+            )
+            .label(),
+            "npm",
+            "an `@` in both the userinfo and the path must not print `dEf`"
+        );
         assert_eq!(
             UnreachableRegistry::new(
                 Ecosystem::Npm,
