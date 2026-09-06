@@ -840,8 +840,11 @@ mod tests {
         write(&dir.join("package.json"), central);
         let nobody = dir.join("member/Cargo.toml");
 
-        // Paired with `PackageJson`, the JSON parser reads TOML, sees no workspace, and
-        // the candidate is not a root.
+        // Paired with `PackageJson`, the candidate is not a root. No JSON parser runs to
+        // decide that: `declares_workspace` inspects content for `CargoToml` alone and is
+        // `false` for every other kind, so it is the pairing rather than a parse that
+        // rejects this. The assertion holds for any bytes and any non-Cargo kind today,
+        // and becomes load-bearing the day a second kind recognises roots of its own.
         assert!(
             root_in_dir(
                 &dir,
