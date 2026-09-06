@@ -86,8 +86,8 @@ pub struct PomXmlParser;
 
 /// A version literal and where it is written, before it is known whether the
 /// dependency that uses it may rewrite it.
-struct Located {
-    value: String,
+pub(super) struct Located {
+    pub(super) value: String,
     span: Option<Range<usize>>,
 }
 
@@ -519,7 +519,13 @@ fn child<'a>(node: roxmltree::Node<'a, 'a>, tag: &str) -> Option<roxmltree::Node
 /// the join are trimmed, so a value broken over lines around a comment keeps the
 /// indentation between its halves — and that is neither a version this file states
 /// nor one Maven would accept.
-fn text_of(node: roxmltree::Node<'_, '_>) -> Option<Located> {
+///
+/// [`project`](super::project)'s POM reader shares this, rather than reading
+/// `Node::text` itself: two readers of one element that disagree about what its text
+/// *is* make a POM's own `<version>` and a dependency's `<version>` two different
+/// rules, and `1.0<!-- c -->.0` then reads as `1.0.0` in one place and `1.0` in the
+/// other.
+pub(super) fn text_of(node: roxmltree::Node<'_, '_>) -> Option<Located> {
     let mut texts = node.children().filter(roxmltree::Node::is_text);
     let first = texts.next()?;
     let raw = first.text()?;
