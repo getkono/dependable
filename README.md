@@ -693,6 +693,34 @@ network access: `--fail-on vulnerable` with vulnerability scanning switched off
 severity rule already did. Every advisory list would be empty and the gate could
 never fail — a gate is either enforceable or it is a mistake.
 
+The refusal names the registries that declined, not just the fact that one did:
+
+```console
+$ dependable check --fail-on vulnerable
+error: cannot honour --fail-on: the Go registry did not answer
+```
+
+```console
+$ dependable check --fail-on vulnerable
+error: cannot honour --fail-on: the Go and npm registries did not answer
+```
+
+A run reaches more than one registry — a polyglot repository has one per ecosystem,
+a `deno.json` reaches npm and JSR, and a `Cargo.toml` reaches crates.io alongside any
+alternate registry its dependencies name — so a registry that is not the ecosystem's
+default one is named beside it (`the npm (jsr.io) registry did not answer`). This line
+prints only the host and port, never the configured URL, because a registry root may
+carry credentials and the line lands in CI job output. Where host and port cannot be
+recovered with confidence — a root whose path contains an `@`, which an ordinary Nexus
+npm proxy path does — the reduction says *less* rather than guessing, and the line falls
+back to the bare ecosystem name (`the npm registry did not answer`), indistinguishable
+from a fetcher that names no root at all. (The per-dependency error text in the table is
+a separate matter: it carries whatever the HTTP client put in its message.)
+
+A registry that answered `404` (or, for a Go proxy, `410`) *answered*: a private,
+internal or deleted package is a per-dependency fact, reported in the table and noted
+on stderr, and it does not make a gate unanswerable.
+
 `.dependable.toml` is validated: an unknown key or a wrong-typed value is an error,
 not a silent fallback to defaults. One mistyped character used to reset
 `[global] fail_on` to `none` and disarm the gate with nothing on stderr.

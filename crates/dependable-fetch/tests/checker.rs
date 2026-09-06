@@ -1284,3 +1284,185 @@ fn a_default_checker_writes_to_no_shared_cache() {
         "the disk cache must be opted into, not inherited"
     );
 }
+
+/// #112: a manifest is not the routing unit, so "the registry did not answer" could not
+/// say which one. A `deno.json` reaches npm *and* JSR, and this is the case that
+/// distinguishes a per-registry answer from a per-ecosystem one end to end — both routes
+/// are `Ecosystem::Npm`, one answered and one did not, and only the routing key can tell
+/// them apart.
+#[tokio::test]
+async fn a_deno_manifest_names_the_jsr_registry_alone_when_only_jsr_declines() {
+    let npm = MockServer::start().await;
+    let jsr = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/chalk"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(r#"{"versions":{"5.0.0":{},"5.3.0":{}}}"#),
+        )
+        .mount(&npm)
+        .await;
+    // JSR declines to answer at all. `any()` rather than a path matcher because the
+    // failure must not depend on how the fetcher spells `@std/path` in a URL.
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&jsr)
+        .await;
+
+    let client = build_client().unwrap();
+    let checker = Checker::builder()
+        .http_client(client.clone())
+        .registry(
+            Ecosystem::Npm,
+            Arc::new(NpmFetcher::with_registry(client.clone(), npm.uri())),
+        )
+        .jsr_registry(Arc::new(JsrFetcher::with_registry(client, jsr.uri())))
+        .vulnerabilities(false)
+        .build()
+        .unwrap();
+
+    let manifest = r#"{ "imports": { "chalk": "npm:chalk@^5.0.0", "p": "jsr:@std/path@^1.0.0" } }"#;
+    let check = checker
+        .check_manifest(ManifestKind::DenoJson, manifest, None)
+        .await
+        .unwrap();
+
+    // The npm half is fully evaluated. Nothing about JSR's outage reaches it.
+    let chalk = check
+        .results
+        .iter()
+        .find(|r| r.item.name == "chalk")
+        .expect("the npm import");
+    assert_eq!(chalk.latest_available.as_deref(), Some("5.3.0"));
+    assert!(
+        !matches!(chalk.status, DependencyStatus::Error(_)),
+        "the npm route answered, so its result must not be an error: {:?}",
+        chalk.status
+    );
+
+    // Exactly one registry declined, and it is JSR — named by its own root, not by npm's.
+    assert_eq!(check.unreachable_registries.len(), 1, "{check:?}");
+    let declined = &check.unreachable_registries[0];
+    assert_eq!(declined.ecosystem, Ecosystem::Npm);
+    assert_eq!(declined.root.as_deref(), Some(jsr.uri().as_str()));
+    assert!(
+        !declined.is_default_root(),
+        "JSR is not npm's default registry"
+    );
+
+    // The label a refusal prints names the JSR host, and never the npm one.
+    let label = declined.label();
+    let jsr_authority = jsr.uri().trim_start_matches("http://").to_owned();
+    let npm_authority = npm.uri().trim_start_matches("http://").to_owned();
+    assert!(label.contains(&jsr_authority), "label was {label}");
+    assert!(!label.contains(&npm_authority), "label was {label}");
+
+    // The boolean still summarises the collection, and cannot disagree with it.
+    assert!(check.registry_unreachable);
+}
+
+/// #112: the order `ManifestCheck::unreachable_registries` is published in is a contract
+/// an embedding consumer reads straight off the value, so it is asserted where
+/// `fetch_all` produces it rather than over a vector a test sorted for itself.
+///
+/// `buffer_unordered` completes in arrival order and the outcomes are gathered in a
+/// `HashMap`, so without the sort in `fetch_all` the published order is whatever the
+/// network and the hasher did — and the sentence a `--fail-on` refusal prints would
+/// reorder itself between two runs of the same repository. Both routes here are
+/// `Ecosystem::Npm`, so it is the root that has to order them, and only `fetch_all` can
+/// do it.
+#[tokio::test]
+async fn a_deno_manifest_orders_both_declining_registries_by_root() {
+    /// Each `HashMap` draws its own seed, so one check would agree with the contract
+    /// half the time by luck. Repeating drives an unsorted `fetch_all`'s chance of
+    /// passing to 1 in 2^ATTEMPTS. The attempts run concurrently against the same two
+    /// servers, so the test still costs one round of retry backoff.
+    const ATTEMPTS: usize = 8;
+    const MANIFEST: &str =
+        r#"{ "imports": { "chalk": "npm:chalk@^5.0.0", "p": "jsr:@std/path@^1.0.0" } }"#;
+
+    let first = MockServer::start().await;
+    let second = MockServer::start().await;
+    // `any()` rather than a path matcher: the failure must not depend on how either
+    // fetcher spells a package name in a URL.
+    for server in [&first, &second] {
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(500))
+            .mount(server)
+            .await;
+    }
+    // The two roots differ only in an ephemeral port the OS chose, so the roles go to
+    // whichever server sorts first. That fixes the expected order without the test
+    // asserting anything about port allocation — and the servers are interchangeable,
+    // since both decline every request.
+    let (npm, jsr) = if first.uri() < second.uri() {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    let npm_root = npm.uri();
+    let jsr_root = jsr.uri();
+
+    let mut attempts = Vec::with_capacity(ATTEMPTS);
+    for _ in 0..ATTEMPTS {
+        let client = build_client().unwrap();
+        // A fresh `Checker` per attempt: a warm versions cache issues no request, so a
+        // reused one would decline nothing and prove nothing.
+        let checker = Checker::builder()
+            .http_client(client.clone())
+            .registry(
+                Ecosystem::Npm,
+                Arc::new(NpmFetcher::with_registry(client.clone(), npm_root.clone())),
+            )
+            .jsr_registry(Arc::new(JsrFetcher::with_registry(
+                client,
+                jsr_root.clone(),
+            )))
+            .vulnerabilities(false)
+            .build()
+            .unwrap();
+        attempts.push(tokio::spawn(async move {
+            checker
+                .check_manifest(ManifestKind::DenoJson, MANIFEST, None)
+                .await
+                .unwrap()
+        }));
+    }
+
+    for attempt in attempts {
+        let check = attempt.await.unwrap();
+
+        // Both registries declined, and they arrive in root order — asserted against the
+        // returned value itself, not against a vector this test sorted.
+        let roots: Vec<&str> = check
+            .unreachable_registries
+            .iter()
+            .map(|r| r.root.as_deref().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            roots,
+            [npm_root.as_str(), jsr_root.as_str()],
+            "unreachable_registries must arrive sorted by ecosystem then root: {check:?}"
+        );
+        assert!(
+            check
+                .unreachable_registries
+                .iter()
+                .all(|r| r.ecosystem == Ecosystem::Npm),
+            "both routes belong to the npm ecosystem: {check:?}"
+        );
+
+        // Neither route answered, so neither dependency could be evaluated, and the
+        // boolean still summarises the collection.
+        assert!(check.registry_unreachable);
+        assert_eq!(check.results.len(), 2, "{check:?}");
+        assert!(
+            check
+                .results
+                .iter()
+                .all(|r| matches!(r.status, DependencyStatus::Error(_))),
+            "{:?}",
+            check.results.iter().map(|r| &r.status).collect::<Vec<_>>()
+        );
+    }
+}

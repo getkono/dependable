@@ -295,7 +295,7 @@ impl Engine {
                 };
                 let integrity = ScanIntegrity {
                     vulnerability_scan_failed: check.vulnerability_scan_failed,
-                    registry_unreachable: check.registry_unreachable,
+                    registry_unreachable: check.unreachable_registries.clone(),
                     unresolved: count(ErrorOrigin::NotFound),
                     unevaluated: count(ErrorOrigin::Local),
                 };
@@ -1672,8 +1672,11 @@ fn gate_is_answerable(reports: &[ManifestReport], fail_on: FailOn) -> Result<(),
     // settings match specific statuses and skip errors entirely, which is where a run
     // that established nothing could still be reported as clean.
     if fail_on != FailOn::Any {
-        if reports.iter().any(|r| r.integrity.registry_unreachable) {
-            reasons.push("the registry did not answer".to_owned());
+        let unanswered = unanswered_registries(reports);
+        // Empty pushes nothing at all — which is what keeps the 404 carve-out and the
+        // locally-unevaluable dependency below reaching the gate on their own terms.
+        if !unanswered.is_empty() {
+            reasons.push(name_unanswered(&unanswered));
         }
         let unevaluated: usize = reports.iter().map(|r| r.integrity.unevaluated).sum();
         if unevaluated > 0 {
@@ -1687,6 +1690,64 @@ fn gate_is_answerable(reports: &[ManifestReport], fail_on: FailOn) -> Result<(),
         return Ok(());
     }
     Err(join_reasons(&reasons))
+}
+
+/// Every registry that declined to answer anywhere in the run, deduplicated, in a stable
+/// order, rendered as labels.
+///
+/// The union across manifests, because the sentence the gate prints is about the run: a
+/// polyglot repository is many [`ManifestReport`]s, and the same unreachable registry is
+/// one fact however many manifests routed to it. Each check already sorts its own list,
+/// but a union of sorted lists is not sorted, so this re-sorts on the same key.
+fn unanswered_registries(reports: &[ManifestReport]) -> Vec<String> {
+    let mut all: Vec<&dependable_fetch::UnreachableRegistry> = reports
+        .iter()
+        .flat_map(|r| r.integrity.registry_unreachable.iter())
+        .collect();
+    all.sort_by_key(|r| {
+        (
+            r.ecosystem.display_name(),
+            r.root.clone().unwrap_or_default(),
+        )
+    });
+    all.dedup();
+    let mut labels: Vec<String> = all.iter().map(|r| r.label()).collect();
+    // Sorted *again*, by label, before deduplicating. Several roots reduce to one printed
+    // label — an unnamed root and the ecosystem's own default both print the bare
+    // ecosystem name, and two paths on one host share an authority — and those roots need
+    // not be adjacent under the root-ordered sort above. Three Rust registries at
+    // `http://nexus.corp/a`, `http://other.host/x` and `https://nexus.corp/b` sort in
+    // exactly that order (`:` sorts before `s`, so `http://` precedes `https://`), and an
+    // adjacency-only dedup left the sentence naming `nexus.corp` twice.
+    //
+    // It also makes the printed order the order a reader sees, rather than the order of
+    // roots they are never shown.
+    labels.sort();
+    labels.dedup();
+    labels
+}
+
+/// `the a registry did not answer`, `the a and b registries did not answer`,
+/// `the a, b and c registries did not answer`.
+///
+/// The same connective grammar as [`join_reasons`], deliberately not the same function:
+/// this string is one *element* of that list, and `join_reasons` over the registry labels
+/// alone would render three of them as a bare `Go, JVM and npm` with no sentence round it.
+///
+/// The nesting is accepted rather than avoided. With three registries and another reason
+/// the commas do belong to two lists at once — `the vulnerability scan did not complete,
+/// the Go, JVM and npm registries did not answer and 2 dependencies could not be
+/// evaluated` — which reads worse than either list alone, and better than a run that
+/// cannot say which registry declined.
+fn name_unanswered(labels: &[String]) -> String {
+    match labels {
+        [] => String::new(),
+        [only] => format!("the {only} registry did not answer"),
+        [rest @ .., last] => format!(
+            "the {} and {last} registries did not answer",
+            rest.join(", ")
+        ),
+    }
 }
 
 /// `a`, `a and b`, `a, b and c` — the gate's reasons read as a sentence.
@@ -2043,6 +2104,12 @@ mod tests {
         )
     }
 
+    /// A registry named only by its ecosystem — what a fetcher that opts out of
+    /// `registry_root` yields, and what the gate prints as a bare ecosystem name.
+    fn unreachable_default(ecosystem: Ecosystem) -> dependable_fetch::UnreachableRegistry {
+        dependable_fetch::UnreachableRegistry::new(ecosystem, None)
+    }
+
     fn report_of(
         integrity: ScanIntegrity,
         results: Vec<dependable_fetch::CheckResult>,
@@ -2074,7 +2141,7 @@ mod tests {
         let reports = vec![report_with(
             ScanIntegrity {
                 vulnerability_scan_failed: true,
-                registry_unreachable: false,
+                registry_unreachable: Vec::new(),
                 unresolved: 0,
                 unevaluated: 0,
             },
@@ -2095,7 +2162,7 @@ mod tests {
         let reports = vec![report_with(
             ScanIntegrity {
                 vulnerability_scan_failed: false,
-                registry_unreachable: true,
+                registry_unreachable: vec![unreachable_default(Ecosystem::Rust)],
                 unresolved: 0,
                 unevaluated: 0,
             },
@@ -2135,7 +2202,7 @@ mod tests {
         let reports = vec![report_of(
             ScanIntegrity {
                 vulnerability_scan_failed: false,
-                registry_unreachable: false,
+                registry_unreachable: Vec::new(),
                 unresolved: 1,
                 unevaluated: 0,
             },
@@ -2179,7 +2246,7 @@ mod tests {
         let reports = vec![report_of(
             ScanIntegrity {
                 vulnerability_scan_failed: false,
-                registry_unreachable: false,
+                registry_unreachable: Vec::new(),
                 unresolved: 0,
                 unevaluated: 1,
             },
@@ -2211,7 +2278,7 @@ mod tests {
         let reports = vec![report_of(
             ScanIntegrity {
                 vulnerability_scan_failed: true,
-                registry_unreachable: true,
+                registry_unreachable: vec![unreachable_default(Ecosystem::Rust)],
                 unresolved: 0,
                 unevaluated: 2,
             },
@@ -2219,8 +2286,159 @@ mod tests {
         )];
         assert_eq!(
             gate_is_answerable(&reports, FailOn::Vulnerable).unwrap_err(),
-            "the vulnerability scan did not complete, the registry did not answer and 2 \
+            "the vulnerability scan did not complete, the Rust registry did not answer and 2 \
              dependencies could not be evaluated"
+        );
+    }
+
+    /// The defect #112 was filed for. A run reaching two registries could say only that
+    /// "the registry" did not answer, so a polyglot repository whose Go proxy was down
+    /// while npm answered every request read as a run that had established nothing —
+    /// and named no host anyone could go and check.
+    #[test]
+    fn the_refusal_names_each_registry_that_declined() {
+        // A fresh report per call: `ManifestReport` is not `Clone`, and a shared fixture
+        // would say nothing about how a union across *separate* manifests behaves.
+        let report = |ecosystem| {
+            report_of(
+                ScanIntegrity {
+                    vulnerability_scan_failed: false,
+                    registry_unreachable: vec![unreachable_default(ecosystem)],
+                    unresolved: 0,
+                    unevaluated: 0,
+                },
+                vec![],
+            )
+        };
+
+        // One registry, one name.
+        assert_eq!(
+            gate_is_answerable(&[report(Ecosystem::Go)], FailOn::Vulnerable).unwrap_err(),
+            "the Go registry did not answer"
+        );
+
+        // The union across manifests, in sorted order rather than in arrival order —
+        // and reversing the reports must not reverse the sentence.
+        let both = [report(Ecosystem::Npm), report(Ecosystem::Go)];
+        let reversed = [report(Ecosystem::Go), report(Ecosystem::Npm)];
+        assert_eq!(
+            gate_is_answerable(&both, FailOn::Vulnerable).unwrap_err(),
+            "the Go and npm registries did not answer"
+        );
+        assert_eq!(
+            gate_is_answerable(&reversed, FailOn::Vulnerable).unwrap_err(),
+            gate_is_answerable(&both, FailOn::Vulnerable).unwrap_err()
+        );
+
+        // The same registry reached from two manifests is one fact, not two.
+        let twice = [report(Ecosystem::Go), report(Ecosystem::Go)];
+        assert_eq!(
+            gate_is_answerable(&twice, FailOn::Vulnerable).unwrap_err(),
+            "the Go registry did not answer"
+        );
+
+        // Three read as a list.
+        let three = [
+            report(Ecosystem::Go),
+            report(Ecosystem::Npm),
+            report(Ecosystem::Jvm),
+        ];
+        assert_eq!(
+            gate_is_answerable(&three, FailOn::Vulnerable).unwrap_err(),
+            "the Go, JVM and npm registries did not answer"
+        );
+
+        // The settings that were never blocked by this reason still are not.
+        assert!(gate_is_answerable(&both, FailOn::Any).is_ok());
+        assert!(gate_is_answerable(&both, FailOn::None).is_ok());
+    }
+
+    /// Several roots reduce to one printed label, and under a root-ordered sort they need
+    /// not be adjacent: `http://nexus.corp/a`, `http://other.host/x` and
+    /// `https://nexus.corp/b` sort in exactly that order, because `:` sorts before `s`.
+    /// An adjacency-only dedup named `nexus.corp` twice in one sentence.
+    #[test]
+    fn one_registry_is_never_named_twice_however_its_roots_sort() {
+        let rust = |root: &str| {
+            dependable_fetch::UnreachableRegistry::new(Ecosystem::Rust, Some(root.to_owned()))
+        };
+        let reports = [report_of(
+            ScanIntegrity {
+                vulnerability_scan_failed: false,
+                registry_unreachable: vec![
+                    rust("http://nexus.corp/a"),
+                    rust("http://other.host/x"),
+                    rust("https://nexus.corp/b"),
+                ],
+                unresolved: 0,
+                unevaluated: 0,
+            },
+            vec![],
+        )];
+        assert_eq!(
+            gate_is_answerable(&reports, FailOn::Vulnerable).unwrap_err(),
+            "the Rust (nexus.corp) and Rust (other.host) registries did not answer"
+        );
+    }
+
+    /// A non-default root is named by its host, so two registries inside one ecosystem
+    /// are told apart — the `deno.json` case, where npm answers and JSR does not.
+    #[test]
+    fn a_registry_that_is_not_the_ecosystems_default_is_named_by_its_host() {
+        let reports = vec![report_of(
+            ScanIntegrity {
+                vulnerability_scan_failed: false,
+                registry_unreachable: vec![dependable_fetch::UnreachableRegistry::new(
+                    Ecosystem::Npm,
+                    Some("https://jsr.io".to_owned()),
+                )],
+                unresolved: 0,
+                unevaluated: 0,
+            },
+            vec![],
+        )];
+        assert_eq!(
+            gate_is_answerable(&reports, FailOn::Vulnerable).unwrap_err(),
+            "the npm (jsr.io) registry did not answer"
+        );
+    }
+
+    /// An empty collection pushes no reason at all. Without that the 404 carve-out and
+    /// the locally-unevaluable dependency would both be swallowed by a sentence about a
+    /// registry nothing had gone wrong with.
+    #[test]
+    fn no_unreachable_registry_contributes_no_reason() {
+        let reports = vec![report_of(
+            ScanIntegrity {
+                vulnerability_scan_failed: false,
+                registry_unreachable: Vec::new(),
+                unresolved: 3,
+                unevaluated: 1,
+            },
+            vec![],
+        )];
+        assert_eq!(
+            gate_is_answerable(&reports, FailOn::Vulnerable).unwrap_err(),
+            "1 dependency could not be evaluated"
+        );
+    }
+
+    /// The sentence fragments, in isolation, so the grammar is pinned without a gate
+    /// around it.
+    #[test]
+    fn the_unanswered_registries_read_as_a_sentence() {
+        let name = |labels: &[&str]| {
+            name_unanswered(&labels.iter().map(|l| (*l).to_owned()).collect::<Vec<_>>())
+        };
+        assert_eq!(name(&[]), "");
+        assert_eq!(name(&["Go"]), "the Go registry did not answer");
+        assert_eq!(
+            name(&["Go", "npm"]),
+            "the Go and npm registries did not answer"
+        );
+        assert_eq!(
+            name(&["Go", "JVM", "npm"]),
+            "the Go, JVM and npm registries did not answer"
         );
     }
 
