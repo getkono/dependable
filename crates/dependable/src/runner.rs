@@ -25,7 +25,7 @@ use dependable_tui::TuiOptions;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use indicatif::{ProgressBar, ProgressStyle};
 
-use crate::cli::{CheckArgs, EcosystemArg, FailOn, FixArgs, ListArgs, TreeArgs, TuiArgs};
+use crate::cli::{CheckArgs, EcosystemArg, FailOn, FixArgs, Format, ListArgs, TreeArgs, TuiArgs};
 use crate::config::{Config, load_config};
 #[cfg(feature = "report")]
 use crate::config::{PolicySource, load_policy};
@@ -694,6 +694,17 @@ pub async fn run_list(args: ListArgs) -> anyhow::Result<ExitCode> {
     )?;
     if manifests.is_empty() {
         report_no_manifests(&ecosystems);
+        // An empty selection still owes a machine-readable format a document.
+        // Exiting 0 with byte-empty stdout is what `list --ecosystem csharp
+        // --format json | jq ...` sees in a per-ecosystem CI matrix, and `jq`
+        // fails to parse nothing — on precisely the ecosystems exit 0 was chosen
+        // to keep green. The stderr line above is not machine-readable.
+        //
+        // `table` and `text` keep returning early: a human handed an empty table
+        // wants the stderr line, not a blank one.
+        if matches!(args.format, Format::Json) {
+            output::list::render(args.format, &[], &root)?;
+        }
         return Ok(ExitCode::SUCCESS);
     }
     let mut reports = Vec::new();
@@ -1410,8 +1421,21 @@ fn collect_manifests(
 
 /// The ecosystems `--ecosystem` asked for, as the core type. Empty means
 /// unrestricted, which is what an absent flag produces.
+///
+/// Deduplicated, in first-named order. clap's `Vec<T>` keeps every repeat, so
+/// `--ecosystem rust --ecosystem rust` arrived as two values and
+/// [`no_ecosystem_match`] read them back as `no manifest for Rust, Rust`.
+/// Selection never cared — it is a `contains` — so this is the diagnostic alone.
+/// Dedupe by membership rather than by sorting: [`Ecosystem`] is `Eq` and not
+/// `Ord`, and the order the user named them in is the order to say them back.
 fn requested_ecosystems(args: &[EcosystemArg]) -> Vec<Ecosystem> {
-    args.iter().copied().map(Ecosystem::from).collect()
+    let mut requested: Vec<Ecosystem> = Vec::new();
+    for ecosystem in args.iter().copied().map(Ecosystem::from) {
+        if !requested.contains(&ecosystem) {
+            requested.push(ecosystem);
+        }
+    }
+    requested
 }
 
 /// Why an `--ecosystem` filter came back empty: what was asked for, how much was
@@ -1455,12 +1479,21 @@ fn ecosystem_names(ecosystems: &[Ecosystem]) -> String {
 
 /// The line a command prints when discovery came back with nothing to do.
 ///
-/// Silent when `--ecosystem` narrowed the set to nothing: [`collect_manifests`]
-/// has already said which ecosystems were asked for and what was there instead,
-/// and "No supported manifests found." is a falsehood in a repository full of
-/// manifests the filter removed. Either way the exit code is 0 — an empty
-/// selection is an answer, not a tool error, and a per-ecosystem CI matrix job
-/// must not fail on the ecosystems a repository does not use.
+/// Silent whenever an `--ecosystem` filter was in force, which is what
+/// `ecosystems` non-empty tests — not whether that filter is what emptied the
+/// set. The two come apart: `--ecosystem rust --manifest-glob 'nope/*'` over a
+/// repository that does contain Rust is emptied by the glob, which printed its
+/// own line, while [`collect_manifests`]' ecosystem explanation never ran. The
+/// generic line is suppressed there too, and deliberately: the glob line is the
+/// specific answer in that case, and "No supported manifests found." is a
+/// falsehood in a repository full of manifests some filter removed. The
+/// predicate is the coarse one because a caller cannot tell the two apart
+/// without [`collect_manifests`] reporting back which filter emptied the set,
+/// and that return type is deliberately still `Vec<PathBuf>`.
+///
+/// Either way the exit code is 0 — an empty selection is an answer, not a tool
+/// error, and a per-ecosystem CI matrix job must not fail on the ecosystems a
+/// repository does not use.
 fn report_no_manifests(ecosystems: &[Ecosystem]) {
     if ecosystems.is_empty() {
         eprintln!("No supported manifests found.");
@@ -1833,14 +1866,25 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample-monorepo")
     }
 
-    fn matched(globs: &[&str]) -> Vec<String> {
+    /// A polyglot fixture: `services/api/Cargo.toml` beside `services/sync/go.mod`,
+    /// so an ecosystem filter has something of another ecosystem to remove.
+    fn polyglot() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample-polyglot")
+    }
+
+    /// The manifests `collect_manifests` keeps under both filters, relative to
+    /// `root` and `/`-separated so an assertion does not depend on the platform.
+    fn matched_under(root: &Path, globs: &[&str], ecosystems: &[Ecosystem]) -> Vec<String> {
         let globs: Vec<String> = globs.iter().map(|g| (*g).to_string()).collect();
-        let root = monorepo();
-        collect_manifests(None, Some(&root), 4, &globs, &[], &|_| true)
+        collect_manifests(None, Some(root), 4, &globs, ecosystems, &|_| true)
             .expect("the patterns are valid")
             .iter()
-            .map(|m| output::posix(&relative_to(&root, m)))
+            .map(|m| output::posix(&relative_to(root, m)))
             .collect()
+    }
+
+    fn matched(globs: &[&str]) -> Vec<String> {
+        matched_under(&monorepo(), globs, &[])
     }
 
     #[test]
@@ -1880,6 +1924,57 @@ mod tests {
     #[test]
     fn a_pattern_matching_nothing_yields_nothing_rather_than_everything() {
         assert!(matched(&["apps/*/Cargo.toml"]).is_empty());
+    }
+
+    /// A flag repeated is one request, not two. clap's `Vec<T>` keeps every
+    /// repeat, so `--ecosystem rust --ecosystem rust` reached the empty-selection
+    /// line as `no manifest for Rust, Rust`. Selection was never affected — it is
+    /// a `contains` — so this is the diagnostic alone.
+    #[test]
+    fn a_repeated_ecosystem_is_named_once() {
+        use crate::cli::EcosystemArg;
+
+        assert_eq!(
+            requested_ecosystems(&[EcosystemArg::Rust, EcosystemArg::Rust]),
+            vec![Ecosystem::Rust]
+        );
+        assert_eq!(
+            ecosystem_names(&requested_ecosystems(&[
+                EcosystemArg::Npm,
+                EcosystemArg::Rust,
+                EcosystemArg::Npm,
+            ])),
+            "npm, Rust",
+            "first-named order survives, and nothing is said twice"
+        );
+        // An absent flag is still the unrestricted answer.
+        assert!(requested_ecosystems(&[]).is_empty());
+    }
+
+    /// Both filters at once, which nothing else exercises: `--ecosystem` and
+    /// `--manifest-glob` intersect rather than override, whichever is narrower.
+    ///
+    /// This pins the *set*, and the set alone cannot pin the order the two run
+    /// in — an intersection is commutative, so both orders return this. What the
+    /// order changes is the diagnostic each filter prints, which is asserted end
+    /// to end in `tests/cli_ecosystem.rs`.
+    #[test]
+    fn an_ecosystem_and_a_glob_narrow_the_same_set() {
+        let root = polyglot();
+        assert_eq!(
+            matched_under(&root, &["services/*/*"], &[]),
+            vec!["services/api/Cargo.toml", "services/sync/go.mod"],
+            "the glob alone keeps both services"
+        );
+        assert_eq!(
+            matched_under(&root, &["services/*/*"], &[Ecosystem::Rust]),
+            vec!["services/api/Cargo.toml"],
+            "adding the ecosystem removes the Go module the glob had kept"
+        );
+        assert!(
+            matched_under(&root, &["services/sync/go.mod"], &[Ecosystem::Rust]).is_empty(),
+            "and a glob naming only an excluded manifest keeps nothing"
+        );
     }
 
     #[test]

@@ -308,3 +308,68 @@ fn fix_rewrites_only_the_ecosystem_it_was_pointed_at() {
         PACKAGE_JSON
     );
 }
+
+/// The ecosystem filter runs **before** the glob filter, so the glob's
+/// "matched nothing" line counts only the manifests still in play.
+///
+/// The order is invisible in the result: both filters are set intersections, so
+/// either order returns the same manifests. It is visible only in what is
+/// printed, which is why this is asserted here on stderr rather than as a unit
+/// test on the returned set. Swapping the two blocks in `collect_manifests` —
+/// an easy move, both are a `filter`/`collect` over `found` — makes both halves
+/// of this test fail.
+#[test]
+fn the_ecosystem_filter_runs_before_the_glob_filter() {
+    let dir = polyglot("order");
+    let path = dir.to_str().expect("utf-8 path");
+
+    // A glob naming a manifest the ecosystem filter has already removed. Filtered
+    // in this order, one manifest survives to be globbed and nothing matches;
+    // globbed first, `svc/go.mod` matches, the ecosystem filter then empties the
+    // set, and the run reports an ecosystem failure instead of a glob one.
+    let output = run(&[
+        "list",
+        path,
+        "--format",
+        "json",
+        "--ecosystem",
+        "rust",
+        "--manifest-glob",
+        "svc/go.mod",
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("no manifest matched svc/go.mod (searched 1 manifest up to --depth 3)"),
+        "the glob must report against the narrowed set, and be the filter that came back empty: {stderr}"
+    );
+    assert!(
+        !stderr.contains("no manifest for Rust"),
+        "Rust was found; the glob is what selected nothing: {stderr}"
+    );
+
+    // And a glob that matches nothing at all, which is where the wrong order
+    // prints two contradicting lines: a glob line counting the three manifests on
+    // disk, and then — `found` now being empty — `no manifest for Rust (searched 0
+    // manifests ...)` about a tree that contains Rust.
+    let output = run(&[
+        "list",
+        path,
+        "--format",
+        "json",
+        "--ecosystem",
+        "rust",
+        "--manifest-glob",
+        "nope/*",
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("no manifest matched nope/* (searched 1 manifest up to --depth 3)"),
+        "the count is the manifests still in play, not the ones on disk: {stderr}"
+    );
+    assert!(
+        !stderr.contains("no manifest for Rust"),
+        "one empty selection is one diagnostic: {stderr}"
+    );
+}
