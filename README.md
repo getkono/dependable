@@ -333,6 +333,51 @@ by walking up rather than by anything the caller spelled, and a relative answer 
 relative to a directory the caller never named. A dependency the root turns out not to
 declare gets no attribution at all, and a warning saying so.
 
+### Forced versions (overrides and resolutions)
+
+An npm-family `package.json` can force a version onto the *resolved* tree, past
+whatever the packages in it asked for: npm's `overrides`, Yarn's `resolutions`,
+and `pnpm.overrides` — including npm's nested form (`"overrides": { "parent":
+{ "child": "…" } }`) and pnpm's scoped keys (`"foo@2>bar"`, which forces a version
+onto **bar**). These are the only maps `dependable` treats this way; nothing in
+Cargo, Go, Python, or the rest declares one, and `pnpm-workspace.yaml` overrides
+are not read at all.
+
+A forced version is usually there for a reason — most often a security pin,
+holding a transitive dependency above a vulnerable release — and the tool cannot
+tell that from a compatibility pin that has outlived its cause. So **`fix` never
+rewrites one by default**, `--all` included. It says so instead:
+
+```
+$ dependable fix .
+note: left lodash = 1.0.0 alone in package.json: 1.9.0 is available, but an override
+      forces this version onto the resolved tree; pass --overrides to advance it
+Nothing to rewrite. 1 available update left alone; see the notes above.
+```
+
+That note is the point: a stale pin used to be skipped in silence, so a manifest
+whose only outdated entry was an override was reported by `check` and then
+answered by `fix` with "Everything is already up to date."
+
+`--overrides` is how you say yes:
+
+```bash
+dependable fix . --overrides             # advance forced versions within their constraint
+dependable fix . --overrides --all       # …and beyond it, like --all everywhere else
+dependable fix . --overrides --dry-run   # see it first; nothing is written
+```
+
+Before you reach for it, check *why* each pin is there — advancing a security pin
+past the release it was holding the tree above puts the vulnerability back.
+`--dry-run` prints every rewrite it would make without touching a file.
+
+Constraint rules still apply on top: `--overrides` lifts the rule about the kind
+of entry, not the rules about what a constraint means. An override written as a
+wildcard (`"resolutions": { "lodash": "1.x" }`) is still left alone and still
+reported, because pinning an npm wildcard to one release changes what the entry
+admits. An override written as a `$name` reference to another entry is never
+rewritten either — the version it names lives in the entry it points at.
+
 ## Project inventory (`list`)
 
 `dependable list` answers "what lives in this repository" — every manifest it
