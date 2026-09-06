@@ -34,16 +34,26 @@ pub struct ManifestReport {
 }
 
 /// How much of what a gate needs was actually established for one manifest.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// Not `Copy`: [`registry_unreachable`](Self::registry_unreachable) names the registries
+/// that declined, and naming them costs an allocation. The code only ever cloned it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ScanIntegrity {
     /// The vulnerability scan was asked for and did not complete.
     pub vulnerability_scan_failed: bool,
-    /// A registry lookup failed for a reason other than the package not existing.
+    /// The registries that declined to answer — a lookup failed for a reason other than
+    /// the package not existing.
     ///
     /// This, and not the count below, is what a `--fail-on` gate cannot be honoured
     /// through: the registry declined to answer, so the run has no facts about the
     /// dependencies it asked about.
-    pub registry_unreachable: bool,
+    ///
+    /// Empty means **every registry this manifest routed to answered**, affirmatively —
+    /// not "nothing is known". Per registry rather than per manifest because a manifest
+    /// is not the routing unit: a `deno.json` reaches npm and JSR, a `Cargo.toml`
+    /// crates.io and any alternate registry its dependencies name. A bare flag could say
+    /// only that *something* declined, which names nothing the reader can go and fix.
+    pub registry_unreachable: Vec<dependable_fetch::UnreachableRegistry>,
     /// How many dependencies a registry answered about by name: no such package.
     ///
     /// Reported, never gated on. Each is a permanent fact about one dependency — a

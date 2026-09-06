@@ -84,6 +84,112 @@ pub enum CheckError {
     Fetch(#[from] FetchError),
 }
 
+/// One registry that declined to answer during a check, named by where the requests
+/// were routed.
+///
+/// A manifest is not the routing unit. A `Cargo.toml` can name crates.io and a private
+/// alternate registry; a `deno.json` routes to npm and to JSR both. A single
+/// per-manifest flag could therefore say only *that* something did not answer, never
+/// which — so a run against two registries could not tell the reader whether its results
+/// were half unfounded or wholly unfounded.
+///
+/// `#[non_exhaustive]`: build one with [`UnreachableRegistry::new`]; future fields are
+/// additive.
+///
+/// # Limitation
+/// [`root`](Self::root) is the fetcher's *default* root. `NpmFetcher` resolves an
+/// `@scope` package to a per-scope registry read from `.npmrc`, which
+/// [`RegistryFetcher::registry_root`] does not name, so a scoped package that failed
+/// against a private host is reported under the fetcher's default root instead. Naming
+/// the host that was actually asked needs a per-package root on the trait, which every
+/// fetcher would have to implement.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreachableRegistry {
+    /// The ecosystem whose lookups were routed here.
+    pub ecosystem: Ecosystem,
+    /// The registry root the fetcher talks to, when it names one.
+    ///
+    /// `None` when the fetcher opts out of [`RegistryFetcher::registry_root`], whose
+    /// trait default returns nothing. The ecosystem is then the whole of what can be
+    /// said, and [`label`](Self::label) says exactly that rather than an empty string.
+    pub root: Option<String>,
+}
+
+impl UnreachableRegistry {
+    /// Name a registry by the ecosystem routed to it and, when known, its root.
+    #[must_use]
+    pub fn new(ecosystem: Ecosystem, root: Option<String>) -> Self {
+        Self { ecosystem, root }
+    }
+
+    /// Whether [`root`](Self::root) is the ecosystem's own default registry — `true`
+    /// also when no root is known, since nothing then distinguishes it.
+    ///
+    /// The same discrimination `default_cache_key` makes when deciding whether a cache
+    /// key needs scoping: only a non-default root says anything the ecosystem name does
+    /// not already say.
+    #[must_use]
+    pub fn is_default_root(&self) -> bool {
+        match &self.root {
+            Some(root) => {
+                root.trim_end_matches('/')
+                    == self.ecosystem.default_registry().trim_end_matches('/')
+            }
+            None => true,
+        }
+    }
+
+    /// A short name for a message: the ecosystem, plus the root's host when that root is
+    /// not the ecosystem's default one — `npm`, or `npm (jsr.io)`.
+    ///
+    /// The root is reduced to its authority, host and port, and never printed whole. A
+    /// configured root may legitimately carry credentials — `.npmrc` interpolates
+    /// `${VAR}` into its `registry` lines, and `.dependable.toml` roots are written by
+    /// hand — and this string is printed on stderr, which CI captures as job output.
+    #[must_use]
+    pub fn label(&self) -> String {
+        let name = self.ecosystem.display_name();
+        if self.is_default_root() {
+            return name.to_owned();
+        }
+        match self.root.as_deref().and_then(authority_of) {
+            Some(authority) => format!("{name} ({authority})"),
+            None => name.to_owned(),
+        }
+    }
+}
+
+/// The order the unreachable registries are reported in: ecosystem name, then root.
+///
+/// `Ecosystem` derives `Hash` but not `Ord`, so this is an explicit key rather than a
+/// `BTreeSet`. The raw root orders the key — two mirrors that reduce to the same
+/// printed authority still sort deterministically.
+fn unreachable_sort_key(registry: &UnreachableRegistry) -> (&str, &str) {
+    (
+        registry.ecosystem.display_name(),
+        registry.root.as_deref().unwrap_or(""),
+    )
+}
+
+/// The scheme-less authority of a URL-ish string: host and port, with userinfo, path,
+/// query and fragment dropped. `None` when nothing is left.
+///
+/// Hand-rolled over `&str` rather than taken from a URL crate: this workspace depends on
+/// none, and the input is not guaranteed to parse as a URL anyway — a configured root
+/// may carry an unexpanded `${VAR}`, or no scheme at all.
+fn authority_of(root: &str) -> Option<String> {
+    let after_scheme = root.split_once("://").map_or(root, |(_, rest)| rest);
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    // Userinfo is credentials. The *last* `@` wins, because a password may legally
+    // contain one and only the tail is the host.
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, h)| h)
+        .trim();
+    (!host.is_empty()).then(|| host.to_owned())
+}
+
 /// The outcome of checking one manifest.
 ///
 /// `#[non_exhaustive]`: future fields are additive.
@@ -114,7 +220,29 @@ pub struct ManifestCheck {
     /// timeout, a refused connection, a 5xx, or an undecodable response is the registry
     /// declining to answer, and a `--fail-on` promise cannot be kept from answers that
     /// were never given.
+    ///
+    /// Exactly `!`[`unreachable_registries`](Self::unreachable_registries)`.is_empty()`,
+    /// derived at construction from that one collection so the two cannot disagree.
+    /// Prefer the collection: it says *which* registry, which a caller reporting the
+    /// failure needs and this cannot supply.
     pub registry_unreachable: bool,
+    /// Which registries declined to answer, in a stable order.
+    ///
+    /// Empty is the affirmative statement that **every registry this manifest routed to
+    /// answered** — not "unknown". A manifest routes to more than one registry often
+    /// enough that "the registry did not answer" names nothing a reader can act on: a
+    /// `deno.json` reaches npm and JSR, and a `Cargo.toml` reaches crates.io and any
+    /// alternate registry its dependencies name.
+    ///
+    /// Deduplicated per registry, not per failed lookup — twenty timeouts against one
+    /// mirror are one registry that did not answer — and sorted by ecosystem name then
+    /// root, because the lookups complete out of order and a message built from an
+    /// arrival-ordered list would change between runs.
+    ///
+    /// Empty on a fully cached run even where the registry is down: a cache hit issues
+    /// no request, so nothing declines to answer. That is the same reach the boolean
+    /// always had.
+    pub unreachable_registries: Vec<UnreachableRegistry>,
     /// The manifest whose `[workspace.dependencies]` govern this one — itself, when it
     /// declares its own `[workspace]`, else the nearest ancestor that does.
     ///
@@ -651,7 +779,7 @@ impl Checker {
             }
         }
 
-        let (fetched, registry_unreachable) = self.fetch_all(tasks).await;
+        let (fetched, unreachable_registries) = self.fetch_all(tasks, ecosystem).await;
         let mut results: Vec<CheckResult> = parsed
             .items
             .iter()
@@ -685,7 +813,10 @@ impl Checker {
             results,
             warnings,
             vulnerability_scan_failed,
-            registry_unreachable,
+            // Derived here, in the one place both are set, so the boolean can never
+            // contradict the collection it summarises.
+            registry_unreachable: !unreachable_registries.is_empty(),
+            unreachable_registries,
             workspace_root: workspace.map(|(root, _)| root),
         };
 
@@ -760,16 +891,41 @@ impl Checker {
     /// request. The concurrency inside a single manifest is safe — its tasks are
     /// already deduplicated by `(cache_key, name)` before they get here. Anyone
     /// parallelising the *manifest* loop must add coalescing here first.
-    /// Fetch every task's version list, returning the results and whether any lookup
-    /// failed for a reason other than the package not existing.
+    /// Fetch every task's version list, returning the results and the registries that
+    /// declined to answer.
     ///
     /// A 404 is an answer: the package is private, internal, deleted, or served by a
     /// registry this run does not route to. Anything else — a timeout, a refused
     /// connection, a 5xx, a response that would not decode — is the registry declining
     /// to answer, and a gate cannot be honoured from answers that were never given.
-    async fn fetch_all(&self, tasks: Vec<FetchTask>) -> (FetchedMap, bool) {
+    ///
+    /// The registry is named per *route*, not per manifest, because a manifest is not
+    /// the routing unit: `route_item` sends a `deno.json` to npm and to JSR,
+    /// and a `Cargo.toml` to crates.io and to any alternate registry it names. Each
+    /// route has its own cache key, so the key is what deduplicates the report.
+    async fn fetch_all(
+        &self,
+        tasks: Vec<FetchTask>,
+        ecosystem: Ecosystem,
+    ) -> (FetchedMap, Vec<UnreachableRegistry>) {
         let total = tasks.len();
         self.emit(ProgressEvent::Started { total });
+
+        // Built before the tasks are consumed: an outcome carries only
+        // `(name, cache_key, result)`, and the `Arc<dyn RegistryFetcher>` that knows the
+        // root is dropped when the task moves into its future.
+        let routes: HashMap<String, UnreachableRegistry> = tasks
+            .iter()
+            .map(|task| {
+                (
+                    task.cache_key.clone(),
+                    UnreachableRegistry::new(
+                        ecosystem,
+                        task.fetcher.registry_root().map(str::to_owned),
+                    ),
+                )
+            })
+            .collect();
 
         let mut out: FetchedMap = HashMap::new();
         let mut to_fetch: Vec<FetchTask> = Vec::new();
@@ -815,7 +971,7 @@ impl Checker {
             .collect()
             .await;
 
-        let mut registry_unreachable = false;
+        let mut unreachable: HashMap<String, UnreachableRegistry> = HashMap::new();
         for (name, cache_key, result) in fetched {
             if let Ok(versions) = &result {
                 self.versions_cache
@@ -828,7 +984,14 @@ impl Checker {
             if let Err(e) = &result
                 && !matches!(e, FetchError::NotFound(_))
             {
-                registry_unreachable = true;
+                // Every task contributed a route, so the lookup always hits; the
+                // fallback is there because losing an entry must degrade to a
+                // less precise report, never to a certified run.
+                let route = routes
+                    .get(&cache_key)
+                    .cloned()
+                    .unwrap_or_else(|| UnreachableRegistry::new(ecosystem, None));
+                unreachable.insert(cache_key.clone(), route);
             }
             out.insert(
                 (cache_key, name),
@@ -837,7 +1000,12 @@ impl Checker {
         }
 
         self.emit(ProgressEvent::Finished);
-        (out, registry_unreachable)
+        // `buffer_unordered` completes in arrival order, so the map's iteration order is
+        // whatever the network did. Sorting here is what stops the gate's sentence
+        // reordering itself between two runs of the same repository.
+        let mut unreachable: Vec<UnreachableRegistry> = unreachable.into_values().collect();
+        unreachable.sort_by(|a, b| unreachable_sort_key(a).cmp(&unreachable_sort_key(b)));
+        (out, unreachable)
     }
 
     fn emit(&self, event: ProgressEvent) {
@@ -2069,5 +2237,199 @@ mod tests {
             UnstableFilter::IncludeAlways,
         );
         assert_eq!(result.latest_available.as_deref(), Some("7.1.0.M1"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Naming the registry that declined to answer
+    // -----------------------------------------------------------------------
+
+    /// A fetcher that opts out of `registry_root` — the trait's default, and what any
+    /// third-party implementation gets without writing a line.
+    struct RootlessFetcher;
+
+    impl RegistryFetcher for RootlessFetcher {
+        fn fetch_versions<'a>(
+            &'a self,
+            name: &'a str,
+        ) -> futures::future::BoxFuture<'a, Result<crate::registries::FetchedVersions, FetchError>>
+        {
+            let name = name.to_owned();
+            Box::pin(async move { Err(FetchError::NotFound(name)) })
+        }
+    }
+
+    /// A manifest is not the routing unit, which is the whole of #112: one `deno.json`
+    /// reaches npm and JSR, and one `Cargo.toml` reaches crates.io and every alternate
+    /// registry its dependencies name. Each route has to be able to name itself, or a
+    /// refusal can say only that *something* declined.
+    #[test]
+    fn each_route_names_its_own_registry() {
+        use crate::registries::{JsrFetcher, NpmFetcher};
+
+        const NPM: &str = "https://nexus.corp.example/repository/npm";
+        const JSR: &str = "https://jsr.corp.example";
+        const ALT: &str = "https://alt.corp.example/index";
+
+        let client = reqwest::Client::new();
+        let checker = Checker::builder()
+            .http_client(client.clone())
+            .registry(
+                Ecosystem::Npm,
+                Arc::new(NpmFetcher::with_registry(client.clone(), NPM)),
+            )
+            .jsr_registry(Arc::new(JsrFetcher::with_registry(client, JSR)))
+            .rust_alt_registry("internal", ALT, None)
+            .vulnerabilities(false)
+            .build()
+            .expect("a checker");
+
+        let deno = parse(
+            ManifestKind::DenoJson,
+            r#"{ "imports": { "chalk": "npm:chalk@^5.0.0", "p": "jsr:@std/path@^1.0.0" } }"#,
+        )
+        .expect("the deno fixture parses");
+        let npm_item = deno
+            .items
+            .iter()
+            .find(|i| i.source == PackageSource::Registry)
+            .expect("an npm-sourced import");
+        let jsr_item = deno
+            .items
+            .iter()
+            .find(|i| i.source == PackageSource::Jsr)
+            .expect("a jsr-sourced import");
+        let alt_item =
+            item("[dependencies]\nthing = { version = \"1\", registry = \"internal\" }\n");
+
+        // Exactly what `fetch_all` records: the route's cache key, and the registry the
+        // route's fetcher talks to.
+        let route = |item: &Item, default: &Arc<dyn RegistryFetcher>, ecosystem| {
+            let (fetcher, cache_key) = checker.route_item(item, default, ecosystem);
+            (
+                cache_key,
+                UnreachableRegistry::new(ecosystem, fetcher.registry_root().map(str::to_owned)),
+            )
+        };
+        let npm_default = checker
+            .registries
+            .get(&Ecosystem::Npm)
+            .expect("the npm fetcher")
+            .clone();
+        let rust_default = checker
+            .registries
+            .get(&Ecosystem::Rust)
+            .expect("the crates.io fetcher")
+            .clone();
+
+        let (npm_key, npm_registry) = route(npm_item, &npm_default, Ecosystem::Npm);
+        let (jsr_key, jsr_registry) = route(jsr_item, &npm_default, Ecosystem::Npm);
+        let (alt_key, alt_registry) = route(&alt_item, &rust_default, Ecosystem::Rust);
+
+        // Three routes, three cache keys — which is what makes the key the right thing
+        // to deduplicate the report by.
+        assert_ne!(npm_key, jsr_key);
+        assert_ne!(npm_key, alt_key);
+        assert_ne!(jsr_key, alt_key);
+
+        // Three routes, three labels. Two of them are the same ecosystem, which is the
+        // granularity a per-ecosystem answer would still have collapsed.
+        assert_eq!(npm_registry.label(), "npm (nexus.corp.example)");
+        assert_eq!(jsr_registry.label(), "npm (jsr.corp.example)");
+        assert_eq!(alt_registry.label(), "Rust (alt.corp.example)");
+
+        // A fetcher that names no root degrades to the ecosystem, never to a blank.
+        assert!(RootlessFetcher.registry_root().is_none());
+        let rootless = UnreachableRegistry::new(
+            Ecosystem::Go,
+            RootlessFetcher.registry_root().map(str::to_owned),
+        );
+        assert_eq!(rootless.label(), "Go");
+        assert_eq!(rootless.root, None);
+    }
+
+    /// Only a root that is not the ecosystem's own says anything the ecosystem name does
+    /// not already say — the same discrimination `default_cache_key` makes.
+    #[test]
+    fn only_a_non_default_root_is_named_beside_the_ecosystem() {
+        let npm_default = Ecosystem::Npm.default_registry();
+        assert_eq!(
+            UnreachableRegistry::new(Ecosystem::Npm, Some(npm_default.to_owned())).label(),
+            "npm"
+        );
+        // A trailing slash is the same registry.
+        assert_eq!(
+            UnreachableRegistry::new(Ecosystem::Npm, Some(format!("{npm_default}/"))).label(),
+            "npm"
+        );
+        // JSR is not npm's default registry, and a `deno.json` reaches both.
+        assert_eq!(
+            UnreachableRegistry::new(Ecosystem::Npm, Some("https://jsr.io".to_owned())).label(),
+            "npm (jsr.io)"
+        );
+        assert_eq!(
+            UnreachableRegistry::new(Ecosystem::Rust, None).label(),
+            "Rust"
+        );
+    }
+
+    /// The security-relevant half. A registry root comes from `.dependable.toml` or
+    /// `.npmrc` — where `expand_env` interpolates `${VAR}` — and the refusal built from
+    /// it is printed on stderr, which CI captures as job output. Only host and port may
+    /// survive.
+    #[test]
+    fn a_registry_root_is_reduced_to_its_authority() {
+        let authority = |root| authority_of(root).unwrap_or_default();
+
+        // Userinfo is credentials, and never reaches the message.
+        assert_eq!(
+            authority("https://ci:secret@nexus.internal/repo/npm"),
+            "nexus.internal"
+        );
+        assert_eq!(authority("https://token@nexus.internal"), "nexus.internal");
+        // A password may legally contain an `@`; only the tail is the host.
+        assert_eq!(
+            authority("https://ci:p@ss@nexus.internal/x"),
+            "nexus.internal"
+        );
+        // Port kept; path, query and fragment dropped.
+        assert_eq!(
+            authority("http://127.0.0.1:8080/repository/npm?x=1#frag"),
+            "127.0.0.1:8080"
+        );
+        // An IPv6 literal keeps its brackets, and its port.
+        assert_eq!(authority("http://[::1]:8080/v1"), "[::1]:8080");
+        assert_eq!(authority("https://[2001:db8::1]"), "[2001:db8::1]");
+        // A root written with no scheme at all, which a hand-edited config may well be.
+        assert_eq!(authority("nexus.internal:8081/repo"), "nexus.internal:8081");
+        // A trailing slash is not part of the host.
+        assert_eq!(
+            authority("https://registry.npmjs.org/"),
+            "registry.npmjs.org"
+        );
+
+        // Nothing to say is `None`, so the label falls back to the ecosystem rather than
+        // rendering an empty pair of brackets.
+        assert_eq!(authority_of(""), None);
+        assert_eq!(authority_of("https://"), None);
+        assert_eq!(authority_of("https:///path"), None);
+        assert_eq!(
+            UnreachableRegistry::new(Ecosystem::Go, Some(String::new())).label(),
+            "Go"
+        );
+    }
+
+    /// `buffer_unordered` completes in arrival order, so the collection is sorted before
+    /// it leaves `fetch_all`. Unsorted, the gate's sentence reorders itself between two
+    /// runs of the same repository.
+    #[test]
+    fn unreachable_registries_sort_by_ecosystem_then_root() {
+        let mut registries = [
+            UnreachableRegistry::new(Ecosystem::Npm, Some("https://jsr.io".to_owned())),
+            UnreachableRegistry::new(Ecosystem::Go, None),
+            UnreachableRegistry::new(Ecosystem::Npm, None),
+        ];
+        registries.sort_by(|a, b| unreachable_sort_key(a).cmp(&unreachable_sort_key(b)));
+        let labels: Vec<String> = registries.iter().map(UnreachableRegistry::label).collect();
+        assert_eq!(labels, ["Go", "npm", "npm (jsr.io)"]);
     }
 }
