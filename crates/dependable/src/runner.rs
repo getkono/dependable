@@ -303,6 +303,7 @@ impl Engine {
 /// Returns whether any notice means the project's dependency list itself went
 /// unread, which the caller has to carry into the exit code: a run that knows
 /// nothing about a project must not report it clean.
+#[must_use]
 fn report_lockfile_notices(manifest: &Path) -> bool {
     let Some(kind) = ManifestKind::detect(manifest) else {
         return false;
