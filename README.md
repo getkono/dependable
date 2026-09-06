@@ -384,6 +384,7 @@ dependable list --licenses         # add each dependency's declared license
       "role": "package",
       "manifest": "crates/dependable-core/Cargo.toml",
       "lockfile": "Cargo.lock",
+      "dependencies_unread": false,
       "dependencies": [
         {
           "name": "serde",
