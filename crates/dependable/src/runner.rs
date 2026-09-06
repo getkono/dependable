@@ -1479,12 +1479,21 @@ fn ecosystem_names(ecosystems: &[Ecosystem]) -> String {
 
 /// The line a command prints when discovery came back with nothing to do.
 ///
-/// Silent when `--ecosystem` narrowed the set to nothing: [`collect_manifests`]
-/// has already said which ecosystems were asked for and what was there instead,
-/// and "No supported manifests found." is a falsehood in a repository full of
-/// manifests the filter removed. Either way the exit code is 0 — an empty
-/// selection is an answer, not a tool error, and a per-ecosystem CI matrix job
-/// must not fail on the ecosystems a repository does not use.
+/// Silent whenever an `--ecosystem` filter was in force, which is what
+/// `ecosystems` non-empty tests — not whether that filter is what emptied the
+/// set. The two come apart: `--ecosystem rust --manifest-glob 'nope/*'` over a
+/// repository that does contain Rust is emptied by the glob, which printed its
+/// own line, while [`collect_manifests`]' ecosystem explanation never ran. The
+/// generic line is suppressed there too, and deliberately: the glob line is the
+/// specific answer in that case, and "No supported manifests found." is a
+/// falsehood in a repository full of manifests some filter removed. The
+/// predicate is the coarse one because a caller cannot tell the two apart
+/// without [`collect_manifests`] reporting back which filter emptied the set,
+/// and that return type is deliberately still `Vec<PathBuf>`.
+///
+/// Either way the exit code is 0 — an empty selection is an answer, not a tool
+/// error, and a per-ecosystem CI matrix job must not fail on the ecosystems a
+/// repository does not use.
 fn report_no_manifests(ecosystems: &[Ecosystem]) {
     if ecosystems.is_empty() {
         eprintln!("No supported manifests found.");
