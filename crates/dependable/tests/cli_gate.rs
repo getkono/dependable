@@ -575,3 +575,41 @@ fn a_dist_tag_is_undetermined_rather_than_unevaluated() {
     let (_, strict_stderr, strict_code) = outcome(&strict);
     assert_eq!(strict_code, 1, "stderr: {strict_stderr}");
 }
+
+// ---------------------------------------------------------------------------
+// An override that references a workspace dependency
+// ---------------------------------------------------------------------------
+
+/// A `$name` override takes the referenced entry's raw manifest value, which is whatever
+/// `package.json` allows a dependency to be. Reading it as a registry range sent
+/// `"my-lib": "workspace:*"` to npm as the literal constraint `workspace:*`, which
+/// `VersionReq` cannot parse — so an ordinary pnpm workspace shape took the whole run to
+/// exit 2.
+#[test]
+fn an_override_referencing_a_workspace_dependency_is_not_sent_to_a_registry() {
+    let dir = workdir("gate_override_workspace_referent");
+    let base = registry(vec![(
+        "/express".to_string(),
+        packument("express", &["4.19.2"], "4.19.2"),
+    )]);
+    let config = write_config(&dir, &base);
+    fs::write(
+        dir.join("package.json"),
+        "{\"name\":\"app\",\"dependencies\":{\"my-lib\":\"workspace:*\",\"express\":\
+         \"^4.19.0\"},\"overrides\":{\"my-lib\":\"$my-lib\"}}\n",
+    )
+    .unwrap();
+
+    let output = check(&dir, &config, &["--fail-on", "vulnerable"]);
+    let (stdout, stderr, code) = outcome(&output);
+
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        !stdout.contains("unparseable constraint") && !stdout.contains("not found"),
+        "a workspace referent was asked of npm:\n{stdout}"
+    );
+    assert!(
+        !stderr.contains("could not be evaluated"),
+        "stderr: {stderr}"
+    );
+}

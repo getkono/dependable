@@ -212,24 +212,41 @@ fn build_item(
         // the manifest names a dependency it does not declare: real package, unreadable
         // version, and nothing to ask a registry for.
         return match override_reference(&entry.value).and_then(|r| declared.get(r)) {
-            Some(constraint) => {
-                let (line, col) = offset_to_line_col(starts, entry.content_start);
-                Item {
-                    name: key.to_owned(),
-                    version_constraint: (*constraint).to_owned(),
-                    source: PackageSource::Registry,
-                    // The span holds `$semver`, not the constraint being checked, so it
-                    // reports its position and declines its width — the same way an
-                    // escaped value does — and no rewriter can splice a version over
-                    // the reference.
-                    version_line: line,
-                    version_col_start: col,
-                    version_col_end: col,
-                    registry: None,
-                    locked_version: None,
-                    kind,
+            // `declared` holds the referenced entry's *raw* manifest value, which is the
+            // whole of what `package.json` allows a dependency to be — an `npm:`/`jsr:`
+            // alias, a `workspace:`/`file:`/`catalog:` spec, a git or tarball URL — and
+            // not merely a registry range. Reading it as one hardcoded
+            // `PackageSource::Registry` constraint sent `"my-lib": "workspace:*"` to npm
+            // as the literal range `workspace:*`; resolving it here is the same
+            // resolution the referenced entry itself gets, so the two agree.
+            Some(constraint) => match resolve(key, constraint) {
+                Resolved::Skip(source) => skip_item(key, source, kind),
+                Resolved::Dep {
+                    name,
+                    constraint,
+                    source,
+                    ..
+                } => {
+                    let (line, col) = offset_to_line_col(starts, entry.content_start);
+                    Item {
+                        name,
+                        version_constraint: constraint,
+                        source,
+                        // The span holds `$semver`, not the constraint being checked, so
+                        // it reports its position and declines its width — the same way
+                        // an escaped value does — and no rewriter can splice a version
+                        // over the reference. `version_offset` is deliberately dropped
+                        // with it: it indexes the *referent's* value, which is not the
+                        // text at this position at all.
+                        version_line: line,
+                        version_col_start: col,
+                        version_col_end: col,
+                        registry: None,
+                        locked_version: None,
+                        kind,
+                    }
                 }
-            }
+            },
             None => skip_item(key, PackageSource::Unresolved, kind),
         };
     }
@@ -529,6 +546,74 @@ mod tests {
         // The recorded span holds `$semver`, not the constraint, so it must not be
         // offered to `--fix` as a place to write a version.
         assert!(!overridden.is_rewritable());
+    }
+
+    /// A referent is whatever `package.json` lets a dependency be, not necessarily a
+    /// registry range.
+    ///
+    /// The reference resolved to the referent's **raw** manifest value under a hardcoded
+    /// `PackageSource::Registry`, so an ordinary pnpm/npm workspace shape —
+    /// `{"dependencies":{"my-lib":"workspace:*"},"overrides":{"my-lib":"$my-lib"}}` —
+    /// produced a checkable dependency whose constraint was the literal string
+    /// `workspace:*`, which npm was asked about and `VersionReq` could not read. An
+    /// aliased referent was checked under the wrong name, and a `jsr:` referent was
+    /// fetched from the wrong registry.
+    #[test]
+    fn a_dollar_override_resolves_its_referent_the_same_way_the_referent_is_resolved() {
+        let content = r#"{
+  "dependencies": {
+    "my-lib": "workspace:*",
+    "local": "file:../local",
+    "forked": "github:org/repo#v1",
+    "lodash": "npm:lodash-es@^4.17.21",
+    "path": "jsr:@std/path@^1.0.0"
+  },
+  "overrides": {
+    "my-lib": "$my-lib",
+    "local": "$local",
+    "forked": "$forked",
+    "lodash": "$lodash",
+    "path": "$path"
+  }
+}"#;
+        let m = parse(content);
+        let overrides: Vec<&Item> = m
+            .items
+            .iter()
+            .filter(|i| i.kind == DependencyKind::Override)
+            .collect();
+        assert_eq!(overrides.len(), 5);
+        let by_source = |source: PackageSource| -> Vec<&Item> {
+            overrides
+                .iter()
+                .copied()
+                .filter(|i| i.source == source)
+                .collect()
+        };
+        // A workspace, file, or git referent is not a registry dependency at either
+        // spelling, so the override is skipped exactly as the referent is.
+        assert_eq!(by_source(PackageSource::Local).len(), 2);
+        assert_eq!(by_source(PackageSource::Git).len(), 1);
+        for item in by_source(PackageSource::Local)
+            .into_iter()
+            .chain(by_source(PackageSource::Git))
+        {
+            assert!(!item.is_checkable(), "{} was sent to a registry", item.name);
+        }
+        // An alias names the package actually published, under the registry that
+        // publishes it.
+        let aliased = by_source(PackageSource::Registry);
+        assert_eq!(aliased.len(), 1);
+        assert_eq!(aliased[0].name, "lodash-es");
+        assert_eq!(aliased[0].version_constraint, "^4.17.21");
+        let jsr = by_source(PackageSource::Jsr);
+        assert_eq!(jsr.len(), 1);
+        assert_eq!(jsr[0].name, "@std/path");
+        assert_eq!(jsr[0].version_constraint, "^1.0.0");
+        // Whatever it resolved to, the span still holds `$name` and declines its width.
+        for item in &overrides {
+            assert!(!item.is_rewritable(), "{}", item.name);
+        }
     }
 
     /// A reference to something the manifest never declares is unresolvable, not a
