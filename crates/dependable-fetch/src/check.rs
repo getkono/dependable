@@ -147,6 +147,11 @@ impl UnreachableRegistry {
     /// configured root may legitimately carry credentials — `.npmrc` interpolates
     /// `${VAR}` into its `registry` lines, and `.dependable.toml` roots are written by
     /// hand — and this string is printed on stderr, which CI captures as job output.
+    ///
+    /// The price of that reduction is that two registries on one host — a Nexus serving
+    /// `/repository/crates-a` and `/repository/crates-b` — share a label. They stay
+    /// distinct in the data; a caller counting registries must count
+    /// [`ManifestCheck::unreachable_registries`], not labels.
     #[must_use]
     pub fn label(&self) -> String {
         let name = self.ecosystem.display_name();
@@ -173,20 +178,41 @@ fn unreachable_sort_key(registry: &UnreachableRegistry) -> (&str, &str) {
 }
 
 /// The scheme-less authority of a URL-ish string: host and port, with userinfo, path,
-/// query and fragment dropped. `None` when nothing is left.
+/// query and fragment dropped. `None` when nothing usable is left.
 ///
 /// Hand-rolled over `&str` rather than taken from a URL crate: this workspace depends on
 /// none, and the input is not guaranteed to parse as a URL anyway — a configured root
 /// may carry an unexpanded `${VAR}`, or no scheme at all.
+///
+/// This is a **redaction**, so it fails towards saying less. Splitting the path off first
+/// and stripping userinfo second leaks a credential whenever a hand-written password
+/// contains `/`, which base64 tokens routinely do:
+/// `https://ci:se/cret@nexus.internal/repo` would have reduced to `ci:se`. So the
+/// authority candidate is taken first, and an `@` surviving *outside* it means the string
+/// cannot be split into userinfo and host with any confidence — the root is then dropped
+/// rather than guessed at.
 fn authority_of(root: &str) -> Option<String> {
     let after_scheme = root.split_once("://").map_or(root, |(_, rest)| rest);
-    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
-    // Userinfo is credentials. The *last* `@` wins, because a password may legally
-    // contain one and only the tail is the host.
-    let host = authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, h)| h)
-        .trim();
+    // The authority is everything before the path, query or fragment.
+    // `\` is included because WHATWG resolves it as `/` for special schemes, so
+    // `http://evil.example\@real.internal/x` reaches `evil.example` — reading it as part
+    // of the authority would print a host the run never contacted.
+    let end = after_scheme
+        .find(['/', '?', '#', '\\'])
+        .unwrap_or(after_scheme.len());
+    let (candidate, rest) = after_scheme.split_at(end);
+
+    let host = match candidate.rsplit_once('@') {
+        // Userinfo, correctly delimited. The *last* `@` wins: a password may legally
+        // contain one, and only the tail is the host.
+        Some((_, host)) => host,
+        // No `@` in the authority, but one further on. Either that is a path containing
+        // `@`, or it is a password containing `/`, and nothing here can tell them apart.
+        // Say the ecosystem's name alone rather than risk saying a secret.
+        None if rest.contains('@') => return None,
+        None => candidate,
+    };
+    let host = host.trim();
     (!host.is_empty()).then(|| host.to_owned())
 }
 
@@ -1005,6 +1031,11 @@ impl Checker {
         // reordering itself between two runs of the same repository.
         let mut unreachable: Vec<UnreachableRegistry> = unreachable.into_values().collect();
         unreachable.sort_by(|a, b| unreachable_sort_key(a).cmp(&unreachable_sort_key(b)));
+        // Per *registry*, which is what the field promises — the map is keyed by cache
+        // key, and `route_item` gives each alternate-registry alias its own key, so two
+        // aliases naming one index URL arrive here as two identical entries. Equal values
+        // sort adjacently under the key above, so an adjacent dedup is total.
+        unreachable.dedup();
         (out, unreachable)
     }
 
@@ -2407,6 +2438,38 @@ mod tests {
             "registry.npmjs.org"
         );
 
+        // The reduction fails towards saying less. A hand-written password containing
+        // `/` — base64 tokens routinely do — cannot be told apart from a path, so the
+        // root is dropped entirely rather than reduced to the credential fragment
+        // `ci:se`.
+        assert_eq!(authority_of("https://ci:se/cret@nexus.internal/repo"), None);
+        assert_eq!(
+            authority_of("https://ci:AbC/dEf+gh=@nexus.internal/npm"),
+            None
+        );
+        assert_eq!(
+            authority_of("sparse+https://ci:tok/en@nexus.internal/index"),
+            None
+        );
+        assert_eq!(authority_of("https://a/b@c"), None);
+        // `?` and `#` end the authority too, so a token containing either takes the same
+        // route.
+        assert_eq!(authority_of("https://ci:p?ss@nexus.internal/x"), None);
+        assert_eq!(authority_of("https://ci:p#ss@nexus.internal/x"), None);
+        // WHATWG resolves `\\` as `/` for special schemes, so this URL reaches
+        // `evil.example`. Reading the backslash as part of the authority named
+        // `real.internal` — a host the run never contacted.
+        assert_eq!(authority_of("http://evil.example\\@real.internal/x"), None);
+        assert_eq!(
+            UnreachableRegistry::new(
+                Ecosystem::Npm,
+                Some("https://ci:se/cret@nexus.internal/repo".to_owned())
+            )
+            .label(),
+            "npm",
+            "a credential fragment must never reach the message"
+        );
+
         // Nothing to say is `None`, so the label falls back to the ecosystem rather than
         // rendering an empty pair of brackets.
         assert_eq!(authority_of(""), None);
@@ -2423,12 +2486,16 @@ mod tests {
     /// runs of the same repository.
     #[test]
     fn unreachable_registries_sort_by_ecosystem_then_root() {
-        let mut registries = [
+        let mut registries = vec![
             UnreachableRegistry::new(Ecosystem::Npm, Some("https://jsr.io".to_owned())),
             UnreachableRegistry::new(Ecosystem::Go, None),
             UnreachableRegistry::new(Ecosystem::Npm, None),
+            // A second alternate-registry alias naming the same index: one registry,
+            // two routes, two cache keys — and one entry in what is published.
+            UnreachableRegistry::new(Ecosystem::Go, None),
         ];
         registries.sort_by(|a, b| unreachable_sort_key(a).cmp(&unreachable_sort_key(b)));
+        registries.dedup();
         let labels: Vec<String> = registries.iter().map(UnreachableRegistry::label).collect();
         assert_eq!(labels, ["Go", "npm", "npm (jsr.io)"]);
     }

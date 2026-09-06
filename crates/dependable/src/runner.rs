@@ -1591,9 +1591,17 @@ fn unanswered_registries(reports: &[ManifestReport]) -> Vec<String> {
     });
     all.dedup();
     let mut labels: Vec<String> = all.iter().map(|r| r.label()).collect();
-    // Two roots can reduce to one printed label — an unnamed root and the ecosystem's
-    // own default both print the bare ecosystem name — and the sentence must not say the
-    // same registry twice.
+    // Sorted *again*, by label, before deduplicating. Several roots reduce to one printed
+    // label — an unnamed root and the ecosystem's own default both print the bare
+    // ecosystem name, and two paths on one host share an authority — and those roots need
+    // not be adjacent under the root-ordered sort above. Three Rust registries at
+    // `http://nexus.corp/a`, `http://other.host/x` and `https://nexus.corp/b` sort in
+    // exactly that order (`:` sorts before `s`, so `http://` precedes `https://`), and an
+    // adjacency-only dedup left the sentence naming `nexus.corp` twice.
+    //
+    // It also makes the printed order the order a reader sees, rather than the order of
+    // roots they are never shown.
+    labels.sort();
     labels.dedup();
     labels
 }
@@ -1602,8 +1610,14 @@ fn unanswered_registries(reports: &[ManifestReport]) -> Vec<String> {
 /// `the a, b and c registries did not answer`.
 ///
 /// The same connective grammar as [`join_reasons`], deliberately not the same function:
-/// this string is one *element* of that list, and composing them would leave a sentence
-/// whose commas belong to two different lists at once.
+/// this string is one *element* of that list, and `join_reasons` over the registry labels
+/// alone would render three of them as a bare `Go, JVM and npm` with no sentence round it.
+///
+/// The nesting is accepted rather than avoided. With three registries and another reason
+/// the commas do belong to two lists at once — `the vulnerability scan did not complete,
+/// the Go, JVM and npm registries did not answer and 2 dependencies could not be
+/// evaluated` — which reads worse than either list alone, and better than a run that
+/// cannot say which registry declined.
 fn name_unanswered(labels: &[String]) -> String {
     match labels {
         [] => String::new(),
@@ -2116,6 +2130,34 @@ mod tests {
         // The settings that were never blocked by this reason still are not.
         assert!(gate_is_answerable(&both, FailOn::Any).is_ok());
         assert!(gate_is_answerable(&both, FailOn::None).is_ok());
+    }
+
+    /// Several roots reduce to one printed label, and under a root-ordered sort they need
+    /// not be adjacent: `http://nexus.corp/a`, `http://other.host/x` and
+    /// `https://nexus.corp/b` sort in exactly that order, because `:` sorts before `s`.
+    /// An adjacency-only dedup named `nexus.corp` twice in one sentence.
+    #[test]
+    fn one_registry_is_never_named_twice_however_its_roots_sort() {
+        let rust = |root: &str| {
+            dependable_fetch::UnreachableRegistry::new(Ecosystem::Rust, Some(root.to_owned()))
+        };
+        let reports = [report_of(
+            ScanIntegrity {
+                vulnerability_scan_failed: false,
+                registry_unreachable: vec![
+                    rust("http://nexus.corp/a"),
+                    rust("http://other.host/x"),
+                    rust("https://nexus.corp/b"),
+                ],
+                unresolved: 0,
+                unevaluated: 0,
+            },
+            vec![],
+        )];
+        assert_eq!(
+            gate_is_answerable(&reports, FailOn::Vulnerable).unwrap_err(),
+            "the Rust (nexus.corp) and Rust (other.host) registries did not answer"
+        );
     }
 
     /// A non-default root is named by its host, so two registries inside one ecosystem
