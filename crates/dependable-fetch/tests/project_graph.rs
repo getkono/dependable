@@ -215,33 +215,63 @@ fn an_ecosystem_without_edge_data_reports_unsupported() {
     assert!(names.len() > 1, "the direct dependencies are still shown");
 }
 
-/// A manifest names its dependencies; it does not resolve them. The graph must
-/// say the version is *unknown* rather than record it as the empty string, which
-/// downstream reads as a version and evaluates as though it were one.
+/// Every version in the graph, by node name, so a change to any one of them has
+/// to be stated rather than absorbed.
+fn versions(graph: &DependencyGraph) -> Vec<(&str, Option<&str>)> {
+    graph
+        .nodes()
+        .iter()
+        .map(|n| (n.name.as_str(), n.version.as_deref()))
+        .collect()
+}
+
+/// The version of one node, panicking if there is no such node — so an assertion
+/// about a node cannot silently pass because the node is missing.
+fn version_of<'g>(graph: &'g DependencyGraph, name: &str) -> Option<&'g str> {
+    graph
+        .nodes()
+        .iter()
+        .find(|n| n.name == name)
+        .unwrap_or_else(|| panic!("a node for {name}"))
+        .version
+        .as_deref()
+}
+
+/// A manifest names its dependencies and usually only constrains them — but a
+/// Gradle catalog states a version outright, and a constraint that admits exactly
+/// one release has already resolved it. Reporting `unknown` for these understated
+/// what the file plainly said.
+///
+/// Asserted per node, with the exact spelling of each, because the two facts worth
+/// protecting are both about *which* string comes back:
+///
+/// - `guava` must be `32.1.3-jre` and never the translated `32.1.3`. Maven Central
+///   publishes `32.1.3-jre` and `32.1.3-android` and nothing called `32.1.3`, so
+///   the translation names no artifact at all.
+/// - `kotlin-stdlib` and `kotlin-reflect` share one `[versions]` alias, which
+///   reaches them as a *resolved* `Inherited` item. Those are checkable and so
+///   report the alias's version; an alias no `[versions]` entry defines would not.
 #[test]
-fn a_manifest_only_graph_leaves_every_dependency_version_unknown() {
+fn a_manifest_only_graph_reports_the_versions_the_manifest_settled() {
     let built = build_project_graph(
         &fixture("sample-kotlin").join("gradle/libs.versions.toml"),
         &WorkspaceGraphOptions::default(),
     )
     .expect("graph");
 
-    let unresolved: Vec<&str> = built
-        .graph
-        .nodes()
-        .iter()
-        .filter(|n| n.kind == NodeKind::Registry)
-        .filter(|n| n.version.is_some())
-        .map(|n| n.name.as_str())
-        .collect();
-    assert!(
-        !built.graph.nodes().is_empty(),
-        "the fixture must produce a graph to assert about"
-    );
     assert_eq!(
-        unresolved,
-        Vec::<&str>::new(),
-        "nothing read a version for these, so none may claim one"
+        versions(&built.graph),
+        vec![
+            // The catalog declares no project of its own; the root is its directory.
+            ("gradle", None),
+            ("org.jetbrains.kotlin:kotlin-stdlib", Some("1.9.24")),
+            ("org.jetbrains.kotlin:kotlin-reflect", Some("1.9.24")),
+            ("com.squareup.okhttp3:okhttp", Some("4.12.0")),
+            ("org.junit.jupiter:junit-jupiter", Some("5.10.2")),
+            // The declared spelling, not `maven_to_semver`'s `32.1.3`.
+            ("com.google.guava:guava", Some("32.1.3-jre")),
+            ("org.apache.commons:commons-lang3", Some("3.14.0")),
+        ],
     );
     assert!(
         built
@@ -251,6 +281,124 @@ fn a_manifest_only_graph_leaves_every_dependency_version_unknown() {
             .all(|n| n.version.as_deref() != Some("")),
         "an unknown version is `None`, never an empty string"
     );
+    // A catalog entry stating no version at all — a BOM supplies it at build time
+    // — is not a dependency this file resolved, and is not in the graph.
+    assert!(
+        !built
+            .graph
+            .nodes()
+            .iter()
+            .any(|n| n.name.contains("jackson-databind")),
+    );
+}
+
+/// The case #107 opened with, and the one this change does **not** close. NuGet
+/// reads a bare `Version` as an inclusive *minimum* (`>=13.0.1`), not a pin — see
+/// `nuget_constraint_to_semver`, "A bare version is an inclusive minimum in NuGet"
+/// — so `Newtonsoft.Json` still reports no version.
+///
+/// Admitting it here would make `tree` claim a resolution for a line `check`
+/// reports as satisfied by every later release, which is a disagreement about one
+/// line of one file. The reading itself is the defect, and it is filed as #113;
+/// this test is the record of what today's translation says, and is expected to
+/// change with it.
+#[test]
+fn a_bare_nuget_version_is_a_minimum_and_so_resolves_nothing() {
+    let built = build_project_graph(
+        &fixture("sample-csharp").join("App.csproj"),
+        &WorkspaceGraphOptions::default(),
+    )
+    .expect("graph");
+
+    assert_eq!(version_of(&built.graph, "Newtonsoft.Json"), None);
+    // An interval spanning two majors names a set by anyone's reading.
+    assert_eq!(version_of(&built.graph, "Serilog"), None);
+    // A reference whose version is an unexpanded MSBuild property, and one with no
+    // `Version` at all, state nothing to resolve — the parser drops both, so they
+    // are absent from the graph rather than present with a version of `None`.
+    for absent in ["FromProperty", "Microsoft.Extensions.Hosting"] {
+        assert!(
+            !built.graph.nodes().iter().any(|n| n.name == absent),
+            "{absent} states no version and is not a dependency this file resolved"
+        );
+    }
+}
+
+/// npm reads a bare `1.3.0` as a caret range, exactly as Cargo does, so neither of
+/// these is a pin. The rule is about what the *constraint* admits, not about how
+/// concrete it looks: `"left-pad": "1.3.0"` accepts every 1.x release npm ever
+/// publishes.
+#[test]
+fn a_concrete_looking_npm_constraint_is_still_a_range() {
+    let dir = TempDir::new().expect("tempdir");
+    write(
+        &dir.path().join("package.json"),
+        r#"{ "name": "app", "version": "1.0.0",
+             "dependencies": { "react": "^18.0.0", "left-pad": "1.3.0", "pinned": "=4.17.21" } }"#,
+    );
+
+    let built = build_project_graph(
+        &dir.path().join("package.json"),
+        &WorkspaceGraphOptions::default(),
+    )
+    .expect("graph");
+
+    assert_eq!(built.source, GraphSource::Manifests);
+    assert_eq!(version_of(&built.graph, "react"), None);
+    assert_eq!(version_of(&built.graph, "left-pad"), None);
+    // npm's explicit `=` is the one form that does name a single release.
+    assert_eq!(version_of(&built.graph, "pinned"), Some("4.17.21"));
+}
+
+/// Candidacy is `Item::is_checkable()`, the existing predicate for "there is a
+/// version string here worth asking a registry about". A git or link spec fails it
+/// however much of a version the spec has written into it, so no second rule is
+/// needed to keep those unknown — and no such rule can drift from the first.
+#[test]
+fn a_git_or_local_dependency_stays_unknown_however_it_is_spelled() {
+    let dir = TempDir::new().expect("tempdir");
+    write(
+        &dir.path().join("package.json"),
+        r#"{ "name": "app", "version": "1.0.0",
+             "dependencies": {
+               "fromgit": "git+https://example.com/x.git#1.2.3",
+               "linked": "link:../linked" } }"#,
+    );
+
+    let built = build_project_graph(
+        &dir.path().join("package.json"),
+        &WorkspaceGraphOptions::default(),
+    )
+    .expect("graph");
+
+    assert_eq!(version_of(&built.graph, "fromgit"), None);
+    assert_eq!(version_of(&built.graph, "linked"), None);
+}
+
+/// Two declarations of one name collapse into one node, so a version may only be
+/// carried when they agree on it. Taking the first would make the graph depend on
+/// the order the sections happen to be listed in — which is not a resolution of
+/// anything, and would report a version half the file contradicts.
+#[test]
+fn two_declarations_that_disagree_resolve_to_nothing() {
+    let dir = TempDir::new().expect("tempdir");
+    write(
+        &dir.path().join("package.json"),
+        r#"{ "name": "app", "version": "1.0.0",
+             "dependencies": { "split": "=1.0.0", "agreed": "=2.0.0" },
+             "peerDependencies": { "split": "=2.0.0", "agreed": "=2.0.0" } }"#,
+    );
+
+    let built = build_project_graph(
+        &dir.path().join("package.json"),
+        &WorkspaceGraphOptions::default(),
+    )
+    .expect("graph");
+
+    assert_eq!(version_of(&built.graph, "split"), None);
+    // Agreement is not ambiguity: two declarations naming the same release still
+    // name it.
+    assert_eq!(version_of(&built.graph, "agreed"), Some("2.0.0"));
 }
 
 #[test]

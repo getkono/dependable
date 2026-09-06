@@ -7,16 +7,18 @@
 //! graph already lives in `Cargo.lock`.
 //!
 //! When no `Cargo.lock` is present it degrades to a **shallow** graph built from
-//! the manifests alone (members plus their direct declared dependencies, with
-//! versions left unresolved), flagged via [`GraphSource::Manifests`].
+//! the manifests alone (members plus their direct declared dependencies), flagged
+//! via [`GraphSource::Manifests`]. Such a dependency's version is normally unknown
+//! — a manifest declares a constraint, not a resolution — except where the
+//! constraint names exactly one release, which [`declared_pin`] reads off it.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use dependable_core::{
-    CargoTomlParser, DependencyGraph, DependencyKind, Item, LockedPackage, LockfileKind,
-    ManifestKind, PackageSource, ParseError, Parser, ResolvedLockfile, parse, parse_bun_lock_graph,
-    parse_cargo_lock_graph, parse_composer_lock_graph, parse_mix_lock_graph,
+    CargoTomlParser, DependencyGraph, DependencyKind, Ecosystem, Item, LockedPackage, LockfileKind,
+    ManifestKind, PackageSource, ParseError, Parser, ResolvedLockfile, exact_pin, parse,
+    parse_bun_lock_graph, parse_cargo_lock_graph, parse_composer_lock_graph, parse_mix_lock_graph,
     parse_package_lock_graph, parse_package_name, parse_project, parse_workspace,
     resolve_workspace_inheritance,
 };
@@ -256,7 +258,9 @@ fn walk_members(
 /// is not resolved against anything, so what the manifest declares **is** its
 /// version, whether or not a lockfile exists. Its dependencies are a different
 /// matter: a manifest declares a constraint, not a resolution, so those stay
-/// unknown.
+/// unknown — unless the constraint names exactly one release (`= "1.0.200"`), in
+/// which case the manifest has already resolved it and [`declared_pin`] reads it
+/// off.
 ///
 /// `version.workspace = true` is resolved against the root's `[workspace.package]`
 /// only for a member the root actually governs (see [`Member::governed_by_root`]).
@@ -286,7 +290,7 @@ fn shallow_graph(
         .unwrap_or_default();
     let mut member_pkgs: Vec<LockedPackage> = Vec::new();
     let mut external_pkgs: Vec<LockedPackage> = Vec::new();
-    let mut external_seen: HashSet<String> = HashSet::new();
+    let mut external_seen: HashMap<String, usize> = HashMap::new();
 
     for member in members {
         let mut items = CargoTomlParser
@@ -297,24 +301,42 @@ fn shallow_graph(
         let mut deps: Vec<String> = Vec::new();
         for item in &items {
             deps.push(item.name.clone());
-            if !workspace_names.contains(&item.name) && external_seen.insert(item.name.clone()) {
-                // Synthesize a source so classification matches the item's kind. An
-                // inherited entry has already taken its root declaration's source above,
-                // so a centrally-declared `path` crate lands on the `Local` arm and a
-                // centrally-declared registry crate does not.
-                let source = match item.source {
-                    PackageSource::Git => Some("git+".to_owned()),
-                    PackageSource::Local => None,
-                    _ => Some("registry+".to_owned()),
-                };
-                external_pkgs.push(LockedPackage::new(
-                    item.name.clone(),
-                    // A manifest declares a constraint, not a resolved version;
-                    // nothing here read one.
-                    None,
-                    source,
-                    Vec::new(),
-                ));
+            if workspace_names.contains(&item.name) {
+                continue;
+            }
+            // Items are inheritance-resolved by now, so a member's
+            // `dep.workspace = true` pointing at a root `= "1.0.200"` is read here
+            // as the pin the root declared.
+            let pin = declared_pin(item, Ecosystem::Rust).map(str::to_owned);
+            match external_seen.get(&item.name) {
+                // One node for the name, so a version survives only where every
+                // member that declares it agrees. First-wins would make the graph
+                // depend on the order the directory walk happened to find them in.
+                Some(&idx) => {
+                    if external_pkgs[idx].version != pin {
+                        external_pkgs[idx].version = None;
+                    }
+                }
+                None => {
+                    // Synthesize a source so classification matches the item's kind. An
+                    // inherited entry has already taken its root declaration's source above,
+                    // so a centrally-declared `path` crate lands on the `Local` arm and a
+                    // centrally-declared registry crate does not.
+                    let source = match item.source {
+                        PackageSource::Git => Some("git+".to_owned()),
+                        PackageSource::Local => None,
+                        _ => Some("registry+".to_owned()),
+                    };
+                    external_seen.insert(item.name.clone(), external_pkgs.len());
+                    external_pkgs.push(LockedPackage::new(
+                        item.name.clone(),
+                        // Usually `None`: a manifest declares a constraint, not a
+                        // resolved version, and nothing here read one.
+                        pin,
+                        source,
+                        Vec::new(),
+                    ));
+                }
             }
         }
         deps.sort();
@@ -388,10 +410,13 @@ pub fn build_project_graph(
     let root_version: Option<String> = meta.literal_version().map(str::to_owned);
 
     // The project's own declared dependencies, used as the root's edges whenever the
-    // lockfile carries no entry for the project itself.
-    let direct: Vec<String> = parse(kind, &content)
-        .map(|parsed| parsed.items.into_iter().map(|i| i.name).collect())
+    // lockfile carries no entry for the project itself. Kept as whole items: a
+    // constraint that names one release is the only version a manifest-only graph
+    // will ever have for these, and mapping to bare names here would discard it.
+    let direct: Vec<Item> = parse(kind, &content)
+        .map(|parsed| parsed.items)
         .unwrap_or_default();
+    let direct_names: Vec<String> = direct.iter().map(|item| item.name.clone()).collect();
 
     let workspace_names: HashSet<String> = std::iter::once(root_name.clone()).collect();
     let roots: Vec<String> = match &opts.package {
@@ -404,6 +429,7 @@ pub fn build_project_graph(
             &root_name,
             root_version.as_deref(),
             &direct,
+            kind.ecosystem(),
             &workspace_names,
             &roots,
         );
@@ -418,6 +444,7 @@ pub fn build_project_graph(
             &root_name,
             root_version.as_deref(),
             &direct,
+            kind.ecosystem(),
             &workspace_names,
             &roots,
         );
@@ -437,6 +464,7 @@ pub fn build_project_graph(
             &root_name,
             root_version.as_deref(),
             &direct,
+            kind.ecosystem(),
             &workspace_names,
             &roots,
         );
@@ -447,7 +475,7 @@ pub fn build_project_graph(
     };
 
     let resolved = parser(&read(&lock_path)?)?;
-    let resolved = with_root(resolved, &root_name, root_version.as_deref(), direct);
+    let resolved = with_root(resolved, &root_name, root_version.as_deref(), direct_names);
     Ok(WorkspaceGraph {
         graph: DependencyGraph::from_resolved(&resolved, &workspace_names, &roots),
         source: GraphSource::Lockfile,
@@ -516,12 +544,34 @@ fn with_root(
     ResolvedLockfile::from_packages(packages)
 }
 
-/// A two-level graph: the project and the dependencies it declares, versions
-/// unresolved. Used when no resolved graph is available.
+/// The version a declared dependency is already resolved to, when its constraint
+/// names exactly one release; `None` otherwise.
+///
+/// This is the whole difference between a manifest-only graph that reports
+/// `unknown` for everything and one that reports what the manifest already
+/// settled: `serde = "=1.0.200"` admits one release and nothing else, so calling
+/// it unknown understates what was read, exactly as it would for a member's own
+/// declared version.
+///
+/// Gated on [`Item::is_checkable`], the existing predicate for "there is a version
+/// string here worth asking a registry about". That is what keeps a git or path
+/// reference — and an `Inherited` entry no root has supplied a constraint for —
+/// unknown, without a second rule that could drift from the first.
+fn declared_pin(item: &Item, ecosystem: Ecosystem) -> Option<&str> {
+    if !item.is_checkable() {
+        return None;
+    }
+    exact_pin(&item.version_constraint, ecosystem)
+}
+
+/// A two-level graph: the project and the dependencies it declares. A version is
+/// carried only where the declaration named one ([`declared_pin`]). Used when no
+/// resolved graph is available.
 fn direct_graph(
     root_name: &str,
     root_version: Option<&str>,
-    direct: &[String],
+    direct: &[Item],
+    ecosystem: Ecosystem,
     workspace_names: &HashSet<String>,
     roots: &[String],
 ) -> DependencyGraph {
@@ -529,19 +579,35 @@ fn direct_graph(
         root_name.to_owned(),
         root_version.map(str::to_owned),
         None,
-        direct.to_vec(),
+        direct.iter().map(|item| item.name.clone()).collect(),
     )];
-    let mut seen: HashSet<&str> = HashSet::new();
-    for name in direct {
-        if name != root_name && seen.insert(name.as_str()) {
-            packages.push(LockedPackage::new(
-                name.clone(),
-                // A manifest names its dependencies; nothing here resolved one
-                // to a version, and saying so is the point of the `None`.
-                None,
-                Some("registry+".to_owned()),
-                Vec::new(),
-            ));
+    let mut seen: HashMap<&str, usize> = HashMap::new();
+    for item in direct {
+        if item.name == root_name {
+            continue;
+        }
+        let pin = declared_pin(item, ecosystem).map(str::to_owned);
+        match seen.get(item.name.as_str()) {
+            // Two declarations of one name collapse into one node, so a version
+            // may only be carried when they agree on it. Taking the first would
+            // make the answer depend on the order the manifest happens to list
+            // them in, which is not a resolution of anything.
+            Some(&idx) => {
+                if packages[idx].version != pin {
+                    packages[idx].version = None;
+                }
+            }
+            None => {
+                seen.insert(item.name.as_str(), packages.len());
+                packages.push(LockedPackage::new(
+                    item.name.clone(),
+                    // A manifest names its dependencies and usually only
+                    // constrains them; `None` is how the graph says so.
+                    pin,
+                    Some("registry+".to_owned()),
+                    Vec::new(),
+                ));
+            }
         }
     }
     let resolved = ResolvedLockfile::from_packages(packages);
