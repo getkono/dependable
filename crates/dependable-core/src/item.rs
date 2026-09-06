@@ -241,6 +241,28 @@ pub enum PackageSource {
     /// declares stay with the source of that declaration and keep their span, and only
     /// the pins no manifest mentions are `Locked`.
     Locked,
+    /// The entry names a package this manifest cannot identify, whatever version it
+    /// states beside it.
+    ///
+    /// A Maven POM is the case that needs it: `<groupId>${project.groupId}</groupId>`
+    /// names a built-in this file does not state, and a `<dependency>` may omit
+    /// `<groupId>` altogether and inherit it from a `<parent>`. Either way the
+    /// coordinate is not a name any registry could answer for, so the entry is never
+    /// fetched — and a check reports it
+    /// [`Undetermined`](crate::result::DependencyStatus::Undetermined), because what
+    /// went unread is which package this is.
+    ///
+    /// Distinct from [`Inherited`](Self::Inherited), whose name *is* known and whose
+    /// missing half is the version: the two get different explanations, and an entry
+    /// whose version is stated right there in the file must never be told it takes
+    /// that version from somewhere else. Distinct from [`Local`](Self::Local), which
+    /// asserts there is no registry behind the package rather than that this file
+    /// could not say which package it is.
+    ///
+    /// The version, when the entry states one, is still recorded in
+    /// [`version_constraint`](Item::version_constraint) — it is written in this file,
+    /// and dropping it would report a manifest as stating less than it does.
+    Unidentified,
 }
 
 #[cfg(test)]

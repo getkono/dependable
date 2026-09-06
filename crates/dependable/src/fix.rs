@@ -120,7 +120,7 @@ fn plan_fixes(content: &str, results: &[CheckResult], all: bool) -> (String, Vec
 /// (npm/pubspec `>=1.0.0 <2.0.0`), a `||` alternation (`^1 || ^2`), a dist-tag
 /// (`latest`), a wildcard (`*`, `1.x`, `1.*`), or anything carrying an `@`
 /// (a Composer stability flag such as `@dev` or `^1.0@beta`, an npm alias such
-/// as `npm:pkg@1.0.0`).
+/// as `npm:pkg@1.0.0`), or a Maven interval (`[1.0]`, `(,2.0)`).
 fn rewrite_constraint(original: &str, new_version: &str) -> Option<String> {
     let trimmed = original.trim();
     if trimmed.contains(',') {
@@ -151,6 +151,16 @@ fn rewrite_constraint(original: &str, new_version: &str) -> Option<String> {
     // once any operator prefix is removed — it names a channel, not a version
     // range, so it must never be pinned to a concrete version (npm D8).
     if rest.starts_with(|c: char| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    // A Maven interval — `[1.0]`, `[1.0,2.0)`, `(,1.0]` — states its bounds in
+    // brackets rather than with an operator, and `[1.0]` in particular is Maven's
+    // one way to say "exactly this, and defeat nearest-wins mediation". Rewriting it
+    // to a bare `1.0` reverts it to a *soft* requirement any transitive declaration
+    // may outvote, and the fix record reads "from [1.0] to 1.0", which does not read
+    // as the semantics change it is. A range with a comma is already declined above;
+    // the single-version form has no comma to catch it.
+    if rest.starts_with(['[', '(']) {
         return None;
     }
     // A wildcard (`*`, `1.x`, `1.*`, Gradle's `1.+`) is a range the author chose,
@@ -280,6 +290,25 @@ mod tests {
         assert_eq!(rewrite_constraint("1.2.x", "2.0.0"), None);
         // The bare wildcard is the same kind of thing.
         assert_eq!(rewrite_constraint("*", "2.0.0"), None);
+    }
+
+    /// A Maven interval states its bounds in brackets, and `[1.0]` is Maven's only
+    /// way to say "exactly 1.0, and do not let nearest-wins mediation substitute
+    /// anything else". Rewriting it to a bare `1.0` turns a hard requirement into a
+    /// soft one that any transitive declaration may outvote, and the fix record reads
+    /// "from [1.0] to 1.0" — a semantics change that does not look like one. Every
+    /// other guard misses it: no comma, no space or `|` after the empty operator
+    /// prefix, no `@`, it starts with `[` rather than a letter, and `is_wildcard`
+    /// splits it into `["[1", "0]"]`, neither of which is `x`/`X` nor starts with
+    /// `*`/`+`.
+    #[test]
+    fn rewrite_never_softens_a_maven_interval() {
+        assert_eq!(rewrite_constraint("[1.0]", "2.0.0"), None);
+        assert_eq!(rewrite_constraint("[1.0,2.0)", "2.0.0"), None);
+        assert_eq!(rewrite_constraint("(,1.0]", "2.0.0"), None);
+        assert_eq!(rewrite_constraint("[1.0,)", "2.0.0"), None);
+        // Whitespace before the bracket is still a bracket.
+        assert_eq!(rewrite_constraint(" [1.0] ", "2.0.0"), None);
     }
 
     /// A wildcard segment is not always the whole dot-segment. Composer allows a
