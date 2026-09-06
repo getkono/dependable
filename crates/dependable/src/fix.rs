@@ -29,8 +29,15 @@ pub struct FixRecord {
     pub to: String,
 }
 
-/// Why [`rewrite_constraint`] would not substitute a new version into a
-/// constraint.
+/// Why `fix` left an update alone that `check` reported.
+///
+/// Most of these are [`rewrite_constraint`] refusing to substitute a new version
+/// into a constraint. The last three are [`plan_fixes`] itself, which drops a row
+/// before the constraint is ever consulted — a pin held back for want of `--all`,
+/// a row with no version resolved to write, and a row whose constraint already
+/// names the target. Those three were silent, and silence is issue #93's exact
+/// symptom: `check` reports an update, `fix` says everything is up to date. An
+/// override is the one skip still not on this list, and [`plan_fixes`] says why.
 ///
 /// Carried out of the planner rather than recomputed, because the answer is only
 /// live at the point the guard fires: reconstructing it later would mean a second
@@ -75,11 +82,27 @@ pub enum DeclineReason {
     /// A partial version behind a tilde operator, which reads its upper bound off
     /// the number of components it was given: `~1`, `~> 1.0`, `~=1.4`.
     TildeArity,
+    /// An exact pin (`=1.0.100`) with no `--all` to authorise moving it. Not a
+    /// refusal by the constraint's *shape* — the rewrite would succeed — but the
+    /// author holds the version deliberately, and the action that changes it is a
+    /// flag rather than a rewrite of the constraint.
+    Pinned,
+    /// No version resolved to write: the row has an update and neither
+    /// `latest_compatible` (the default target) nor `latest_available` (under
+    /// `--all`) named one. The usual cause is a constraint no published release
+    /// satisfies, whose newer releases are all beyond it.
+    NoTarget,
+    /// The constraint already names the version that would have been written.
+    /// Reached most sharply by a `Vulnerable` row whose only fixed release is the
+    /// one already in force: there is an update to report and nothing to write.
+    AlreadyAtTarget,
 }
 
 impl DeclineReason {
     /// The clause that completes a `note:` line, reading on from
-    /// "… is available, but ".
+    /// "… is available, but " — or, for a decline with no version to name, from
+    /// "an update was reported, but ". [`crate::runner`] picks the opening; every
+    /// clause here has to read after either.
     ///
     /// Every reason says what the constraint *is*, not that a rule fired — the
     /// point of the note is to let the author decide whether to widen the
@@ -125,6 +148,13 @@ impl DeclineReason {
                 "a tilde reads its upper bound off the number of components it was given, and a \
                  full version here would narrow that bound"
             }
+            Self::Pinned => "the constraint pins one release, and only `--all` moves a pin",
+            Self::NoTarget => {
+                "no release the constraint admits was resolved, so there is nothing to write"
+            }
+            Self::AlreadyAtTarget => {
+                "the constraint already names it, and nothing newer satisfies the constraint"
+            }
         }
     }
 }
@@ -141,8 +171,13 @@ pub struct Declined {
     pub name: String,
     /// The constraint left in place, verbatim.
     pub constraint: String,
-    /// The version that would have been written had the constraint allowed it.
-    pub target: String,
+    /// The version that would have been written had nothing refused it.
+    ///
+    /// [`None`] where there was no such version to name —
+    /// [`DeclineReason::NoTarget`] is exactly that case. The note then opens "an
+    /// update was reported, but …" instead of naming a release, because printing
+    /// an invented or empty version would be worse than printing none.
+    pub target: Option<String>,
     /// Why it was not.
     pub reason: DeclineReason,
 }
@@ -260,11 +295,18 @@ pub fn commit(planned: &PlannedFix) -> anyhow::Result<()> {
 /// answer rather than as permission.
 ///
 /// Returns the rewritten content, the changes made, and the changes *not* made:
-/// every dependency with an update available whose constraint
-/// [`rewrite_constraint`] declined. The third list exists because it cannot be
+/// every dependency with an update available that this loop left alone, whether
+/// [`rewrite_constraint`] declined it or the loop itself dropped it — a pin
+/// without `--all`, a row with no version resolved to write, or a constraint
+/// already naming the target. The third list exists because it cannot be
 /// recovered afterwards — the caller would have to redo the rewritability,
 /// pinning, and target selection above *and* every guard inside
 /// [`rewrite_constraint`] to learn what this loop already knew and threw away.
+///
+/// The plan set and the declined set together account for every `has_update()`
+/// row that is rewritable and not an override. That is the invariant the summary
+/// line in [`crate::runner`] rests on: "everything is already up to date" is only
+/// printable when both are empty.
 fn plan_fixes(
     content: &str,
     results: &[CheckResult],
@@ -289,15 +331,32 @@ fn plan_fixes(
         // the pin to it defeats the reason the entry was written, so `fix` declines the
         // whole kind rather than trying to guess which overrides are safe to move.
         //
-        // Skipped outright rather than recorded in `declined`: that list is for a
-        // rewrite a *constraint* refused, which the author could act on by widening it.
-        // An override is not rewritable by this tool at all, whatever it says, so a
-        // note offering to explain the refusal would be describing a decision the
-        // author cannot change and did not make.
+        // Skipped outright rather than recorded in `declined`: that list is for an
+        // update the author could act on. An override is not rewritable by this
+        // tool at all, whatever it says and whatever flags are passed, so a note
+        // offering to explain the refusal would be describing a decision the
+        // author cannot change and did not make. Contrast the pin below, which is
+        // also not a shape refusal and *is* recorded, because `--all` acts on it.
         if item.kind == DependencyKind::Override {
             continue;
         }
-        if !result.status.has_update() || (item.is_pinned() && !all) {
+        if !result.status.has_update() {
+            continue;
+        }
+        // A pin is a constraint, and it refused. Recorded rather than dropped:
+        // this is the single most common way a dependency is deliberately held
+        // back, so leaving it silent reproduces issue #93's symptom — `check`
+        // reports the update, `fix` prints "everything is already up to date" —
+        // by default configuration, on the path a user is likeliest to hit. The
+        // version named is the one `--all` would write, because `--all` is the
+        // action the note points at.
+        if item.is_pinned() && !all {
+            declined.push(Declined {
+                name: item.name.clone(),
+                constraint: item.version_constraint.clone(),
+                target: result.latest_available.clone(),
+                reason: DeclineReason::Pinned,
+            });
             continue;
         }
 
@@ -306,22 +365,44 @@ fn plan_fixes(
         } else {
             result.latest_compatible.as_ref()
         };
-        let Some(target) = target else { continue };
+        // An update with nothing to write it from: the row is `has_update()` and
+        // the target this run would have used is absent. Usually a constraint no
+        // published release satisfies, whose newer releases all sit beyond it.
+        // Also a decline — `check` said something, so `fix` has to.
+        let Some(target) = target else {
+            declined.push(Declined {
+                name: item.name.clone(),
+                constraint: item.version_constraint.clone(),
+                target: None,
+                reason: DeclineReason::NoTarget,
+            });
+            continue;
+        };
         let new_constraint = match rewrite_constraint(&item.version_constraint, target, ecosystem) {
             Ok(new_constraint) => new_constraint,
             Err(reason) => {
                 declined.push(Declined {
                     name: item.name.clone(),
                     constraint: item.version_constraint.clone(),
-                    target: target.clone(),
+                    target: Some(target.clone()),
                     reason,
                 });
                 continue;
             }
         };
-        // Already at the target: nothing to write and nothing to say. Not a
-        // decline — the constraint would have accepted the rewrite.
+        // Already at the target: nothing to write, and — until this was recorded
+        // — nothing said either. The constraint would have accepted the rewrite,
+        // which is why this is not a shape refusal; what refused is the range,
+        // and a `Vulnerable` row whose only fixed release is the one already in
+        // force reaches it with an advisory attached. `check` reports that row,
+        // so `fix` cannot answer it with "everything is already up to date".
         if new_constraint == item.version_constraint {
+            declined.push(Declined {
+                name: item.name.clone(),
+                constraint: item.version_constraint.clone(),
+                target: Some(target.clone()),
+                reason: DeclineReason::AlreadyAtTarget,
+            });
             continue;
         }
 
@@ -1403,8 +1484,130 @@ mod tests {
             vec![Declined {
                 name: "lodash".to_string(),
                 constraint: "1.x".to_string(),
-                target: "1.9.0".to_string(),
+                target: Some("1.9.0".to_string()),
                 reason: DeclineReason::WildcardPins,
+            }]
+        );
+    }
+
+    /// A pin is a constraint, and `fix` refusing to move it without `--all` is a
+    /// refusal the author can act on. Silent, it was issue #93's symptom reached
+    /// by default configuration on the single most common way a dependency is
+    /// deliberately held back.
+    #[test]
+    fn a_pin_held_back_for_want_of_all_is_recorded() {
+        let content = "[dependencies]\nserde = \"=1.0.100\"\n";
+        let results = results_for(ManifestKind::CargoToml, content, &[("serde", "1.0.219")]);
+
+        let (updated, records, declined) = plan_fixes(
+            content,
+            &results,
+            false,
+            Some(ManifestKind::CargoToml.ecosystem()),
+        )
+        .expect("the plan applies");
+        assert_eq!(updated, content, "the pin was rewritten without `--all`");
+        assert!(records.is_empty());
+        assert_eq!(
+            declined,
+            vec![Declined {
+                name: "serde".to_string(),
+                constraint: "=1.0.100".to_string(),
+                // What `--all` would write, because `--all` is what the note points at.
+                target: Some("1.0.219".to_string()),
+                reason: DeclineReason::Pinned,
+            }]
+        );
+        assert!(
+            DeclineReason::Pinned.explain().contains("--all"),
+            "the note must name the action that moves a pin"
+        );
+
+        // With `--all` the pin is rewritten, and there is nothing left to say.
+        let (updated, records, declined) = plan_fixes(
+            content,
+            &results,
+            true,
+            Some(ManifestKind::CargoToml.ecosystem()),
+        )
+        .expect("the plan applies");
+        assert!(updated.contains("serde = \"=1.0.219\""));
+        assert_eq!(records.len(), 1);
+        assert!(declined.is_empty(), "{declined:?}");
+    }
+
+    /// `check` reported an update and the run resolved no version to write it
+    /// from — a constraint no published release satisfies, whose newer releases
+    /// all sit beyond it. The note has no version to name, so it opens on the fact
+    /// it does have.
+    #[test]
+    fn an_update_with_no_resolved_target_is_recorded() {
+        let content = "[dependencies]\nserde = \"^1.0\"\n";
+        let mut results: Vec<CheckResult> = parse(ManifestKind::CargoToml, content)
+            .unwrap()
+            .items
+            .into_iter()
+            .map(|item| CheckResult::new(item, DependencyStatus::UpdateAvailable))
+            .collect();
+        // Neither field: the default path reads `latest_compatible` and `--all`
+        // reads `latest_available`, and this row answers neither.
+        for result in &mut results {
+            result.latest_compatible = None;
+            result.latest_available = None;
+        }
+
+        let (updated, records, declined) = plan_fixes(
+            content,
+            &results,
+            false,
+            Some(ManifestKind::CargoToml.ecosystem()),
+        )
+        .expect("the plan applies");
+        assert_eq!(updated, content);
+        assert!(records.is_empty());
+        assert_eq!(
+            declined,
+            vec![Declined {
+                name: "serde".to_string(),
+                constraint: "^1.0".to_string(),
+                target: None,
+                reason: DeclineReason::NoTarget,
+            }]
+        );
+    }
+
+    /// The constraint already names the version that would have been written.
+    /// Reached most sharply by a `Vulnerable` row whose only fixed release is the
+    /// one already in force: `check` reports it, so `fix` cannot answer with
+    /// "everything is already up to date".
+    #[test]
+    fn a_constraint_already_at_its_target_is_recorded() {
+        let content = r#"{
+  "name": "demo",
+  "dependencies": {
+    "lodash": "1.0.0"
+  }
+}
+"#;
+        let mut results = results_for(ManifestKind::PackageJson, content, &[("lodash", "1.0.0")]);
+        results[0].status = DependencyStatus::Vulnerable;
+
+        let (updated, records, declined) = plan_fixes(
+            content,
+            &results,
+            false,
+            Some(ManifestKind::PackageJson.ecosystem()),
+        )
+        .expect("the plan applies");
+        assert_eq!(updated, content);
+        assert!(records.is_empty());
+        assert_eq!(
+            declined,
+            vec![Declined {
+                name: "lodash".to_string(),
+                constraint: "1.0.0".to_string(),
+                target: Some("1.0.0".to_string()),
+                reason: DeclineReason::AlreadyAtTarget,
             }]
         );
     }
