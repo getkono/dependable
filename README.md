@@ -410,9 +410,19 @@ and the `ascii` and `dot` renderers drop the `vX.Y.Z` suffix for the same node.
 A shallow tree — built from manifests, with no `Cargo.lock` to resolve against —
 still reports each **workspace member's** declared version, because a member is
 not resolved against anything and what its manifest declares is what the crate
-is; its **dependencies** are `null`, because a manifest declares a constraint
-rather than a resolution. A version is never the empty string: a blank one in a
-lockfile is read as no version at all.
+is. A **dependency** is `null` there, because a manifest usually declares a
+constraint rather than a resolution — with one exception: a constraint that
+admits exactly one release (`serde = "=1.0.200"`, a PEP 440 `==2.28.1`, a NuGet
+`[1.2.3]`, a bare Gradle or Hex version) has already resolved it, and the version
+reported is the one the manifest spells, not a normalized form of it. Whether a
+bare version is a pin is the ecosystem's call, not the string's shape: Cargo,
+npm, and Python read `1.2.3` as a range, and NuGet reads it as a lower bound. It
+is also `null` where the spelling itself is not a version the comparison engine
+can read as written — a two-segment `4.12`, a four-segment `1.2.3.4`, a Maven
+`6.4.4.Final` — because reporting one of those would put a string downstream that
+every consumer reads as no version at all. A git or path dependency is always
+`null`, whatever version sits beside it. A version is never the empty string: a
+blank one in a lockfile is read as no version at all.
 
 ```
 my-app v0.1.0 (workspace)

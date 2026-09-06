@@ -40,9 +40,14 @@ pub struct Node {
     ///
     /// A workspace member carries the version its own manifest declares — a
     /// member is resolved against nothing, so its declaration *is* its version,
-    /// whether or not a lockfile exists. `None` is a dependency in a graph built
-    /// from manifests alone, where the manifest gave a constraint and nothing
-    /// resolved it, and a package a lockfile records without a version at all.
+    /// whether or not a lockfile exists. A dependency in a graph built from
+    /// manifests alone carries one only where its constraint named exactly one
+    /// release *and* spelled it as a version this crate can parse, which is the
+    /// manifest resolving it rather than constraining it. `None` is everything
+    /// else: a constraint that admits a set and nothing resolved it, a spelling
+    /// no consumer of this field could compare with (`4.12`, `6.4.4.Final`), a
+    /// git or path reference, and a package a lockfile records without a version
+    /// at all.
     ///
     /// An [`Option`] rather than an empty-string sentinel, and never
     /// `Some("")`: a renderer must be able to say "unknown" rather than evaluate

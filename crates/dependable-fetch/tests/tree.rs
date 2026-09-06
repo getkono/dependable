@@ -127,6 +127,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
     .unwrap();
 }
 
+/// The version of one node, panicking if there is no such node — so an assertion
+/// about a node cannot silently pass because the node is missing.
+fn version_of<'g>(graph: &'g DependencyGraph, name: &str) -> Option<&'g str> {
+    graph
+        .nodes()
+        .iter()
+        .find(|n| n.name == name)
+        .unwrap_or_else(|| panic!("node {name} missing"))
+        .version
+        .as_deref()
+}
+
 fn kind_of(graph: &DependencyGraph, name: &str) -> NodeKind {
     graph
         .nodes()
@@ -426,4 +438,119 @@ fn the_root_decides_what_an_inherited_dependency_is_in_the_shallow_graph() {
     assert_eq!(kind_of(&built.graph, "centrally_declared"), NodeKind::Path);
     // And a member's own path entry, which never depended on the root at all.
     assert_eq!(kind_of(&built.graph, "vendored"), NodeKind::Path);
+}
+
+/// Without a lockfile a dependency's version is normally unknown, because a
+/// manifest declares a constraint rather than a resolution. `= "1.0.200"` is the
+/// exception: it admits exactly one release, so the manifest has already resolved
+/// it and calling it unknown understates what was read.
+///
+/// Cargo's `"1"` beside it is the control. It looks concrete and is a caret range
+/// over every 1.x release, which is why the rule cannot be "the string has three
+/// numbers in it".
+#[test]
+fn an_exactly_pinned_dependency_reports_its_version_without_a_lockfile() {
+    let tmp = TempDir::new().unwrap();
+    fs::write(
+        tmp.path().join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"crates/a\"]\n",
+    )
+    .unwrap();
+    fs::create_dir_all(tmp.path().join("crates/a")).unwrap();
+    fs::write(
+        tmp.path().join("crates/a/Cargo.toml"),
+        "[package]\nname = \"a\"\nversion = \"0.1.0\"\n\n\
+         [dependencies]\n\
+         serde = \"=1.0.200\"\n\
+         regex = \"1\"\n\
+         partial = \"=1.2\"\n\
+         gitdep = { git = \"https://example.com/gitdep\", version = \"=1.2.3\" }\n\
+         localdep = { path = \"../../vendor/v\", version = \"=4.5.6\" }\n",
+    )
+    .unwrap();
+
+    let built = build_workspace_graph(tmp.path(), &WorkspaceGraphOptions::default()).unwrap();
+    assert_eq!(built.source, GraphSource::Manifests);
+    let g = &built.graph;
+
+    assert_eq!(version_of(g, "serde"), Some("1.0.200"));
+    // A caret range over every 1.x release names no single one of them.
+    assert_eq!(version_of(g, "regex"), None);
+    // `=1.2` is exact only to the minor: Cargo still accepts every 1.2.x patch.
+    assert_eq!(version_of(g, "partial"), None);
+    // Candidacy is `Item::is_checkable()`, which a git or path source fails
+    // whatever version is written beside it. These are the crate at that location,
+    // not the crate the registry publishes under that number.
+    assert_eq!(version_of(g, "gitdep"), None);
+    assert_eq!(version_of(g, "localdep"), None);
+    assert_eq!(kind_of(g, "gitdep"), NodeKind::Git);
+    assert_eq!(kind_of(g, "localdep"), NodeKind::Path);
+
+    // The member's own version is read from `[package] version` and is untouched
+    // by any of this.
+    assert_eq!(version_of(g, "a"), Some("0.1.0"));
+    assert!(
+        g.nodes().iter().all(|n| n.version != Some(String::new())),
+        "and never the empty string"
+    );
+}
+
+/// A member's `dep.workspace = true` carries no version of its own; the root's
+/// `[workspace.dependencies]` entry does, and inheritance is already resolved
+/// before the graph is assembled. So a centrally pinned crate reports the pin the
+/// root declared — the shape most workspaces that pin anything actually use.
+#[test]
+fn a_centrally_pinned_inherited_dependency_reports_the_roots_version() {
+    let tmp = TempDir::new().unwrap();
+    fs::write(
+        tmp.path().join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"crates/a\"]\n\n\
+         [workspace.dependencies]\n\
+         serde = \"=1.0.200\"\n\
+         regex = \"1\"\n",
+    )
+    .unwrap();
+    fs::create_dir_all(tmp.path().join("crates/a")).unwrap();
+    fs::write(
+        tmp.path().join("crates/a/Cargo.toml"),
+        "[package]\nname = \"a\"\nversion = \"0.1.0\"\n\n\
+         [dependencies]\nserde.workspace = true\nregex.workspace = true\n",
+    )
+    .unwrap();
+
+    let built = build_workspace_graph(tmp.path(), &WorkspaceGraphOptions::default()).unwrap();
+    assert_eq!(built.source, GraphSource::Manifests);
+    assert_eq!(version_of(&built.graph, "serde"), Some("1.0.200"));
+    assert_eq!(version_of(&built.graph, "regex"), None);
+}
+
+/// One node per name across the whole workspace, so a version may only be carried
+/// when every member that declares the crate agrees on it. Reporting the first
+/// would make the graph depend on the order the directory walk found the members
+/// in, and would state a version the other member's manifest contradicts.
+#[test]
+fn two_members_that_pin_one_crate_differently_resolve_to_nothing() {
+    let tmp = TempDir::new().unwrap();
+    fs::write(
+        tmp.path().join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"crates/a\", \"crates/b\"]\n",
+    )
+    .unwrap();
+    for (member, serde, agreed) in [("a", "=1.0.200", "=1.0.0"), ("b", "=1.0.201", "=1.0.0")] {
+        fs::create_dir_all(tmp.path().join("crates").join(member)).unwrap();
+        fs::write(
+            tmp.path().join("crates").join(member).join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"{member}\"\nversion = \"0.1.0\"\n\n\
+                 [dependencies]\nserde = \"{serde}\"\nagreed = \"{agreed}\"\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    let built = build_workspace_graph(tmp.path(), &WorkspaceGraphOptions::default()).unwrap();
+    assert_eq!(built.source, GraphSource::Manifests);
+    assert_eq!(version_of(&built.graph, "serde"), None);
+    // Agreement is not ambiguity: two members naming the same release still name it.
+    assert_eq!(version_of(&built.graph, "agreed"), Some("1.0.0"));
 }
