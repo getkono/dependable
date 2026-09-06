@@ -689,6 +689,50 @@ version.workspace = true
     );
 }
 
+/// Two crates in the *same* scope can share a `[package] name` too — `crates/dup`
+/// and `examples/dup` in one workspace — and there no scope comparison can pick a
+/// winner: both index the same root. First-wins then decides, and what "first"
+/// means is the walk's own sorted descent, not whatever order `read_dir` happened
+/// to return. Without that sort this answer would vary between two machines
+/// holding byte-identical checkouts, which is what makes the sort load-bearing
+/// rather than tidy.
+#[test]
+fn a_name_shared_within_one_scope_settles_on_the_alphabetically_earlier_path() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    fs::write(
+        dir.join("Cargo.toml"),
+        r#"
+[workspace]
+resolver = "2"
+members = ["aaa", "zzz"]
+"#,
+    )
+    .unwrap();
+    // Same name, same (root) scope, different literal versions — so which manifest
+    // the walk records is visible in the graph. Created in reverse alphabetical
+    // order deliberately: a filesystem that reports entries in creation order then
+    // hands back the *wrong* crate first, so the assertion below is answered by the
+    // walk's sort rather than by the directory happening to agree with it.
+    for (subdir, version) in [("zzz", "9.9.9"), ("aaa", "1.1.1")] {
+        let member = dir.join(subdir);
+        fs::create_dir_all(&member).unwrap();
+        fs::write(
+            member.join("Cargo.toml"),
+            format!("[package]\nname = \"dup\"\nversion = \"{version}\"\n"),
+        )
+        .unwrap();
+    }
+
+    let built = build_workspace_graph(dir, &WorkspaceGraphOptions::default()).unwrap();
+    assert_eq!(built.source, GraphSource::Manifests);
+    assert_eq!(
+        version_of(&built.graph, "dup"),
+        Some("1.1.1"),
+        "the sorted walk reaches `aaa` first, on every filesystem"
+    );
+}
+
 /// The scope stack's guarantee has to hold for a nested root that cannot be read at
 /// all. A `Cargo.toml` with a TOML syntax error yields no `[workspace]` table — but
 /// "it does not parse" is not "it is not a workspace", and treating the two alike
