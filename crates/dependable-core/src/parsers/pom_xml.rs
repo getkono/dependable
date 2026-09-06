@@ -45,10 +45,15 @@
 //! The same holds for a coordinate: `<groupId>${project.groupId}</groupId>` — the
 //! standard idiom for a sibling module in a multi-module build — names a built-in
 //! this file does not state, and the dependency is reported under that literal
-//! rather than dropped.
+//! rather than dropped. Such an entry is
+//! [`PackageSource::Unidentified`]: nothing is fetched under a name this file never
+//! spelled. Its `<version>` is read and reported all the same, because the two are
+//! independent — a POM stating `<version>2.0.13</version>` beside
+//! `${project.groupId}` states that version whatever else it leaves to Maven, and
+//! blanking it would then have to be explained by a `<parent>` that is not involved.
 //!
-//! A dependency whose version or coordinate those rules leave unknown is
-//! **reported anyway**, with no constraint and no span — the shape a Cargo member's unresolved
+//! A dependency whose version those rules leave unknown is **reported anyway**, with
+//! no constraint and no span — the shape a Cargo member's unresolved
 //! `dep.workspace = true` already has, which the CLI renders as `(unresolved)` and
 //! never fetches, fixes, or claims a status for. Dropping it instead, as the
 //! `csproj` parser drops an MSBuild `$(…)` version, would report a POM that
@@ -81,8 +86,8 @@ pub struct PomXmlParser;
 
 /// A version literal and where it is written, before it is known whether the
 /// dependency that uses it may rewrite it.
-struct Located {
-    value: String,
+pub(super) struct Located {
+    pub(super) value: String,
     span: Option<Range<usize>>,
 }
 
@@ -132,17 +137,32 @@ impl Parser for PomXmlParser {
 
         let items = declared
             .iter()
-            .map(|entry| match &entry.version {
-                Source::Literal(version) => item(entry, version, &starts),
-                Source::Property(name) => {
-                    let located = &properties[name.as_str()];
-                    if uses.get(name.as_str()).copied() == Some(1) {
-                        item(entry, located, &starts)
-                    } else {
-                        inherited(entry, &located.value)
-                    }
+            .map(|entry| {
+                // The version this entry reports, and whether the line it is written
+                // on belongs to this entry alone. A `<properties>` value several
+                // dependencies read is nobody's line to rewrite; a literal beside the
+                // dependency is its own. Read for every entry, including one whose
+                // coordinate did not resolve: a version stated in this file is
+                // reported whether or not anything can be fetched under the name
+                // beside it, because it *is* the version, and reporting nothing there
+                // would then be explained by a `<parent>` that has nothing to do
+                // with it.
+                let (located, sole) = match &entry.version {
+                    Source::Literal(version) => (Some(version), true),
+                    Source::Property(name) => (
+                        Some(&properties[name.as_str()]),
+                        uses.get(name.as_str()).copied() == Some(1),
+                    ),
+                    Source::Unknown => (None, false),
+                };
+                let Some(located) = located else {
+                    return unresolved(entry);
+                };
+                if sole {
+                    item(entry, located, &starts)
+                } else {
+                    inherited(entry, &located.value)
                 }
-                Source::Unknown => unresolved(entry),
             })
             .collect();
 
@@ -150,7 +170,10 @@ impl Parser for PomXmlParser {
             kind: ManifestKind::PomXml,
             items,
             alternate_registries: Vec::new(),
-            notices: profile_notice(project).into_iter().collect(),
+            notices: profile_notice(project)
+                .into_iter()
+                .chain(unnameable_notice(&declared))
+                .collect(),
         })
     }
 }
@@ -213,17 +236,21 @@ fn read_dependencies<'a>(
             .unwrap_or_default();
         out.push(Declared {
             name,
-            // A coordinate this file cannot state is a coordinate nothing can be
-            // fetched for, whatever version sits beside it.
-            version: if known {
-                version_source(node, properties)
-            } else {
-                Source::Unknown
-            },
+            // Read whatever the entry states, whether or not the coordinate beside it
+            // resolved. The two are independent facts: forcing the version to
+            // `Unknown` here discarded a `<version>2.0.13</version>` the reader can
+            // see in their own file, and left its absence to be explained by
+            // `<parent>` inheritance that was never involved.
+            version: version_source(node, properties),
             // A `system` dependency is a jar at a path on this machine, not
-            // something a registry has ever heard of.
-            source: match scope.as_str() {
-                "system" => PackageSource::Local,
+            // something a registry has ever heard of. A coordinate this file cannot
+            // state is not a name any registry could answer for either — a different
+            // fact, and one with its own token, because `Local` would claim the
+            // package has no registry rather than that this file could not say which
+            // package it is.
+            source: match (scope.as_str(), known) {
+                ("system", _) => PackageSource::Local,
+                (_, false) => PackageSource::Unidentified,
                 _ => PackageSource::Registry,
             },
             kind: dependency_kind(node, &scope),
@@ -434,6 +461,42 @@ fn profile_notice(project: roxmltree::Node<'_, '_>) -> Option<String> {
     ))
 }
 
+/// Say that some entries name a coordinate this file cannot state, so nothing was
+/// fetched for them however clearly they state a version.
+///
+/// The sibling of the `<profiles>` notice above, and for the same reason: an entry
+/// that reports no status reads as an oversight unless the run says why. It is kept
+/// apart from the check's own "this version comes from a `<parent>`" notice because
+/// the two are different failures — here the *name* went unread, and the version may
+/// be stated right there in the file, so borrowing the version story would tell the
+/// reader two false things at once and point them at a parent POM that does not
+/// exist.
+fn unnameable_notice(declared: &[Declared]) -> Option<String> {
+    let mut names: Vec<&str> = declared
+        .iter()
+        .filter(|entry| entry.source == PackageSource::Unidentified)
+        .map(|entry| entry.name.as_str())
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    if names.is_empty() {
+        return None;
+    }
+    let (subject, verb) = if names.len() == 1 {
+        ("dependency names a coordinate", "does")
+    } else {
+        ("dependencies name coordinates", "do")
+    };
+    Some(format!(
+        "{} {subject} this file {verb} not state — a `${{project.*}}` built-in, a \
+         `<groupId>` left to a `<parent>`, or a property declared elsewhere — so \
+         nothing was fetched for {}: {}",
+        names.len(),
+        if names.len() == 1 { "it" } else { "them" },
+        names.join(", ")
+    ))
+}
+
 /// The first direct child element named `tag`.
 fn child<'a>(node: roxmltree::Node<'a, 'a>, tag: &str) -> Option<roxmltree::Node<'a, 'a>> {
     node.children()
@@ -456,7 +519,13 @@ fn child<'a>(node: roxmltree::Node<'a, 'a>, tag: &str) -> Option<roxmltree::Node
 /// the join are trimmed, so a value broken over lines around a comment keeps the
 /// indentation between its halves — and that is neither a version this file states
 /// nor one Maven would accept.
-fn text_of(node: roxmltree::Node<'_, '_>) -> Option<Located> {
+///
+/// [`project`](super::project)'s POM reader shares this, rather than reading
+/// `Node::text` itself: two readers of one element that disagree about what its text
+/// *is* make a POM's own `<version>` and a dependency's `<version>` two different
+/// rules, and `1.0<!-- c -->.0` then reads as `1.0.0` in one place and `1.0` in the
+/// other.
+pub(super) fn text_of(node: roxmltree::Node<'_, '_>) -> Option<Located> {
     let mut texts = node.children().filter(roxmltree::Node::is_text);
     let first = texts.next()?;
     let raw = first.text()?;
@@ -834,9 +903,9 @@ mod tests {
 
     /// `${project.groupId}` is *the* idiom for a sibling module in a multi-module
     /// build, and a POM using it for two of its three dependencies must not list as
-    /// depending on one. Reported under the literal, with no constraint — the shape
-    /// a parent-deferred version already has, which the CLI renders `(unresolved)`
-    /// and never fetches — rather than dropped in silence.
+    /// depending on one. Reported under the literal it states, as
+    /// [`PackageSource::Unidentified`] — never fetched, because no registry has heard
+    /// of a package by that name — rather than dropped in silence.
     #[test]
     fn a_group_this_file_cannot_resolve_is_reported_not_dropped() {
         let content = pom("  <dependencies>\n\
@@ -854,18 +923,66 @@ mod tests {
         let m = parse(&content);
         assert_eq!(m.items.len(), 2, "both dependencies are declared");
         let sibling = find(&m, "${project.groupId}:app-core");
+        // `${project.version}` is a built-in too, so this entry states no version
+        // either — the coordinate and the version are unread independently.
         assert_eq!(sibling.version_constraint, "");
-        assert_eq!(sibling.source, PackageSource::Inherited);
+        assert_eq!(sibling.source, PackageSource::Unidentified);
         assert!(
             !sibling.is_checkable(),
             "no coordinate, so nothing to fetch"
         );
         assert!(!sibling.is_rewritable());
         assert_eq!(find(&m, "org.slf4j:slf4j-api").version_constraint, "2.0.13");
+        assert_eq!(
+            m.notices.len(),
+            1,
+            "the reader is told why one of the two reports nothing: {:?}",
+            m.notices
+        );
+        assert!(
+            m.notices[0].contains("${project.groupId}:app-core"),
+            "{:?}",
+            m.notices
+        );
+    }
+
+    /// A coordinate this file cannot state and a version it can are independent
+    /// facts, and the standard multi-module idiom states both at once. Blanking the
+    /// version because the name did not resolve dropped a `2.0.13` written in plain
+    /// sight, and the check then explained its absence with `<parent>` inheritance
+    /// that is not involved.
+    #[test]
+    fn an_unnameable_coordinate_still_reports_the_version_it_states() {
+        let content = pom("  <dependencies>\n\
+             \x20   <dependency>\n\
+             \x20     <groupId>${project.groupId}</groupId>\n\
+             \x20     <artifactId>app-core</artifactId>\n\
+             \x20     <version>2.0.13</version>\n\
+             \x20   </dependency>\n\
+             \x20 </dependencies>\n");
+        let m = parse(&content);
+        let sibling = find(&m, "${project.groupId}:app-core");
+        assert_eq!(
+            sibling.version_constraint, "2.0.13",
+            "the version is written in this file and is reported"
+        );
+        assert_eq!(sibling.source, PackageSource::Unidentified);
+        assert!(
+            !sibling.is_checkable(),
+            "no registry has heard of a package named by an unresolved `${{…}}`"
+        );
+        assert!(!sibling.is_rewritable());
+        assert_eq!(m.notices.len(), 1, "{:?}", m.notices);
+        assert!(
+            m.notices[0].contains("app-core") && m.notices[0].contains("coordinate"),
+            "the unread coordinate is the story, not a version borrowed elsewhere: {:?}",
+            m.notices
+        );
     }
 
     /// A `<groupId>` this file never states is the same omission by a shorter
-    /// route: the artifact is named, so the entry is reported under what there is.
+    /// route: the artifact is named, so the entry is reported under what there is —
+    /// and so is the version beside it, which the file states outright.
     /// A `<dependency>` naming neither half states nothing at all and is skipped.
     #[test]
     fn a_missing_coordinate_half_is_still_reported_under_the_other() {
@@ -881,8 +998,13 @@ mod tests {
         let m = parse(&content);
         let names: Vec<&str> = m.items.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(names, vec![":orphan"]);
-        assert_eq!(m.items[0].version_constraint, "");
+        assert_eq!(
+            m.items[0].version_constraint, "1.0.0",
+            "the version is stated here; only the coordinate is not"
+        );
+        assert_eq!(m.items[0].source, PackageSource::Unidentified);
         assert!(!m.items[0].is_checkable());
+        assert!(!m.items[0].is_rewritable());
     }
 
     /// A `system` jar is a file on this machine whatever shape its version takes.

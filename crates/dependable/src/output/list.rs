@@ -324,6 +324,7 @@ fn source_token(source: PackageSource) -> &'static str {
         PackageSource::Git => "git",
         PackageSource::Inherited => "inherited",
         PackageSource::Locked => "locked",
+        PackageSource::Unidentified => "unidentified",
         _ => "unknown",
     }
 }
@@ -355,6 +356,10 @@ fn annotation(item: &Item) -> &'static str {
         // not unresolved, and it is not a source a reader of a table needs told about
         // — what a reader wants to know is that it is not a declared direct
         // dependency, which is exactly what its `kind` says below.
+
+        // The version beside it may be perfectly clear; what this file never stated is
+        // which package it belongs to, so nothing was fetched under that name.
+        PackageSource::Unidentified => " (unidentified)",
         _ => match item.kind {
             DependencyKind::Dev => " (dev)",
             DependencyKind::Build => " (build)",
