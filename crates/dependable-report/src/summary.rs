@@ -165,9 +165,17 @@ impl Summary {
     ///
     /// `None` when nothing is checkable, so a renderer can print "n/a" rather
     /// than dividing by zero and emitting `NaN%`.
+    ///
+    /// `None` too when anything went [`Undetermined`](DependencyStatus::Undetermined).
+    /// Such a dependency is rightly outside the denominator — an unread version is no
+    /// evidence of currency — but a headline "100% up to date" over a run that read
+    /// half the manifest is a stronger claim than the run can make, and it is the one
+    /// figure a reader takes away. A run that could not read everything has no single
+    /// number for how current it is; the status counts beside it still say exactly
+    /// what was and was not read.
     #[must_use]
     pub fn up_to_date_percent(&self) -> Option<f64> {
-        if self.checkable == 0 {
+        if self.checkable == 0 || self.undetermined > 0 {
             return None;
         }
         #[allow(clippy::cast_precision_loss)]
@@ -333,7 +341,12 @@ mod tests {
         assert_eq!(summary.checkable, 6);
     }
 
-    /// A run that read nothing is not a run that is 100% up to date.
+    /// A run that read half the manifest is not a run that is 100% up to date.
+    ///
+    /// The undetermined dependency stays out of the denominator — an unread version
+    /// is not evidence of currency — and the percentage is withheld rather than
+    /// rendered, because "100%" of a run that never read one of two dependencies is
+    /// the wrong headline for the one figure a reader remembers.
     #[test]
     fn an_undetermined_dependency_is_outside_the_up_to_date_denominator() {
         let report = report(vec![ManifestResults::new(
@@ -348,7 +361,12 @@ mod tests {
         let summary = report.summary();
 
         assert_eq!(summary.checkable, 1);
-        assert_eq!(summary.up_to_date_percent(), Some(100.0));
+        assert_eq!(summary.undetermined, 1);
+        assert_eq!(
+            summary.up_to_date_percent(),
+            None,
+            "no single number describes a run that could not read everything"
+        );
     }
 
     #[test]
