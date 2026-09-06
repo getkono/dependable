@@ -15,7 +15,7 @@ pub mod parsers;
 pub mod result;
 pub mod semver;
 
-pub use ecosystem::Ecosystem;
+pub use ecosystem::{BareVersion, Ecosystem};
 pub use error::ParseError;
 pub use graph::{
     DependencyGraph, Node, NodeKind, PathPredicate, Placement, Tree, TreeNode, TreeOptions, Visit,
