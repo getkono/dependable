@@ -404,7 +404,9 @@ impl From<UnstableFilter> for dependable_fetch::UnstableFilter {
 /// implementing one for the other; deriving `ValueEnum` upstream instead would
 /// put clap into `dependable-core`, which is deliberately IO-free and
 /// frontend-agnostic. The [`From`] impl below is the only bridge, and the unit
-/// test beside it pins that every ecosystem crosses it.
+/// test beside it asserts that its image is exactly
+/// [`Ecosystem::ALL`](dependable_fetch::Ecosystem::ALL) — the list the defining
+/// crate keeps beside the exhaustive matches a new variant breaks.
 ///
 /// The accepted spellings are the canonical lowercase names and nothing else.
 /// Aliases (`kotlin`, `java`, `deno`, `nuget`) are deliberately absent: every
@@ -451,31 +453,23 @@ mod tests {
 
     use dependable_fetch::Ecosystem;
 
-    /// Every ecosystem, spelled out. [`Ecosystem`] is `#[non_exhaustive]`, so a
-    /// manual list is the strongest guard available — the same one
-    /// `dependable-core`'s own `ALL` uses.
-    const ALL: [Ecosystem; 9] = [
-        Ecosystem::Rust,
-        Ecosystem::Go,
-        Ecosystem::Npm,
-        Ecosystem::Python,
-        Ecosystem::Php,
-        Ecosystem::Dart,
-        Ecosystem::CSharp,
-        Ecosystem::Elixir,
-        Ecosystem::Jvm,
-    ];
-
     /// Adding an ecosystem without adding its `--ecosystem` value would leave a
     /// supported ecosystem unfilterable, and — worse — leave `--ecosystem` unable
-    /// to say so. A missing variant fails here rather than at a user's prompt.
+    /// to say so.
+    ///
+    /// The comparison is against [`Ecosystem::ALL`], not against a second list
+    /// written here: a list local to this test would be updated by the same hand
+    /// that forgot the variant, and would agree with itself for ever. `ALL` lives
+    /// in `dependable-core` beside the exhaustive matches a new variant does not
+    /// compile past, so it is the one list a new ecosystem cannot be added
+    /// without meeting.
     #[test]
     fn every_ecosystem_can_be_named_on_the_command_line() {
         let nameable: Vec<Ecosystem> = EcosystemArg::value_variants()
             .iter()
             .map(|arg| Ecosystem::from(*arg))
             .collect();
-        assert_eq!(nameable, ALL.to_vec());
+        assert_eq!(nameable, Ecosystem::ALL.to_vec());
     }
 
     /// The one value whose derived spelling is wrong: clap kebab-cases `CSharp`
