@@ -915,7 +915,7 @@ pub async fn run_fix(args: FixArgs) -> anyhow::Result<ExitCode> {
             continue;
         };
         report_inherited_skips(manifest, &report);
-        let plan = fix::plan(manifest, &report.results, args.all)?;
+        let plan = fix::plan(manifest, &report.results, args.all, args.overrides)?;
         report_declined_fixes(manifest, &plan.declined);
         planned.push(plan);
     }

@@ -434,3 +434,166 @@ fn a_run_with_no_declines_still_says_everything_is_up_to_date() {
     );
     assert!(!stderr.contains("note: left"), "stderr: {stderr}");
 }
+
+// ---------------------------------------------------------------------------
+// Forced versions (issue #111)
+//
+// An `overrides` / `resolutions` entry forces a version onto the resolved tree.
+// `fix` skipped the whole kind before it ever looked at whether an update was
+// waiting, so a stale forced version was indistinguishable from one with nothing
+// to do — `check` reported it and `fix` answered "Everything is already up to
+// date." The default is still never to write over one; `--overrides` is how the
+// author asks.
+// ---------------------------------------------------------------------------
+
+/// A `package.json` forcing `lodash` to `1.0.0`, beside an ordinary dependency
+/// that is already current so it contributes nothing to the counts below.
+const FORCED_VERSION_MANIFEST: &str = "{\n  \"name\": \"app\",\n  \"dependencies\": {\n    \
+                                       \"react\": \"^18.0.0\"\n  },\n  \"overrides\": {\n    \
+                                       \"lodash\": \"1.0.0\"\n  }\n}\n";
+
+/// `lodash` with a newer patch line and a newer major, and a `react` that has
+/// only the release already declared. Written out rather than built by
+/// [`packument`], which names `lodash` in every entry it writes.
+fn forced_version_routes() -> Vec<(String, String)> {
+    vec![
+        (
+            "/lodash".to_string(),
+            packument(&["1.0.0", "1.9.0", "2.0.0"], "2.0.0"),
+        ),
+        (
+            "/react".to_string(),
+            "{\"name\":\"react\",\"dist-tags\":{\"latest\":\"18.0.0\"},\"versions\":\
+             {\"18.0.0\":{\"name\":\"react\",\"version\":\"18.0.0\"}}}"
+                .to_string(),
+        ),
+    ]
+}
+
+/// The defect as reported: an override with a newer release available produced no
+/// output of any kind, and the run claimed to be up to date over the top of it.
+#[test]
+fn a_forced_version_is_reported_instead_of_silently_skipped() {
+    let dir = workdir("fix_forced_version_reported");
+    let base = registry(forced_version_routes());
+    let config = write_config(&dir, &base);
+    let manifest = dir.join("package.json");
+    fs::write(&manifest, FORCED_VERSION_MANIFEST).unwrap();
+
+    let output = run_with_config(&dir, &config, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(output.status.success(), "{stderr}");
+
+    assert!(
+        stderr.contains(&format!(
+            "note: left lodash = 1.0.0 alone in {}",
+            manifest.display()
+        )) && stderr.contains(
+            "1.9.0 is available, but an override forces this version onto the resolved \
+                 tree; pass --overrides to advance it"
+        ),
+        "no note for the forced version.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        !stdout.contains("Everything is already up to date."),
+        "fix claimed everything was up to date over a forced version it left alone:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Nothing to rewrite. 1 available update left alone"),
+        "stdout: {stdout}"
+    );
+    // Reporting is not rewriting: the pin the author wrote is still exactly there.
+    assert_eq!(
+        fs::read_to_string(&manifest).unwrap(),
+        FORCED_VERSION_MANIFEST
+    );
+}
+
+/// `--all` reaches beyond the declared constraint, and must still stop at a forced
+/// version: it is the flag most likely to be aimed at a tree full of security pins.
+#[test]
+fn fix_all_still_leaves_a_forced_version_alone() {
+    let dir = workdir("fix_forced_version_all");
+    let base = registry(forced_version_routes());
+    let config = write_config(&dir, &base);
+    let manifest = dir.join("package.json");
+    fs::write(&manifest, FORCED_VERSION_MANIFEST).unwrap();
+
+    let output = run_with_config(&dir, &config, &["--all"]);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(output.status.success(), "{stderr}");
+
+    assert!(
+        stderr.contains("note: left lodash = 1.0.0 alone in ")
+            && stderr.contains("2.0.0 is available, but an override forces this version"),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(&manifest).unwrap(),
+        FORCED_VERSION_MANIFEST,
+        "--all rewrote a forced version"
+    );
+}
+
+/// Asked for by name, the forced version moves — and only then.
+#[test]
+fn overrides_are_rewritten_when_asked_for() {
+    let dir = workdir("fix_forced_version_requested");
+    let base = registry(forced_version_routes());
+    let config = write_config(&dir, &base);
+    let manifest = dir.join("package.json");
+    fs::write(&manifest, FORCED_VERSION_MANIFEST).unwrap();
+
+    let output = run_with_config(&dir, &config, &["--overrides", "--all"]);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(output.status.success(), "{stderr}");
+
+    let written = fs::read_to_string(&manifest).unwrap();
+    assert!(
+        written.contains("\"lodash\": \"2.0.0\""),
+        "the forced version was not advanced: {written}"
+    );
+    // One span, in place: the neighbouring dependency and the formatting are not
+    // this command's to touch.
+    assert_eq!(
+        written,
+        FORCED_VERSION_MANIFEST.replace("\"lodash\": \"1.0.0\"", "\"lodash\": \"2.0.0\""),
+        "more than the override's value span changed"
+    );
+    assert!(stdout.contains("Updated 1 dependency."), "stdout: {stdout}");
+    assert!(
+        !stderr.contains("note: left lodash"),
+        "a rewritten override was also reported as left alone: {stderr}"
+    );
+}
+
+/// `--overrides` is the destructive flag in this command, so the mode people use
+/// to find out what it would do must still write nothing.
+#[test]
+fn a_requested_override_rewrite_honours_dry_run() {
+    let dir = workdir("fix_forced_version_dry_run");
+    let base = registry(forced_version_routes());
+    let config = write_config(&dir, &base);
+    let manifest = dir.join("package.json");
+    fs::write(&manifest, FORCED_VERSION_MANIFEST).unwrap();
+    let before = fs::metadata(&manifest).unwrap().modified().unwrap();
+
+    let output = run_with_config(&dir, &config, &["--overrides", "--all", "--dry-run"]);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(output.status.success(), "{stderr}");
+
+    assert!(
+        stdout.contains("lodash 1.0.0 → 2.0.0"),
+        "the dry run did not say what it would do: {stdout}"
+    );
+    assert_eq!(
+        fs::read_to_string(&manifest).unwrap(),
+        FORCED_VERSION_MANIFEST,
+        "a dry run rewrote a forced version"
+    );
+    assert_eq!(fs::metadata(&manifest).unwrap().modified().unwrap(), before);
+}
