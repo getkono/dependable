@@ -47,6 +47,13 @@ pub fn nuget_to_semver(version: &str) -> Option<String> {
 /// Handles interval notation (`[1.0,2.0)`, `[1.0]`, `(1.0,)`, `(,2.0]`), floating
 /// wildcards (`*`, `1.*`, `1.0.*`), and a bare version (`1.0`), which NuGet reads
 /// as an inclusive minimum (`>=1.0`).
+///
+/// Anything else returns the **empty string**, the signal
+/// [`try_to_semver_constraint`](crate::semver::try_to_semver_constraint) reads as a
+/// failed translation. A wildcard shape this does not recognise used to widen to `"*"`,
+/// which matches every version and so reports the newest release as satisfying a
+/// constraint nobody read — a confident `up to date` is the worst available answer for a
+/// constraint that was never understood.
 #[must_use]
 pub fn nuget_constraint_to_semver(constraint: &str) -> String {
     let c = constraint.trim();
@@ -54,7 +61,7 @@ pub fn nuget_constraint_to_semver(constraint: &str) -> String {
         return String::new();
     }
     if c.contains('*') {
-        return floating_range(c).unwrap_or_else(|| "*".to_string());
+        return floating_range(c).unwrap_or_default();
     }
     if c.starts_with('[') || c.starts_with('(') {
         return interval_range(c).unwrap_or_default();

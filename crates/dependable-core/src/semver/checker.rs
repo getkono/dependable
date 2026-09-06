@@ -2,7 +2,7 @@
 
 use ::semver::{Version, VersionReq};
 
-use super::normalize::{normalize_constraint, try_to_semver_constraint};
+use super::normalize::{is_dialect_tag, normalize_range_constraint, try_to_semver_constraint};
 use crate::ecosystem::Ecosystem;
 use crate::result::DependencyStatus;
 
@@ -22,10 +22,15 @@ pub struct Evaluation {
 
 /// Parse a version-requirement string into a [`semver::VersionReq`].
 ///
+/// The string is put through [`normalize_range_constraint`] first, so the ordinary
+/// npm / Composer / Dart spellings of a range — a `||` union, space-separated
+/// comparators, a hyphen range, a stability flag, Dart's `any` — are accepted rather
+/// than rejected as malformed.
+///
 /// # Errors
 /// Returns an error if the (normalized) constraint is not a valid requirement.
 pub fn to_version_req(constraint: &str) -> Result<VersionReq, ::semver::Error> {
-    VersionReq::parse(&normalize_constraint(constraint))
+    VersionReq::parse(&normalize_range_constraint(constraint))
 }
 
 /// Whether `constraint` is an npm dist-tag that tracks the newest release
@@ -100,13 +105,29 @@ pub fn check_version(constraint: &str, versions: &[String], locked_at: Option<&s
         // string, so the intent has to be spelled out.
         Err(_) if constraint.trim().is_empty() => VersionReq::STAR,
         Err(_) if is_latest_tag(constraint) => VersionReq::STAR,
-        // A constraint we cannot read is not an upgrade recommendation. It used to fall
-        // through as `UpdateAvailable`, which reads as "a newer version is waiting for
-        // you" — the one message a dependency whose requirement was never understood
-        // must not send. npm-native ranges the `semver` crate has no dialect for
-        // (`^1 || ^2`, `>=1.0.0 <2.0.0`) land here. Wildcards do not: `1.x` and `1.*`
-        // are requirements the crate parses, so they stay real evaluations and reach
-        // the fix layer, where the wildcard guard declines to pin them.
+        // A constraint that names a channel or a branch rather than a range — npm's
+        // `next`, Composer's `dev-master` — is a declaration this crate has no front-end
+        // for, not input the author got wrong. It is `Undetermined`: nothing is claimed
+        // about the dependency's currency, the run says so on stderr, and `--fail-on any`
+        // still fails on it, but a gate about vulnerabilities or staleness is not failed
+        // because of a dialect gap that is ours. `latest` never reaches here; the ranges
+        // npm and Composer document (`^1 || ^2`, `>=1.0.0 <2.0.0`, `1.2.3 - 2.3.4`,
+        // `2.8.*@dev`) are translated by `normalize_range_constraint` and do not either.
+        Err(_) if is_dialect_tag(constraint) => {
+            return Evaluation {
+                status: DependencyStatus::Undetermined,
+                latest_compatible: None,
+                latest_available: Some(latest_available.to_string()),
+                patch_available: false,
+            };
+        }
+        // What is left is not a range at all — `^^^bogus`, a constraint whose operators
+        // say it means to be one and is not. It used to fall through as
+        // `UpdateAvailable`, which reads as "a newer version is waiting for you" — the
+        // one message a dependency whose requirement was never understood must not send.
+        // Wildcards never land here: `1.x` and `1.*` are requirements the crate parses,
+        // so they stay real evaluations and reach the fix layer, where the wildcard guard
+        // declines to pin them.
         Err(e) => {
             return Evaluation {
                 status: DependencyStatus::Error(format!("unparseable constraint: {e}")),
@@ -313,19 +334,18 @@ mod tests {
         assert!(matches!(e.status, DependencyStatus::Error(_)));
     }
 
-    /// A requirement nobody could parse is not an upgrade recommendation. npm-native
-    /// ranges reach the Rust `semver` crate untranslated, and every one of them used to
+    /// A requirement nobody could parse is not an upgrade recommendation. It used to
     /// come back as `UpdateAvailable` — indistinguishable from a real available upgrade.
+    ///
+    /// `Error` is now reserved for input that is not a range at all: operators that
+    /// announce a range and then do not spell one. The npm and Composer ranges that used
+    /// to land here are translated instead (see
+    /// [`the_ordinary_npm_and_composer_ranges_translate`]), and a name — a dist-tag, a
+    /// branch alias — is `Undetermined`.
     #[test]
-    fn an_unparseable_constraint_is_an_error_not_an_upgrade() {
+    fn a_constraint_that_is_not_a_range_at_all_is_an_error_not_an_upgrade() {
         let versions = vec!["1.0.0".to_string(), "2.0.0".to_string()];
-        for constraint in [
-            "^1 || ^2",
-            ">=1.0.0 <2.0.0",
-            "next",
-            "not-a-range",
-            "workspace:^",
-        ] {
+        for constraint in ["^^^bogus", "workspace:^", ">=<1.0.0", "~~"] {
             let ev = check_version(constraint, &versions, None);
             assert!(
                 matches!(ev.status, DependencyStatus::Error(_)),
@@ -334,6 +354,72 @@ mod tests {
             );
             assert!(ev.latest_compatible.is_none(), "{constraint}");
             // The registry answered, so what it said is still worth reporting.
+            assert_eq!(
+                ev.latest_available.as_deref(),
+                Some("2.0.0"),
+                "{constraint}"
+            );
+        }
+    }
+
+    /// The ranges npm and Composer document are *valid* constraints this crate merely
+    /// had no front-end for, and every one of them used to reach `VersionReq::parse`
+    /// verbatim, fail, and be recorded as a dependency the run could not evaluate — which
+    /// the new `unevaluated` gate turns into exit 2 for the whole repository under the
+    /// shipped Action's default `fail-on: vulnerable`.
+    #[test]
+    fn the_ordinary_npm_and_composer_ranges_translate() {
+        let versions = vec![
+            "15.4.0".to_string(),
+            "16.8.0".to_string(),
+            "17.0.2".to_string(),
+            "19.0.0".to_string(),
+        ];
+        // (constraint, the newest release it admits out of `versions`)
+        for (constraint, compatible) in [
+            (">=16.8.0 <19.0.0", "17.0.2"),
+            ("^15.0.0 || ^16.0.0", "16.8.0"),
+            ("15.4.0 - 17.0.2", "17.0.2"),
+            ("16.8.0 - 17", "17.0.2"),
+            (">= 16.8.0", "19.0.0"),
+            ("any", "19.0.0"),
+            ("@dev", "19.0.0"),
+            ("16.*@dev", "16.8.0"),
+        ] {
+            let ev = check_version(constraint, &versions, None);
+            assert!(
+                !matches!(
+                    ev.status,
+                    DependencyStatus::Error(_) | DependencyStatus::Undetermined
+                ),
+                "{constraint} yielded {:?}",
+                ev.status
+            );
+            assert_eq!(
+                ev.latest_compatible.as_deref(),
+                Some(compatible),
+                "{constraint}"
+            );
+        }
+    }
+
+    /// A name is not a malformed range. npm's `next`, Composer's `dev-master` and a Git
+    /// branch alias are ordinary declarations in dialects this crate has no front-end
+    /// for, so they claim nothing rather than failing the run: `Undetermined` keeps
+    /// `--fail-on any` failing while leaving `--fail-on vulnerable` and
+    /// `--fail-on outdated` — which promise nothing about parseability — alone.
+    #[test]
+    fn a_channel_or_branch_name_is_undetermined_not_an_error() {
+        let versions = vec!["1.0.0".to_string(), "2.0.0".to_string()];
+        for constraint in ["next", "beta", "canary", "dev-master", "not-a-range"] {
+            let ev = check_version(constraint, &versions, None);
+            assert_eq!(
+                ev.status,
+                DependencyStatus::Undetermined,
+                "{constraint} yielded {:?}",
+                ev.status
+            );
+            assert!(ev.latest_compatible.is_none(), "{constraint}");
             assert_eq!(
                 ev.latest_available.as_deref(),
                 Some("2.0.0"),
