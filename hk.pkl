@@ -27,7 +27,10 @@ local test = new Step {
 // catches an assertion that matches unstyled text and would otherwise pass here and
 // fail for whoever runs the suite from a terminal that exports the variable.
 local testColor = new Step {
-    check = "mise run test:color"
+    check = "cargo test --workspace"
+    env {
+        ["FORCE_COLOR"] = "3"
+    }
 }
 
 local coverage = new Step {
