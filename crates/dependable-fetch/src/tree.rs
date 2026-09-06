@@ -12,7 +12,7 @@
 //! — a manifest declares a constraint, not a resolution — except where the
 //! constraint names exactly one release, which [`declared_pin`] reads off it.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use dependable_core::{
@@ -25,6 +25,13 @@ use dependable_core::{
 use thiserror::Error;
 
 /// Directories never descended into while collecting member manifests.
+///
+/// Deliberately **not** [`crate::discover::SKIP_DIRS`], despite listing the same
+/// names today. That list bounds what `list` and `check` scan for manifests to
+/// report on; this one bounds what the graph walk treats as workspace members. The
+/// two answer different questions with different blast radii — adding a name here
+/// silently drops crates from the graph, adding one there only narrows a report —
+/// so they are free to diverge, and unifying them would couple the two decisions.
 const SKIP_DIRS: &[&str] = &["target", "node_modules", ".git", "vendor"];
 
 /// Where a workspace graph's edges came from.
@@ -109,7 +116,7 @@ pub fn build_workspace_graph(
     let root_content = read(&root_dir.join("Cargo.toml"))?;
 
     let excluded = excluded_dirs(&root_dir, &root_content);
-    let members = collect_members(&root_dir, &excluded);
+    let (members, scopes) = collect_members(&root_dir, &root_content, &excluded);
     let workspace_names: HashSet<String> =
         members.iter().map(|member| member.name.clone()).collect();
 
@@ -136,7 +143,7 @@ pub fn build_workspace_graph(
         });
     }
 
-    let graph = shallow_graph(&members, &workspace_names, &roots, &root_content);
+    let graph = shallow_graph(&members, &workspace_names, &roots, &scopes);
     Ok(WorkspaceGraph {
         graph,
         source: GraphSource::Manifests,
@@ -169,58 +176,215 @@ fn excluded_dirs(root_dir: &Path, root_content: &str) -> HashSet<PathBuf> {
         .unwrap_or_default()
 }
 
+/// The authority one `[workspace]` root lends its members: both of Cargo's
+/// inheritance tables, read off that root's manifest.
+///
+/// A single scan can span more than one workspace — a `fuzz/` or `examples/` tree
+/// with its own `[workspace]` is a root in its own right — so "the workspace root"
+/// is not a single thing and each member must be read against the one that
+/// actually governs it. The two tables travel together because a member's
+/// `version.workspace = true` and its `dep.workspace = true` name the *same* root;
+/// answering them from different manifests is the bug this type exists to prevent.
+///
+/// The [`Default`] scope — both tables empty — is what an *opaque* boundary gets:
+/// a root whose manifest cannot be read or parsed lends no authority at all, but
+/// still stops the enclosing root's from reaching past it.
+#[derive(Default)]
+struct Scope {
+    /// `[workspace.package]`, the source of a member's `version.workspace = true`.
+    package_defaults: BTreeMap<String, String>,
+    /// `[workspace.dependencies]`, the source of a member's `dep.workspace = true`.
+    declarations: Vec<Item>,
+}
+
+/// Read a manifest's two workspace inheritance tables.
+///
+/// A table that is absent, or a manifest that does not parse, yields an empty one
+/// — which is the honest answer rather than a fallback: a root declaring no
+/// `[workspace.package] version` resolves its members' `version.workspace = true`
+/// to nothing, never to some other root's number.
+fn scope_of(content: &str) -> Scope {
+    Scope {
+        package_defaults: parse_workspace(content)
+            .map(|ws| ws.package_defaults)
+            .unwrap_or_default(),
+        // A member's `dep.workspace = true` says nothing about what the crate *is* —
+        // its root's declaration does. Resolving against it is what tells a
+        // centrally-declared registry crate from a centrally-declared vendored path,
+        // which the member's own text cannot.
+        declarations: CargoTomlParser
+            .parse(content)
+            .map(|m| m.items)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|item| item.kind == DependencyKind::Workspace)
+            .collect(),
+    }
+}
+
+/// What a directory's `Cargo.toml` tells the walk about the subtree beneath it.
+///
+/// The distinction that matters is between *absent* and *unusable*. A directory
+/// with no manifest is plainly still governed by the enclosing workspace root; a
+/// directory whose manifest exists but cannot be read or parsed is not — it may
+/// well declare a `[workspace]`, and there is no way to tell. Collapsing the two
+/// into "not a workspace" is what would let a crate below an unreadable nested
+/// root inherit a version from a root with no authority over it.
+enum Boundary {
+    /// No `Cargo.toml` here. The enclosing scope still governs what is below.
+    Absent,
+    /// A `Cargo.toml` that was read and parses as TOML.
+    Manifest(String),
+    /// A `Cargo.toml` that exists but could not be read, or is not valid TOML.
+    Opaque,
+}
+
+/// Classify a directory's `Cargo.toml` into a [`Boundary`].
+///
+/// Anything other than "the file is not there" is [`Boundary::Opaque`]: a
+/// permission error, an unreadable device, a directory of that name, or a syntax
+/// error all leave the manifest's contents unknown, and unknown is not the same as
+/// empty.
+fn boundary_at(dir: &Path) -> Boundary {
+    match std::fs::read_to_string(dir.join("Cargo.toml")) {
+        // `CargoTomlParser` fails only when the TOML itself does not parse, which is
+        // exactly the question being asked here.
+        Ok(content) if CargoTomlParser.parse(&content).is_ok() => Boundary::Manifest(content),
+        Ok(_) => Boundary::Opaque,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Boundary::Absent,
+        Err(_) => Boundary::Opaque,
+    }
+}
+
 /// A crate manifest found under the scan root.
 struct Member {
     /// The crate's `[package] name`.
     name: String,
     /// The manifest's text.
     content: String,
-    /// Whether the scan root is this crate's **nearest** `[workspace]` ancestor,
-    /// and so whether the root's `[workspace.package]` table governs it.
+    /// Index into the scan's [`Scope`] arena: the workspace root that governs this
+    /// crate, which is its **nearest** `[workspace]` ancestor.
     ///
-    /// False for a crate inside a nested, independent workspace — a `fuzz/` or
-    /// `examples/` directory with its own `[workspace]` table. Cargo resolves
-    /// those against *their* root; the scan root has no authority over them.
-    governed_by_root: bool,
+    /// The scan root is index 0. A crate inside a nested, independent workspace — a
+    /// `fuzz/` or `examples/` directory with its own `[workspace]` table — points at
+    /// that nested root instead, because Cargo resolves it against *that* one and the
+    /// scan root has no authority over it. An unreadable or unparseable manifest in
+    /// between opens a scope too — an empty one, per [`Boundary::Opaque`].
+    scope: usize,
 }
 
-/// Collect a [`Member`] for every crate under `root_dir`, deduplicated by name.
-/// A crate is treated as in-workspace iff its `[package] name` appears here —
-/// this sidesteps needing a glob engine.
-fn collect_members(root_dir: &Path, excluded: &HashSet<PathBuf>) -> Vec<Member> {
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
-    walk_members(root_dir, root_dir, excluded, &mut seen, &mut out, 64, true);
-    out
-}
-
-/// Whether `dir` holds a `Cargo.toml` declaring a `[workspace]` table.
-fn declares_workspace(dir: &Path) -> bool {
-    std::fs::read_to_string(dir.join("Cargo.toml"))
-        .is_ok_and(|content| parse_workspace(&content).is_some())
-}
-
-fn walk_members(
-    dir: &Path,
+/// Collect a [`Member`] for every crate under `root_dir`, deduplicated by name,
+/// together with the [`Scope`] arena those members index into. A crate is treated
+/// as in-workspace iff its `[package] name` appears here — this sidesteps needing
+/// a glob engine.
+fn collect_members(
     root_dir: &Path,
+    root_content: &str,
     excluded: &HashSet<PathBuf>,
-    seen: &mut HashSet<String>,
-    out: &mut Vec<Member>,
-    depth_left: usize,
-    governed: bool,
-) {
-    // A nested `[workspace]` is a workspace root in its own right. Cargo already
-    // ignores such a subtree, so nobody lists it in `[workspace] exclude`, and the
-    // walk still descends into it — but the scan root's `[workspace.package]` has
-    // no authority there, so nothing at or below this manifest may inherit from it.
-    let governed = governed && (dir == root_dir || !declares_workspace(dir));
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+) -> (Vec<Member>, Vec<Scope>) {
+    let mut walk = Walk {
+        root_dir,
+        excluded,
+        seen: HashMap::new(),
+        members: Vec::new(),
+        // The scan root is index 0, and a nested root can only be pushed after the
+        // root that contains it — so a smaller index is always the outer scope.
+        scopes: vec![scope_of(root_content)],
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            if depth_left == 0 || excluded.contains(&path) {
+    walk.descend(root_dir, 64, 0);
+    (walk.members, walk.scopes)
+}
+
+/// One run of the member walk.
+///
+/// The walk carries state across the whole recursion — the dedup index, the
+/// members found, and the [`Scope`] arena that grows as nested workspace roots are
+/// met — so it lives here rather than in an argument list threaded through every
+/// call. Only what actually varies per directory stays an argument.
+struct Walk<'a> {
+    /// The scan root, the one directory whose `[workspace]` does not open a new scope.
+    root_dir: &'a Path,
+    /// Absolute directories named in the scan root's `[workspace] exclude`.
+    excluded: &'a HashSet<PathBuf>,
+    /// `[package] name` -> index into `members`; a crate name yields one member.
+    seen: HashMap<String, usize>,
+    members: Vec<Member>,
+    scopes: Vec<Scope>,
+}
+
+impl Walk<'_> {
+    /// Record `dir`'s crate, if it holds one, then descend into its subdirectories.
+    fn descend(&mut self, dir: &Path, depth_left: usize, scope: usize) {
+        // Read once: the same text answers both "is this a workspace root?" and "is
+        // this a crate?", and a `cargo fuzz` manifest is routinely both.
+        let manifest = boundary_at(dir);
+        // A nested `[workspace]` is a workspace root in its own right. Cargo already
+        // ignores such a subtree, so nobody lists it in `[workspace] exclude`, and the
+        // walk still descends into it — but the outer root's tables have no authority
+        // there. Everything at or below this manifest resolves against the nested root
+        // instead. The scope is switched *before* this directory's own `[package]` is
+        // read, so a manifest that is both a `[workspace]` and a `[package]` resolves
+        // against itself.
+        let scope = match &manifest {
+            Boundary::Manifest(content)
+                if dir != self.root_dir && parse_workspace(content).is_some() =>
+            {
+                self.scopes.push(scope_of(content));
+                self.scopes.len() - 1
+            }
+            // A manifest that exists but cannot be read or parsed is an opaque
+            // boundary, not an absent one: it may declare a `[workspace]`, and nothing
+            // here can rule that out. Push an empty scope so the crates below it
+            // resolve their `workspace = true` fields to nothing, rather than silently
+            // borrowing an enclosing root's — a file that exists and cannot be read is
+            // not evidence that the outer root governs what is beneath it.
+            Boundary::Opaque if dir != self.root_dir => {
+                self.scopes.push(Scope::default());
+                self.scopes.len() - 1
+            }
+            _ => scope,
+        };
+        if let Boundary::Manifest(content) = manifest
+            && let Some(name) = parse_package_name(&content)
+        {
+            match self.seen.get(&name).copied() {
+                // Two crates can share a `[package] name` across a nested-workspace
+                // boundary, and only one node can carry it. The outer scope wins: a
+                // nested root is only pushed after the root containing it, so a
+                // smaller index is the enclosing one. Between two crates in *sibling*
+                // nested workspaces neither encloses the other, and the smaller index
+                // is then the alphabetically earlier path — arbitrary, but fixed,
+                // which is the point. Without this the answer would follow whichever
+                // one the filesystem happened to hand back first.
+                Some(idx) => {
+                    if scope < self.members[idx].scope {
+                        self.members[idx] = Member {
+                            name,
+                            content,
+                            scope,
+                        };
+                    }
+                }
+                None => {
+                    self.seen.insert(name.clone(), self.members.len());
+                    self.members.push(Member {
+                        name,
+                        content,
+                        scope,
+                    });
+                }
+            }
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        // `read_dir` yields filesystem order, which can differ between machines holding
+        // identical contents. Descending in a fixed order is what makes the walk — and
+        // with it the duplicate-name rule above — reproducible.
+        let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+        paths.sort();
+        for path in paths {
+            if !path.is_dir() || depth_left == 0 || self.excluded.contains(&path) {
                 continue;
             }
             if let Some(name) = path.file_name().and_then(|n| n.to_str())
@@ -228,25 +392,7 @@ fn walk_members(
             {
                 continue;
             }
-            walk_members(
-                &path,
-                root_dir,
-                excluded,
-                seen,
-                out,
-                depth_left - 1,
-                governed,
-            );
-        } else if path.file_name().and_then(|n| n.to_str()) == Some("Cargo.toml")
-            && let Ok(content) = std::fs::read_to_string(&path)
-            && let Some(name) = parse_package_name(&content)
-            && seen.insert(name.clone())
-        {
-            out.push(Member {
-                name,
-                content,
-                governed_by_root: governed,
-            });
+            self.descend(&path, depth_left - 1, scope);
         }
     }
 }
@@ -262,42 +408,31 @@ fn walk_members(
 /// which case the manifest has already resolved it and [`declared_pin`] reads it
 /// off.
 ///
-/// `version.workspace = true` is resolved against the root's `[workspace.package]`
-/// only for a member the root actually governs (see [`Member::governed_by_root`]).
-/// A crate in a nested, independent workspace keeps no version at all: reporting
-/// nothing is honest, where borrowing an unrelated root's number would not be.
+/// Both kinds of `workspace = true` — a member's own `version` and its
+/// dependencies — are resolved against [`Member::scope`], the crate's nearest
+/// `[workspace]` ancestor, rather than against the scan root. A crate in a nested,
+/// independent workspace therefore reports what *its* root declares; where that
+/// root declares nothing, nothing is reported, because borrowing an unrelated
+/// root's number would be a confidently wrong answer rather than an absent one.
 fn shallow_graph(
     members: &[Member],
     workspace_names: &HashSet<String>,
     roots: &[String],
-    root_content: &str,
+    scopes: &[Scope],
 ) -> DependencyGraph {
-    // A member's `dep.workspace = true` says nothing about what the crate *is* — the
-    // root's declaration does, and the root is already in hand here. Resolving against
-    // it is what tells a centrally-declared registry crate from a centrally-declared
-    // vendored path, which the member's own text cannot.
-    let declarations: Vec<Item> = CargoTomlParser
-        .parse(root_content)
-        .map(|m| m.items)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|item| item.kind == DependencyKind::Workspace)
-        .collect();
-    // `[workspace.package]`, the source a member's `version.workspace = true`
-    // inherits from. A member that inherits its version still has one.
-    let package_defaults = parse_workspace(root_content)
-        .map(|ws| ws.package_defaults)
-        .unwrap_or_default();
     let mut member_pkgs: Vec<LockedPackage> = Vec::new();
     let mut external_pkgs: Vec<LockedPackage> = Vec::new();
     let mut external_seen: HashMap<String, usize> = HashMap::new();
 
     for member in members {
+        // The root that governs *this* crate, which in a scan spanning more than one
+        // workspace is not necessarily the scan root.
+        let scope = &scopes[member.scope];
         let mut items = CargoTomlParser
             .parse(&member.content)
             .map(|m| m.items)
             .unwrap_or_default();
-        let _ = resolve_workspace_inheritance(&mut items, &declarations);
+        let _ = resolve_workspace_inheritance(&mut items, &scope.declarations);
         let mut deps: Vec<String> = Vec::new();
         for item in &items {
             deps.push(item.name.clone());
@@ -305,8 +440,8 @@ fn shallow_graph(
                 continue;
             }
             // Items are inheritance-resolved by now, so a member's
-            // `dep.workspace = true` pointing at a root `= "1.0.200"` is read here
-            // as the pin the root declared.
+            // `dep.workspace = true` pointing at its own root's `= "1.0.200"` is read
+            // here as the pin that root declared.
             let pin = declared_pin(item, Ecosystem::Rust).map(str::to_owned);
             match external_seen.get(&item.name) {
                 // One node for the name, so a version survives only where every
@@ -348,15 +483,7 @@ fn shallow_graph(
         let version = parse_project(ManifestKind::CargoToml, &member.content)
             .version
             .as_ref()
-            .and_then(|field| {
-                if member.governed_by_root {
-                    field.resolve(&package_defaults, "version")
-                } else {
-                    // Not this root's crate to resolve — take only what its own
-                    // manifest states outright.
-                    field.literal()
-                }
-            })
+            .and_then(|field| field.resolve(&scope.package_defaults, "version"))
             .map(str::to_owned);
         member_pkgs.push(LockedPackage::new(member.name.clone(), version, None, deps));
     }

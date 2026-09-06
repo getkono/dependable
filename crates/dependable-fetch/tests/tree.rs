@@ -326,10 +326,12 @@ version.workspace = true
 /// `examples/` tree with its own `[workspace]` — because Cargo already ignores such
 /// a subtree, so nobody lists it in `[workspace] exclude`. The outer root has no
 /// authority over those crates, so its `[workspace.package] version` must not be
-/// handed to them: that would turn "no version" into a confidently wrong one.
+/// handed to them. The nested root's own table is the one that governs them, and it
+/// is one directory up from the crate: reading it is what turns "no version" into
+/// the right one rather than a confidently wrong one.
 /// A version the nested crate states outright is still its own, and still reported.
 #[test]
-fn a_nested_independent_workspace_does_not_inherit_the_outer_roots_version() {
+fn a_nested_independent_workspaces_crate_resolves_against_its_own_root() {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path();
     fs::write(
@@ -386,26 +388,424 @@ version = "7.7.7"
 
     let built = build_workspace_graph(dir, &WorkspaceGraphOptions::default()).unwrap();
     assert_eq!(built.source, GraphSource::Manifests);
-    let version_of = |name: &str| {
-        built
-            .graph
-            .nodes()
-            .iter()
-            .find(|n| n.name == name)
-            .unwrap_or_else(|| panic!("a node for {name}"))
-            .version
-            .clone()
-    };
-    assert_eq!(version_of("a").as_deref(), Some("1.0.0"));
+    let g = &built.graph;
+    assert_eq!(version_of(g, "a"), Some("1.0.0"));
     assert_eq!(
-        version_of("a-fuzz"),
-        None,
-        "the outer root does not govern a nested workspace's crate"
+        version_of(g, "a-fuzz"),
+        Some("0.0.0"),
+        "a nested workspace's crate inherits from the nested root, never the outer one"
     );
     assert_eq!(
-        version_of("a-fuzz-stated").as_deref(),
+        version_of(g, "a-fuzz-stated"),
         Some("7.7.7"),
-        "but a version the crate states outright is still its own"
+        "and a version the crate states outright is still its own"
+    );
+}
+
+/// The guard on the fix above: a nested root that declares a `[workspace]` and no
+/// `[workspace.package]` resolves its members' `version.workspace = true` to
+/// nothing. Reaching past it to the outer root's `1.0.0` would be the bug the
+/// scope stack exists to prevent, dressed up as a fallback.
+#[test]
+fn a_nested_root_declaring_no_version_leaves_its_crate_without_one() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    fs::write(
+        dir.join("Cargo.toml"),
+        r#"
+[workspace]
+resolver = "2"
+members = ["crates/a"]
+
+[workspace.package]
+version = "1.0.0"
+"#,
+    )
+    .unwrap();
+    let member = dir.join("crates").join("a");
+    fs::create_dir_all(&member).unwrap();
+    fs::write(
+        member.join("Cargo.toml"),
+        r#"
+[package]
+name = "a"
+version.workspace = true
+"#,
+    )
+    .unwrap();
+    let silent = dir.join("silent");
+    fs::create_dir_all(&silent).unwrap();
+    fs::write(
+        silent.join("Cargo.toml"),
+        r#"
+[workspace]
+
+[package]
+name = "silent"
+version.workspace = true
+"#,
+    )
+    .unwrap();
+
+    let built = build_workspace_graph(dir, &WorkspaceGraphOptions::default()).unwrap();
+    assert_eq!(built.source, GraphSource::Manifests);
+    let g = &built.graph;
+    assert_eq!(version_of(g, "a"), Some("1.0.0"));
+    assert_eq!(
+        version_of(g, "silent"),
+        None,
+        "its own root declares no version, and the outer root's is not a fallback"
+    );
+}
+
+/// Workspaces nest more than one deep — a `fuzz/` tree that itself vendors an
+/// example workspace. The governing root is the *nearest* `[workspace]` ancestor,
+/// so the innermost one wins, for the crate that declares it and for everything
+/// below it.
+#[test]
+fn the_innermost_workspace_root_governs_when_workspaces_nest_twice() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    fs::write(
+        dir.join("Cargo.toml"),
+        r#"
+[workspace]
+resolver = "2"
+
+[workspace.package]
+version = "1.0.0"
+"#,
+    )
+    .unwrap();
+    let outer_member = dir.join("crates").join("a");
+    fs::create_dir_all(&outer_member).unwrap();
+    fs::write(
+        outer_member.join("Cargo.toml"),
+        r#"
+[package]
+name = "a"
+version.workspace = true
+"#,
+    )
+    .unwrap();
+    let mid = dir.join("mid");
+    fs::create_dir_all(&mid).unwrap();
+    fs::write(
+        mid.join("Cargo.toml"),
+        r#"
+[workspace]
+
+[workspace.package]
+version = "2.0.0"
+
+[package]
+name = "mid"
+version.workspace = true
+"#,
+    )
+    .unwrap();
+    let inner = mid.join("inner");
+    fs::create_dir_all(&inner).unwrap();
+    fs::write(
+        inner.join("Cargo.toml"),
+        r#"
+[workspace]
+
+[workspace.package]
+version = "3.0.0"
+
+[package]
+name = "inner"
+version.workspace = true
+"#,
+    )
+    .unwrap();
+    let leaf = inner.join("crates").join("leaf");
+    fs::create_dir_all(&leaf).unwrap();
+    fs::write(
+        leaf.join("Cargo.toml"),
+        r#"
+[package]
+name = "leaf"
+version.workspace = true
+"#,
+    )
+    .unwrap();
+
+    let built = build_workspace_graph(dir, &WorkspaceGraphOptions::default()).unwrap();
+    assert_eq!(built.source, GraphSource::Manifests);
+    let g = &built.graph;
+    assert_eq!(version_of(g, "a"), Some("1.0.0"));
+    // A manifest that is both a `[workspace]` and a `[package]` resolves against
+    // itself, not against the root that contains it.
+    assert_eq!(version_of(g, "mid"), Some("2.0.0"));
+    assert_eq!(version_of(g, "inner"), Some("3.0.0"));
+    assert_eq!(
+        version_of(g, "leaf"),
+        Some("3.0.0"),
+        "the nearest [workspace] ancestor governs, not the outermost"
+    );
+}
+
+/// `[workspace.dependencies]` is the second thing a root lends its members, and it
+/// decides what a `dep.workspace = true` crate *is*. It is scoped exactly like
+/// `[workspace.package]`: a nested workspace's crate takes its own root's
+/// declaration, so a name that root vendors by path is a path crate, even though
+/// the outer root declares the same shape of entry as a registry one.
+///
+/// The two names are deliberately different: one node carries one name, so a name
+/// declared on both sides could not distinguish which root was consulted.
+#[test]
+fn a_nested_workspaces_crate_inherits_dependencies_from_its_own_root() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    fs::write(
+        dir.join("Cargo.toml"),
+        r#"
+[workspace]
+resolver = "2"
+
+[workspace.dependencies]
+outer-dep = "1"
+nested-dep = "1"
+"#,
+    )
+    .unwrap();
+    let outer_member = dir.join("crates").join("outer");
+    fs::create_dir_all(&outer_member).unwrap();
+    fs::write(
+        outer_member.join("Cargo.toml"),
+        r#"
+[package]
+name = "outer"
+version = "0.1.0"
+
+[dependencies]
+outer-dep.workspace = true
+"#,
+    )
+    .unwrap();
+    let nested = dir.join("nested");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(
+        nested.join("Cargo.toml"),
+        r#"
+[workspace]
+
+[workspace.dependencies]
+nested-dep = { path = "../vendor/nested-dep" }
+
+[package]
+name = "nested"
+version = "0.1.0"
+
+[dependencies]
+nested-dep.workspace = true
+"#,
+    )
+    .unwrap();
+
+    let built = build_workspace_graph(dir, &WorkspaceGraphOptions::default()).unwrap();
+    assert_eq!(built.source, GraphSource::Manifests);
+    let g = &built.graph;
+    assert_eq!(kind_of(g, "outer-dep"), NodeKind::Registry);
+    // The outer root declares `nested-dep = "1"` too, and consulting it would make
+    // this a registry crate. The nested root is the one with authority here.
+    assert_eq!(
+        kind_of(g, "nested-dep"),
+        NodeKind::Path,
+        "a nested workspace's crate inherits from the nested root's declarations"
+    );
+}
+
+/// Two crates can share a `[package] name` across a nested-workspace boundary, and
+/// the graph keys nodes by name, so only one of them survives. The outer one does —
+/// it is the crate the scan is actually about — and it does so whichever of the two
+/// the directory walk reaches first, since a version that depends on filesystem
+/// iteration order is not a resolution of anything.
+#[test]
+fn a_name_shared_across_a_nested_boundary_keeps_the_outer_crates_version() {
+    // The same two crates twice, with the directories named so the walk reaches the
+    // outer crate first in one layout and the nested crate first in the other.
+    let built_with = |outer_dir: &str, nested_dir: &str| {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        fs::write(
+            dir.join("Cargo.toml"),
+            r#"
+[workspace]
+resolver = "2"
+
+[workspace.package]
+version = "1.0.0"
+"#,
+        )
+        .unwrap();
+        let outer_member = dir.join(outer_dir);
+        fs::create_dir_all(&outer_member).unwrap();
+        fs::write(
+            outer_member.join("Cargo.toml"),
+            r#"
+[package]
+name = "dup"
+version.workspace = true
+"#,
+        )
+        .unwrap();
+        let nested = dir.join(nested_dir);
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(
+            nested.join("Cargo.toml"),
+            r#"
+[workspace]
+
+[workspace.package]
+version = "9.9.9"
+"#,
+        )
+        .unwrap();
+        let nested_member = nested.join("dup");
+        fs::create_dir_all(&nested_member).unwrap();
+        fs::write(
+            nested_member.join("Cargo.toml"),
+            r#"
+[package]
+name = "dup"
+version.workspace = true
+"#,
+        )
+        .unwrap();
+
+        let built = build_workspace_graph(dir, &WorkspaceGraphOptions::default()).unwrap();
+        assert_eq!(built.source, GraphSource::Manifests);
+        version_of(&built.graph, "dup").map(str::to_owned)
+    };
+
+    assert_eq!(built_with("aaa", "zzz").as_deref(), Some("1.0.0"));
+    assert_eq!(
+        built_with("zzz", "aaa").as_deref(),
+        Some("1.0.0"),
+        "and still the outer crate when the walk meets the nested one first"
+    );
+}
+
+/// Two crates in the *same* scope can share a `[package] name` too — `crates/dup`
+/// and `examples/dup` in one workspace — and there no scope comparison can pick a
+/// winner: both index the same root. First-wins then decides, and what "first"
+/// means is the walk's own sorted descent, not whatever order `read_dir` happened
+/// to return. Without that sort this answer would vary between two machines
+/// holding byte-identical checkouts, which is what makes the sort load-bearing
+/// rather than tidy.
+#[test]
+fn a_name_shared_within_one_scope_settles_on_the_alphabetically_earlier_path() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    fs::write(
+        dir.join("Cargo.toml"),
+        r#"
+[workspace]
+resolver = "2"
+members = ["aaa", "zzz"]
+"#,
+    )
+    .unwrap();
+    // Same name, same (root) scope, different literal versions — so which manifest
+    // the walk records is visible in the graph. Created in reverse alphabetical
+    // order deliberately: a filesystem that reports entries in creation order then
+    // hands back the *wrong* crate first, so the assertion below is answered by the
+    // walk's sort rather than by the directory happening to agree with it.
+    for (subdir, version) in [("zzz", "9.9.9"), ("aaa", "1.1.1")] {
+        let member = dir.join(subdir);
+        fs::create_dir_all(&member).unwrap();
+        fs::write(
+            member.join("Cargo.toml"),
+            format!("[package]\nname = \"dup\"\nversion = \"{version}\"\n"),
+        )
+        .unwrap();
+    }
+
+    let built = build_workspace_graph(dir, &WorkspaceGraphOptions::default()).unwrap();
+    assert_eq!(built.source, GraphSource::Manifests);
+    assert_eq!(
+        version_of(&built.graph, "dup"),
+        Some("1.1.1"),
+        "the sorted walk reaches `aaa` first, on every filesystem"
+    );
+}
+
+/// The scope stack's guarantee has to hold for a nested root that cannot be read at
+/// all. A `Cargo.toml` with a TOML syntax error yields no `[workspace]` table — but
+/// "it does not parse" is not "it is not a workspace", and treating the two alike
+/// would hand every crate beneath it to the outer root, which is precisely the
+/// confidently-wrong number the scope stack exists to prevent. An unusable manifest
+/// is an opaque boundary: nothing is inherited across it, in either direction.
+#[test]
+fn a_crate_under_an_unparseable_nested_root_inherits_nothing() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    fs::write(
+        dir.join("Cargo.toml"),
+        r#"
+[workspace]
+resolver = "2"
+members = ["crates/a"]
+
+[workspace.package]
+version = "1.0.0"
+
+[workspace.dependencies]
+shared-dep = "1"
+"#,
+    )
+    .unwrap();
+    let member = dir.join("crates").join("a");
+    fs::create_dir_all(&member).unwrap();
+    fs::write(
+        member.join("Cargo.toml"),
+        r#"
+[package]
+name = "a"
+version.workspace = true
+"#,
+    )
+    .unwrap();
+    // An unterminated table header: the file exists, and no reader can say whether
+    // it declares a `[workspace]`.
+    let broken = dir.join("fuzz");
+    fs::create_dir_all(&broken).unwrap();
+    fs::write(broken.join("Cargo.toml"), "[workspace\n").unwrap();
+    let below = broken.join("crates").join("target-crate");
+    fs::create_dir_all(&below).unwrap();
+    fs::write(
+        below.join("Cargo.toml"),
+        r#"
+[package]
+name = "target-crate"
+version.workspace = true
+
+[dependencies]
+shared-dep.workspace = true
+"#,
+    )
+    .unwrap();
+
+    let built = build_workspace_graph(dir, &WorkspaceGraphOptions::default()).unwrap();
+    assert_eq!(built.source, GraphSource::Manifests);
+    let g = &built.graph;
+    assert_eq!(
+        version_of(g, "a"),
+        Some("1.0.0"),
+        "the outer root still governs its own members"
+    );
+    assert_eq!(
+        version_of(g, "target-crate"),
+        None,
+        "a crate under an unreadable root inherits no version, least of all the outer root's 1.0.0"
+    );
+    assert_eq!(
+        version_of(g, "shared-dep"),
+        None,
+        "and no dependency constraint either — the outer `[workspace.dependencies]` does not reach across"
     );
 }
 
