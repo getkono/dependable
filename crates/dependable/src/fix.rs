@@ -32,12 +32,13 @@ pub struct FixRecord {
 /// Why `fix` left an update alone that `check` reported.
 ///
 /// Most of these are [`rewrite_constraint`] refusing to substitute a new version
-/// into a constraint. The last three are [`plan_fixes`] itself, which drops a row
-/// before the constraint is ever consulted — a pin held back for want of `--all`,
-/// a row with no version resolved to write, and a row whose constraint already
-/// names the target. Those three were silent, and silence is issue #93's exact
-/// symptom: `check` reports an update, `fix` says everything is up to date. An
-/// override is the one skip still not on this list, and [`plan_fixes`] says why.
+/// into a constraint. The last four are [`plan_fixes`] itself, and none of them
+/// is a property of the constraint's shape: a pin held back for want of `--all`,
+/// a row with no version resolved to write, a row whose constraint already names
+/// the target, and — the one the constraint would have taken outright — an
+/// `overrides` / `resolutions` entry held back for want of `--overrides`. All
+/// four were silent once, and silence is issue #93's exact symptom: `check`
+/// reports an update, `fix` says everything is up to date.
 ///
 /// Carried out of the planner rather than recomputed, because the answer is only
 /// live at the point the guard fires: reconstructing it later would mean a second
@@ -96,6 +97,14 @@ pub enum DeclineReason {
     /// Reached most sharply by a `Vulnerable` row whose only fixed release is the
     /// one already in force: there is an update to report and nothing to write.
     AlreadyAtTarget,
+    /// Not the constraint at all: the entry is an `overrides` / `resolutions`
+    /// value, a version the manifest forces onto the resolved tree. `fix` moves
+    /// one only when `--overrides` asks it to.
+    ///
+    /// Last, and asked last: every reason above it would still stand with
+    /// `--overrides` turned on, so any of them that fits an override is the one
+    /// worth reporting — see the ordering [`plan_fixes`] holds them in.
+    ForcedVersion,
 }
 
 impl DeclineReason {
@@ -104,9 +113,13 @@ impl DeclineReason {
     /// "an update was reported, but ". [`crate::runner`] picks the opening; every
     /// clause here has to read after either.
     ///
-    /// Every reason says what the constraint *is*, not that a rule fired — the
-    /// point of the note is to let the author decide whether to widen the
-    /// constraint by hand, and a rule name would not help them do that.
+    /// Every reason says what the entry *is*, not that a rule fired — the point
+    /// of the note is to let the author decide what to do about it, and a rule
+    /// name would not help them do that. For a constraint reason that means
+    /// deciding whether to widen the constraint by hand; for
+    /// [`ForcedVersion`](Self::ForcedVersion) the decision is whether the pin has
+    /// outlived its reason, so that clause names the flag that acts on the
+    /// answer.
     #[must_use]
     pub fn explain(self) -> &'static str {
         match self {
@@ -155,13 +168,19 @@ impl DeclineReason {
             Self::AlreadyAtTarget => {
                 "the constraint already names it, and nothing newer satisfies the constraint"
             }
+            Self::ForcedVersion => {
+                "an override forces this version onto the resolved tree; pass --overrides to \
+                 advance it"
+            }
         }
     }
 }
 
-/// An update `check` reports that `fix` will not write.
+/// An update `check` reports that `fix` will not write: either a constraint
+/// refused the rewrite, or the entry is a version this manifest forces onto the
+/// resolved tree and no `--overrides` was given.
 ///
-/// The whole point of recording it: without one, a declined constraint and a
+/// The whole point of recording it: without one, a declined update and a
 /// dependency with nothing to do are the same empty result, and `fix` answers
 /// "everything is already up to date" to a manifest `check` just said had an
 /// update waiting.
@@ -215,7 +234,8 @@ pub struct PlannedFix {
 ///
 /// Pinned (`=x.y.z`) deps are skipped unless `all` is set; multi-constraint forms
 /// (containing `,`) are skipped because they can't be rewritten to a single
-/// version.
+/// version. An `overrides` / `resolutions` entry is left alone — and reported —
+/// unless `overrides` is set.
 ///
 /// Planning is separated from writing so a multi-manifest run can compute every rewrite
 /// before it writes any. Writing as it went left the tree half-rewritten when the third
@@ -224,7 +244,12 @@ pub struct PlannedFix {
 /// # Errors
 /// Returns an error if the manifest cannot be read, or if a recorded span no longer
 /// holds the constraint it was planned against.
-pub fn plan(manifest: &Path, results: &[CheckResult], all: bool) -> anyhow::Result<PlannedFix> {
+pub fn plan(
+    manifest: &Path,
+    results: &[CheckResult],
+    all: bool,
+    overrides: bool,
+) -> anyhow::Result<PlannedFix> {
     let content = std::fs::read_to_string(manifest)
         .with_context(|| format!("reading {}", manifest.display()))?;
     // What a rewritten constraint *means* is an ecosystem question, and the file
@@ -232,7 +257,7 @@ pub fn plan(manifest: &Path, results: &[CheckResult], all: bool) -> anyhow::Resu
     // `detect` does not recognize — is not an error here: the rewrite still runs,
     // under the reading that declines the most (see [`rewrite_constraint`]).
     let ecosystem = ManifestKind::detect(manifest).map(ManifestKind::ecosystem);
-    let (updated, records, declined) = plan_fixes(&content, results, all, ecosystem)
+    let (updated, records, declined) = plan_fixes(&content, results, all, overrides, ecosystem)
         .with_context(|| format!("rewriting {}", manifest.display()))?;
     Ok(PlannedFix {
         path: manifest.to_path_buf(),
@@ -294,23 +319,28 @@ pub fn commit(planned: &PlannedFix) -> anyhow::Result<()> {
 /// manifest kind was not recognized, which is treated as the most restrictive
 /// answer rather than as permission.
 ///
+/// `overrides` opts into rewriting an `overrides` / `resolutions` entry, which is
+/// otherwise reported and left in place; see the guard in the loop below.
+///
 /// Returns the rewritten content, the changes made, and the changes *not* made:
 /// every dependency with an update available that this loop left alone, whether
 /// [`rewrite_constraint`] declined it or the loop itself dropped it — a pin
-/// without `--all`, a row with no version resolved to write, or a constraint
-/// already naming the target. The third list exists because it cannot be
-/// recovered afterwards — the caller would have to redo the rewritability,
-/// pinning, and target selection above *and* every guard inside
-/// [`rewrite_constraint`] to learn what this loop already knew and threw away.
+/// without `--all`, a row with no version resolved to write, a constraint
+/// already naming the target, or a forced version without `--overrides`. The
+/// third list exists because it cannot be recovered afterwards — the caller would
+/// have to redo the rewritability, pinning, and target selection above *and*
+/// every guard inside [`rewrite_constraint`] to learn what this loop already knew
+/// and threw away.
 ///
 /// The plan set and the declined set together account for every `has_update()`
-/// row that is rewritable and not an override. That is the invariant the summary
-/// line in [`crate::runner`] rests on: "everything is already up to date" is only
+/// row that is rewritable. That is the invariant the summary line in
+/// [`crate::runner`] rests on: "everything is already up to date" is only
 /// printable when both are empty.
 fn plan_fixes(
     content: &str,
     results: &[CheckResult],
     all: bool,
+    overrides: bool,
     ecosystem: Option<Ecosystem>,
 ) -> anyhow::Result<(String, Vec<FixRecord>, Vec<Declined>)> {
     let mut edits: Vec<Edit> = Vec::new();
@@ -325,21 +355,6 @@ fn plan_fixes(
         if !item.is_rewritable() {
             continue;
         }
-        // An override is a version this manifest deliberately forces onto the resolved
-        // tree — very often a security pin holding a transitive dependency above a
-        // vulnerable release. Reporting that a newer version exists is useful; rewriting
-        // the pin to it defeats the reason the entry was written, so `fix` declines the
-        // whole kind rather than trying to guess which overrides are safe to move.
-        //
-        // Skipped outright rather than recorded in `declined`: that list is for an
-        // update the author could act on. An override is not rewritable by this
-        // tool at all, whatever it says and whatever flags are passed, so a note
-        // offering to explain the refusal would be describing a decision the
-        // author cannot change and did not make. Contrast the pin below, which is
-        // also not a shape refusal and *is* recorded, because `--all` acts on it.
-        if item.kind == DependencyKind::Override {
-            continue;
-        }
         if !result.status.has_update() {
             continue;
         }
@@ -350,6 +365,16 @@ fn plan_fixes(
         // by default configuration, on the path a user is likeliest to hit. The
         // version named is the one `--all` would write, because `--all` is the
         // action the note points at.
+        //
+        // Ahead of the `forced` guard below, and so this is also the reason an
+        // `overrides` entry written as an explicit pin (`=1.2.3`) reports the pin:
+        // `--overrides` on its own would still leave it exactly where it is, so
+        // the flag worth naming is the next one that has to be lifted, not one
+        // that finishes the job. For that entry it takes both, and the notes
+        // disclose them one at a time — with `--all` the pin guard passes and the
+        // `forced` guard below names `--overrides` in turn. Each note is true at
+        // the moment it is printed, which is what
+        // `an_override_that_is_also_a_pin_reports_the_pin` walks through.
         if item.is_pinned() && !all {
             declined.push(Declined {
                 name: item.name.clone(),
@@ -378,8 +403,26 @@ fn plan_fixes(
             });
             continue;
         };
+        // An override is a version this manifest deliberately forces onto the resolved
+        // tree — very often a security pin holding a transitive dependency above a
+        // vulnerable release. Rewriting it to the newest release defeats the reason the
+        // entry was written, so the default is still never to write over one; `fix`
+        // moves it only when `--overrides` asks for it by name.
+        //
+        // Decided *here*, after target selection, and not as an early `continue` at the
+        // top of the loop: the note this produces names a concrete version that is
+        // actually available, so the question it puts to the author — has this pin
+        // outlived its reason? — is one they can answer. Skipped before that, an
+        // override with an update waiting was indistinguishable from one with nothing
+        // to do, which is the same contradiction with `check` that `declined` exists to
+        // remove.
+        let forced = item.kind == DependencyKind::Override && !overrides;
         let new_constraint = match rewrite_constraint(&item.version_constraint, target, ecosystem) {
             Ok(new_constraint) => new_constraint,
+            // Before the `forced` guard, deliberately: a constraint that refuses the
+            // rewrite refuses it whether or not `--overrides` was passed, so an override
+            // carrying a wildcard reports the wildcard — the reason that would still
+            // stand with the flag turned on — rather than a flag that would not help.
             Err(reason) => {
                 declined.push(Declined {
                     name: item.name.clone(),
@@ -402,6 +445,18 @@ fn plan_fixes(
                 constraint: item.version_constraint.clone(),
                 target: Some(target.clone()),
                 reason: DeclineReason::AlreadyAtTarget,
+            });
+            continue;
+        }
+        // Last of the guards, so every reason above it wins over this one: each of
+        // them would still stand with `--overrides` turned on, and this one names
+        // a flag that would then not be the flag to reach for.
+        if forced {
+            declined.push(Declined {
+                name: item.name.clone(),
+                constraint: item.version_constraint.clone(),
+                target: Some(target.clone()),
+                reason: DeclineReason::ForcedVersion,
             });
             continue;
         }
@@ -800,6 +855,7 @@ mod tests {
             content,
             &results,
             true,
+            false,
             Some(ManifestKind::PackageJson.ecosystem()),
         )
         .expect("the plan applies");
@@ -818,16 +874,371 @@ mod tests {
             updated.contains(r#""minimist": "1.2.6""#),
             "the override was rewritten: {updated}"
         );
-        // And it is skipped *silently*. A `Declined` says a constraint refused a
-        // rewrite the author could permit by widening it; an override refuses for a
-        // reason that has nothing to do with its constraint and that no edit to the
-        // constraint would change, so reporting one here would tell the author to go
-        // fix a string that is not the problem.
+        // And it is left alone *out loud* (#111). It used to be skipped before the
+        // update filter ever ran, which made an override with a newer release waiting
+        // indistinguishable from one with nothing to do — so `fix` answered "everything
+        // is already up to date" over a version `check` had just reported. The note is
+        // what the author needs to decide whether the pin has outlived its reason.
         assert_eq!(
             declined,
-            [],
-            "the override was reported as a declined update"
+            [Declined {
+                name: "minimist".to_string(),
+                constraint: "1.2.6".to_string(),
+                target: Some("1.2.8".to_string()),
+                reason: DeclineReason::ForcedVersion,
+            }],
+            "the forced version was not reported"
         );
+    }
+
+    /// [`DeclineReason::ForcedVersion`]'s note offers `--overrides` as the way to
+    /// advance the pin. An override already at the newest release has nothing to
+    /// advance *to*, so that offer must not be made — otherwise every current
+    /// override in the tree invites a flag that would do nothing to it.
+    ///
+    /// What it reports instead is [`DeclineReason::AlreadyAtTarget`], and that is
+    /// the whole of the precedence rule in one row: the reason that would still
+    /// stand with `--overrides` turned on is the one worth printing.
+    #[test]
+    fn an_override_with_nothing_available_reports_the_range_not_the_flag() {
+        let content = r#"{
+  "overrides": {
+    "minimist": "1.2.6"
+  }
+}
+"#;
+        // The same version the override already forces: `plan_fixes` reaches the
+        // rewrite, produces the constraint that is already there, and stops before
+        // the `forced` guard ever runs.
+        let results = results_for(ManifestKind::PackageJson, content, &[("minimist", "1.2.6")]);
+        assert_eq!(results.len(), 1, "the fixture must produce one item");
+
+        let (updated, records, declined) = plan_fixes(
+            content,
+            &results,
+            true,
+            false,
+            Some(ManifestKind::PackageJson.ecosystem()),
+        )
+        .expect("the plan applies");
+        assert_eq!(updated, content);
+        assert!(records.is_empty(), "{records:?}");
+        assert_eq!(
+            declined.iter().map(|item| item.reason).collect::<Vec<_>>(),
+            [DeclineReason::AlreadyAtTarget],
+            "an override with nothing to advance to must not be offered --overrides: {declined:?}"
+        );
+    }
+
+    /// The ordering rule: a constraint that refuses the rewrite refuses it with or
+    /// without `--overrides`, so it — and not the flag — is what the note names.
+    /// Reporting `ForcedVersion` here would point the author at a flag that would
+    /// leave the wildcard exactly where it is.
+    #[test]
+    fn an_override_whose_constraint_also_refuses_reports_the_constraint() {
+        let content = r#"{
+  "resolutions": {
+    "lodash": "1.x"
+  }
+}
+"#;
+        let results = results_for(ManifestKind::PackageJson, content, &[("lodash", "1.9.0")]);
+        assert_eq!(results.len(), 1, "the fixture must produce one item");
+        assert_eq!(results[0].item.kind, DependencyKind::Override);
+
+        let (_, records, declined) = plan_fixes(
+            content,
+            &results,
+            false,
+            false,
+            Some(ManifestKind::PackageJson.ecosystem()),
+        )
+        .expect("the plan applies");
+        assert!(records.is_empty(), "{records:?}");
+        assert_eq!(
+            declined.iter().map(|item| item.reason).collect::<Vec<_>>(),
+            [DeclineReason::WildcardPins],
+            "{declined:?}"
+        );
+    }
+
+    /// …and it still holds when the flag *is* set: `--overrides` lifts the kind
+    /// guard, not the constraint guards.
+    #[test]
+    fn a_requested_override_still_obeys_its_constraint() {
+        let content = r#"{
+  "resolutions": {
+    "lodash": "1.x"
+  }
+}
+"#;
+        let results = results_for(ManifestKind::PackageJson, content, &[("lodash", "1.9.0")]);
+
+        let (updated, records, declined) = plan_fixes(
+            content,
+            &results,
+            false,
+            true,
+            Some(ManifestKind::PackageJson.ecosystem()),
+        )
+        .expect("the plan applies");
+        assert_eq!(updated, content, "the wildcard was pinned");
+        assert!(records.is_empty(), "{records:?}");
+        assert_eq!(
+            declined.iter().map(|item| item.reason).collect::<Vec<_>>(),
+            [DeclineReason::WildcardPins],
+            "{declined:?}"
+        );
+    }
+
+    /// An override written as an explicit pin answers to two flags, and only one
+    /// of them moves it. `--all` is that one: the pin guard fires first, so
+    /// `--overrides` alone leaves the entry exactly where it is and a
+    /// [`DeclineReason::ForcedVersion`] note would name the flag that does not
+    /// act. The rule is the same one the wildcard case states — the reason that
+    /// survives `--overrides` is the reason the note carries.
+    #[test]
+    fn an_override_that_is_also_a_pin_reports_the_pin() {
+        let content = r#"{
+  "overrides": {
+    "lodash": "=1.0.0"
+  }
+}
+"#;
+        let results = results_for(ManifestKind::PackageJson, content, &[("lodash", "1.9.0")]);
+        assert_eq!(results.len(), 1, "the fixture must produce one item");
+        assert_eq!(results[0].item.kind, DependencyKind::Override);
+        assert!(results[0].item.is_pinned(), "the fixture must be a pin");
+
+        // Even with `--overrides` asked for by name: the flag that would move this
+        // entry is `--all`, and that is what the note has to say.
+        for overrides in [false, true] {
+            let (updated, records, declined) = plan_fixes(
+                content,
+                &results,
+                false,
+                overrides,
+                Some(ManifestKind::PackageJson.ecosystem()),
+            )
+            .expect("the plan applies");
+            assert_eq!(updated, content, "the pin was rewritten without `--all`");
+            assert!(records.is_empty(), "{records:?}");
+            assert_eq!(
+                declined.iter().map(|item| item.reason).collect::<Vec<_>>(),
+                [DeclineReason::Pinned],
+                "overrides={overrides}: {declined:?}"
+            );
+        }
+
+        // With `--all` the pin guard passes and the override guard is reached, so
+        // the note moves on to the flag that is now the one still holding it back.
+        let (updated, records, declined) = plan_fixes(
+            content,
+            &results,
+            true,
+            false,
+            Some(ManifestKind::PackageJson.ecosystem()),
+        )
+        .expect("the plan applies");
+        assert_eq!(updated, content, "`--all` alone rewrote a forced version");
+        assert!(records.is_empty(), "{records:?}");
+        assert_eq!(
+            declined.iter().map(|item| item.reason).collect::<Vec<_>>(),
+            [DeclineReason::ForcedVersion],
+            "{declined:?}"
+        );
+
+        // Both flags, and it moves.
+        let (updated, records, declined) = plan_fixes(
+            content,
+            &results,
+            true,
+            true,
+            Some(ManifestKind::PackageJson.ecosystem()),
+        )
+        .expect("the plan applies");
+        assert!(
+            updated.contains(r#""lodash": "=1.9.0""#),
+            "the override was not advanced: {updated}"
+        );
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert!(declined.is_empty(), "{declined:?}");
+    }
+
+    /// A `$name` override is a reference to another entry's constraint, and the
+    /// parser records a zero-width span for it precisely so nothing can splice a
+    /// version over the reference. It is therefore not a decline either: `fix`
+    /// declining to advance it would offer a flag that still could not write it.
+    #[test]
+    fn a_dollar_reference_override_is_never_a_decline_and_never_rewritten() {
+        let content = r#"{
+  "dependencies": {
+    "semver": "^7.5.0"
+  },
+  "overrides": {
+    "semver": "$semver"
+  }
+}
+"#;
+        let results = results_for(ManifestKind::PackageJson, content, &[("semver", "7.6.0")]);
+        assert!(
+            results
+                .iter()
+                .any(|r| r.item.kind == DependencyKind::Override && !r.item.is_rewritable()),
+            "the fixture must produce an unrewritable override"
+        );
+
+        let (updated, records, declined) = plan_fixes(
+            content,
+            &results,
+            true,
+            true,
+            Some(ManifestKind::PackageJson.ecosystem()),
+        )
+        .expect("the plan applies");
+        assert!(
+            updated.contains(r#""semver": "$semver""#),
+            "the reference was overwritten: {updated}"
+        );
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.name.as_str())
+                .collect::<Vec<_>>(),
+            ["semver"],
+            "only the declaration the reference points at is rewritable: {records:?}"
+        );
+        assert!(declined.is_empty(), "{declined:?}");
+    }
+
+    /// The whole point of the flag: asked for by name, the forced version moves.
+    #[test]
+    fn an_override_is_rewritten_when_overrides_are_requested() {
+        let content = r#"{
+  "dependencies": {
+    "monolog": "^2.0"
+  },
+  "overrides": {
+    "minimist": "1.2.6"
+  }
+}
+"#;
+        let results = results_for(
+            ManifestKind::PackageJson,
+            content,
+            &[("minimist", "1.2.8"), ("monolog", "2.9.1")],
+        );
+
+        let (updated, records, declined) = plan_fixes(
+            content,
+            &results,
+            true,
+            true,
+            Some(ManifestKind::PackageJson.ecosystem()),
+        )
+        .expect("the plan applies");
+        assert!(
+            updated.contains(r#""minimist": "1.2.8""#),
+            "the override was not advanced: {updated}"
+        );
+        let mut names: Vec<&str> = records.iter().map(|record| record.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["minimist", "monolog"], "{records:?}");
+        assert!(declined.is_empty(), "{declined:?}");
+    }
+
+    /// `--overrides` *without* `--all`, which is the combination the README
+    /// recommends first and the one every other test here reaches only to watch
+    /// it decline. The write path for it was unpinned: each of the two cases
+    /// passing `all = false, overrides = true` ends in a decline, and every case
+    /// that produces a record passes `all = true`.
+    ///
+    /// A range-form override is the honest fixture for "advances within its
+    /// constraint": `^1.0.0` admits `1.9.0` and refuses `2.0.0`, so the target
+    /// this run picks is visible in the result rather than assumed. Written with
+    /// `latest_available` deliberately *past* `latest_compatible` — with the two
+    /// equal, an `--all` path that ignored the compatible target would pass this
+    /// test unchanged.
+    #[test]
+    fn an_override_advances_within_its_range_without_all() {
+        let content = r#"{
+  "overrides": {
+    "lodash": "^1.0.0"
+  }
+}
+"#;
+        let mut results = results_for(ManifestKind::PackageJson, content, &[("lodash", "1.9.0")]);
+        assert_eq!(results.len(), 1, "the fixture must produce one item");
+        assert_eq!(results[0].item.kind, DependencyKind::Override);
+        assert!(
+            !results[0].item.is_pinned(),
+            "a range-form override must not be a pin, or the pin guard answers first"
+        );
+        results[0].latest_available = Some("2.0.0".to_string());
+
+        let (updated, records, declined) = plan_fixes(
+            content,
+            &results,
+            false,
+            true,
+            Some(ManifestKind::PackageJson.ecosystem()),
+        )
+        .expect("the plan applies");
+
+        assert!(
+            updated.contains(r#""lodash": "^1.9.0""#),
+            "the override was not advanced without `--all`: {updated}"
+        );
+        assert!(
+            !updated.contains("2.0.0"),
+            "`--overrides` alone reached past the constraint: {updated}"
+        );
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| (
+                    record.name.as_str(),
+                    record.from.as_str(),
+                    record.to.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            [("lodash", "^1.0.0", "^1.9.0")],
+            "{records:?}"
+        );
+        assert!(declined.is_empty(), "{declined:?}");
+    }
+
+    /// A pnpm key scopes an override to the parent that pulls the package in:
+    /// `"foo@2>bar"` forces a version onto **bar**. The rewrite must land on that
+    /// entry's own value span — the defect the kind guard originally hid was a
+    /// rewrite aimed at an unrelated package's newest release.
+    #[test]
+    fn a_scoped_pnpm_override_rewrites_the_package_it_names() {
+        let content = r#"{
+  "pnpm": {
+    "overrides": {
+      "foo@2>bar": "1.0.0"
+    }
+  }
+}
+"#;
+        let results = results_for(ManifestKind::PackageJson, content, &[("bar", "1.5.0")]);
+        assert_eq!(results.len(), 1, "the fixture must produce one item");
+        assert_eq!(results[0].item.name, "bar");
+
+        let (updated, records, _declined) = plan_fixes(
+            content,
+            &results,
+            true,
+            true,
+            Some(ManifestKind::PackageJson.ecosystem()),
+        )
+        .expect("the plan applies");
+        assert!(
+            updated.contains(r#""foo@2>bar": "1.5.0""#),
+            "the value span was not the one rewritten: {updated}"
+        );
+        assert_eq!(records.len(), 1, "{records:?}");
     }
 
     /// Every ecosystem, so a guard that is ecosystem-independent is asserted
@@ -1470,6 +1881,7 @@ mod tests {
             content,
             &results,
             false,
+            false,
             Some(ManifestKind::PackageJson.ecosystem()),
         )
         .expect("the plan applies");
@@ -1503,6 +1915,7 @@ mod tests {
             content,
             &results,
             false,
+            false,
             Some(ManifestKind::CargoToml.ecosystem()),
         )
         .expect("the plan applies");
@@ -1528,6 +1941,7 @@ mod tests {
             content,
             &results,
             true,
+            false,
             Some(ManifestKind::CargoToml.ecosystem()),
         )
         .expect("the plan applies");
@@ -1559,6 +1973,7 @@ mod tests {
         let (updated, records, declined) = plan_fixes(
             content,
             &results,
+            false,
             false,
             Some(ManifestKind::CargoToml.ecosystem()),
         )
@@ -1596,6 +2011,7 @@ mod tests {
             content,
             &results,
             false,
+            false,
             Some(ManifestKind::PackageJson.ecosystem()),
         )
         .expect("the plan applies");
@@ -1629,6 +2045,7 @@ mod tests {
         let (_, records, declined) = plan_fixes(
             content,
             &results_for(ManifestKind::PackageJson, content, &[]),
+            false,
             false,
             Some(ManifestKind::PackageJson.ecosystem()),
         )
@@ -1729,6 +2146,7 @@ mod tests {
             content,
             &results,
             false,
+            false,
             Some(ManifestKind::PackageJson.ecosystem()),
         )
         .expect("the plan applies");
@@ -1773,6 +2191,7 @@ mod tests {
             content,
             &results,
             false,
+            false,
             Some(ManifestKind::ComposerJson.ecosystem()),
         )
         .expect("the plan applies");
@@ -1804,6 +2223,7 @@ mod tests {
         let (updated, records, _declined) = plan_fixes(
             content,
             &results,
+            false,
             false,
             Some(ManifestKind::PubspecYaml.ecosystem()),
         )
@@ -1855,6 +2275,7 @@ mod tests {
             member,
             &results,
             false,
+            false,
             Some(ManifestKind::CargoToml.ecosystem()),
         )
         .expect("the plan applies");
@@ -1889,6 +2310,7 @@ mod tests {
         let (updated, records, _declined) = plan_fixes(
             root,
             &results,
+            false,
             false,
             Some(ManifestKind::CargoToml.ecosystem()),
         )
@@ -1972,6 +2394,7 @@ mod tests {
             content,
             &results,
             false,
+            false,
             Some(ManifestKind::PackageJson.ecosystem()),
         )
         .expect("the plan applies");
@@ -2014,6 +2437,7 @@ mod tests {
             content,
             &results,
             true,
+            false,
             Some(ManifestKind::ComposerJson.ecosystem()),
         )
         .expect("the plan applies");
@@ -2065,6 +2489,7 @@ mod tests {
             content,
             &results,
             false,
+            false,
             Some(ManifestKind::CargoToml.ecosystem()),
         )
         .expect("the plan applies");
@@ -2097,6 +2522,7 @@ mod tests {
             content,
             &results,
             false,
+            false,
             Some(ManifestKind::PackageJson.ecosystem()),
         )
         .expect("the plan applies");
@@ -2124,6 +2550,7 @@ mod tests {
         let (updated, records, _declined) = plan_fixes(
             content,
             &results,
+            false,
             false,
             Some(ManifestKind::PackageJson.ecosystem()),
         )

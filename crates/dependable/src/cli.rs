@@ -221,6 +221,11 @@ pub struct FixArgs {
     /// Update all, including beyond the declared constraint.
     #[arg(long)]
     pub all: bool,
+    /// Also rewrite `overrides` / `resolutions` entries — versions this manifest
+    /// forces onto the resolved tree, often to hold a transitive dependency above
+    /// a vulnerable release.
+    #[arg(long)]
+    pub overrides: bool,
     /// Print what would change without writing.
     #[arg(long)]
     pub dry_run: bool,
