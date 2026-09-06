@@ -127,6 +127,22 @@ fn write_config(dir: &Path, base: &str) -> PathBuf {
     config
 }
 
+/// Point npm at one base and Go at another, so a run reaches two registries that can
+/// fail independently. The single-base [`write_config`] cannot express that, and it is
+/// exactly the shape #112 is about.
+fn write_split_config(dir: &Path, npm: &str, go: &str) -> PathBuf {
+    let config = dir.join(".dependable.toml");
+    fs::write(
+        &config,
+        format!(
+            "[npm]\nregistry = \"{npm}\"\n\n[go]\nregistry = \"{go}\"\n\n\
+             [vulnerability]\nenabled = false\n"
+        ),
+    )
+    .unwrap();
+    config
+}
+
 fn check(dir: &Path, config: &Path, args: &[&str]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_dependable"));
     command
@@ -192,7 +208,7 @@ fn a_go_module_the_proxy_answers_410_for_does_not_break_the_gate() {
         "a 410 was not read as an absent module:\n{stdout}"
     );
     assert!(
-        !stderr.contains("the registry did not answer"),
+        !stderr.contains("did not answer"),
         "one private module marked the whole registry unreachable:\n{stderr}"
     );
     assert!(
@@ -444,11 +460,78 @@ fn a_metadata_document_listing_no_versions_is_not_exempt_from_the_gate() {
 
     assert_eq!(code, 2, "stdout: {stdout}\nstderr: {stderr}");
     assert!(
-        stderr.contains("error: cannot honour --fail-on: the registry did not answer"),
+        stderr.contains("error: cannot honour --fail-on: the JVM ("),
         "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains(") registry did not answer"),
+        "the refusal did not name the registry it could not read:\nstderr: {stderr}"
     );
     assert!(
         !stderr.contains("not found in its registry"),
         "an answered-but-empty document was reported as a 404:\n{stderr}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// One registry declines; the other answers
+// ---------------------------------------------------------------------------
+
+/// #112. `registry_unreachable` was one boolean per manifest, so a run whose Go proxy
+/// timed out while npm answered every request could say only "the registry did not
+/// answer" — naming no host, and reading as though nothing at all had been established.
+///
+/// The negative assertion is the whole issue: npm answered, and the refusal must not
+/// implicate it.
+#[test]
+fn the_refusal_names_the_registry_that_declined_and_not_the_one_that_answered() {
+    let dir = workdir("gate_split_registries");
+    let npm_base = registry(vec![(
+        "/express".to_string(),
+        packument("express", &["4.19.2"], "4.19.2"),
+    )]);
+    // A proxy that answers 500 has not said "no such module"; it has declined to answer.
+    let go_base = registry(vec![
+        ("/github.com/acme/thing/@v/list".to_string(), status(500)),
+        ("/github.com/acme/thing/@latest".to_string(), status(500)),
+    ]);
+    let config = write_split_config(&dir, &npm_base, &go_base);
+    fs::write(
+        dir.join("package.json"),
+        "{\"name\":\"app\",\"dependencies\":{\"express\":\"^4.19.0\"}}\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("go.mod"),
+        "module example.com/app\n\ngo 1.22\n\nrequire github.com/acme/thing v0.1.0\n",
+    )
+    .unwrap();
+
+    let output = check(&dir, &config, &["--fail-on", "vulnerable"]);
+    let (stdout, stderr, code) = outcome(&output);
+
+    assert_eq!(code, 2, "stdout: {stdout}\nstderr: {stderr}");
+    let refusal = stderr
+        .lines()
+        .find(|line| line.contains("cannot honour --fail-on"))
+        .unwrap_or_else(|| panic!("no refusal on stderr:\n{stderr}"));
+
+    // The Go proxy is named, by its own host.
+    let go_authority = go_base.trim_start_matches("http://");
+    assert!(
+        refusal.contains(&format!("the Go ({go_authority}) registry did not answer")),
+        "the refusal did not name the Go proxy:\n{refusal}"
+    );
+    // npm answered every request, and must not be implicated in the refusal.
+    let npm_authority = npm_base.trim_start_matches("http://");
+    assert!(
+        !refusal.contains("npm"),
+        "npm answered, but the refusal blamed it:\n{refusal}"
+    );
+    assert!(
+        !refusal.contains(npm_authority),
+        "the refusal named the registry that answered:\n{refusal}"
+    );
+    // The manifest whose registry answered is still evaluated in full.
+    assert!(stdout.contains("express"), "stdout: {stdout}");
 }
