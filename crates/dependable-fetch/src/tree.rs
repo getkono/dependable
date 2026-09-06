@@ -25,6 +25,13 @@ use dependable_core::{
 use thiserror::Error;
 
 /// Directories never descended into while collecting member manifests.
+///
+/// Deliberately **not** [`crate::discover::SKIP_DIRS`], despite listing the same
+/// names today. That list bounds what `list` and `check` scan for manifests to
+/// report on; this one bounds what the graph walk treats as workspace members. The
+/// two answer different questions with different blast radii — adding a name here
+/// silently drops crates from the graph, adding one there only narrows a report —
+/// so they are free to diverge, and unifying them would couple the two decisions.
 const SKIP_DIRS: &[&str] = &["target", "node_modules", ".git", "vendor"];
 
 /// Where a workspace graph's edges came from.
