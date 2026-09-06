@@ -367,9 +367,14 @@ fn plan_fixes(
         // action the note points at.
         //
         // Ahead of the `forced` guard below, and so this is also the reason an
-        // `overrides` entry written as an explicit pin (`=1.2.3`) reports: `--all`
-        // is the flag that would move it, and `--overrides` on its own would still
-        // leave it exactly where it is. Every note names a flag that acts.
+        // `overrides` entry written as an explicit pin (`=1.2.3`) reports the pin:
+        // `--overrides` on its own would still leave it exactly where it is, so
+        // the flag worth naming is the next one that has to be lifted, not one
+        // that finishes the job. For that entry it takes both, and the notes
+        // disclose them one at a time — with `--all` the pin guard passes and the
+        // `forced` guard below names `--overrides` in turn. Each note is true at
+        // the moment it is printed, which is what
+        // `an_override_that_is_also_a_pin_reports_the_pin` walks through.
         if item.is_pinned() && !all {
             declined.push(Declined {
                 name: item.name.clone(),
@@ -1139,6 +1144,67 @@ mod tests {
         let mut names: Vec<&str> = records.iter().map(|record| record.name.as_str()).collect();
         names.sort_unstable();
         assert_eq!(names, ["minimist", "monolog"], "{records:?}");
+        assert!(declined.is_empty(), "{declined:?}");
+    }
+
+    /// `--overrides` *without* `--all`, which is the combination the README
+    /// recommends first and the one every other test here reaches only to watch
+    /// it decline. The write path for it was unpinned: each of the two cases
+    /// passing `all = false, overrides = true` ends in a decline, and every case
+    /// that produces a record passes `all = true`.
+    ///
+    /// A range-form override is the honest fixture for "advances within its
+    /// constraint": `^1.0.0` admits `1.9.0` and refuses `2.0.0`, so the target
+    /// this run picks is visible in the result rather than assumed. Written with
+    /// `latest_available` deliberately *past* `latest_compatible` — with the two
+    /// equal, an `--all` path that ignored the compatible target would pass this
+    /// test unchanged.
+    #[test]
+    fn an_override_advances_within_its_range_without_all() {
+        let content = r#"{
+  "overrides": {
+    "lodash": "^1.0.0"
+  }
+}
+"#;
+        let mut results = results_for(ManifestKind::PackageJson, content, &[("lodash", "1.9.0")]);
+        assert_eq!(results.len(), 1, "the fixture must produce one item");
+        assert_eq!(results[0].item.kind, DependencyKind::Override);
+        assert!(
+            !results[0].item.is_pinned(),
+            "a range-form override must not be a pin, or the pin guard answers first"
+        );
+        results[0].latest_available = Some("2.0.0".to_string());
+
+        let (updated, records, declined) = plan_fixes(
+            content,
+            &results,
+            false,
+            true,
+            Some(ManifestKind::PackageJson.ecosystem()),
+        )
+        .expect("the plan applies");
+
+        assert!(
+            updated.contains(r#""lodash": "^1.9.0""#),
+            "the override was not advanced without `--all`: {updated}"
+        );
+        assert!(
+            !updated.contains("2.0.0"),
+            "`--overrides` alone reached past the constraint: {updated}"
+        );
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| (
+                    record.name.as_str(),
+                    record.from.as_str(),
+                    record.to.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            [("lodash", "^1.0.0", "^1.9.0")],
+            "{records:?}"
+        );
         assert!(declined.is_empty(), "{declined:?}");
     }
 
