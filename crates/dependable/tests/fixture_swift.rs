@@ -425,6 +425,50 @@ fn fix_never_claims_a_swift_project_is_up_to_date() {
     assert!(before.contains("for (name, version) in extraPackages"));
 }
 
+/// The same requirement in the state Apple actually advises a library package to
+/// be in: a `Package.swift` with **no** `Package.resolved` beside it.
+///
+/// The test above cannot catch this one. `sample-swift/` has a `Package.resolved`
+/// pinning four versioned packages, so `fix` counts four `Undetermined` rows and
+/// takes the honest branch on the strength of that count alone. Delete the
+/// resolved file and there is no list to read, so there are *no rows* — the
+/// undetermined count is zero, and a run that read nothing at all used to fall
+/// straight through to "Everything is already up to date."
+#[test]
+fn fix_never_claims_an_unread_swift_project_is_up_to_date() {
+    let dir = scratch("swift_fix_unread");
+    std::fs::copy(
+        fixture("sample-swift/Package.swift"),
+        dir.join("Package.swift"),
+    )
+    .unwrap();
+    assert!(
+        !dir.join("Package.resolved").exists(),
+        "the whole point of this case is the file that is not there"
+    );
+
+    let output = run(&[
+        "fix",
+        "--manifest",
+        dir.join("Package.swift").to_str().unwrap(),
+        "--dry-run",
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert!(
+        !stdout.contains("Everything is already up to date"),
+        "nothing was read, so there is nothing to call up to date; stdout: {stdout}"
+    );
+    // Worded apart from the undetermined case on purpose: an undetermined
+    // dependency was read and could not be checked, this one was never read.
+    assert!(
+        stdout.contains("The dependency list for 1 manifest could not be read"),
+        "stdout: {stdout}"
+    );
+}
+
 /// Live: the one verdict a Swift run can actually give. `SwiftURL` advisories are
 /// keyed by the repository URL with no scheme and no `.git`, and getting that
 /// wrong fails silently — it reports a vulnerable package as clean — so only a
