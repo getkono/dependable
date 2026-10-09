@@ -80,6 +80,7 @@ mod tests {
 
     fn report(path: &str) -> ManifestReport {
         ManifestReport {
+            integrity: crate::output::ScanIntegrity::default(),
             path: PathBuf::from(path),
             ecosystem: Ecosystem::Rust,
             results: Vec::new(),
