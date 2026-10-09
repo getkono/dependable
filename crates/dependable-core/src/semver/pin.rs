@@ -77,10 +77,13 @@ const NOT_IN_A_VERSION: &[char] = &[
 /// that can be reported is the declared one, and the only test that means anything
 /// is whether *that* string parses.
 ///
-/// Note that "exact" is the ecosystem's reading, not the string's shape. A bare
-/// `1.2.3` is an exact version in Maven and Hex, a caret range in Cargo, npm, and
-/// Python, and an open lower bound in NuGet — this reports a pin only where that
-/// ecosystem's own translator already says so.
+/// Note that "exact" is the translator's reading, not the string's shape. A bare
+/// `1.2.3` translates to an exact version for Maven and Hex, a caret range for
+/// Cargo, Python, npm, and Dart, and an open lower bound for NuGet — this reports
+/// a pin only where that ecosystem's translator already says so. For npm and Dart
+/// the caret reading is this tree's, not the ecosystem's: both read a bare version
+/// as exact, so their pins go unreported until the translator agrees (#155 for
+/// npm, #149 for Dart).
 ///
 /// Pure: consults no registry, filesystem, or network.
 ///
@@ -205,6 +208,7 @@ mod tests {
             // -- npm --------------------------------------------------------
             ("^18.0.0", Ecosystem::Npm, None),
             ("latest", Ecosystem::Npm, None),
+            // Exact to npm, but a caret range to this tree's translator (#155).
             ("1.2.3", Ecosystem::Npm, None),
             ("=1.3.0", Ecosystem::Npm, Some("1.3.0")),
             // -- Python -----------------------------------------------------

@@ -397,12 +397,13 @@ fn a_bare_nuget_version_is_a_minimum_and_so_resolves_nothing() {
     }
 }
 
-/// npm reads a bare `1.3.0` as a caret range, exactly as Cargo does, so neither of
-/// these is a pin. The rule is about what the *constraint* admits, not about how
-/// concrete it looks: `"left-pad": "1.3.0"` accepts every 1.x release npm ever
-/// publishes.
+/// The pin rule follows the constraint translator, not how concrete a constraint
+/// looks. npm itself reads a bare `1.3.0` as exact, but this tree's translator
+/// reads it as a caret range, as Cargo does, so `left-pad` is not reported. This
+/// records the current reading, not an endorsement of it: #155 tracks the npm
+/// defect (and #149 the same one for Dart), and fixing it flips this assertion.
 #[test]
-fn a_concrete_looking_npm_constraint_is_still_a_range() {
+fn a_bare_npm_version_is_read_as_a_range_by_this_tree() {
     let dir = TempDir::new().expect("tempdir");
     write(
         &dir.path().join("package.json"),
