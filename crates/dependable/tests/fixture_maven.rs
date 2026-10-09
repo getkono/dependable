@@ -343,11 +343,13 @@ fn the_table_and_the_text_format_both_say_undetermined() {
 
 /// A CI job that reads nothing must not go green. `--fail-on any` asks whether
 /// every dependency is checked and current; an unread version answers neither.
-/// The two narrower gates keep meaning what they say.
+/// The narrower `outdated` gate keeps meaning what it says. (`vulnerable` is not
+/// exercised here: it refuses to run at all without the vulnerability scan this
+/// hermetic helper disables.)
 #[test]
 fn fail_on_any_does_not_pass_a_pom_whose_versions_were_never_read() {
     let dir = pom_dir("maven_parent_only_gate", PARENT_ONLY);
-    for (gate, expected) in [("any", false), ("outdated", true), ("vulnerable", true)] {
+    for (gate, expected) in [("any", false), ("outdated", true)] {
         let output = run(&dir, &["check", ".", "--fail-on", gate]);
         assert_eq!(
             output.status.success(),

@@ -109,7 +109,11 @@ fn level_of(status: &DependencyStatus) -> Option<Level> {
     match status {
         DependencyStatus::Vulnerable => Some(Level::Error),
         DependencyStatus::Outdated | DependencyStatus::UpdateAvailable => Some(Level::Warning),
-        DependencyStatus::Error(_) => Some(Level::Notice),
+        // Both are "this dependency was not checked": one because the registry or the
+        // fetch failed, one because the declared version could not be read. A plain
+        // `Error` got a notice and `Undetermined` got nothing at all, so the status made
+        // honest elsewhere was the one status a pull request never heard about.
+        DependencyStatus::Error(_) | DependencyStatus::Undetermined => Some(Level::Notice),
         _ => None,
     }
 }
@@ -374,6 +378,9 @@ fn message(finding: &Finding<'_>, level: Level) -> String {
         ),
         Level::Notice => match &result.status {
             DependencyStatus::Error(why) => format!("{name} could not be checked: {why}"),
+            DependencyStatus::Undetermined => {
+                format!("{name} could not be checked: its declared version could not be read")
+            }
             other => format!("{name}: {}", other.label()),
         },
     };
@@ -515,14 +522,19 @@ fn counted(count: usize, singular: &str, plural: &str) -> String {
 }
 
 /// The totals line, from the same [`Summary`] the table renderer uses.
+///
+/// `undetermined` is counted beside `errors` because its rows sit in the same table;
+/// leaving it out made a summary listing undetermined rows say `0 errors` and nothing
+/// else about them.
 fn totals(reports: &[ManifestReport]) -> String {
     let summary = Summary::of(reports);
     format!(
-        "{} checked — {} vulnerable, {} outdated, {}, {} up to date.",
+        "{} checked — {} vulnerable, {} outdated, {}, {} undetermined, {} up to date.",
         counted(summary.total, "dependency", "dependencies"),
         summary.vulnerable,
         summary.outdated + summary.update_available,
         counted(summary.error, "error", "errors"),
+        summary.undetermined,
         summary.up_to_date + summary.patch_available
     )
 }
@@ -811,6 +823,7 @@ mod tests {
 
     fn report(path: &str, results: Vec<CheckResult>) -> ManifestReport {
         ManifestReport {
+            integrity: crate::output::ScanIntegrity::default(),
             path: PathBuf::from(path),
             ecosystem: Ecosystem::Rust,
             results,
@@ -1064,6 +1077,22 @@ mod tests {
         assert!(markdown.contains("No outdated or vulnerable dependencies found."));
     }
 
+    /// An undetermined row lands in the errors table, so the totals line has to count
+    /// it too, or the table and the line above it disagree.
+    #[test]
+    fn the_totals_line_counts_undetermined_rows() {
+        let reports = vec![report(
+            "/w/package.json",
+            vec![
+                CheckResult::new(item("next-thing", 1), DependencyStatus::Undetermined),
+                CheckResult::new(item("b", 2), DependencyStatus::UpToDate),
+            ],
+        )];
+        let line = totals(&reports);
+        assert!(line.contains("1 undetermined"), "{line}");
+        assert!(line.contains("0 errors"), "{line}");
+    }
+
     #[test]
     fn the_summary_tabulates_each_level() {
         let reports = vec![report(
@@ -1133,5 +1162,23 @@ mod tests {
     fn table_cells_cannot_break_the_table() {
         assert_eq!(cell("a|b\nc"), "a\\|b c");
         assert_eq!(code_cell("a`b`c"), "`abc`");
+    }
+
+    /// Both statuses mean "this dependency was not checked", and a pull request has to
+    /// hear about both. `Undetermined` produced no annotation at all while a plain
+    /// `Error` got a notice, so the one status that says "we could not read this" was
+    /// the one nobody saw.
+    #[test]
+    fn a_dependency_that_could_not_be_checked_is_annotated_either_way() {
+        assert_eq!(
+            level_of(&DependencyStatus::Undetermined),
+            Some(Level::Notice)
+        );
+        assert_eq!(
+            level_of(&DependencyStatus::Error("boom".to_owned())),
+            Some(Level::Notice)
+        );
+        assert_eq!(level_of(&DependencyStatus::UpToDate), None);
+        assert_eq!(level_of(&DependencyStatus::PatchAvailable), None);
     }
 }
