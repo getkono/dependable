@@ -27,6 +27,7 @@ Validate changes before committing:
 
 ```bash
 mise run test         # correctness (cargo test --workspace)
+mise run test:color   # the same suite with terminal color forced on
 mise run fmt:check    # formatting
 mise run lint         # clippy -D warnings
 mise run coverage     # coverage (informational, no threshold)
