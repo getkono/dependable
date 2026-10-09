@@ -621,7 +621,7 @@ is a composite action that installs the released binary and runs the check:
 
 ```yaml
 - uses: actions/checkout@v4
-- uses: getkono/dependable/.github/actions/dependable-check@v0.1.3
+- uses: getkono/dependable/.github/actions/dependable-check@v0.1.4
   with:
     fail-on: vulnerable
 ```
