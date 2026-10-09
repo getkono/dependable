@@ -1008,9 +1008,11 @@ const TEMPLATE_DIR: &str = "dependable-templates";
 /// would be worse than twenty honest lines.
 #[cfg(feature = "report")]
 fn resolve_report_settings(args: &crate::cli::ReportArgs, cfg: &Config) -> Settings {
-    let env_no_vuln = std::env::var_os("DEPENDABLE_NO_VULN").is_some();
-    let env_no_cache = std::env::var_os("DEPENDABLE_NO_CACHE").is_some();
-    let env_ghsa = std::env::var_os("DEPENDABLE_INCLUDE_GHSA").is_some();
+    // The same value-sensitive reading `check` uses: `DEPENDABLE_NO_VULN=0` keeps the
+    // scan on here too, rather than disabling it because the variable merely exists.
+    let env_no_vuln = env_flag("DEPENDABLE_NO_VULN");
+    let env_no_cache = env_flag("DEPENDABLE_NO_CACHE");
+    let env_ghsa = env_flag("DEPENDABLE_INCLUDE_GHSA");
     let env_concurrency = std::env::var("DEPENDABLE_CONCURRENCY")
         .ok()
         .and_then(|s| s.parse::<usize>().ok());
