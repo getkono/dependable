@@ -95,6 +95,10 @@ fn hex_repository(links: &std::collections::HashMap<String, String>) -> Option<S
 }
 
 impl RegistryFetcher for HexFetcher {
+    fn registry_root(&self) -> Option<&str> {
+        Some(&self.base_url)
+    }
+
     fn fetch_versions<'a>(
         &'a self,
         name: &'a str,
