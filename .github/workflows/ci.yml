@@ -44,13 +44,14 @@ jobs:
         run: mise run fmt:check
       - name: Lint
         run: mise run lint
-      - name: Test
-        run: mise run test
-      # A second run with color forced on. The tree assertions match unstyled
-      # text, and `FORCE_COLOR` outranks the TTY check the default run relies on,
-      # so this is the leg that catches an assertion straddling a style boundary
-      # before it reaches a contributor whose shell exports the variable.
-      - name: Test (color forced)
+      # One step runs both legs: `test:color` depends on `test`, so mise runs the
+      # plain suite first and then the suite again with color forced on. A
+      # separate `mise run test` step before it would run the plain suite twice.
+      # The tree assertions match unstyled text, and `FORCE_COLOR` outranks the
+      # TTY check the default run relies on, so the second leg is what catches an
+      # assertion straddling a style boundary before it reaches a contributor
+      # whose shell exports the variable.
+      - name: Test (plain, then color forced)
         run: mise run test:color
 
   # Run the hermetic test suite on Windows and macOS so those targets are
