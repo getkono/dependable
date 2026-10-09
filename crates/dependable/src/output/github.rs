@@ -594,14 +594,22 @@ fn counted(count: usize, singular: &str, plural: &str) -> String {
 /// vanish into a row of zeros. A Swift project — every checkable pin of which is
 /// undetermined, because the ecosystem publishes no registry — would otherwise
 /// render as a fully checked project with nothing wrong.
+///
+/// The clause appears only when the count is non-zero. A run with no
+/// undetermined row has nothing to disclaim, and leaving its line exactly as it
+/// was keeps every such run's job summary byte-identical to before.
 fn totals(summary: &Summary) -> String {
+    let undetermined = if summary.undetermined == 0 {
+        String::new()
+    } else {
+        format!(", {} undetermined", summary.undetermined)
+    };
     format!(
-        "{} checked — {} vulnerable, {} outdated, {}, {} undetermined, {} up to date.",
+        "{} checked — {} vulnerable, {} outdated, {}{undetermined}, {} up to date.",
         counted(summary.total, "dependency", "dependencies"),
         summary.vulnerable,
         summary.outdated + summary.update_available,
         counted(summary.error, "error", "errors"),
-        summary.undetermined,
         summary.up_to_date + summary.patch_available
     )
 }
@@ -1231,6 +1239,34 @@ mod tests {
         assert!(markdown.starts_with("## dependable\n"));
         assert!(markdown.contains("1 dependency checked"), "{markdown}");
         assert!(markdown.contains("No outdated or vulnerable dependencies found."));
+    }
+
+    /// A run with nothing undetermined keeps the totals line it always had, so
+    /// the job summary of every such run is unchanged; one with an undetermined
+    /// row names the count.
+    #[test]
+    fn the_totals_line_names_undetermined_only_when_there_is_one() {
+        let clean = vec![report(
+            "/w/Cargo.toml",
+            vec![CheckResult::new(item("a", 1), DependencyStatus::UpToDate)],
+        )];
+        assert_eq!(
+            totals(&Summary::of(&clean)),
+            "1 dependency checked — 0 vulnerable, 0 outdated, 0 errors, 1 up to date."
+        );
+
+        let unknown = vec![report(
+            "/w/Cargo.toml",
+            vec![
+                CheckResult::new(item("a", 1), DependencyStatus::UpToDate),
+                CheckResult::new(item("b", 2), DependencyStatus::Undetermined),
+            ],
+        )];
+        assert_eq!(
+            totals(&Summary::of(&unknown)),
+            "2 dependencies checked — 0 vulnerable, 0 outdated, 0 errors, 1 undetermined, \
+             1 up to date."
+        );
     }
 
     #[test]
