@@ -421,18 +421,36 @@ mod tests {
     fn decodes_unicode_escapes_including_surrogate_pairs() {
         // `@scope/pkg` is how a scoped name arrives from generated manifests; the
         // old unescape dropped the backslash and yielded `u0040scope/pkg`.
-        let src = r#"{"dependencies":{"@scope\/pkg":"^1.0.0"}}"#;
-        let values = scan_strings(src);
+        //
+        // The escapes are assembled at run time from a backslash code point, so the
+        // test source cannot be decoded ahead of the scanner by anything that edits
+        // or renders it: what reaches `scan_strings` is the six ASCII bytes of each
+        // escape, and the assertions hold only if the scanner decodes them.
+        let esc = |hex: &str| format!("{}u{hex}", char::from(92u8));
+        let src = format!(
+            r#"{{"dependencies":{{"{}scope\/pkg":"^1.0.0"}}}}"#,
+            esc("0040")
+        );
+        assert!(!src.contains('@'), "the `@` must reach the scanner escaped");
+        let values = scan_strings(&src);
         let got = paths(&values);
         assert!(
             got.contains(&(vec!["dependencies", "@scope/pkg"], "^1.0.0")),
             "got {got:?}"
         );
 
-        // A surrogate pair is one character, not two replacement chars.
-        let src = r#"{"a":"😀"}"#;
-        let v = scan_strings(src);
+        // An escaped surrogate pair is one character, not two replacement chars. The
+        // source holds only ASCII escapes; the emoji exists only once they combine.
+        let src = format!(r#"{{"a":"{}{}"}}"#, esc("D83D"), esc("DE00"));
+        assert!(src.is_ascii());
+        let v = scan_strings(&src);
         assert_eq!(v[0].value, "\u{1F600}");
+
+        // A BMP escape in a value decodes too.
+        let src = format!(r#"{{"a":"caf{}"}}"#, esc("00e9"));
+        assert!(src.is_ascii());
+        let v = scan_strings(&src);
+        assert_eq!(v[0].value, "caf\u{e9}");
 
         // A lone high surrogate has no completion and must not panic.
         let src = r#"{"a":"\uD83D"}"#;
