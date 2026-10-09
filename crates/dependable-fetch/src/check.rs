@@ -1191,8 +1191,14 @@ async fn scan_vulnerabilities(
         if let Some(ids) = osv_results.get(query_idx)
             && !ids.is_empty()
         {
-            results[result_idx].current_vulnerabilities = ids.clone();
-            results[result_idx].status = DependencyStatus::Vulnerable;
+            let result = &mut results[result_idx];
+            result.current_vulnerabilities = ids.clone();
+            result.status = DependencyStatus::Vulnerable;
+            // `Vulnerable` is a real status, established from the lockfile even where
+            // the registry fetch failed. Keeping the fetch's origin made the gate read
+            // the result as still errored — a not-found it ignores, or an unevaluated
+            // dependency that turned exit 1 into exit 2.
+            result.error_origin = ErrorOrigin::None;
         }
     }
     Ok(())
