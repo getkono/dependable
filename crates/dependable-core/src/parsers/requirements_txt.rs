@@ -91,7 +91,10 @@ pub(crate) fn parse_pep508_spec(spec: &str) -> Option<(String, &str, usize)> {
         .find(|c: char| "<>=!~;[ \t@(".contains(c))
         .unwrap_or(spec.len());
     let name = &spec[..name_len];
-    if name.is_empty() {
+    // A leading `-` is an installer option, never a distribution name: PDM documents
+    // editable entries as `"-e ./sub"` inside a PEP 508 array, and reading one as a
+    // spec produced a registry package named `-e`.
+    if name.is_empty() || name.starts_with('-') {
         return None;
     }
 
