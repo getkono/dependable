@@ -343,11 +343,13 @@ fn the_table_and_the_text_format_both_say_undetermined() {
 
 /// A CI job that reads nothing must not go green. `--fail-on any` asks whether
 /// every dependency is checked and current; an unread version answers neither.
-/// The two narrower gates keep meaning what they say.
+/// The narrower `outdated` gate keeps meaning what it says. (`vulnerable` is not
+/// exercised here: it refuses to run at all without the vulnerability scan this
+/// hermetic helper disables.)
 #[test]
 fn fail_on_any_does_not_pass_a_pom_whose_versions_were_never_read() {
     let dir = pom_dir("maven_parent_only_gate", PARENT_ONLY);
-    for (gate, expected) in [("any", false), ("outdated", true), ("vulnerable", true)] {
+    for (gate, expected) in [("any", false), ("outdated", true)] {
         let output = run(&dir, &["check", ".", "--fail-on", gate]);
         assert_eq!(
             output.status.success(),
@@ -578,9 +580,47 @@ fn a_version_beside_an_unnameable_coordinate_is_read_and_reported() {
 fn parent_story(stderr: &str) -> String {
     stderr
         .lines()
-        .find(|line| line.contains("takes its version from") || line.contains("take their version"))
+        .find(|line| line.contains("resolves on its own"))
         .unwrap_or_default()
         .to_owned()
+}
+
+/// A version composed around a property this file declares is not blamed on a
+/// `<parent>` alone.
+///
+/// `1.${minor}.0` is unread because it is composed, not because anything is
+/// inherited: `minor` is declared a few lines up. The warning used to say the
+/// version came from "a `<parent>`, `<dependencyManagement>`, or a property this
+/// file does not declare" — none of which is true of it — so it now names the
+/// composed spelling among its reasons.
+#[test]
+fn a_composed_version_is_not_blamed_on_a_parent() {
+    let dir = pom_dir(
+        "maven_composed_version",
+        "  <properties>\n    \
+         <minor>2</minor>\n  \
+         </properties>\n  \
+         <dependencies>\n    \
+         <dependency>\n      \
+         <groupId>org.example</groupId>\n      \
+         <artifactId>composed</artifactId>\n      \
+         <version>1.${minor}.0</version>\n    \
+         </dependency>\n  \
+         </dependencies>\n",
+    );
+
+    let checked = run(&dir, &["check", "."]);
+    let stderr = String::from_utf8_lossy(&checked.stderr);
+    let story = parent_story(&stderr);
+    assert!(story.contains("org.example:composed"), "{stderr}");
+    assert!(
+        story.contains("composed around a property"),
+        "the warning names the reason that applies: {stderr}"
+    );
+    assert!(
+        !story.contains("takes its version from"),
+        "it must not claim the version comes from elsewhere: {stderr}"
+    );
 }
 
 /// The `system` scope survives a version this parser had to reconstruct.

@@ -34,6 +34,47 @@ pub struct ManifestReport {
     /// "nothing was found wrong" and "nothing was looked at" must not share an
     /// exit code.
     pub dependencies_unread: bool,
+    /// Whether this manifest's results are complete enough to gate a build on.
+    ///
+    /// A scan that could not run produces the same empty advisory lists as a scan that
+    /// found nothing, so without this the exit code cannot tell a clean project from an
+    /// unreachable OSV.
+    pub integrity: ScanIntegrity,
+}
+
+/// How much of what a gate needs was actually established for one manifest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ScanIntegrity {
+    /// The vulnerability scan was asked for and did not complete.
+    pub vulnerability_scan_failed: bool,
+    /// A registry lookup failed for a reason other than the package not existing.
+    ///
+    /// This, and not the count below, is what a `--fail-on` gate cannot be honoured
+    /// through: the registry declined to answer, so the run has no facts about the
+    /// dependencies it asked about.
+    pub registry_unreachable: bool,
+    /// How many dependencies a registry answered about by name: no such package.
+    ///
+    /// Reported, never gated on. Each is a permanent fact about one dependency — a
+    /// private or internal package, one served by a registry this run does not route to,
+    /// a deleted package — and says nothing about the ones that did resolve, so it must
+    /// not turn a whole gate into a failure; it is said plainly on stderr instead.
+    ///
+    /// Counted from [`CheckResult::registry_not_found`], never from the error message:
+    /// the carve-out is only safe while it covers exactly the answers a registry gave.
+    ///
+    /// [`CheckResult::registry_not_found`]: dependable_fetch::CheckResult::registry_not_found
+    pub unresolved: usize,
+    /// How many dependencies this run failed to evaluate on its own.
+    ///
+    /// An `Error` that no registry ever produced: a constraint written in a dialect that
+    /// did not parse, a dependency whose fetch task never ran. Nothing was established
+    /// about the package, and unlike a 404 there is no fact to report in place of a
+    /// status — so a `--fail-on` gate cannot be honoured over it, exactly as it could
+    /// not before the 404 carve-out existed. Folding these in with the 404s let two
+    /// unparseable constraints pass `--fail-on vulnerable` under a note claiming the
+    /// registry had not found them.
+    pub unevaluated: usize,
 }
 
 /// Aggregate status counts across one or more reports.
@@ -67,7 +108,9 @@ pub struct Summary {
     /// [`DependencyStatus::Undetermined`] count: declarations whose currency this
     /// run could not establish. Kept apart from [`local`](Self::local) and
     /// [`git`](Self::git), which are deliberately skipped and therefore clean,
-    /// because these were not skipped on purpose — nothing was learned about them.
+    /// because these were not skipped on purpose — nothing was learned about them:
+    /// an unresolved inheritance, an untranslatable constraint, or a reference to
+    /// something never declared.
     pub undetermined: usize,
     /// How many of the [`manifests`](Self::manifests) had their dependency list go
     /// unread — [`ManifestReport::dependencies_unread`].
@@ -195,6 +238,7 @@ mod tests {
 
     fn report(path: &str, declarations: &[(&str, DependencyStatus)]) -> ManifestReport {
         ManifestReport {
+            integrity: ScanIntegrity::default(),
             path: PathBuf::from(path),
             ecosystem: Ecosystem::Rust,
             results: declarations

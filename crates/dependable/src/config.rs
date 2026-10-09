@@ -17,6 +17,7 @@ use dependable_report::policy::Policy;
 
 /// The full configuration, with sane defaults when the file is absent.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
     pub global: GlobalConfig,
@@ -48,9 +49,25 @@ pub struct Config {
     /// By construction this is the same value [`load_policy`] returns — same
     /// figment, same key — so there is one schema and no way for the two to
     /// disagree.
+    ///
+    /// Declared in every build, and typed as the policy schema only where the
+    /// `report` feature can enforce it. `deny_unknown_fields` on this struct means an
+    /// absent field is a *rejected* field: with the declaration behind the feature, a
+    /// `--no-default-features` build failed to load any config carrying `[policy]` at
+    /// all, exiting 2 on "unknown field: found `policy`" — and the warning path that
+    /// exists precisely to say "this build cannot enforce your policy" was never
+    /// reached. The feature gates what is done with the block, not whether it is a
+    /// known key.
     #[cfg(feature = "report")]
     #[serde(default)]
     pub policy: Policy,
+    /// The `[policy]` block, unread.
+    ///
+    /// See the `report` build's field above: the key stays known so the file still
+    /// loads, and [`crate::runner`] warns that the gate is not enforced.
+    #[cfg(not(feature = "report"))]
+    #[serde(default)]
+    pub policy: figment::value::Dict,
 }
 
 impl Config {
@@ -81,7 +98,7 @@ impl Config {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct GlobalConfig {
     pub concurrency: usize,
     pub include_ghsa: bool,
@@ -103,7 +120,7 @@ impl Default for GlobalConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct RustConfig {
     pub enabled: bool,
     pub registry: String,
@@ -119,7 +136,7 @@ impl Default for RustConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct GoConfig {
     pub enabled: bool,
     pub registry: String,
@@ -135,7 +152,7 @@ impl Default for GoConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct NpmConfig {
     pub enabled: bool,
     pub registry: String,
@@ -154,7 +171,7 @@ impl Default for NpmConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct PythonConfig {
     pub enabled: bool,
     pub registry: String,
@@ -170,7 +187,7 @@ impl Default for PythonConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct PhpConfig {
     pub enabled: bool,
     pub registry: String,
@@ -186,7 +203,7 @@ impl Default for PhpConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct DartConfig {
     pub enabled: bool,
     pub registry: String,
@@ -202,7 +219,7 @@ impl Default for DartConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct CsharpConfig {
     pub enabled: bool,
     pub registry: String,
@@ -218,7 +235,7 @@ impl Default for CsharpConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ElixirConfig {
     pub enabled: bool,
     pub registry: String,
@@ -234,7 +251,7 @@ impl Default for ElixirConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct JvmConfig {
     pub enabled: bool,
     pub registry: String,
@@ -273,7 +290,7 @@ impl Default for SwiftConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct VulnConfig {
     pub enabled: bool,
     pub osv_batch_url: String,
@@ -290,14 +307,22 @@ impl Default for VulnConfig {
 
 /// Load configuration: defaults overlaid with `path` (if present).
 ///
-/// A missing file is not an error — defaults are used. A malformed file falls
-/// back to defaults as well (the runner surfaces nothing fatal for config).
-#[must_use]
-pub fn load_config(path: &Path) -> Config {
+/// A missing file is not an error — defaults are used.
+///
+/// # Errors
+/// A file that is present but cannot be read into the schema is an error. It used to
+/// fall back to `Config::default()`, which silently reset `[global] fail_on` to `none`:
+/// one mistyped value anywhere in the file disarmed the CI gate, and the run then
+/// exited 0 with nothing on stderr to say why. Unknown keys are rejected for the same
+/// reason — `fail-on` with a hyphen was accepted and dropped — matching `[policy]`,
+/// which has always rejected its own typos.
+pub fn load_config(path: &Path) -> Result<Config, Box<figment::Error>> {
     Figment::from(Serialized::defaults(Config::default()))
         .merge(Toml::file(path))
         .extract()
-        .unwrap_or_default()
+        // Boxed: `figment::Error` is 200-odd bytes, and this sits on the hot success
+        // path of every subcommand.
+        .map_err(Box::new)
 }
 
 /// Where a `[policy]` block came from — or why there is none.
@@ -363,6 +388,45 @@ pub fn load_policy(path: &Path) -> Result<PolicySource, Box<figment::Error>> {
 #[must_use]
 pub fn has_policy_table(path: &Path) -> bool {
     Figment::from(Toml::file(path)).find_value("policy").is_ok()
+}
+
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+
+    fn write(name: &str, content: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir()
+            .join("dependable-config-schema-tests")
+            .join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create the scratch directory");
+        let path = dir.join("dependable.toml");
+        std::fs::write(&path, content).expect("write the config");
+        path
+    }
+
+    /// `[policy]` is a known key in every build, enforced or not.
+    ///
+    /// `deny_unknown_fields` turns "not declared" into "rejected", so declaring the
+    /// field only under the `report` feature made a `--no-default-features` build exit 2
+    /// on any config carrying a policy block — including the configs the very warning
+    /// about unenforced policies exists to serve.
+    #[test]
+    fn a_policy_block_loads_whether_or_not_this_build_enforces_it() {
+        let path = write("policy_present", "[policy]\nmax_cvss = 7.0\n");
+        let config = load_config(&path).expect("a config carrying `[policy]` must load");
+        // The rest of the file is still read, so this is not a blanket "ignore
+        // everything" escape hatch.
+        assert!(config.rust.enabled);
+    }
+
+    /// The other half of `deny_unknown_fields`: a key nothing declares is still a hard
+    /// error, in both builds.
+    #[test]
+    fn an_undeclared_key_is_still_rejected() {
+        let path = write("unknown_key", "[nonsense]\nvalue = 1\n");
+        assert!(load_config(&path).is_err());
+    }
 }
 
 #[cfg(all(test, feature = "report"))]
@@ -442,7 +506,7 @@ mod tests {
         };
         assert_eq!(policy.allowed_licenses, vec!["MIT", "Apache-2.0"]);
         assert!(policy.requires_licenses());
-        assert_eq!(load_config(&path).policy, policy);
+        assert_eq!(load_config(&path).expect("a valid config").policy, policy);
     }
 
     #[test]
@@ -451,7 +515,51 @@ mod tests {
         // leaving a gate that looks configured and enforces nothing.
         let path = write("wrong_type", "[policy]\nmax_cvss = \"high\"\n");
         assert!(load_policy(&path).is_err());
-        assert_eq!(load_config(&path).policy, Policy::default());
+        // `load_config` used to return `Policy::default()` here — the same silent
+        // fallback, one layer down. It now refuses the file outright.
+        assert!(load_config(&path).is_err());
+    }
+
+    /// One mistyped value used to reset the *whole* config to defaults, which meant
+    /// `[global] fail_on` silently became `none` and the CI gate was disarmed — with
+    /// nothing on stderr to say so.
+    #[test]
+    fn a_wrong_typed_value_does_not_silently_disarm_the_gate() {
+        let path = write(
+            "wrong_typed_global",
+            "[global]\nfail_on = \"vulnerable\"\nconcurrency = \"twenty\"\n",
+        );
+        assert!(
+            load_config(&path).is_err(),
+            "a bad value must not become defaults"
+        );
+    }
+
+    /// `[policy]` has always rejected its own typos; `[global]` accepted and dropped
+    /// them, so `fail-on` with a hyphen left the gate off and looked configured.
+    #[test]
+    fn an_unknown_key_is_rejected_rather_than_ignored() {
+        for (name, body) in [
+            ("hyphen_key", "[global]\nfail-on = \"vulnerable\"\n"),
+            ("typo_key", "[global]\nconcurency = 4\n"),
+            ("typo_table", "[globl]\nfail_on = \"any\"\n"),
+            (
+                "typo_rust",
+                "[rust]\nregistery = \"https://example.test\"\n",
+            ),
+        ] {
+            let path = write(name, body);
+            assert!(load_config(&path).is_err(), "{name} was accepted");
+        }
+    }
+
+    /// A file that is simply absent is still not an error.
+    #[test]
+    fn a_missing_config_is_defaults() {
+        let path = scratch("missing_config").join("nope.toml");
+        let cfg = load_config(&path).expect("a missing file is not an error");
+        assert_eq!(cfg.global.fail_on, FailOn::None);
+        assert_eq!(cfg.global.concurrency, 20);
     }
 
     #[test]
@@ -485,7 +593,7 @@ mod tests {
         let Ok(PolicySource::Configured(policy)) = load_policy(&path) else {
             panic!("expected a configured policy");
         };
-        assert_eq!(load_config(&path).policy, policy);
+        assert_eq!(load_config(&path).expect("a valid config").policy, policy);
         assert_eq!(policy.fail_on_severity, Some(Severity::High));
     }
 }

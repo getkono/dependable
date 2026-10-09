@@ -7,10 +7,11 @@
 //! is not silently changed (e.g. an npm caret range is not turned into a pin).
 
 use std::collections::HashMap;
+use std::io::Write as _;
 use std::path::Path;
 
 use anyhow::Context;
-use dependable_fetch::{CheckResult, DependencyStatus};
+use dependable_fetch::{CheckResult, DependencyKind, DependencyStatus};
 
 /// A single applied (or would-be-applied) version change.
 #[derive(Debug, Clone)]
@@ -25,38 +26,129 @@ struct Edit {
     line: usize,
     start: usize,
     end: usize,
+    /// The text the span held when the plan was made.
+    ///
+    /// The span comes from a parse that happened before the network check, and the file
+    /// is read again when the plan is made. If anything moved in between — an editor
+    /// auto-save, a `cargo add`, a concurrent `dependable fix` — the offsets now point
+    /// somewhere else, and splicing into them corrupts the manifest. Checking the text
+    /// first is what turns that into a refusal. A change landing *after* the plan, while
+    /// other manifests are still being checked, is refused by [`commit`], which writes
+    /// only over the exact contents the plan was computed from.
+    expected: String,
     replacement: String,
 }
 
-/// Rewrite version constraints in `manifest` to the best available upgrade.
+/// A manifest rewrite that has been computed but not yet written.
+pub struct PlannedFix {
+    /// The manifest the rewrite applies to.
+    pub path: std::path::PathBuf,
+    /// The full new contents.
+    updated: String,
+    /// The contents the plan was computed from, which [`commit`] requires the file to
+    /// still hold before it writes.
+    original: String,
+    /// What changed, for reporting.
+    pub records: Vec<FixRecord>,
+}
+
+/// Compute the rewrite for `manifest` without touching it.
 ///
 /// Pinned (`=x.y.z`) deps are skipped unless `all` is set; multi-constraint forms
 /// (containing `,`) are skipped because they can't be rewritten to a single
-/// version. With `dry_run`, nothing is written.
+/// version.
+///
+/// Planning is separated from writing so a multi-manifest run can compute every rewrite
+/// before it writes any. Writing as it went left the tree half-rewritten when the third
+/// of five manifests failed, with no record of the two already changed.
 ///
 /// # Errors
-/// Returns an error if the manifest cannot be read or written.
-pub fn apply_fixes(
-    manifest: &Path,
-    results: &[CheckResult],
-    all: bool,
-    dry_run: bool,
-) -> anyhow::Result<Vec<FixRecord>> {
+/// Returns an error if the manifest cannot be read, or if a recorded span no longer
+/// holds the constraint it was planned against.
+pub fn plan(manifest: &Path, results: &[CheckResult], all: bool) -> anyhow::Result<PlannedFix> {
     let content = std::fs::read_to_string(manifest)
         .with_context(|| format!("reading {}", manifest.display()))?;
-    let (updated, records) = plan_fixes(&content, results, all);
-    if !dry_run && !records.is_empty() {
-        std::fs::write(manifest, updated)
-            .with_context(|| format!("writing {}", manifest.display()))?;
+    let (updated, records) = plan_fixes(&content, results, all)
+        .with_context(|| format!("rewriting {}", manifest.display()))?;
+    Ok(PlannedFix {
+        path: manifest.to_path_buf(),
+        updated,
+        original: content,
+        records,
+    })
+}
+
+/// Write a planned rewrite, atomically.
+///
+/// The new contents go to a temporary file in the manifest's own directory and are
+/// renamed over it, so a crash, a full disk, or a `SIGINT` leaves the original intact.
+/// `fs::write` truncates first, which meant an interrupted write left a manifest empty
+/// or half-written and no backup to recover from.
+///
+/// The file is read again first, and the write is refused unless it still holds exactly
+/// what the plan was computed from. A run plans every manifest before writing any, and
+/// the network check happens in between, so an editor save, a `cargo add`, or a
+/// concurrent `fix` landing in that window would otherwise be overwritten in silence.
+///
+/// A symlinked manifest is written through: the link is resolved and its target is
+/// replaced, so the link survives and points at the rewritten file. Renaming over the
+/// link itself replaced it with a regular file and left the real manifest unedited.
+///
+/// # Errors
+/// Returns an error if the manifest changed since it was planned, or if the temporary
+/// file cannot be created, written, or renamed.
+pub fn commit(planned: &PlannedFix) -> anyhow::Result<()> {
+    if planned.records.is_empty() {
+        return Ok(());
     }
-    Ok(records)
+    let target = std::fs::canonicalize(&planned.path)
+        .with_context(|| format!("resolving {}", planned.path.display()))?;
+    let current = std::fs::read_to_string(&target)
+        .with_context(|| format!("re-reading {}", planned.path.display()))?;
+    if current != planned.original {
+        anyhow::bail!(
+            "{} changed after it was checked; it was not rewritten — run `fix` again",
+            planned.path.display()
+        );
+    }
+    let directory = target.parent().unwrap_or_else(|| Path::new("."));
+    let mut temp = tempfile::NamedTempFile::new_in(directory).with_context(|| {
+        format!(
+            "creating a temporary file beside {}",
+            planned.path.display()
+        )
+    })?;
+    temp.write_all(planned.updated.as_bytes())
+        .with_context(|| format!("writing {}", planned.path.display()))?;
+    // Flush to the filesystem before the rename, so the rename cannot publish a file
+    // whose contents are still only in memory.
+    temp.as_file()
+        .sync_all()
+        .with_context(|| format!("flushing {}", planned.path.display()))?;
+    // A manifest is usually 0644 while a temporary file is 0600; preserve what was there.
+    #[cfg(unix)]
+    if let Ok(metadata) = std::fs::metadata(&target) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = temp
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(
+                metadata.permissions().mode(),
+            ));
+    }
+    temp.persist(&target)
+        .with_context(|| format!("replacing {}", planned.path.display()))?;
+    Ok(())
 }
 
 /// Compute the rewritten manifest and the applied records from `content` and the
 /// check `results`, with no filesystem IO (the file boundary lives in
 /// [`apply_fixes`]). Format-agnostic: it edits each recorded version span in place,
 /// so JSON, YAML, and TOML manifests are rewritten without reformatting.
-fn plan_fixes(content: &str, results: &[CheckResult], all: bool) -> (String, Vec<FixRecord>) {
+fn plan_fixes(
+    content: &str,
+    results: &[CheckResult],
+    all: bool,
+) -> anyhow::Result<(String, Vec<FixRecord>)> {
     let mut edits: Vec<Edit> = Vec::new();
     let mut records = Vec::new();
     for result in results {
@@ -66,6 +158,14 @@ fn plan_fixes(content: &str, results: &[CheckResult], all: bool) -> (String, Vec
         // recorded span is `0/0/0` — which `apply_edits`' bounds check passes trivially,
         // splicing the new version into byte 0 of line 0 of this file.
         if !item.is_rewritable() {
+            continue;
+        }
+        // An override is a version this manifest deliberately forces onto the resolved
+        // tree — very often a security pin holding a transitive dependency above a
+        // vulnerable release. Reporting that a newer version exists is useful; rewriting
+        // the pin to it defeats the reason the entry was written, so `fix` declines the
+        // whole kind rather than trying to guess which overrides are safe to move.
+        if item.kind == DependencyKind::Override {
             continue;
         }
         let updatable = matches!(
@@ -96,6 +196,7 @@ fn plan_fixes(content: &str, results: &[CheckResult], all: bool) -> (String, Vec
             line: item.version_line,
             start: item.version_col_start,
             end: item.version_col_end,
+            expected: item.version_constraint.clone(),
             replacement: new_constraint.clone(),
         });
         records.push(FixRecord {
@@ -108,9 +209,9 @@ fn plan_fixes(content: &str, results: &[CheckResult], all: bool) -> (String, Vec
     let updated = if edits.is_empty() {
         content.to_string()
     } else {
-        apply_edits(content, &edits)
+        apply_edits(content, &edits)?
     };
-    (updated, records)
+    Ok((updated, records))
 }
 
 /// Build a new constraint from `original`, preserving its leading operator/`v`
@@ -196,7 +297,7 @@ fn is_wildcard(rest: &str) -> bool {
 
 /// Apply byte-range edits to `content`, operating per line. Edits on the same
 /// line are applied right-to-left so earlier offsets stay valid.
-fn apply_edits(content: &str, edits: &[Edit]) -> String {
+fn apply_edits(content: &str, edits: &[Edit]) -> anyhow::Result<String> {
     let mut by_line: HashMap<usize, Vec<&Edit>> = HashMap::new();
     for edit in edits {
         by_line.entry(edit.line).or_default().push(edit);
@@ -211,18 +312,77 @@ fn apply_edits(content: &str, edits: &[Edit]) -> String {
         sorted.sort_by_key(|edit| std::cmp::Reverse(edit.start));
         let mut s = line.to_string();
         for edit in sorted {
-            if edit.start <= edit.end && edit.end <= s.len() {
-                s.replace_range(edit.start..edit.end, &edit.replacement);
-            }
+            // A bounds check alone only proves the span is *inside* the file, not that it
+            // still points at the constraint. The content is re-read after the network
+            // check, so anything that edited the file in between shifts every later
+            // offset — and the splice would land on whatever now occupies them.
+            let found = s
+                .get(edit.start..edit.end)
+                .filter(|found| *found == edit.expected);
+            let Some(_) = found else {
+                anyhow::bail!(
+                    "the manifest changed while it was being checked: expected `{}` at line {}, \
+                     found `{}` — nothing was written; re-run to pick up the new contents",
+                    edit.expected,
+                    edit.line + 1,
+                    s.get(edit.start..edit.end).unwrap_or("<out of range>")
+                );
+            };
+            s.replace_range(edit.start..edit.end, &edit.replacement);
         }
         out.push_str(&s);
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An override forces a version onto the resolved tree — frequently a security pin.
+    /// `fix --all` used to rewrite it to the newest release, undoing the pin; combined
+    /// with a `>`-scoped pnpm key it rewrote it to an unrelated package's newest release.
+    #[test]
+    fn fix_all_leaves_an_override_alone() {
+        let content = r#"{
+  "dependencies": {
+    "monolog": "^2.0"
+  },
+  "overrides": {
+    "minimist": "1.2.6"
+  }
+}
+"#;
+        let results = results_for(
+            ManifestKind::PackageJson,
+            content,
+            &[("minimist", "1.2.8"), ("monolog", "2.9.1")],
+        );
+        assert_eq!(results.len(), 2, "the fixture must produce two items");
+        assert!(
+            results
+                .iter()
+                .any(|r| r.item.kind == DependencyKind::Override),
+            "the fixture must produce an override item"
+        );
+
+        let (updated, records) = plan_fixes(content, &results, true).expect("the plan applies");
+
+        // The override is declined; its non-override neighbour is still fixed, so this
+        // asserts the guard rather than a `--all` path that happens to do nothing.
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.name.as_str())
+                .collect::<Vec<_>>(),
+            ["monolog"],
+            "{records:?}"
+        );
+        assert!(
+            updated.contains(r#""minimist": "1.2.6""#),
+            "the override was rewritten: {updated}"
+        );
+    }
 
     #[test]
     fn rewrite_preserves_operator_prefix() {
@@ -426,9 +586,10 @@ mod tests {
             line: 1,
             start: 9,
             end: 13,
+            expected: "^1.0".to_string(),
             replacement: "^1.5.0".to_string(),
         }];
-        let out = apply_edits(content, &edits);
+        let out = apply_edits(content, &edits).expect("the span still holds `^1.0`");
         assert_eq!(out, "[dependencies]\nserde = \"^1.5.0\"\n");
     }
 
@@ -441,16 +602,18 @@ mod tests {
                 line: 0,
                 start: 2,
                 end: 5,
+                expected: "1.0".to_string(),
                 replacement: "1.9".to_string(),
             },
             Edit {
                 line: 0,
                 start: 8,
                 end: 11,
+                expected: "2.0".to_string(),
                 replacement: "2.9".to_string(),
             },
         ];
-        let out = apply_edits(content, &edits);
+        let out = apply_edits(content, &edits).expect("both spans still hold their text");
         assert_eq!(out, "a=1.9 b=2.9\n");
     }
 
@@ -504,7 +667,7 @@ mod tests {
             content,
             &[("react", "18.2.0"), ("typescript", "5.4.5")],
         );
-        let (updated, records) = plan_fixes(content, &results, false);
+        let (updated, records) = plan_fixes(content, &results, false).expect("the plan applies");
 
         assert_eq!(
             updated,
@@ -542,7 +705,7 @@ mod tests {
             content,
             &[("monolog/monolog", "2.9.1")],
         );
-        let (updated, records) = plan_fixes(content, &results, false);
+        let (updated, records) = plan_fixes(content, &results, false).expect("the plan applies");
 
         assert_eq!(
             updated,
@@ -568,7 +731,7 @@ mod tests {
             content,
             &[("http", "1.2.0"), ("provider", "6.1.0")],
         );
-        let (updated, records) = plan_fixes(content, &results, false);
+        let (updated, records) = plan_fixes(content, &results, false).expect("the plan applies");
 
         // Versions bumped, indentation and the trailing comment untouched.
         assert_eq!(
@@ -612,7 +775,7 @@ mod tests {
             "the old guards would both have passed"
         );
 
-        let (updated, records) = plan_fixes(member, &results, false);
+        let (updated, records) = plan_fixes(member, &results, false).expect("the plan applies");
 
         assert!(records.is_empty(), "{records:?}");
         assert_eq!(
@@ -641,10 +804,57 @@ mod tests {
         );
         assert_eq!(declaration.version_line, 1, "and the span points at it");
 
-        let (updated, records) = plan_fixes(root, &results, false);
+        let (updated, records) = plan_fixes(root, &results, false).expect("the plan applies");
 
         assert_eq!(records.len(), 1, "{records:?}");
         assert_eq!(updated, "[workspace.dependencies]\nserde = \"1.0.219\"\n");
+    }
+
+    /// The span is computed from a parse that happened before the network check, and the
+    /// file is read again at write time. If it moved in between — an editor auto-save, a
+    /// `cargo add`, a concurrent `fix` — the offsets point at different bytes now. The
+    /// old bounds check only proved the span was inside the file, so the splice landed on
+    /// whatever now occupied it and the manifest was silently corrupted.
+    #[test]
+    fn a_span_that_no_longer_holds_its_constraint_is_refused() {
+        let content = "[dependencies]\nserde = \"^1.0\"\n";
+        // The same span, against content where a line was inserted above it.
+        let shifted = "[dependencies]\n# a comment someone just added\nserde = \"^1.0\"\n";
+        let edits = vec![Edit {
+            line: 1,
+            start: 9,
+            end: 13,
+            expected: "^1.0".to_string(),
+            replacement: "^1.5.0".to_string(),
+        }];
+
+        assert!(
+            apply_edits(content, &edits).is_ok(),
+            "the unshifted file still applies"
+        );
+
+        let err = apply_edits(shifted, &edits).expect_err("a moved span must be refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("changed while it was being checked"),
+            "{message}"
+        );
+        assert!(message.contains("nothing was written"), "{message}");
+    }
+
+    /// A span running past the end of its line is refused rather than silently skipped:
+    /// the old code's bounds check dropped such an edit and reported success for it.
+    #[test]
+    fn an_out_of_range_span_is_refused_not_skipped() {
+        let content = "a=1.0\n";
+        let edits = vec![Edit {
+            line: 0,
+            start: 2,
+            end: 99,
+            expected: "1.0".to_string(),
+            replacement: "1.9".to_string(),
+        }];
+        assert!(apply_edits(content, &edits).is_err());
     }
 
     /// The end-to-end shape of issue #87, with no flags and no lockfile.
@@ -670,7 +880,7 @@ mod tests {
             "the fixture must produce a checkable item"
         );
 
-        let (updated, records) = plan_fixes(content, &results, false);
+        let (updated, records) = plan_fixes(content, &results, false).expect("the plan applies");
 
         assert!(records.is_empty(), "{records:?}");
         assert_eq!(updated, content, "the manifest must be byte-identical");
@@ -706,7 +916,7 @@ mod tests {
             "the `--all` branch reads `latest_available`, so the fixture must set it"
         );
 
-        let (updated, records) = plan_fixes(content, &results, true);
+        let (updated, records) = plan_fixes(content, &results, true).expect("the plan applies");
 
         // The wildcard is declined; its non-wildcard neighbour still gets fixed, so
         // this asserts the guard and not a `--all` path that simply does nothing.
@@ -728,5 +938,130 @@ mod tests {
 }
 "#
         );
+    }
+
+    const PACKAGE_JSON: &str = "{\n  \"dependencies\": {\n    \"react\": \"^18.0.0\"\n  }\n}\n";
+    const PACKAGE_JSON_FIXED: &str =
+        "{\n  \"dependencies\": {\n    \"react\": \"^18.2.0\"\n  }\n}\n";
+
+    /// Write `PACKAGE_JSON` to `path` and plan a rewrite of it to `^18.2.0`.
+    fn planned_at(path: &Path) -> PlannedFix {
+        std::fs::write(path, PACKAGE_JSON).unwrap();
+        let results = results_for(
+            ManifestKind::PackageJson,
+            PACKAGE_JSON,
+            &[("react", "18.2.0")],
+        );
+        let planned = plan(path, &results, false).expect("the plan applies");
+        assert_eq!(planned.records.len(), 1, "the fixture must plan one edit");
+        planned
+    }
+
+    /// The write path itself: `commit` publishes the planned bytes, leaves no temporary
+    /// file behind, and keeps the manifest's permissions rather than the temporary
+    /// file's `0600`.
+    #[test]
+    fn commit_writes_the_planned_contents_and_keeps_the_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("package.json");
+        let planned = planned_at(&manifest);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(0o640)).unwrap();
+        }
+
+        commit(&planned).expect("the commit succeeds");
+
+        assert_eq!(
+            std::fs::read_to_string(&manifest).unwrap(),
+            PACKAGE_JSON_FIXED
+        );
+        let entries: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert_eq!(entries.len(), 1, "a temporary file was left behind");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&manifest).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o640);
+        }
+    }
+
+    /// An edit landing between the plan and the write — an editor save, a `cargo add`,
+    /// a concurrent `fix` — is kept, and the write is refused rather than overwriting it.
+    #[test]
+    fn commit_refuses_a_manifest_changed_after_it_was_planned() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("package.json");
+        let planned = planned_at(&manifest);
+        let edited = PACKAGE_JSON.replace("react", "preact");
+        std::fs::write(&manifest, &edited).unwrap();
+
+        let error = commit(&planned).expect_err("a changed manifest must be refused");
+
+        assert!(error.to_string().contains("changed"), "{error:#}");
+        assert_eq!(std::fs::read_to_string(&manifest).unwrap(), edited);
+    }
+
+    /// A symlinked manifest is written through: the link stays a link and its target
+    /// carries the rewrite.
+    #[cfg(unix)]
+    #[test]
+    fn commit_writes_through_a_symlinked_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let target = real.join("package.json");
+        let link = dir.path().join("package.json");
+        std::fs::write(&target, PACKAGE_JSON).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let results = results_for(
+            ManifestKind::PackageJson,
+            PACKAGE_JSON,
+            &[("react", "18.2.0")],
+        );
+        let planned = plan(&link, &results, false).expect("the plan applies");
+
+        commit(&planned).expect("the commit succeeds");
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link was replaced by a regular file"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            PACKAGE_JSON_FIXED
+        );
+    }
+
+    /// A manifest in a directory that cannot be written to fails loudly and is left
+    /// intact — the rename never publishes a partial file.
+    #[cfg(unix)]
+    #[test]
+    fn commit_into_an_unwritable_directory_fails_and_leaves_the_manifest_intact() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("locked");
+        std::fs::create_dir(&sub).unwrap();
+        let manifest = sub.join("package.json");
+        let planned = planned_at(&manifest);
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let outcome = commit(&planned);
+        // Restore before asserting, so the scratch directory can be removed.
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Root ignores directory permissions; there the write simply succeeds.
+        if outcome.is_err() {
+            assert_eq!(std::fs::read_to_string(&manifest).unwrap(), PACKAGE_JSON);
+        } else {
+            assert_eq!(
+                std::fs::read_to_string(&manifest).unwrap(),
+                PACKAGE_JSON_FIXED
+            );
+        }
     }
 }

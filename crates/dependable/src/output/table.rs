@@ -155,14 +155,14 @@ fn print_totals(summary: &Summary) {
     if summary.error > 0 {
         parts.push(format!("{} error", summary.error));
     }
-    let skipped = summary.local + summary.git;
-    if skipped > 0 {
-        parts.push(format!("{skipped} skipped"));
-    }
     // Counted separately from `skipped`: a path dependency was passed over on
     // purpose, an undetermined one is a version this run failed to read.
     if summary.undetermined > 0 {
         parts.push(format!("{} undetermined", summary.undetermined));
+    }
+    let skipped = summary.local + summary.git;
+    if skipped > 0 {
+        parts.push(format!("{skipped} skipped"));
     }
     if parts.is_empty() {
         parts.push("nothing to check".to_string());

@@ -80,9 +80,16 @@ impl Item {
     /// on a line worth reporting, but records a *zero-width* span, and writing a version
     /// into it would produce `numpy1.5.0`. `--fix` gates on this; the reporters, which
     /// only ever read the line, gate on `has_position`.
+    ///
+    /// The width is checked directly rather than inferred from the constraint. A parser
+    /// that knows its offsets have drifted — a JSON value whose escapes make the source
+    /// span and the decoded value disagree — collapses the span to signal exactly that,
+    /// and the constraint it parsed is still perfectly non-empty.
     #[must_use]
     pub fn is_rewritable(&self) -> bool {
-        self.has_position() && !self.version_constraint.is_empty()
+        self.has_position()
+            && !self.version_constraint.is_empty()
+            && self.version_col_end > self.version_col_start
     }
 }
 
@@ -123,6 +130,12 @@ pub enum DependencyKind {
     /// `Package.resolved`). Either way, calling it direct would be a claim the
     /// file does not support.
     Indirect,
+    /// A version this manifest forces onto the tree regardless of what asked for it —
+    /// npm `overrides`, Yarn `resolutions`, `pnpm.overrides`.
+    ///
+    /// Worth reporting precisely because it is how a vulnerable transitive dependency is
+    /// remediated: the pin is the fix, and a stale pin is the fix having quietly expired.
+    Override,
 }
 
 impl DependencyKind {
@@ -137,15 +150,20 @@ impl DependencyKind {
             Self::Peer => "peer",
             Self::Workspace => "workspace",
             Self::Indirect => "indirect",
+            Self::Override => "override",
         }
     }
 
     /// Whether this is a dependency the package itself pulls in — everything except a
-    /// central declaration ([`Workspace`](Self::Workspace)) and a recorded transitive
-    /// ([`Indirect`](Self::Indirect)).
+    /// central declaration ([`Workspace`](Self::Workspace)), a recorded transitive
+    /// ([`Indirect`](Self::Indirect)), and a forced version ([`Override`](Self::Override)).
+    ///
+    /// An override names a package somewhere in the tree, not one this manifest depends
+    /// on, so counting it as direct would inflate the inventory with packages the
+    /// manifest never asked for.
     #[must_use]
     pub fn is_direct(self) -> bool {
-        !matches!(self, Self::Workspace | Self::Indirect)
+        !matches!(self, Self::Workspace | Self::Indirect | Self::Override)
     }
 }
 
@@ -212,6 +230,15 @@ pub enum PackageSource {
     /// [`version_constraint`](Item::version_constraint) — it is written in this file,
     /// and dropping it would report a manifest as stating less than it does.
     Unidentified,
+    /// A real registry package whose declared version this manifest does not, on its
+    /// own, resolve to a range: an npm `"$name"` override naming a dependency the
+    /// manifest never declares.
+    ///
+    /// Not [`Local`](Self::Local) — the package is published and the entry is real —
+    /// and not a parse error: the manifest is valid, its intent simply cannot be read
+    /// from what is written. Nothing is fetched for it, and the checker reports it as
+    /// [`DependencyStatus::Undetermined`](crate::result::DependencyStatus::Undetermined).
+    Unresolved,
 }
 
 #[cfg(test)]
