@@ -883,10 +883,19 @@ fn detached_inheritance(items: &[Item], kind: ManifestKind) -> Vec<String> {
 /// never declared is a *broken* manifest, while a POM deferring to its `<parent>` is
 /// an ordinary, valid, extremely common one — the same status, two different things
 /// to tell the reader.
+///
+/// The wording names every way a POM entry reaches this state, not only the common
+/// one. An empty constraint carries no record of *why* it is empty, and some of the
+/// reasons are in this very file: a version composed around a property the file
+/// does declare (`1.${minor}.0`), or one split across lines by a comment. Blaming
+/// those on a `<parent>` would send the reader to a file that has nothing to do
+/// with it.
 fn deferred_versions(items: &[Item], kind: ManifestKind) -> Option<String> {
-    let source = match kind {
+    let reasons = match kind {
         ManifestKind::PomXml => {
-            "a `<parent>`, `<dependencyManagement>`, or a property this file does not declare"
+            "the version is left to a `<parent>` or `<dependencyManagement>`, names a property this \
+             file does not declare, or is composed around a property (`1.${minor}.0`) or \
+             split across lines by a comment, which this tool does not read"
         }
         _ => return None,
     };
@@ -902,13 +911,13 @@ fn deferred_versions(items: &[Item], kind: ManifestKind) -> Option<String> {
     if names.is_empty() {
         return None;
     }
-    let (subject, verb, object) = if names.len() == 1 {
-        ("dependency", "takes its version", "it")
+    let (subject, object) = if names.len() == 1 {
+        ("dependency states", "it")
     } else {
-        ("dependencies", "take their version", "them")
+        ("dependencies state", "them")
     };
     Some(format!(
-        "{} {subject} {verb} from {source}, so no version was read for {object} and nothing was checked: {}",
+        "{} {subject} no version this file resolves on its own ({reasons}), so no version was read for {object} and nothing was checked: {}",
         names.len(),
         names.join(", ")
     ))
