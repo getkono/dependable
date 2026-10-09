@@ -25,7 +25,9 @@ use dependable_tui::TuiOptions;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use indicatif::{ProgressBar, ProgressStyle};
 
-use crate::cli::{CheckArgs, EcosystemArg, FailOn, FixArgs, Format, ListArgs, TreeArgs, TuiArgs};
+use crate::cli::{
+    CheckArgs, CheckFormat, EcosystemArg, FailOn, FixArgs, Format, ListArgs, TreeArgs, TuiArgs,
+};
 use crate::config::{Config, load_config};
 #[cfg(feature = "report")]
 use crate::config::{PolicySource, load_policy};
@@ -405,6 +407,17 @@ pub async fn run_check(args: CheckArgs) -> anyhow::Result<ExitCode> {
     )?;
     if manifests.is_empty() {
         report_no_manifests(&ecosystems);
+        // The same contract `run_list` keeps: an empty selection still owes a
+        // machine-readable format a document. `json` and `sarif` are what a CI
+        // step captures to a file (the bundled action's `json-path`, a SARIF
+        // upload), and byte-empty stdout there is a parse failure on exactly the
+        // runs exit 0 was chosen to keep green. Both renderers already produce a
+        // valid zero-result document from no reports.
+        //
+        // `table` and `text` keep returning early: a human wants the stderr line.
+        if !matches!(args.format, CheckFormat::Table | CheckFormat::Text) {
+            output::render(args.format, &[], args.quiet)?;
+        }
         return Ok(ExitCode::SUCCESS);
     }
 

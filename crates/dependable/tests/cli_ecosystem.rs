@@ -189,6 +189,51 @@ fn check_narrows_discovery_without_touching_the_network() {
     );
 }
 
+/// `check`'s machine-readable formats owe an empty selection a document, as
+/// `list --format json` does: the bundled action captures `--format json` to a
+/// file and a SARIF upload reads its file, and byte-empty stdout is a parse
+/// failure on exactly the runs exit 0 keeps green. `table` and `text` still print
+/// nothing on stdout — the stderr line is for a human.
+#[test]
+fn an_empty_check_selection_is_an_empty_document_not_empty_stdout() {
+    let dir = workdir("empty_check_document");
+    write(&dir, "mix.exs", MIX_EXS);
+    let path = dir.to_str().expect("utf-8 path");
+    let check = |format: &str| {
+        let output = run(&[
+            "check",
+            path,
+            "--ecosystem",
+            "rust",
+            "--no-vuln",
+            "--format",
+            format,
+        ]);
+        assert!(
+            output.status.success(),
+            "{format}: an empty selection is exit 0: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    };
+
+    let json: Value = serde_json::from_slice(&check("json")).expect("a JSON document");
+    assert_eq!(json["summary"]["manifests"], 0);
+    assert_eq!(json["summary"]["total"], 0);
+    assert_eq!(json["results"], serde_json::json!([]));
+
+    let sarif: Value = serde_json::from_slice(&check("sarif")).expect("a SARIF document");
+    assert_eq!(sarif["version"], "2.1.0");
+    assert_eq!(sarif["runs"][0]["results"], serde_json::json!([]));
+
+    for format in ["table", "text"] {
+        assert!(
+            check(format).is_empty(),
+            "{format} says nothing on stdout when nothing was selected"
+        );
+    }
+}
+
 /// `--manifest` names one file and skips discovery, so there is no discovered set
 /// for an ecosystem to narrow. clap rejects the pair rather than letting one of
 /// them be silently ignored — the same contract `--manifest-glob` has.

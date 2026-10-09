@@ -286,8 +286,9 @@ the same reason `--manifest-glob` is, and it conflicts with `--manifest`. When i
 selects nothing, `dependable` says which ecosystems it searched and which it found
 instead, and still exits 0 — an unused ecosystem must not fail a per-ecosystem CI
 matrix job. `list --format json` prints a valid `dependable.list/v1` document with
-zero projects in that case, so a shard that pipes into `jq` gets something to
-parse rather than empty output.
+zero projects in that case, and `check --format json` / `--format sarif` print a
+document with zero results, so a shard that pipes into `jq` or uploads SARIF gets
+something to parse rather than empty output.
 
 It only ever **narrows** a run. Naming an ecosystem that `.dependable.toml` has
 switched off does not switch it back on: `check --ecosystem jvm` under
