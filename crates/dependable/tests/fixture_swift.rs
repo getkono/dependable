@@ -399,6 +399,46 @@ fn a_disabled_swift_ecosystem_is_skipped() {
     );
 }
 
+/// The missing-`Package.resolved` notice used to print before the ecosystem gate
+/// was consulted, so a project whose Swift checking was switched off was told how
+/// to resolve a dependency list nobody had asked to read — and then skipped.
+#[test]
+fn a_disabled_swift_project_with_no_package_resolved_is_not_warned_about() {
+    let dir = scratch("swift_disabled_no_resolved");
+    std::fs::copy(
+        fixture("sample-swift/Package.swift"),
+        dir.join("Package.swift"),
+    )
+    .unwrap();
+    let config = dir.join("dependable.toml");
+    std::fs::write(&config, "[swift]\nenabled = false\n").unwrap();
+
+    let output = run(&[
+        "check",
+        "--manifest",
+        dir.join("Package.swift").to_str().unwrap(),
+        "--config",
+        config.to_str().unwrap(),
+        "--no-vuln",
+        "--fail-on",
+        "any",
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        stderr.contains("skipping") && stderr.contains("Swift"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Package.resolved"),
+        "a skipped project gets no lockfile advice; stderr: {stderr}"
+    );
+    assert!(
+        output.status.success(),
+        "a skipped project is not an unread one; stderr: {stderr}"
+    );
+}
+
 /// `fix` used to end every run that rewrote nothing with "Everything is already up
 /// to date." For a Swift project it rewrites nothing *by construction*, so that
 /// line would be a flat claim of currency on the one ecosystem that can never

@@ -258,8 +258,17 @@ impl Engine {
     /// has no registered checker or no parser yet — so a polyglot repo with a
     /// not-yet-supported manifest does not abort the whole run.
     async fn check_manifest(&self, path: &Path) -> anyhow::Result<Option<ManifestReport>> {
-        let dependencies_unread = report_lockfile_notices(path);
-        match self.checker.check_path(path).await {
+        // The lockfile notices wait for the outcome: a manifest whose ecosystem is
+        // switched off is skipped, and a warning about its lockfile — or about a
+        // `Package.resolved` it lacks — is advice about a project nobody asked to
+        // check. Every other outcome prints them exactly as before, ahead of
+        // anything else said about the manifest.
+        let outcome = self.checker.check_path(path).await;
+        let dependencies_unread = match outcome {
+            Err(CheckError::UnsupportedEcosystem(_)) => false,
+            _ => report_lockfile_notices(path),
+        };
+        match outcome {
             Ok(check) => {
                 for warning in &check.warnings {
                     eprintln!("warning: {} — {warning}", path.display());
@@ -1178,11 +1187,11 @@ pub async fn run_report(args: crate::cli::ReportArgs) -> anyhow::Result<ExitCode
     let engine = Engine::new(&settings, &cfg, !args.quiet)?;
     let mut report = dependable_report::Report::new(root.clone());
     for manifest in &manifests {
-        for notice in lockfile_notes(manifest) {
-            notes.push(notice);
-        }
         match engine.check_manifest(manifest).await? {
-            Some(checked) => report.push(
+            Some(checked) => report.push({
+                // After the check, not before it: a skipped manifest's lockfile is
+                // not this report's business, exactly as on the console.
+                notes.extend(lockfile_notes(manifest));
                 dependable_report::ManifestResults::new(
                     relative_to(&root, &checked.path),
                     checked.ecosystem,
@@ -1191,8 +1200,8 @@ pub async fn run_report(args: crate::cli::ReportArgs) -> anyhow::Result<ExitCode
                 // Structural, not a note: `--quiet` suppresses the notes below, and
                 // a caveat about what the report does not cover is not chatter. A
                 // report that omits it is indistinguishable from a clean one.
-                .with_dependencies_unread(checked.dependencies_unread),
-            ),
+                .with_dependencies_unread(checked.dependencies_unread)
+            }),
             None => notes.push(format!(
                 "Skipped {}: its ecosystem is not enabled or not yet supported.",
                 relative_to(&root, manifest).display()
