@@ -1560,6 +1560,49 @@ mod tests {
         );
     }
 
+    /// `plan` is where the ecosystem comes from in a real run: it reads the
+    /// manifest's file name, not a value a caller hands it. The same `"1.*"`
+    /// written to a `Cargo.toml` and to a `package.json` must get opposite
+    /// verdicts through `plan` itself, so detection that answered `None` (or the
+    /// wrong kind) fails here rather than passing every `plan_fixes` test.
+    #[test]
+    fn plan_reads_the_ecosystem_from_the_manifest_file_name() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+
+        let cargo_content = "[dependencies]\nserde = \"1.*\"\n";
+        let cargo_path = dir.path().join("Cargo.toml");
+        std::fs::write(&cargo_path, cargo_content).expect("write Cargo.toml");
+        let cargo_results = results_for(
+            ManifestKind::CargoToml,
+            cargo_content,
+            &[("serde", "1.0.219")],
+        );
+        assert_eq!(cargo_results.len(), 1, "the fixture must produce one item");
+        let planned = plan(&cargo_path, &cargo_results, false).expect("the plan applies");
+        assert_eq!(
+            planned
+                .records
+                .iter()
+                .map(|record| (record.name.as_str(), record.to.as_str()))
+                .collect::<Vec<_>>(),
+            [("serde", "1.0.219")]
+        );
+        assert_eq!(planned.updated, "[dependencies]\nserde = \"1.0.219\"\n");
+
+        let npm_content = "{\n  \"dependencies\": {\n    \"lodash\": \"1.*\"\n  }\n}\n";
+        let npm_path = dir.path().join("package.json");
+        std::fs::write(&npm_path, npm_content).expect("write package.json");
+        let npm_results = results_for(
+            ManifestKind::PackageJson,
+            npm_content,
+            &[("lodash", "1.9.0")],
+        );
+        assert_eq!(npm_results.len(), 1, "the fixture must produce one item");
+        let planned = plan(&npm_path, &npm_results, false).expect("the plan applies");
+        assert!(planned.records.is_empty(), "{:?}", planned.records);
+        assert_eq!(planned.updated, npm_content);
+    }
+
     /// The same manifest shape in the ecosystem that must still decline it: npm
     /// reads a bare `1.0.219` as that release and nothing else, so the identical
     /// rewrite would destroy the range. One ecosystem apart, opposite verdicts —
