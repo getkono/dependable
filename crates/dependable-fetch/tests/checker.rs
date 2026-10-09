@@ -9,7 +9,7 @@ use dependable_fetch::{
     Checker, DependencyStatus, Ecosystem, GoProxyFetcher, JsrFetcher, ManifestKind, NpmFetcher,
     PackageSource, PackagistFetcher, PyPiFetcher, build_client,
 };
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const MANIFEST: &str = r#"
@@ -1167,4 +1167,124 @@ async fn an_inherited_name_the_root_never_declared_is_reported() {
     for result in &check.results {
         assert_eq!(result.status, DependencyStatus::Undetermined);
     }
+}
+
+/// One Swift pin whose repository path is mixed-case, so it is asked about under
+/// two spellings: as written, and all-lowercase.
+const MIXED_CASE_PACKAGE_RESOLVED: &str = r#"{
+  "pins" : [
+    {
+      "identity" : "zipfoundation",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/Weichsel/ZIPFoundation.git",
+      "state" : { "revision" : "b979e8b52c7ae7f3f39fa0182e738e9e7257eb78", "version" : "0.9.0" }
+    }
+  ],
+  "version" : 2
+}"#;
+
+/// The detail record for one advisory ID, as `/v1/query` returns it.
+fn swift_detail(ids: &[&str]) -> String {
+    let vulns: Vec<String> = ids
+        .iter()
+        .map(|id| format!(r#"{{"id":"{id}","summary":"advisory {id}"}}"#))
+        .collect();
+    format!(r#"{{"vulns":[{}]}}"#, vulns.join(","))
+}
+
+/// A Swift pin whose path is not lowercase is queried under both spellings, and the
+/// two answers are folded into one result. The spellings overlap here on purpose —
+/// `GHSA-bbbb` comes back under both — so the union has to deduplicate as it
+/// merges, in the batch scan's IDs and in the enriched advisories alike, and the
+/// one result is neither short an ID nor carrying one twice.
+#[tokio::test]
+async fn a_mixed_case_swift_pin_unions_both_spellings_without_duplicates() {
+    const AS_WRITTEN: &str = "github.com/Weichsel/ZIPFoundation";
+    const LOWERCASE: &str = "github.com/weichsel/zipfoundation";
+
+    let server = MockServer::start().await;
+    // Slot 0 is the spelling as written, slot 1 the lowercase variant.
+    Mock::given(method("POST"))
+        .and(path("/v1/querybatch"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"results":[
+                {"vulns":[{"id":"GHSA-aaaa-aaaa-aaaa"},{"id":"GHSA-bbbb-bbbb-bbbb"}]},
+                {"vulns":[{"id":"GHSA-bbbb-bbbb-bbbb"},{"id":"GHSA-cccc-cccc-cccc"}]}
+            ]}"#,
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    for (name, ids) in [
+        (AS_WRITTEN, ["GHSA-aaaa-aaaa-aaaa", "GHSA-bbbb-bbbb-bbbb"]),
+        (LOWERCASE, ["GHSA-bbbb-bbbb-bbbb", "GHSA-cccc-cccc-cccc"]),
+    ] {
+        Mock::given(method("POST"))
+            .and(path("/v1/query"))
+            .and(body_string_contains(format!("\"name\":\"{name}\"")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(swift_detail(&ids)))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    let checker = Checker::builder()
+        .http_client(build_client().unwrap())
+        .rust_registry("http://127.0.0.1:1".to_string(), None)
+        .registryless(Ecosystem::Swift)
+        .osv_url(format!("{}/v1/querybatch", server.uri()))
+        .include_ghsa(true)
+        .advisory_details(true)
+        .disk_cache(false)
+        .build()
+        .unwrap();
+
+    let check = checker
+        .check_manifest(
+            ManifestKind::PackageSwift,
+            "",
+            Some(MIXED_CASE_PACKAGE_RESOLVED),
+        )
+        .await
+        .unwrap();
+
+    // Both spellings went out in the one batch, as written first.
+    let requests = server.received_requests().await.unwrap();
+    let batch = requests
+        .iter()
+        .find(|request| request.url.path() == "/v1/querybatch")
+        .expect("one batch request");
+    let body = String::from_utf8_lossy(&batch.body);
+    let written_at = body.find(AS_WRITTEN).expect("the spelling as written");
+    let lower_at = body.find(LOWERCASE).expect("the lowercase spelling");
+    assert!(written_at < lower_at, "{body}");
+
+    assert_eq!(check.results.len(), 1, "two queries, one result");
+    let pin = &check.results[0];
+    assert_eq!(
+        pin.item.name, AS_WRITTEN,
+        "the result keeps the name as written"
+    );
+    assert_eq!(pin.status, DependencyStatus::Vulnerable);
+    assert_eq!(
+        pin.current_vulnerabilities,
+        [
+            "GHSA-aaaa-aaaa-aaaa",
+            "GHSA-bbbb-bbbb-bbbb",
+            "GHSA-cccc-cccc-cccc"
+        ],
+        "the union of both answers, deduplicated, in the order they arrived"
+    );
+
+    let mut advisories: Vec<&str> = pin.advisories.iter().map(|a| a.id.as_str()).collect();
+    advisories.sort_unstable();
+    assert_eq!(
+        advisories,
+        [
+            "GHSA-aaaa-aaaa-aaaa",
+            "GHSA-bbbb-bbbb-bbbb",
+            "GHSA-cccc-cccc-cccc"
+        ],
+        "each record once, from whichever spelling returned it"
+    );
 }
