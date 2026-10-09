@@ -426,7 +426,12 @@ on `source` was never safe. `inherited` means the version is declared elsewhere 
 manifest — a Cargo `dep.workspace = true` resolved against the workspace root, a
 Gradle `[versions]` alias, a shared Maven `<properties>` value — and such a dependency
 is checked wherever it is used and rewritten only where it is declared; see
-[Monorepos and workspaces](#monorepos-and-workspaces). `locked` means the version came
+[Monorepos and workspaces](#monorepos-and-workspaces). An `inherited` entry whose
+version could not be found is the exception: a Cargo `dep.workspace = true` with no
+workspace root, or no matching `[workspace.dependencies]` entry, in reach, or a Maven
+dependency whose version comes from a parent POM or an imported BOM this tool does not
+read. It keeps the `inherited` source but has no `constraint`, is never checked or
+rewritten, and `check` reports it `undetermined`. `locked` means the version came
 from a lockfile and no manifest declares it at all, which today is a SwiftPM
 `Package.resolved` pin: it is checked and scanned like any other, but there is no
 declaration anywhere to point at or to rewrite, so `inherited` stays `false` for it.
