@@ -26,7 +26,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
             let hovered = app.hover == Some(i);
             let table_row = TableRow::new(vec![
                 name_cell(app, row, hovered),
-                Line::styled(row.version.clone(), theme::fg(Token::Muted)),
+                Line::styled(version_cell(row), theme::fg(Token::Muted)),
                 Line::styled(age(app, row), theme::fg(Token::Muted)),
                 status_cell(app, row),
             ]);
@@ -81,6 +81,14 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
 
 /// The version column: wide enough for a long semver with a pre-release tag.
 const VERSION_WIDTH: u16 = 12;
+
+/// The version column's cell: the resolved version, or blank when none was read.
+///
+/// Left blank rather than filled with a placeholder — the STATUS column is where
+/// this row says it does not know, and saying it twice on one line adds nothing.
+fn version_cell(row: &Row) -> String {
+    row.version.clone().unwrap_or_default()
+}
 /// The age column, bounded by [`crate::model::compact_age`].
 const AGE_WIDTH: u16 = 6;
 /// The status column, wide enough for the longest badge.
@@ -104,14 +112,19 @@ fn age(app: &App, row: &Row) -> String {
     if row.kind != RowKind::Package || row.node_kind != Some(NodeKind::Registry) {
         return String::new();
     }
-    let key = crate::model::key(app.ecosystem_of(row), &row.name, &row.version);
+    // The age shown is the resolved version's publish date, so a row with no
+    // resolved version has no age to report.
+    let Some(version) = row.version.as_deref() else {
+        return String::new();
+    };
+    let key = crate::model::key(app.ecosystem_of(row), &row.name, version);
     let Some(PackageData::Ready(facts)) = app.packages.get(&key) else {
         return String::new();
     };
     facts
         .metadata
         .as_ref()
-        .and_then(|meta| meta.published_at(&row.version))
+        .and_then(|meta| meta.published_at(version))
         .map(crate::model::compact_age)
         .unwrap_or_default()
 }
@@ -211,17 +224,22 @@ fn status_cell<'a>(app: &App, row: &Row) -> Line<'a> {
 
 /// A short badge for what is known about the package, so the tree itself carries
 /// the headline: vulnerable, outdated, or still loading.
+///
+/// A package whose version was never read reports `unknown`. Freshness is a
+/// comparison, and there is nothing here to compare: leaving the column blank
+/// would read as "nothing to say about this one", which is the opposite of what
+/// is true.
 fn status_badge<'a>(app: &App, row: &Row) -> Option<Line<'a>> {
     use dependable_fetch::DependencyStatus;
 
     // Only registry packages are ever looked up, so only they can carry a badge.
-    if row.kind != RowKind::Package
-        || row.version.is_empty()
-        || row.node_kind != Some(NodeKind::Registry)
-    {
+    if row.kind != RowKind::Package || row.node_kind != Some(NodeKind::Registry) {
         return None;
     }
-    let key = crate::model::key(app.ecosystem_of(row), &row.name, &row.version);
+    let Some(version) = row.version.as_deref() else {
+        return Some(Line::styled("unknown", theme::fg(Token::Muted)));
+    };
+    let key = crate::model::key(app.ecosystem_of(row), &row.name, version);
     Some(match app.packages.get(&key)? {
         PackageData::Loading => Line::styled(app.spinner(), theme::fg(Token::Muted)),
         PackageData::Failed(_) => Line::styled("failed", theme::fg(Token::Critical)),

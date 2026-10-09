@@ -35,8 +35,21 @@ pub enum NodeKind {
 pub struct Node {
     /// Package name.
     pub name: String,
-    /// Resolved version.
-    pub version: String,
+    /// The version this package is at, or `None` when no version was ever read
+    /// for it.
+    ///
+    /// A workspace member carries the version its own manifest declares — a
+    /// member is resolved against nothing, so its declaration *is* its version,
+    /// whether or not a lockfile exists. `None` is a dependency in a graph built
+    /// from manifests alone, where the manifest gave a constraint and nothing
+    /// resolved it, and a package a lockfile records without a version at all.
+    ///
+    /// An [`Option`] rather than an empty-string sentinel, and never
+    /// `Some("")`: a renderer must be able to say "unknown" rather than evaluate
+    /// a blank string as though it were a version. The two states are different
+    /// claims about a dependency, and the type is what keeps them from being
+    /// confused.
+    pub version: Option<String>,
     /// Relationship to the workspace.
     pub kind: NodeKind,
 }
@@ -633,7 +646,11 @@ mod tests {
     fn flatten<'a>(g: &'a DependencyGraph, t: &Tree) -> Vec<(&'a str, &'a str, bool)> {
         fn walk<'a>(g: &'a DependencyGraph, n: &TreeNode, out: &mut Vec<(&'a str, &'a str, bool)>) {
             let node = &g.nodes()[n.node];
-            out.push((&node.name, &node.version, n.deduped()));
+            out.push((
+                &node.name,
+                node.version.as_deref().unwrap_or_default(),
+                n.deduped(),
+            ));
             for c in &n.children {
                 walk(g, c, out);
             }
@@ -705,7 +722,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
         let kind_at = |version: &str| {
             g.nodes()
                 .iter()
-                .find(|n| n.name == "b" && n.version == version)
+                .find(|n| n.name == "b" && n.version.as_deref() == Some(version))
                 .unwrap()
                 .kind
         };
@@ -739,7 +756,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
         let roots: Vec<(&str, &str)> = g
             .roots()
             .iter()
-            .map(|&i| (g.nodes()[i].name.as_str(), g.nodes()[i].version.as_str()))
+            .map(|&i| {
+                (
+                    g.nodes()[i].name.as_str(),
+                    g.nodes()[i].version.as_deref().unwrap_or_default(),
+                )
+            })
             .collect();
         assert_eq!(
             roots,
@@ -986,7 +1008,7 @@ source = "registry+https://x"
         let tree = g.tree(&TreeOptions::default());
 
         let namesake = under_root(&g, &tree, "a", "b");
-        assert_eq!(g.nodes()[namesake.node].version, "9.0.0");
+        assert_eq!(g.nodes()[namesake.node].version.as_deref(), Some("9.0.0"));
         assert_eq!(
             namesake.placement,
             Placement::Full,
@@ -1174,7 +1196,7 @@ source = "registry+https://x"
         for n in 0..depth {
             nodes.push(Node {
                 name: format!("c{n}"),
-                version: "1.0.0".to_string(),
+                version: Some("1.0.0".to_string()),
                 kind: NodeKind::Registry,
             });
             edges.push(if n + 1 < depth { vec![n + 1] } else { vec![] });
@@ -1204,7 +1226,7 @@ source = "registry+https://x"
             for side in 0..2 {
                 nodes.push(Node {
                     name: format!("n{layer}_{side}"),
-                    version: "1.0.0".to_string(),
+                    version: Some("1.0.0".to_string()),
                     kind: NodeKind::Registry,
                 });
                 let next = (layer + 1) * 2;
@@ -1257,7 +1279,7 @@ source = "registry+https://x"
             root_slots: std::iter::once((0, 0)).collect(),
             nodes: vec![Node {
                 name: "a".to_string(),
-                version: "1.0.0".to_string(),
+                version: Some("1.0.0".to_string()),
                 kind: NodeKind::Registry,
             }],
             edges: vec![vec![0]],
