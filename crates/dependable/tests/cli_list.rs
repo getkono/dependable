@@ -314,6 +314,51 @@ serde = "1"
     assert_eq!(root["version_inherited"], true);
 }
 
+/// A nested Cargo root that is also a package is governed by its **own**
+/// `[workspace.package]` table, even when that table has no `version`. Cargo does not
+/// fall through to an outer workspace for a field the governing root leaves out, so the
+/// inventory reports the version as unknown — still flagged inherited — rather than
+/// borrowing the outer root's.
+#[test]
+fn a_nested_root_without_a_version_does_not_borrow_an_outer_roots() {
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    std::fs::write(
+        tmp.path().join("Cargo.toml"),
+        r#"
+[workspace]
+exclude = ["inner"]
+
+[workspace.package]
+version = "1.2.3"
+"#,
+    )
+    .expect("write outer manifest");
+    let inner = tmp.path().join("inner");
+    std::fs::create_dir(&inner).expect("create inner dir");
+    std::fs::write(
+        inner.join("Cargo.toml"),
+        r#"
+[workspace]
+
+[workspace.package]
+edition = "2021"
+
+[package]
+name = "innerroot"
+version.workspace = true
+
+[dependencies]
+serde = "1"
+"#,
+    )
+    .expect("write inner manifest");
+
+    let doc = list_json(tmp.path(), &[]);
+    let inner = project(&doc, "innerroot");
+    assert_eq!(inner["version"], Value::Null);
+    assert_eq!(inner["version_inherited"], true);
+}
+
 /// The root's `[workspace.dependencies]` are central declarations, not dependencies of
 /// the root — and it inherits nothing, because it is what everything else inherits from.
 #[test]
