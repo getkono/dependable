@@ -7,8 +7,9 @@
 //! graph already lives in `Cargo.lock`.
 //!
 //! When no `Cargo.lock` is present it degrades to a **shallow** graph built from
-//! the manifests alone (members plus their direct declared dependencies, with
-//! versions left unresolved), flagged via [`GraphSource::Manifests`].
+//! the manifests alone (members plus their direct declared dependencies), flagged
+//! via [`GraphSource::Manifests`]. Members keep the version their manifest
+//! declares; only the dependencies' versions are left unresolved.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -32,7 +33,8 @@ pub enum GraphSource {
     /// The full resolved transitive graph, read from the ecosystem's lockfile.
     Lockfile,
     /// A shallow graph from manifests only — no lockfile was found, so this is
-    /// members plus their *direct* declared dependencies, versions unresolved.
+    /// members plus their *direct* declared dependencies. Members report the
+    /// version their manifest declares; the dependencies' versions are unresolved.
     Manifests,
     /// A shallow graph because the ecosystem's lockfile **cannot** express edges.
     ///

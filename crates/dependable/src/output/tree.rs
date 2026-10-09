@@ -214,7 +214,8 @@ struct NodeDto<'a> {
     id: usize,
     name: &'a str,
     /// `null` when no version was ever read for this node — a graph built from
-    /// manifests alone resolves none. Emitted rather than omitted so every node
+    /// manifests alone resolves no dependency's version, though a workspace
+    /// member still reports the version its manifest declares. Emitted rather than omitted so every node
     /// has the same shape and a consumer never has to tell an absent key from an
     /// absent version.
     version: Option<&'a str>,
