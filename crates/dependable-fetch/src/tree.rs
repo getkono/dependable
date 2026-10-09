@@ -310,9 +310,18 @@ pub fn build_project_graph(
     let root_version = meta.literal_version().unwrap_or_default().to_owned();
 
     // The project's own declared dependencies, used as the root's edges whenever the
-    // lockfile carries no entry for the project itself.
+    // lockfile carries no entry for the project itself. Only dependencies the project
+    // itself pulls in: an override forces a version somewhere in the tree, a catalog
+    // entry is a declaration members opt into, and neither is an edge from the root.
     let direct: Vec<String> = parse(kind, &content)
-        .map(|parsed| parsed.items.into_iter().map(|i| i.name).collect())
+        .map(|parsed| {
+            parsed
+                .items
+                .into_iter()
+                .filter(|i| i.kind.is_direct())
+                .map(|i| i.name)
+                .collect()
+        })
         .unwrap_or_default();
 
     let workspace_names: HashSet<String> = std::iter::once(root_name.clone()).collect();
@@ -350,7 +359,19 @@ pub fn build_project_graph(
         });
     };
 
-    let resolved = parser(&read(&lock_path)?)?;
+    // A lockfile we cannot read is not a reason to fail the command. The manifests still
+    // describe the direct dependencies, and `UnreadableLockfile` is how the caller tells
+    // the user that a lockfile is sitting there unread — which is the actionable half.
+    let resolved = match parser(&read(&lock_path)?) {
+        Ok(resolved) => resolved,
+        Err(_) => {
+            let graph = direct_graph(&root_name, &root_version, &direct, &workspace_names, &roots);
+            return Ok(WorkspaceGraph {
+                graph,
+                source: GraphSource::UnreadableLockfile,
+            });
+        }
+    };
     let resolved = with_root(resolved, &root_name, &root_version, direct);
     Ok(WorkspaceGraph {
         graph: DependencyGraph::from_resolved(&resolved, &workspace_names, &roots),
