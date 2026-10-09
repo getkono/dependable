@@ -748,7 +748,26 @@ pub fn evaluate(report: &Report, policy: &Policy) -> PolicyOutcome {
                 // the gate exists to catch. It has no score, so it is unrated, and the
                 // `unrated_advisories` knob decides, exactly as for a scored-but-unrated
                 // advisory.
-                if result.current_vulnerabilities.is_empty() {
+                //
+                // A finding whose enriched record says it was withdrawn is not unrated,
+                // it is retracted: counting it here let a withdrawn advisory fail the
+                // build under `unrated_advisories = "fail"` through the back door.
+                let withdrawn: Vec<&Advisory> = result
+                    .advisories
+                    .iter()
+                    .filter(|a| a.is_withdrawn())
+                    .collect();
+                let unrated: Vec<String> = result
+                    .current_vulnerabilities
+                    .iter()
+                    .filter(|id| {
+                        !withdrawn
+                            .iter()
+                            .any(|a| a.id == **id || a.aliases.iter().any(|alias| alias == *id))
+                    })
+                    .cloned()
+                    .collect();
+                if unrated.is_empty() {
                     continue;
                 }
                 let level = match policy.unrated_advisories {
@@ -760,8 +779,8 @@ pub fn evaluate(report: &Report, policy: &Policy) -> PolicyOutcome {
                     level,
                     cvss_rule,
                     Detail::Unrated {
-                        count: result.current_vulnerabilities.len(),
-                        advisories: result.current_vulnerabilities.clone(),
+                        count: unrated.len(),
+                        advisories: unrated,
                         best_known: None,
                     },
                     None,
@@ -883,7 +902,7 @@ fn parse_version(raw: &str, ecosystem: Ecosystem) -> Option<semver::Version> {
 /// a `max_major_behind = 2` gate it had been failing starts passing the moment upstream
 /// ships `1.0.0` — further behind, measured as closer. Repairing that needs the
 /// published version set this function is not given, which is a design change rather
-/// than a repair; it is filed rather than attempted here.
+/// than a repair; it is tracked in #150 rather than attempted here.
 fn major_distance(current: &semver::Version, latest: &semver::Version) -> u64 {
     match (current.major, latest.major) {
         // Both on the 0.x line: the minor is the breaking axis.
@@ -1860,15 +1879,44 @@ reason = "CVE-2023-xxxx fix"
         result.current_vulnerabilities = vec!["RUSTSEC-2020-0071".to_owned()];
         result.advisories = vec![withdrawn(scored("RUSTSEC-2020-0071", 9.8))];
 
+        // Under every `unrated_advisories` setting: once every enriched record is
+        // withdrawn, the finding must not resurface as an unrated one.
+        for knob in ["ignore", "warn", "fail"] {
+            let outcome = evaluate(
+                &rust(vec![result.clone()]),
+                &policy(&format!(
+                    "max_cvss = 7.0\nunrated_advisories = \"{knob}\"\n"
+                )),
+            );
+            assert!(
+                outcome.findings.is_empty(),
+                "a withdrawn advisory produced a finding under `{knob}`: {:?}",
+                outcome.findings
+            );
+        }
+
+        // Withdrawn under an alias the scan reported it by: still retracted.
+        let mut aliased = result.clone();
+        aliased.current_vulnerabilities = vec!["GHSA-xxxx".to_owned()];
+        let mut record = withdrawn(scored("RUSTSEC-2020-0071", 9.8));
+        record.aliases = vec!["GHSA-xxxx".to_owned()];
+        aliased.advisories = vec![record];
         let outcome = evaluate(
-            &rust(vec![result]),
-            &policy("max_cvss = 7.0\nunrated_advisories = \"ignore\"\n"),
+            &rust(vec![aliased]),
+            &policy("max_cvss = 7.0\nunrated_advisories = \"fail\"\n"),
         );
-        assert!(
-            !outcome.has_violations(),
-            "a withdrawn advisory failed the build: {:?}",
-            outcome.findings
+        assert!(!outcome.has_violations(), "{:?}", outcome.findings);
+
+        // A second finding with no record at all is still unrated, and still fails.
+        let mut mixed = result;
+        mixed
+            .current_vulnerabilities
+            .push("RUSTSEC-2099-0001".to_owned());
+        let outcome = evaluate(
+            &rust(vec![mixed]),
+            &policy("max_cvss = 7.0\nunrated_advisories = \"fail\"\n"),
         );
+        assert!(outcome.has_violations(), "{:?}", outcome.findings);
     }
 
     /// A live advisory alongside a withdrawn one still fails: filtering the retracted one
@@ -1887,7 +1935,7 @@ reason = "CVE-2023-xxxx fix"
     /// axis; past `1.0` the major is; and across the crossing only the majors past `0`
     /// are counted — so `0.1 -> 0.9` is 8 while `0.1 -> 1.0` is 1, and being further
     /// behind measures as being closer. That is a known limitation, recorded on
-    /// [`major_distance`] and filed, not something this test claims is fixed.
+    /// [`major_distance`] and tracked in #150, not something this test claims is fixed.
     #[test]
     fn major_distance_counts_the_breaking_axis_of_each_version_line() {
         let v = |s: &str| semver::Version::parse(s).unwrap();
