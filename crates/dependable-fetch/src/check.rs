@@ -1361,11 +1361,13 @@ impl CheckerBuilder {
         self
     }
 
-    /// Enable or disable the persistent on-disk registry cache (default: enabled).
-    /// When enabled, registry version lists are cached under the OS cache directory
-    /// with a short TTL so repeat and CI runs avoid re-fetching. Maps to `--no-cache`.
-    /// Turn the on-disk cache on or off explicitly. An explicit choice always wins,
-    /// whatever order the builder is called in.
+    /// Turn the persistent on-disk registry cache on or off explicitly (default: off
+    /// unless [`CheckerBuilder::disk_cache_dir`] names a directory). An explicit choice
+    /// always wins, whatever order the builder is called in. Maps to `--no-cache`.
+    ///
+    /// When on, registry version lists are cached with a short TTL so repeat and CI runs
+    /// avoid re-fetching — under the directory [`CheckerBuilder::disk_cache_dir`] named,
+    /// or, when `true` is passed with no directory named, under the OS cache directory.
     ///
     /// Unset, the cache is on only when [`CheckerBuilder::disk_cache_dir`] named a
     /// directory. It used to default to on *with the shared OS cache directory*, so
