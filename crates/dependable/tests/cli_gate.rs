@@ -668,3 +668,39 @@ fn an_override_referencing_a_workspace_dependency_is_not_sent_to_a_registry() {
         "stderr: {stderr}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A `[policy]` severity rule over a registry that never answered
+// ---------------------------------------------------------------------------
+
+/// An unlocked dependency whose fetch failed has no version to ask OSV about, so it is
+/// never queried and its advisory list is empty — exactly as on a run whose scan did not
+/// complete. A `max_cvss` rule passed over it with exit 0; it must refuse, as
+/// `--fail-on vulnerable` does, with exit 2.
+#[cfg(feature = "report")]
+#[test]
+fn a_severity_policy_refuses_a_run_whose_registry_never_answered() {
+    let dir = workdir("gate_policy_registry_unanswered");
+    let base = registry(vec![(
+        "/lodash".to_string(),
+        (503, "text/plain", String::new()),
+    )]);
+    let config = write_config(&dir, &base);
+    let mut content = fs::read_to_string(&config).unwrap();
+    content.push_str("\n[policy]\nmax_cvss = 7.0\n");
+    fs::write(&config, content).unwrap();
+    fs::write(
+        dir.join("package.json"),
+        "{\"name\":\"app\",\"dependencies\":{\"lodash\":\"^4.17.0\"}}\n",
+    )
+    .unwrap();
+
+    let output = check(&dir, &config, &[]);
+    let (stdout, stderr, code) = outcome(&output);
+
+    assert_eq!(code, 2, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stderr.contains("gates on advisory severity") && stderr.contains("did not answer"),
+        "stderr: {stderr}"
+    );
+}

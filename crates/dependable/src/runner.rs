@@ -433,14 +433,16 @@ pub async fn run_check(args: CheckArgs) -> anyhow::Result<ExitCode> {
         // *was*. A CVSS rule reads advisory lists, and a scan that never ran leaves those
         // empty — indistinguishable from a project with no advisories, so the gate would
         // pass vacuously on exactly the run that could not check it.
+        //
+        // A registry that never answered is the same hole one step earlier: an unlocked
+        // dependency whose fetch failed has no version to ask OSV about, so it is never
+        // queried and its advisory list is empty too. The test is the one
+        // `--fail-on vulnerable` already applies, so a severity rule and that gate refuse
+        // exactly the same runs.
         if policy.requires_cvss()
-            && reports
-                .iter()
-                .any(|r| r.integrity.vulnerability_scan_failed)
+            && let Err(reason) = gate_is_answerable(&reports, FailOn::Vulnerable)
         {
-            eprintln!(
-                "error: `[policy]` gates on advisory severity, but the vulnerability scan did not complete"
-            );
+            eprintln!("error: `[policy]` gates on advisory severity, but {reason}");
             eprintln!("       refusing to pass a policy that was never evaluated");
             return Ok(ExitCode::from(2));
         }
