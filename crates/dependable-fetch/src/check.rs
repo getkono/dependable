@@ -233,7 +233,9 @@ impl From<&FetchError> for FetchFailure {
     fn from(error: &FetchError) -> Self {
         Self {
             origin: match error {
-                FetchError::NotFound(_) => ErrorOrigin::NotFound,
+                // A 404, and a crate whose every release is yanked: both permanent
+                // answers about this one package.
+                e if e.is_permanent_absence() => ErrorOrigin::NotFound,
                 // Everything else is a request that produced no usable answer: a
                 // timeout, a refused connection, a 5xx, an undecodable body, a document
                 // listing no versions at all.
@@ -834,7 +836,7 @@ impl Checker {
                 }
             }
             if let Err(e) = &result
-                && !matches!(e, FetchError::NotFound(_))
+                && !e.is_permanent_absence()
             {
                 registry_unreachable = true;
             }
