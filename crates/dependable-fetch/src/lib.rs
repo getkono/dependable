@@ -48,7 +48,9 @@ mod retry;
 pub mod tree;
 
 // High-level entry point (recommended for embedding).
-pub use check::{CheckError, Checker, CheckerBuilder, ManifestCheck, ProgressEvent};
+pub use check::{
+    CheckError, Checker, CheckerBuilder, ManifestCheck, ProgressEvent, UnreachableRegistry,
+};
 
 // Manifest discovery (filesystem; shared by every frontend).
 pub use discover::{
