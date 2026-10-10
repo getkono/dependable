@@ -161,14 +161,30 @@ impl OsvClient {
                     .collect(),
             };
 
-            let resp = self.client.post(&self.batch_url).json(&body).send().await?;
-            if !resp.status().is_success() {
-                return Err(FetchError::Osv(format!("status {}", resp.status())));
+            let parsed: BatchResponse = crate::retry::with_retry(|| async {
+                let resp = self.client.post(&self.batch_url).json(&body).send().await?;
+                if !resp.status().is_success() {
+                    return Err(FetchError::OsvStatus {
+                        code: resp.status().as_u16(),
+                    });
+                }
+                resp.json::<BatchResponse>()
+                    .await
+                    .map_err(|e| FetchError::Osv(e.to_string()))
+            })
+            .await?;
+
+            // One result per query, in order, is the API's contract. A short body used
+            // to leave the unanswered slots empty — recorded as "no vulnerabilities" and
+            // written into the cache for ten minutes, so even a retry in the same process
+            // could not recover. A truncated answer is an error, not a clean bill.
+            if parsed.results.len() < chunk.len() {
+                return Err(FetchError::Osv(format!(
+                    "querybatch answered {} of {} queries",
+                    parsed.results.len(),
+                    chunk.len()
+                )));
             }
-            let parsed: BatchResponse = resp
-                .json()
-                .await
-                .map_err(|e| FetchError::Osv(e.to_string()))?;
 
             for (slot, &i) in chunk.iter().enumerate() {
                 let ids: Vec<String> = parsed
@@ -236,7 +252,9 @@ impl OsvClient {
             };
             let resp = self.client.post(&self.query_url).json(&body).send().await?;
             if !resp.status().is_success() {
-                return Err(FetchError::Osv(format!("status {}", resp.status())));
+                return Err(FetchError::OsvStatus {
+                    code: resp.status().as_u16(),
+                });
             }
             let parsed: DetailResponse = resp
                 .json()

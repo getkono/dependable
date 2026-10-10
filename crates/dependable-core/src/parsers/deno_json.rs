@@ -57,13 +57,20 @@ fn build_item(entry: &JsonStringValue, starts: &[usize]) -> Option<Item> {
 
     let global_start = entry.content_start + version_offset;
     let (line, col_start) = offset_to_line_col(starts, global_start);
+    // See `package_json::build_item`: an escaped value's decoded offsets do not map onto
+    // the source span, so the span is withheld and the import is reported but not fixed.
+    let col_end = if entry.escaped {
+        col_start
+    } else {
+        col_start + entry.content_end.saturating_sub(global_start)
+    };
     Some(Item {
         name,
         version_constraint: constraint,
         source,
         version_line: line,
         version_col_start: col_start,
-        version_col_end: col_start + entry.content_end.saturating_sub(global_start),
+        version_col_end: col_end,
         registry: None,
         locked_version: None,
         // `imports`/`scopes` are one flat map with no dev/build distinction to read.

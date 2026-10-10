@@ -397,12 +397,13 @@ fn a_bare_nuget_version_is_a_minimum_and_so_resolves_nothing() {
     }
 }
 
-/// npm reads a bare `1.3.0` as a caret range, exactly as Cargo does, so neither of
-/// these is a pin. The rule is about what the *constraint* admits, not about how
-/// concrete it looks: `"left-pad": "1.3.0"` accepts every 1.x release npm ever
-/// publishes.
+/// The pin rule follows the constraint translator, not how concrete a constraint
+/// looks. npm itself reads a bare `1.3.0` as exact, but this tree's translator
+/// reads it as a caret range, as Cargo does, so `left-pad` is not reported. This
+/// records the current reading, not an endorsement of it: #155 tracks the npm
+/// defect (and #149 the same one for Dart), and fixing it flips this assertion.
 #[test]
-fn a_concrete_looking_npm_constraint_is_still_a_range() {
+fn a_bare_npm_version_is_read_as_a_range_by_this_tree() {
     let dir = TempDir::new().expect("tempdir");
     write(
         &dir.path().join("package.json"),
@@ -493,6 +494,34 @@ fn a_missing_lockfile_falls_back_to_direct_dependencies() {
         GraphSource::Manifests,
         "a lockfile would have helped and simply was not there"
     );
+    assert_eq!(flatten(&built.graph), vec!["app", "react"]);
+}
+
+/// An `overrides`/`resolutions`/`pnpm.overrides` entry forces a version somewhere in
+/// the tree; it is not a dependency of the root, so the fallback graph must not draw
+/// it as one.
+#[test]
+fn the_fallback_graph_does_not_draw_overrides_as_direct_dependencies() {
+    let dir = TempDir::new().expect("tempdir");
+    write(
+        &dir.path().join("package.json"),
+        r#"{
+  "name": "app",
+  "version": "1.0.0",
+  "dependencies": { "react": "^18.0.0" },
+  "overrides": { "semver": "7.5.4" },
+  "resolutions": { "lodash": "4.17.21" },
+  "pnpm": { "overrides": { "minimist": "1.2.8" } }
+}"#,
+    );
+
+    let built = build_project_graph(
+        &dir.path().join("package.json"),
+        &WorkspaceGraphOptions::default(),
+    )
+    .expect("graph");
+
+    assert_eq!(built.source, GraphSource::Manifests);
     assert_eq!(flatten(&built.graph), vec!["app", "react"]);
 }
 
