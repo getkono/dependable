@@ -405,6 +405,15 @@ dependable tree --format json      # nodes + edges, for tooling / IDEs
 dependable tree --format dot | dot -Tsvg > deps.svg   # visual graph
 ```
 
+In `--format json`, a node's `version` is `null` when no version was read for it,
+and the `ascii` and `dot` renderers drop the `vX.Y.Z` suffix for the same node.
+A shallow tree — built from manifests, with no `Cargo.lock` to resolve against —
+still reports each **workspace member's** declared version, because a member is
+not resolved against anything and what its manifest declares is what the crate
+is; its **dependencies** are `null`, because a manifest declares a constraint
+rather than a resolution. A version is never the empty string: a blank one in a
+lockfile is read as no version at all.
+
 ```
 my-app v0.1.0 (workspace)
 ├── gitdep v0.3.0 (git)
@@ -621,7 +630,7 @@ is a composite action that installs the released binary and runs the check:
 
 ```yaml
 - uses: actions/checkout@v4
-- uses: getkono/dependable/.github/actions/dependable-check@v0.1.3
+- uses: getkono/dependable/.github/actions/dependable-check@v0.1.4
   with:
     fail-on: vulnerable
 ```

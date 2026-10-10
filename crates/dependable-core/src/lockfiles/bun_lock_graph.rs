@@ -130,7 +130,7 @@ pub fn parse_bun_lock_graph(content: &str) -> Result<ResolvedLockfile, ParseErro
             .collect();
         packages.push(LockedPackage::new(
             name,
-            workspace.version.clone().unwrap_or_default(),
+            workspace.version.clone(),
             // A workspace member is local, never fetched from a registry.
             None,
             dependencies,
@@ -154,6 +154,9 @@ pub fn parse_bun_lock_graph(content: &str) -> Result<ResolvedLockfile, ParseErro
             .filter_map(|dep| edge(key, dep, &index, &identity))
             .collect();
         let source = (!version.is_empty()).then(|| NPM_SOURCE.to_owned());
+        // A workspace link carries no version of its own; that is an absence,
+        // not a package resolved at the empty version.
+        let version = (!version.is_empty()).then_some(version);
         packages.push(LockedPackage::new(name, version, source, dependencies));
     }
 
@@ -243,7 +246,9 @@ mod tests {
             .iter()
             .map(|p| {
                 (
-                    format!("{} {}", p.name, p.version).trim().to_owned(),
+                    format!("{} {}", p.name, p.version.as_deref().unwrap_or_default())
+                        .trim()
+                        .to_owned(),
                     p.dependencies.clone(),
                 )
             })
@@ -257,7 +262,7 @@ mod tests {
         let resolved = parse_bun_lock_graph(LOCK).unwrap();
         let root = &resolved.packages[0];
         assert_eq!(root.name, "app");
-        assert_eq!(root.version, "1.0.0");
+        assert_eq!(root.version.as_deref(), Some("1.0.0"));
         assert_eq!(root.source, None, "the project is local");
         assert_eq!(
             root.dependencies,
@@ -311,7 +316,7 @@ mod tests {
             resolved
                 .packages
                 .iter()
-                .find(|p| p.name == name && !p.version.is_empty())
+                .find(|p| p.name == name && p.version.is_some())
                 .cloned()
                 .unwrap_or_else(|| panic!("missing {name}"))
         };

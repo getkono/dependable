@@ -385,6 +385,10 @@ mod tests {
             ("any", "19.0.0"),
             ("@dev", "19.0.0"),
             ("16.*@dev", "16.8.0"),
+            // Composer's single-pipe union.
+            ("^15.0|^16.0", "16.8.0"),
+            // Wildcard branches rank by the line they name: the newest branch wins.
+            ("15.x||16.x", "16.8.0"),
         ] {
             let ev = check_version(constraint, &versions, None);
             assert!(
@@ -411,7 +415,16 @@ mod tests {
     #[test]
     fn a_channel_or_branch_name_is_undetermined_not_an_error() {
         let versions = vec!["1.0.0".to_string(), "2.0.0".to_string()];
-        for constraint in ["next", "beta", "canary", "dev-master", "not-a-range"] {
+        for constraint in [
+            "next",
+            "beta",
+            "canary",
+            "dev-master",
+            "not-a-range",
+            "2.x-dev",
+            "1.0.x-dev",
+            "dev-main as 1.0.x-dev",
+        ] {
             let ev = check_version(constraint, &versions, None);
             assert_eq!(
                 ev.status,
@@ -447,13 +460,25 @@ mod tests {
     #[test]
     fn zero_zero_versions_have_no_patch_axis() {
         let versions = vec!["0.0.3".to_string(), "0.0.4".to_string()];
-        let ev = check_version("^0.0.3", &versions, Some("0.0.3"));
+        // `^0.0.3` admits only `0.0.3`, so it never offers `0.0.4` as compatible; the
+        // guard is reached only by a constraint that does admit it. `~0.0.3`, `>=0.0.3`
+        // and `*` each put `0.0.4` in `latest_compatible` with the same major and minor
+        // as the locked `0.0.3`, which without the guard would read as a patch.
+        for constraint in ["^0.0.3", "~0.0.3", ">=0.0.3", "*"] {
+            let ev = check_version(constraint, &versions, Some("0.0.3"));
+            assert_eq!(
+                ev.status,
+                DependencyStatus::UpdateAvailable,
+                "`{constraint}`: 0.0.3 -> 0.0.4 is a breaking bump"
+            );
+            assert!(!ev.patch_available, "{constraint}");
+        }
+        let ev = check_version("~0.0.3", &versions, Some("0.0.3"));
         assert_eq!(
-            ev.status,
-            DependencyStatus::UpdateAvailable,
-            "0.0.3 -> 0.0.4 is a breaking bump"
+            ev.latest_compatible.as_deref(),
+            Some("0.0.4"),
+            "the guard, not the range, is what refuses the patch label"
         );
-        assert!(!ev.patch_available);
 
         // `0.2.z` still has one: the patch component floats under `^0.2.3`.
         let versions = vec!["0.2.3".to_string(), "0.2.9".to_string()];

@@ -37,10 +37,12 @@ struct Edit {
     /// The text the span held when the plan was made.
     ///
     /// The span comes from a parse that happened before the network check, and the file
-    /// is read again at write time. If anything moved in between — an editor auto-save, a
-    /// `cargo add`, a concurrent `dependable fix` — the offsets now point somewhere else,
-    /// and splicing into them corrupts the manifest. Checking the text first is what
-    /// turns that into a refusal.
+    /// is read again when the plan is made. If anything moved in between — an editor
+    /// auto-save, a `cargo add`, a concurrent `dependable fix` — the offsets now point
+    /// somewhere else, and splicing into them corrupts the manifest. Checking the text
+    /// first is what turns that into a refusal. A change landing *after* the plan, while
+    /// other manifests are still being checked, is refused by [`commit`], which writes
+    /// only over the exact contents the plan was computed from.
     expected: String,
     replacement: String,
 }
@@ -51,6 +53,9 @@ pub struct PlannedFix {
     pub path: std::path::PathBuf,
     /// The full new contents.
     updated: String,
+    /// The contents the plan was computed from, which [`commit`] requires the file to
+    /// still hold before it writes.
+    original: String,
     /// What changed, for reporting.
     pub records: Vec<FixRecord>,
 }
@@ -81,6 +86,7 @@ pub fn plan(manifest: &Path, results: &[CheckResult], all: bool) -> anyhow::Resu
     Ok(PlannedFix {
         path: manifest.to_path_buf(),
         updated,
+        original: content,
         records,
     })
 }
@@ -92,13 +98,33 @@ pub fn plan(manifest: &Path, results: &[CheckResult], all: bool) -> anyhow::Resu
 /// `fs::write` truncates first, which meant an interrupted write left a manifest empty
 /// or half-written and no backup to recover from.
 ///
+/// The file is read again first, and the write is refused unless it still holds exactly
+/// what the plan was computed from. A run plans every manifest before writing any, and
+/// the network check happens in between, so an editor save, a `cargo add`, or a
+/// concurrent `fix` landing in that window would otherwise be overwritten in silence.
+///
+/// A symlinked manifest is written through: the link is resolved and its target is
+/// replaced, so the link survives and points at the rewritten file. Renaming over the
+/// link itself replaced it with a regular file and left the real manifest unedited.
+///
 /// # Errors
-/// Returns an error if the temporary file cannot be created, written, or renamed.
+/// Returns an error if the manifest changed since it was planned, or if the temporary
+/// file cannot be created, written, or renamed.
 pub fn commit(planned: &PlannedFix) -> anyhow::Result<()> {
     if planned.records.is_empty() {
         return Ok(());
     }
-    let directory = planned.path.parent().unwrap_or_else(|| Path::new("."));
+    let target = std::fs::canonicalize(&planned.path)
+        .with_context(|| format!("resolving {}", planned.path.display()))?;
+    let current = std::fs::read_to_string(&target)
+        .with_context(|| format!("re-reading {}", planned.path.display()))?;
+    if current != planned.original {
+        anyhow::bail!(
+            "{} changed after it was checked; it was not rewritten — run `fix` again",
+            planned.path.display()
+        );
+    }
+    let directory = target.parent().unwrap_or_else(|| Path::new("."));
     let mut temp = tempfile::NamedTempFile::new_in(directory).with_context(|| {
         format!(
             "creating a temporary file beside {}",
@@ -114,7 +140,7 @@ pub fn commit(planned: &PlannedFix) -> anyhow::Result<()> {
         .with_context(|| format!("flushing {}", planned.path.display()))?;
     // A manifest is usually 0644 while a temporary file is 0600; preserve what was there.
     #[cfg(unix)]
-    if let Ok(metadata) = std::fs::metadata(&planned.path) {
+    if let Ok(metadata) = std::fs::metadata(&target) {
         use std::os::unix::fs::PermissionsExt as _;
         let _ = temp
             .as_file()
@@ -122,7 +148,7 @@ pub fn commit(planned: &PlannedFix) -> anyhow::Result<()> {
                 metadata.permissions().mode(),
             ));
     }
-    temp.persist(&planned.path)
+    temp.persist(&target)
         .with_context(|| format!("replacing {}", planned.path.display()))?;
     Ok(())
 }
@@ -1684,5 +1710,130 @@ mod tests {
             rewrite_constraint("1.0.0", "1.5.0", None).as_deref(),
             Some("1.5.0")
         );
+    }
+
+    const PACKAGE_JSON: &str = "{\n  \"dependencies\": {\n    \"react\": \"^18.0.0\"\n  }\n}\n";
+    const PACKAGE_JSON_FIXED: &str =
+        "{\n  \"dependencies\": {\n    \"react\": \"^18.2.0\"\n  }\n}\n";
+
+    /// Write `PACKAGE_JSON` to `path` and plan a rewrite of it to `^18.2.0`.
+    fn planned_at(path: &Path) -> PlannedFix {
+        std::fs::write(path, PACKAGE_JSON).unwrap();
+        let results = results_for(
+            ManifestKind::PackageJson,
+            PACKAGE_JSON,
+            &[("react", "18.2.0")],
+        );
+        let planned = plan(path, &results, false).expect("the plan applies");
+        assert_eq!(planned.records.len(), 1, "the fixture must plan one edit");
+        planned
+    }
+
+    /// The write path itself: `commit` publishes the planned bytes, leaves no temporary
+    /// file behind, and keeps the manifest's permissions rather than the temporary
+    /// file's `0600`.
+    #[test]
+    fn commit_writes_the_planned_contents_and_keeps_the_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("package.json");
+        let planned = planned_at(&manifest);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(0o640)).unwrap();
+        }
+
+        commit(&planned).expect("the commit succeeds");
+
+        assert_eq!(
+            std::fs::read_to_string(&manifest).unwrap(),
+            PACKAGE_JSON_FIXED
+        );
+        let entries: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert_eq!(entries.len(), 1, "a temporary file was left behind");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&manifest).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o640);
+        }
+    }
+
+    /// An edit landing between the plan and the write — an editor save, a `cargo add`,
+    /// a concurrent `fix` — is kept, and the write is refused rather than overwriting it.
+    #[test]
+    fn commit_refuses_a_manifest_changed_after_it_was_planned() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("package.json");
+        let planned = planned_at(&manifest);
+        let edited = PACKAGE_JSON.replace("react", "preact");
+        std::fs::write(&manifest, &edited).unwrap();
+
+        let error = commit(&planned).expect_err("a changed manifest must be refused");
+
+        assert!(error.to_string().contains("changed"), "{error:#}");
+        assert_eq!(std::fs::read_to_string(&manifest).unwrap(), edited);
+    }
+
+    /// A symlinked manifest is written through: the link stays a link and its target
+    /// carries the rewrite.
+    #[cfg(unix)]
+    #[test]
+    fn commit_writes_through_a_symlinked_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let target = real.join("package.json");
+        let link = dir.path().join("package.json");
+        std::fs::write(&target, PACKAGE_JSON).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let results = results_for(
+            ManifestKind::PackageJson,
+            PACKAGE_JSON,
+            &[("react", "18.2.0")],
+        );
+        let planned = plan(&link, &results, false).expect("the plan applies");
+
+        commit(&planned).expect("the commit succeeds");
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link was replaced by a regular file"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            PACKAGE_JSON_FIXED
+        );
+    }
+
+    /// A manifest in a directory that cannot be written to fails loudly and is left
+    /// intact — the rename never publishes a partial file.
+    #[cfg(unix)]
+    #[test]
+    fn commit_into_an_unwritable_directory_fails_and_leaves_the_manifest_intact() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("locked");
+        std::fs::create_dir(&sub).unwrap();
+        let manifest = sub.join("package.json");
+        let planned = planned_at(&manifest);
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let outcome = commit(&planned);
+        // Restore before asserting, so the scratch directory can be removed.
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Root ignores directory permissions; there the write simply succeeds.
+        if outcome.is_err() {
+            assert_eq!(std::fs::read_to_string(&manifest).unwrap(), PACKAGE_JSON);
+        } else {
+            assert_eq!(
+                std::fs::read_to_string(&manifest).unwrap(),
+                PACKAGE_JSON_FIXED
+            );
+        }
     }
 }

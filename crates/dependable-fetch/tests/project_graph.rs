@@ -215,6 +215,44 @@ fn an_ecosystem_without_edge_data_reports_unsupported() {
     assert!(names.len() > 1, "the direct dependencies are still shown");
 }
 
+/// A manifest names its dependencies; it does not resolve them. The graph must
+/// say the version is *unknown* rather than record it as the empty string, which
+/// downstream reads as a version and evaluates as though it were one.
+#[test]
+fn a_manifest_only_graph_leaves_every_dependency_version_unknown() {
+    let built = build_project_graph(
+        &fixture("sample-kotlin").join("gradle/libs.versions.toml"),
+        &WorkspaceGraphOptions::default(),
+    )
+    .expect("graph");
+
+    let unresolved: Vec<&str> = built
+        .graph
+        .nodes()
+        .iter()
+        .filter(|n| n.kind == NodeKind::Registry)
+        .filter(|n| n.version.is_some())
+        .map(|n| n.name.as_str())
+        .collect();
+    assert!(
+        !built.graph.nodes().is_empty(),
+        "the fixture must produce a graph to assert about"
+    );
+    assert_eq!(
+        unresolved,
+        Vec::<&str>::new(),
+        "nothing read a version for these, so none may claim one"
+    );
+    assert!(
+        built
+            .graph
+            .nodes()
+            .iter()
+            .all(|n| n.version.as_deref() != Some("")),
+        "an unknown version is `None`, never an empty string"
+    );
+}
+
 #[test]
 fn a_missing_lockfile_falls_back_to_direct_dependencies() {
     let dir = TempDir::new().expect("tempdir");
@@ -234,6 +272,34 @@ fn a_missing_lockfile_falls_back_to_direct_dependencies() {
         GraphSource::Manifests,
         "a lockfile would have helped and simply was not there"
     );
+    assert_eq!(flatten(&built.graph), vec!["app", "react"]);
+}
+
+/// An `overrides`/`resolutions`/`pnpm.overrides` entry forces a version somewhere in
+/// the tree; it is not a dependency of the root, so the fallback graph must not draw
+/// it as one.
+#[test]
+fn the_fallback_graph_does_not_draw_overrides_as_direct_dependencies() {
+    let dir = TempDir::new().expect("tempdir");
+    write(
+        &dir.path().join("package.json"),
+        r#"{
+  "name": "app",
+  "version": "1.0.0",
+  "dependencies": { "react": "^18.0.0" },
+  "overrides": { "semver": "7.5.4" },
+  "resolutions": { "lodash": "4.17.21" },
+  "pnpm": { "overrides": { "minimist": "1.2.8" } }
+}"#,
+    );
+
+    let built = build_project_graph(
+        &dir.path().join("package.json"),
+        &WorkspaceGraphOptions::default(),
+    )
+    .expect("graph");
+
+    assert_eq!(built.source, GraphSource::Manifests);
     assert_eq!(flatten(&built.graph), vec!["app", "react"]);
 }
 
