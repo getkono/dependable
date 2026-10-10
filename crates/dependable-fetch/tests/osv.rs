@@ -195,6 +195,55 @@ async fn query_detail_skips_the_request_when_the_batch_found_nothing() {
     assert!(advisories.is_empty());
 }
 
+/// A `querybatch` that fails transiently once is retried, and the scan completes on the
+/// answer rather than failing the run's vulnerability gate.
+#[tokio::test]
+async fn query_batch_retries_a_transient_failure() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/querybatch"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/querybatch"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"results":[{"vulns":[{"id":"RUSTSEC-2020-0071"}]}]}"#),
+        )
+        .with_priority(2)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let ids = client(&server, false)
+        .query_batch(std::slice::from_ref(&query()))
+        .await
+        .expect("the retry answers");
+    assert_eq!(ids, vec![vec!["RUSTSEC-2020-0071".to_string()]]);
+}
+
+/// A `querybatch` that keeps failing is attempted three times and then surfaces the
+/// error, rather than looping or reporting a clean bill.
+#[tokio::test]
+async fn query_batch_gives_up_after_three_attempts() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/querybatch"))
+        .respond_with(ResponseTemplate::new(502))
+        .expect(3)
+        .mount(&server)
+        .await;
+
+    let result = client(&server, false)
+        .query_batch(std::slice::from_ref(&query()))
+        .await;
+    assert!(result.is_err(), "{result:?}");
+}
+
 #[tokio::test]
 async fn query_detail_follows_pagination() {
     let server = MockServer::start().await;

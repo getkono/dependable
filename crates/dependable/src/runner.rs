@@ -19,13 +19,15 @@ use dependable_fetch::{
     HexFetcher, Item, JsrFetcher, ManifestKind, MavenCentralFetcher, NpmFetcher, NuGetFetcher,
     PackageSource, PackagistFetcher, ParseError, ProgressEvent, PubDevFetcher, PyPiFetcher,
     ScopedRegistry, TreeOptions, UnstableFilter, WorkspaceGraphOptions, build_client,
-    build_workspace_graph, nearest_workspace_root, workspace_source,
+    build_workspace_graph, workspace_root_of, workspace_source,
 };
 use dependable_tui::TuiOptions;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use indicatif::{ProgressBar, ProgressStyle};
 
-use crate::cli::{CheckArgs, EcosystemArg, FailOn, FixArgs, Format, ListArgs, TreeArgs, TuiArgs};
+use crate::cli::{
+    CheckArgs, CheckFormat, EcosystemArg, FailOn, FixArgs, Format, ListArgs, TreeArgs, TuiArgs,
+};
 use crate::config::{Config, load_config};
 #[cfg(feature = "report")]
 use crate::config::{PolicySource, load_policy};
@@ -405,6 +407,17 @@ pub async fn run_check(args: CheckArgs) -> anyhow::Result<ExitCode> {
     )?;
     if manifests.is_empty() {
         report_no_manifests(&ecosystems);
+        // The same contract `run_list` keeps: an empty selection still owes a
+        // machine-readable format a document. `json` and `sarif` are what a CI
+        // step captures to a file (the bundled action's `json-path`, a SARIF
+        // upload), and byte-empty stdout there is a parse failure on exactly the
+        // runs exit 0 was chosen to keep green. Both renderers already produce a
+        // valid zero-result document from no reports.
+        //
+        // `table` and `text` keep returning early: a human wants the stderr line.
+        if !matches!(args.format, CheckFormat::Table | CheckFormat::Text) {
+            output::render(args.format, &[], args.quiet)?;
+        }
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -435,14 +448,16 @@ pub async fn run_check(args: CheckArgs) -> anyhow::Result<ExitCode> {
         // *was*. A CVSS rule reads advisory lists, and a scan that never ran leaves those
         // empty — indistinguishable from a project with no advisories, so the gate would
         // pass vacuously on exactly the run that could not check it.
+        //
+        // A registry that never answered is the same hole one step earlier: an unlocked
+        // dependency whose fetch failed has no version to ask OSV about, so it is never
+        // queried and its advisory list is empty too. The test is the one
+        // `--fail-on vulnerable` already applies, so a severity rule and that gate refuse
+        // exactly the same runs.
         if policy.requires_cvss()
-            && reports
-                .iter()
-                .any(|r| r.integrity.vulnerability_scan_failed)
+            && let Err(reason) = gate_is_answerable(&reports, FailOn::Vulnerable)
         {
-            eprintln!(
-                "error: `[policy]` gates on advisory severity, but the vulnerability scan did not complete"
-            );
+            eprintln!("error: `[policy]` gates on advisory severity, but {reason}");
             eprintln!("       refusing to pass a policy that was never evaluated");
             return Ok(ExitCode::from(2));
         }
@@ -749,7 +764,7 @@ pub async fn run_list(args: ListArgs) -> anyhow::Result<ExitCode> {
             .then(|| apply_nearest_lockfile(manifest, kind, &root, &mut parsed.items))
             .flatten();
         let meta = parse_project(kind, &content);
-        let (version, version_inherited) = resolve_version(manifest, kind, &meta);
+        let (version, version_inherited) = resolve_version(manifest, kind, &content, &meta);
 
         reports.push(ProjectReport {
             relative: relative_to(&root, manifest),
@@ -800,18 +815,19 @@ fn apply_nearest_lockfile(
 }
 
 /// The manifest's version, resolving a Cargo `version.workspace = true` against the
-/// nearest ancestor `[workspace.package]` table. Returns the version and whether it was
-/// inherited.
+/// `[workspace.package]` table governing it — its own, when the manifest is itself the
+/// root. Returns the version and whether it was inherited.
 fn resolve_version(
     manifest: &Path,
     kind: ManifestKind,
+    content: &str,
     meta: &ProjectMeta,
 ) -> (Option<String>, bool) {
     match &meta.version {
         None => (None, false),
         Some(PackageField::Literal(version)) => (Some(version.clone()), false),
         Some(PackageField::Workspace) => {
-            let inherited = workspace_package_defaults(manifest, kind)
+            let inherited = workspace_package_defaults(manifest, kind, content)
                 .and_then(|defaults| defaults.get("version").cloned());
             (inherited, true)
         }
@@ -820,7 +836,14 @@ fn resolve_version(
     }
 }
 
-/// `[workspace.package]` from the nearest ancestor `Cargo.toml` declaring a workspace.
+/// `[workspace.package]` from the `Cargo.toml` governing `manifest`.
+///
+/// [`workspace_root_of`] rather than `nearest_workspace_root`, because a Cargo root that
+/// is also a package inherits from its **own** table: a single `Cargo.toml` holding both
+/// `[workspace.package] version` and `[package] version.workspace = true` is legal, and a
+/// walk that excludes the asking manifest never finds the table sitting in it. That is
+/// already how the dependency inheritance a few lines up resolves, via `workspace_source`;
+/// the scalar axis had no reason to disagree.
 ///
 /// Reading the located root as a Cargo `[workspace]` table is this function's own
 /// business: scalar inheritance (`version.workspace = true`) is a different axis from the
@@ -828,11 +851,22 @@ fn resolve_version(
 fn workspace_package_defaults(
     manifest: &Path,
     kind: ManifestKind,
+    content: &str,
 ) -> Option<BTreeMap<String, String>> {
     if kind != ManifestKind::CargoToml {
         return None;
     }
-    let (_, content) = nearest_workspace_root(manifest, kind)?;
+    let (_, root_kind, content) = workspace_root_of(manifest, kind, content)?;
+    // Checked rather than assumed. Cargo's descriptor names one candidate today, so
+    // this always holds — but pairing a kind with each candidate name is precisely
+    // what makes a second candidate of another kind possible, and reading someone
+    // else's file as a `[workspace.package]` table would answer with its contents
+    // instead of declining. Every other caller now uses the kind the walk returned;
+    // this one hard-codes Cargo because scalar inheritance is Cargo-only, so the
+    // guard is how it says so.
+    if root_kind != ManifestKind::CargoToml {
+        return None;
+    }
     Some(parse_workspace(&content)?.package_defaults)
 }
 
@@ -1052,9 +1086,11 @@ const TEMPLATE_DIR: &str = "dependable-templates";
 /// would be worse than twenty honest lines.
 #[cfg(feature = "report")]
 fn resolve_report_settings(args: &crate::cli::ReportArgs, cfg: &Config) -> Settings {
-    let env_no_vuln = std::env::var_os("DEPENDABLE_NO_VULN").is_some();
-    let env_no_cache = std::env::var_os("DEPENDABLE_NO_CACHE").is_some();
-    let env_ghsa = std::env::var_os("DEPENDABLE_INCLUDE_GHSA").is_some();
+    // The same value-sensitive reading `check` uses: `DEPENDABLE_NO_VULN=0` keeps the
+    // scan on here too, rather than disabling it because the variable merely exists.
+    let env_no_vuln = env_flag("DEPENDABLE_NO_VULN");
+    let env_no_cache = env_flag("DEPENDABLE_NO_CACHE");
+    let env_ghsa = env_flag("DEPENDABLE_INCLUDE_GHSA");
     let env_concurrency = std::env::var("DEPENDABLE_CONCURRENCY")
         .ok()
         .and_then(|s| s.parse::<usize>().ok());

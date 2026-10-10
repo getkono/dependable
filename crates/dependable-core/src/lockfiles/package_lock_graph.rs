@@ -127,6 +127,9 @@ pub fn parse_package_lock_graph(content: &str) -> Result<ResolvedLockfile, Parse
                     Some(reference(target_name, Some(target_version.as_str())))
                 })
                 .collect();
+            // An install entry that records no version is a workspace link; it
+            // is a package whose version was never read, not one versioned "".
+            let version = (!version.is_empty()).then_some(version);
             LockedPackage::new(name, version, source_of(key, entry), dependencies)
         })
         .collect();
@@ -468,7 +471,7 @@ mod tests {
         let app = resolved
             .packages
             .iter()
-            .find(|p| p.name == "app" && p.version == "2.0.0")
+            .find(|p| p.name == "app" && p.version.as_deref() == Some("2.0.0"))
             .expect("member");
         assert_eq!(app.dependencies, vec!["lodash 4.17.21".to_string()]);
     }

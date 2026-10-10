@@ -28,6 +28,15 @@ pub enum FetchError {
     #[error("registry listed no versions for `{package}`")]
     EmptyVersionList { package: String },
 
+    /// The registry listed the package, and every release it lists is yanked.
+    ///
+    /// A permanent answer about this one package, exactly as a 404 is: Cargo will not
+    /// resolve a yanked release for a new lockfile, and asking again returns the same
+    /// list. Unlike [`EmptyVersionList`](Self::EmptyVersionList) nothing about it
+    /// suggests the registry failed to answer.
+    #[error("every published version of `{package}` is yanked")]
+    AllYanked { package: String },
+
     #[error("failed to decode response for `{package}`: {detail}")]
     Decode { package: String, detail: String },
 
@@ -39,6 +48,16 @@ pub enum FetchError {
 }
 
 impl FetchError {
+    /// Whether the registry answered, permanently, that this package has nothing to
+    /// offer: it does not exist, or every release of it is yanked.
+    ///
+    /// Such an answer is a per-dependency fact rather than a registry that could not be
+    /// reached, so it neither marks the registry unreachable nor fails a gate.
+    #[must_use]
+    pub fn is_permanent_absence(&self) -> bool {
+        matches!(self, Self::NotFound(_) | Self::AllYanked { .. })
+    }
+
     /// Whether retrying might succeed.
     ///
     /// Rate limits and server faults are the registry saying "not now"; a timeout or a
@@ -57,6 +76,7 @@ impl FetchError {
             // reasoning as a decode failure. It is still not a 404, so the gate refuses
             // to certify through it.
             Self::NotFound(_)
+            | Self::AllYanked { .. }
             | Self::EmptyVersionList { .. }
             | Self::Decode { .. }
             | Self::Osv(_) => false,

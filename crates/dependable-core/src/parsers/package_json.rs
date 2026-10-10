@@ -300,9 +300,48 @@ enum Resolved {
 }
 
 /// Local/workspace spec prefixes that are not version-checked.
-const LOCAL_PREFIXES: &[&str] = &["file:", "link:", "workspace:", "catalog:", "portal:"];
+///
+/// Yarn's `patch:` protocol — which `yarn patch-commit` writes into `resolutions` —
+/// and its `exec:` protocol name a package built from files in the repository, and
+/// npm reads a value that opens like a path (`./sub`, `../lib`, `/abs`, `~/pkg`) as a
+/// folder dependency.
+const LOCAL_PREFIXES: &[&str] = &[
+    "file:",
+    "link:",
+    "workspace:",
+    "catalog:",
+    "portal:",
+    "patch:",
+    "exec:",
+    "./",
+    "../",
+    "/",
+    "~/",
+];
 /// Git/URL spec prefixes that are not version-checked.
-const GIT_PREFIXES: &[&str] = &["git+", "git:", "github:", "http://", "https://"];
+const GIT_PREFIXES: &[&str] = &[
+    "git+",
+    "git:",
+    "github:",
+    "gitlab:",
+    "bitbucket:",
+    "gist:",
+    "http://",
+    "https://",
+];
+
+/// npm's GitHub shorthand, `user/repo` optionally followed by `#ref`.
+///
+/// No semver range contains a `/`, and a value cannot start with a scope's `@`, so a
+/// slash in the part before any `#` is a repository path rather than a range.
+fn is_github_shorthand(value: &str) -> bool {
+    let repo = value.split('#').next().unwrap_or(value);
+    !value.starts_with('@')
+        && !repo.contains(char::is_whitespace)
+        && repo
+            .split_once('/')
+            .is_some_and(|(user, name)| !user.is_empty() && !name.is_empty())
+}
 
 /// Resolve a `package.json` dependency `value` (`convertAliasToPackageName`).
 fn resolve(key: &str, value: &str) -> Resolved {
@@ -327,8 +366,13 @@ fn resolve(key: &str, value: &str) -> Resolved {
     if LOCAL_PREFIXES.iter().any(|p| value.starts_with(p)) {
         return Resolved::Skip(PackageSource::Local);
     }
-    if GIT_PREFIXES.iter().any(|p| value.starts_with(p)) {
+    if GIT_PREFIXES.iter().any(|p| value.starts_with(p)) || is_github_shorthand(value) {
         return Resolved::Skip(PackageSource::Git);
+    }
+    // pnpm's `"-"` override value removes the package from the tree. It forces no
+    // version, so there is no range to check; it is reported, not evaluated.
+    if value.trim() == "-" {
+        return Resolved::Skip(PackageSource::Unresolved);
     }
     Resolved::Dep {
         name: key.to_string(),
@@ -442,6 +486,42 @@ mod tests {
         assert_eq!(find(&m, "fromgit").source, PackageSource::Git);
         assert_eq!(find(&m, "catdep").source, PackageSource::Local);
         assert!(!find(&m, "linked").is_checkable());
+    }
+
+    /// Values `package.json` accepts that are not registry ranges: a Yarn `patch:`
+    /// resolution (what `yarn patch-commit` writes), npm's GitHub shorthand, a folder
+    /// path, and pnpm's `"-"` removal. Each reached the checker as a constraint and
+    /// failed the run as an unparseable one.
+    #[test]
+    fn non_registry_values_are_never_handed_to_the_checker_as_ranges() {
+        let content = r#"{
+  "dependencies": {
+    "gh": "expressjs/express#v4.18.2",
+    "ghbare": "user/repo",
+    "folder": "./packages/sub"
+  },
+  "resolutions": {
+    "lodash": "patch:lodash@npm%3A4.17.21#./.yarn/patches/lodash.patch"
+  },
+  "pnpm": {
+    "overrides": {
+      "removed": "-"
+    }
+  }
+}"#;
+        let m = parse(content);
+        assert_eq!(find(&m, "gh").source, PackageSource::Git);
+        assert_eq!(find(&m, "ghbare").source, PackageSource::Git);
+        assert_eq!(find(&m, "folder").source, PackageSource::Local);
+        assert_eq!(find(&m, "lodash").source, PackageSource::Local);
+        assert_eq!(find(&m, "removed").source, PackageSource::Unresolved);
+        for item in &m.items {
+            assert!(!item.is_checkable(), "{} is checkable", item.name);
+            assert!(item.version_constraint.is_empty(), "{}", item.name);
+        }
+        // A scoped name is not a shorthand, and a range never contains a slash.
+        assert!(!is_github_shorthand("@scope/pkg"));
+        assert!(!is_github_shorthand("^1.2.3 || ~2.0"));
     }
 
     #[test]

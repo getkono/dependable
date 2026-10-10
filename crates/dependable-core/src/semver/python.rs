@@ -149,10 +149,26 @@ fn convert_op(op: &str, version: &str) -> Option<String> {
         // Poetry / semver-native. The operand still has to be normalized: Poetry accepts
         // a full PEP 440 version here, and `^1.0.post1` handed through verbatim is not a
         // requirement `semver` can parse.
+        //
+        // A plain release of up to three segments is handed through unpadded, because
+        // for `^` and `~` the number of segments written *is* the range: `~1` admits
+        // every `1.x` while `~1.0.0` admits only `1.0.x`, and `^0` admits every `0.x`
+        // while `^0.0.0` admits nothing past `0.0.0`. Padding first narrowed each one.
+        "^" | "~" if is_plain_release(version) => Some(format!("{op}{version}")),
         "^" | "~" => pep440_to_semver(version).map(|v| format!("{op}{v}")),
         ">=" | "<=" | ">" | "<" => pep440_to_semver(version).map(|v| format!("{op}{v}")),
         _ => None,
     }
+}
+
+/// Whether `version` is one to three dot-separated numeric segments and nothing else
+/// (`1`, `1.2`, `1.2.3`) — a spelling `semver` already reads with Cargo's meaning.
+fn is_plain_release(version: &str) -> bool {
+    let segments: Vec<&str> = version.split('.').collect();
+    segments.len() <= 3
+        && segments
+            .iter()
+            .all(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// `==1.0.*` → `>=1.0.0, <1.1.0` (the next release of the last specified segment).
@@ -345,7 +361,7 @@ mod tests {
     #[test]
     fn passes_through_poetry_operators_and_drops_exclusions() {
         assert_eq!(pep440_constraint_to_semver("^1.2.3"), "^1.2.3");
-        assert_eq!(pep440_constraint_to_semver("~1.2"), "~1.2.0");
+        assert_eq!(pep440_constraint_to_semver("~1.2"), "~1.2");
         // `!=` is dropped, leaving the expressible clauses.
         assert_eq!(pep440_constraint_to_semver(">=1.0,!=1.5"), ">=1.0.0");
     }
@@ -360,6 +376,34 @@ mod tests {
             assert!(
                 ::semver::VersionReq::parse(&converted).is_ok(),
                 "{constraint} -> {converted} does not parse"
+            );
+        }
+    }
+
+    /// For `^` and `~` the segments written are the range, so padding the operand before
+    /// re-applying the operator narrowed it: `~1` became `~1.0.0` (only `1.0.x`), and
+    /// `^0`/`^0.0` became `^0.0.0` (only `0.0.0`). A project declaring `foo = "~1"` and
+    /// locked at `1.5.0` was reported outdated.
+    #[test]
+    fn poetry_caret_and_tilde_keep_the_width_of_a_partial_operand() {
+        let v = |s: &str| ::semver::Version::parse(s).unwrap();
+        // (constraint, admitted, rejected)
+        for (constraint, admits, rejects) in [
+            ("~1", "1.5.0", "2.0.0"),
+            ("~1.2", "1.2.9", "1.3.0"),
+            ("^0", "0.9.0", "1.0.0"),
+            ("^0.0", "0.0.7", "0.1.0"),
+            ("^1", "1.9.0", "2.0.0"),
+        ] {
+            let converted = pep440_constraint_to_semver(constraint);
+            let req = ::semver::VersionReq::parse(&converted).unwrap();
+            assert!(
+                req.matches(&v(admits)),
+                "{constraint} -> {converted} rejected {admits}"
+            );
+            assert!(
+                !req.matches(&v(rejects)),
+                "{constraint} -> {converted} admitted {rejects}"
             );
         }
     }
