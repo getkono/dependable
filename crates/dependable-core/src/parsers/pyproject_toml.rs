@@ -175,7 +175,17 @@ fn parse_table_dep(
     // (`foo = [{version = "^1.0", python = "<3.8"}, {version = "^2.0", python = ">=3.8"}]`).
     // Markers are not evaluated here, so the first entry that declares a version stands
     // for the dependency — which reports it, where dropping the whole array did not.
+    //
+    // When more than one entry declares a version, the first is only one branch of a
+    // marker split, so its span is collapsed: the dependency is still reported, but
+    // `fix --all` no longer rewrites the `python<3.8` branch to the newest major and
+    // collapses the split.
     if let Some(array) = item.as_array() {
+        let versioned = array
+            .iter()
+            .filter_map(|value| value.as_inline_table())
+            .filter(|table| table.get("version").is_some_and(|v| v.as_str().is_some()))
+            .count();
         for value in array.iter() {
             let Some(table) = value.as_inline_table() else {
                 continue;
@@ -190,14 +200,12 @@ fn parse_table_dep(
                 && let Some(version) = version_value.as_str()
                 && let Some(span) = version_value.span()
             {
-                return Some(make_item(
-                    name,
-                    version,
-                    span,
-                    PackageSource::Registry,
-                    kind,
-                    starts,
-                ));
+                let mut parsed =
+                    make_item(name, version, span, PackageSource::Registry, kind, starts);
+                if versioned > 1 {
+                    parsed.version_col_end = parsed.version_col_start;
+                }
+                return Some(parsed);
             }
         }
         return None;
@@ -408,6 +416,30 @@ mod tests {
             .find(|i| i.name == "foo")
             .expect("foo missing");
         assert_eq!(foo.version_constraint, "^1.0");
-        assert!(foo.is_rewritable());
+        // Reported, but not rewritable: `^1.0` is only the `python<3.8` branch, and
+        // rewriting it to the newest major would collapse the marker split.
+        assert!(foo.has_position());
+        assert!(!foo.is_rewritable());
+
+        // A single-entry array has no split to collapse, and stays rewritable.
+        let content = concat!(
+            "[tool.poetry.dependencies]\n",
+            "bar = [{version = \"^1.0\", python = \"<3.8\"}]\n",
+        );
+        let m = PyprojectTomlParser.parse(content).expect("valid TOML");
+        assert!(m.items.iter().any(|i| i.name == "bar" && i.is_rewritable()));
+    }
+
+    /// PDM documents editable entries as `"-e ./sub"` inside its PEP 508 arrays. That is
+    /// an installer option and a path, not a registry package named `-e`.
+    #[test]
+    fn a_pdm_editable_entry_is_not_a_registry_package() {
+        let content = concat!(
+            "[tool.pdm.dev-dependencies]\n",
+            "dev = [\"-e ./sub\", \"-e file:///${PROJECT_ROOT}/lib#egg=lib\", \"pytest>=8\"]\n",
+        );
+        let m = PyprojectTomlParser.parse(content).expect("valid TOML");
+        let names: Vec<&str> = m.items.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, ["pytest"]);
     }
 }

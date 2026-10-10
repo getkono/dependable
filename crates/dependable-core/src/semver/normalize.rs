@@ -226,7 +226,11 @@ pub fn normalize_range_constraint(constraint: &str) -> String {
     translate_union(core).unwrap_or_else(|| normalize_constraint(constraint))
 }
 
-/// Pick one branch of a `||` union: the one admitting the highest versions.
+/// Pick one branch of a union: the one admitting the highest versions.
+///
+/// npm and Cargo spell a union `||`; Composer accepts `||` and a single `|` as the same
+/// operator, so both split here. No dialect this front-end serves uses a lone `|` for
+/// anything else, so splitting on it never mis-reads an npm or Cargo range.
 ///
 /// `VersionReq` has no union, so a branch has to be chosen. The highest lower bound
 /// is the same choice [`hex_constraint_to_semver`](crate::semver::elixir::hex_constraint_to_semver)
@@ -236,7 +240,7 @@ pub fn normalize_range_constraint(constraint: &str) -> String {
 /// branch as out of range.
 fn translate_union(core: &str) -> Option<String> {
     let mut best: Option<((u64, u64, u64), String)> = None;
-    for branch in core.split("||") {
+    for branch in core.split('|') {
         let branch = branch.trim();
         if branch.is_empty() {
             continue;
@@ -266,7 +270,7 @@ fn lower_bound(req: &::semver::VersionReq) -> (u64, u64, u64) {
         .filter(|c| {
             matches!(
                 c.op,
-                Op::Greater | Op::GreaterEq | Op::Exact | Op::Caret | Op::Tilde
+                Op::Greater | Op::GreaterEq | Op::Exact | Op::Caret | Op::Tilde | Op::Wildcard
             )
         })
         .map(|c| (c.major, c.minor.unwrap_or(0), c.patch.unwrap_or(0)))
@@ -334,12 +338,53 @@ fn hyphen_range(low: &str, high: &str) -> Option<String> {
 /// crate has no front-end for, and failing a build over one punishes the user for a
 /// gap that is ours. A name is spelled the way a name is spelled: it opens with a
 /// letter and carries no comparison operator anywhere.
+///
+/// Composer also names a branch by its version line — `2.x-dev`, `1.0.x-dev` — and
+/// lets a requirement alias one branch as another (`dev-main as 1.0.x-dev`). Those
+/// open with a digit or carry spaces, but they name a branch exactly as `dev-master`
+/// does, so they are recognised as names too.
 #[must_use]
 pub fn is_dialect_tag(constraint: &str) -> bool {
-    let c = constraint.trim();
+    let c = strip_stability_flag(constraint.trim());
+    if let Some((branch, alias)) = c.split_once(" as ") {
+        return is_alias_side(branch.trim()) && is_alias_side(alias.trim());
+    }
+    is_name(c) || is_branch_line(c)
+}
+
+/// One side of a Composer inline alias: a branch name, a numbered branch, or a plain
+/// version.
+fn is_alias_side(c: &str) -> bool {
+    is_name(c) || is_branch_line(c) || is_plain_version(c)
+}
+
+/// A token spelled the way a name is spelled: a leading letter, then letters, digits,
+/// and the separators a branch or channel name uses.
+fn is_name(c: &str) -> bool {
     c.starts_with(|ch: char| ch.is_ascii_alphabetic())
         && c.chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/'))
+}
+
+/// Composer's numbered-branch spelling: a version line suffixed `-dev`
+/// (`2.x-dev`, `1.0.x-dev`).
+fn is_branch_line(c: &str) -> bool {
+    let Some(line) = c.strip_suffix("-dev").or_else(|| c.strip_suffix("-DEV")) else {
+        return false;
+    };
+    line.starts_with(|ch: char| ch.is_ascii_digit())
+        && line
+            .chars()
+            .all(|ch| ch.is_ascii_digit() || matches!(ch, '.' | 'x' | 'X' | '*'))
+}
+
+/// A bare dotted version (`1.0.0`, `v2.1`), which Composer's inline alias accepts on
+/// either side.
+fn is_plain_version(c: &str) -> bool {
+    let c = c.strip_prefix(['v', 'V']).unwrap_or(c);
+    !c.is_empty()
+        && c.split('.')
+            .all(|seg| !seg.is_empty() && seg.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Convert a constraint into a `semver::VersionReq`-compatible string for the
@@ -542,6 +587,15 @@ mod tests {
                 &["2.4.0"],
                 &["3.0.0", "0.9.0"],
             ),
+            // Composer accepts a single `|` as the same union operator.
+            (Ecosystem::Php, "^1.0|^2.0", &["2.4.0"], &["3.0.0", "0.9.0"]),
+            // A wildcard branch ranks by the line it names, so the newest branch wins.
+            (
+                Ecosystem::Npm,
+                "1.x || 2.x",
+                &["2.5.0"],
+                &["1.9.0", "3.0.0"],
+            ),
         ];
         for (ecosystem, constraint, admits, rejects) in cases {
             let req = assert_translates(constraint, *ecosystem);
@@ -584,6 +638,9 @@ mod tests {
             (Ecosystem::Npm, "beta"),
             (Ecosystem::Npm, "canary"),
             (Ecosystem::Php, "dev-master"),
+            (Ecosystem::Php, "2.x-dev"),
+            (Ecosystem::Php, "1.0.x-dev"),
+            (Ecosystem::Php, "dev-main as 1.0.x-dev"),
         ] {
             let translated = try_to_semver_constraint(constraint, ecosystem)
                 .expect("a name is handed back, not dropped");
@@ -604,10 +661,30 @@ mod tests {
     /// not spell one are not names, and must stay a hard error.
     #[test]
     fn garbage_wearing_range_operators_is_not_a_name() {
-        for constraint in ["^^^bogus", ">=<1.0.0", "~~", "1.2.3", "*", "@dev"] {
+        for constraint in [
+            "^^^bogus",
+            ">=<1.0.0",
+            "~~",
+            "1.2.3",
+            "*",
+            "@dev",
+            "^1 as 2.0",
+            ">=1 as dev-main",
+            "1.x-devx",
+        ] {
             assert!(!is_dialect_tag(constraint), "{constraint}");
         }
-        for constraint in ["next", "dev-master", "latest", "release/2.x"] {
+        for constraint in [
+            "next",
+            "dev-master",
+            "latest",
+            "release/2.x",
+            "2.x-dev",
+            "1.0.x-dev",
+            "dev-main as 1.0.x-dev",
+            "dev-bugfix as 1.0.0",
+            "dev-main@dev",
+        ] {
             assert!(is_dialect_tag(constraint), "{constraint}");
         }
     }

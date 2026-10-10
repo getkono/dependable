@@ -32,11 +32,12 @@ pub struct FixRecord {
 /// Why `fix` left an update alone that `check` reported.
 ///
 /// Most of these are [`rewrite_constraint`] refusing to substitute a new version
-/// into a constraint. The last three are [`plan_fixes`] itself, which drops a row
+/// into a constraint. The last four are [`plan_fixes`] itself, which drops a row
 /// before the constraint is ever consulted — a pin held back for want of `--all`,
 /// a row with no version resolved to write, and a row whose constraint already
-/// names the target. Those three were silent, and silence is issue #93's exact
-/// symptom: `check` reports an update, `fix` says everything is up to date. An
+/// names the target, split by whether `--all` would move it. Those were silent,
+/// and silence is issue #93's exact symptom: `check` reports an update, `fix`
+/// says everything is up to date. An
 /// override is the one skip still not on this list, and [`plan_fixes`] says why.
 ///
 /// Carried out of the planner rather than recomputed, because the answer is only
@@ -71,14 +72,18 @@ pub enum DeclineReason {
     /// A wildcard whose shape no bare version reproduces even where the bare
     /// reading is a caret: `*`, `1.2.*`, `1.+`.
     WildcardShape,
-    /// A constraint whose every written component is zero, where a bare version
-    /// is read as a caret: Cargo's `0.*`, `0`, `0.0`. The shape is one a caret
+    /// A constraint whose every written component is zero, read as a caret —
+    /// where a bare version is one (Cargo's `0.*`, `0`, `0.0`) or behind a
+    /// written caret in any ecosystem (`^0`, `^0.0`). The shape is one a caret
     /// otherwise reproduces; what does not survive is the *bound*, because a
     /// caret is minor-scoped below 1.0.0.
     CaretBoundNarrows,
     /// A partial version, which is an X-range wherever a bare version is exact:
     /// npm's `"react": "16"`.
     PartialVersion,
+    /// A partial version behind a lone `=`, which is a range rather than a pin:
+    /// Cargo's `=1.2` is `>=1.2.0, <1.3.0`, node-semver's `=16` is `16.x`.
+    EqualsPartial,
     /// A partial version behind a tilde operator, which reads its upper bound off
     /// the number of components it was given: `~1`, `~> 1.0`, `~=1.4`.
     TildeArity,
@@ -96,6 +101,13 @@ pub enum DeclineReason {
     /// Reached most sharply by a `Vulnerable` row whose only fixed release is the
     /// one already in force: there is an update to report and nothing to write.
     AlreadyAtTarget,
+    /// The constraint already names the newest release it admits, a newer one
+    /// exists beyond it, and `--all` would write that one. The exact pins
+    /// [`Item::is_pinned`](dependable_fetch::core::Item::is_pinned)
+    /// does not recognise reach this — npm's bare `"1.0.0"`, PEP 440's `==1.0.0` —
+    /// so, like [`Self::Pinned`], the note names `--all` and the release it would
+    /// write rather than the one already in force.
+    NeedsAll,
 }
 
 impl DeclineReason {
@@ -144,6 +156,10 @@ impl DeclineReason {
             Self::PartialVersion => {
                 "a partial version is an X-range that already tracks new releases"
             }
+            Self::EqualsPartial => {
+                "an `=` in front of a partial version is a range that already tracks new \
+                 releases, and a full version here would pin it to one"
+            }
             Self::TildeArity => {
                 "a tilde reads its upper bound off the number of components it was given, and a \
                  full version here would narrow that bound"
@@ -154,6 +170,10 @@ impl DeclineReason {
             }
             Self::AlreadyAtTarget => {
                 "the constraint already names it, and nothing newer satisfies the constraint"
+            }
+            Self::NeedsAll => {
+                "nothing newer satisfies the constraint, and only `--all` writes a release beyond \
+                 it"
             }
         }
     }
@@ -190,10 +210,12 @@ struct Edit {
     /// The text the span held when the plan was made.
     ///
     /// The span comes from a parse that happened before the network check, and the file
-    /// is read again at write time. If anything moved in between — an editor auto-save, a
-    /// `cargo add`, a concurrent `dependable fix` — the offsets now point somewhere else,
-    /// and splicing into them corrupts the manifest. Checking the text first is what
-    /// turns that into a refusal.
+    /// is read again when the plan is made. If anything moved in between — an editor
+    /// auto-save, a `cargo add`, a concurrent `dependable fix` — the offsets now point
+    /// somewhere else, and splicing into them corrupts the manifest. Checking the text
+    /// first is what turns that into a refusal. A change landing *after* the plan, while
+    /// other manifests are still being checked, is refused by [`commit`], which writes
+    /// only over the exact contents the plan was computed from.
     expected: String,
     replacement: String,
 }
@@ -204,6 +226,9 @@ pub struct PlannedFix {
     pub path: std::path::PathBuf,
     /// The full new contents.
     updated: String,
+    /// The contents the plan was computed from, which [`commit`] requires the file to
+    /// still hold before it writes.
+    original: String,
     /// What changed, for reporting.
     pub records: Vec<FixRecord>,
     /// The updates this rewrite declined to make, and why — reported so `check`
@@ -237,6 +262,7 @@ pub fn plan(manifest: &Path, results: &[CheckResult], all: bool) -> anyhow::Resu
     Ok(PlannedFix {
         path: manifest.to_path_buf(),
         updated,
+        original: content,
         records,
         declined,
     })
@@ -249,13 +275,33 @@ pub fn plan(manifest: &Path, results: &[CheckResult], all: bool) -> anyhow::Resu
 /// `fs::write` truncates first, which meant an interrupted write left a manifest empty
 /// or half-written and no backup to recover from.
 ///
+/// The file is read again first, and the write is refused unless it still holds exactly
+/// what the plan was computed from. A run plans every manifest before writing any, and
+/// the network check happens in between, so an editor save, a `cargo add`, or a
+/// concurrent `fix` landing in that window would otherwise be overwritten in silence.
+///
+/// A symlinked manifest is written through: the link is resolved and its target is
+/// replaced, so the link survives and points at the rewritten file. Renaming over the
+/// link itself replaced it with a regular file and left the real manifest unedited.
+///
 /// # Errors
-/// Returns an error if the temporary file cannot be created, written, or renamed.
+/// Returns an error if the manifest changed since it was planned, or if the temporary
+/// file cannot be created, written, or renamed.
 pub fn commit(planned: &PlannedFix) -> anyhow::Result<()> {
     if planned.records.is_empty() {
         return Ok(());
     }
-    let directory = planned.path.parent().unwrap_or_else(|| Path::new("."));
+    let target = std::fs::canonicalize(&planned.path)
+        .with_context(|| format!("resolving {}", planned.path.display()))?;
+    let current = std::fs::read_to_string(&target)
+        .with_context(|| format!("re-reading {}", planned.path.display()))?;
+    if current != planned.original {
+        anyhow::bail!(
+            "{} changed after it was checked; it was not rewritten — run `fix` again",
+            planned.path.display()
+        );
+    }
+    let directory = target.parent().unwrap_or_else(|| Path::new("."));
     let mut temp = tempfile::NamedTempFile::new_in(directory).with_context(|| {
         format!(
             "creating a temporary file beside {}",
@@ -271,7 +317,7 @@ pub fn commit(planned: &PlannedFix) -> anyhow::Result<()> {
         .with_context(|| format!("flushing {}", planned.path.display()))?;
     // A manifest is usually 0644 while a temporary file is 0600; preserve what was there.
     #[cfg(unix)]
-    if let Ok(metadata) = std::fs::metadata(&planned.path) {
+    if let Ok(metadata) = std::fs::metadata(&target) {
         use std::os::unix::fs::PermissionsExt as _;
         let _ = temp
             .as_file()
@@ -279,7 +325,7 @@ pub fn commit(planned: &PlannedFix) -> anyhow::Result<()> {
                 metadata.permissions().mode(),
             ));
     }
-    temp.persist(&planned.path)
+    temp.persist(&target)
         .with_context(|| format!("replacing {}", planned.path.display()))?;
     Ok(())
 }
@@ -397,6 +443,25 @@ fn plan_fixes(
         // force reaches it with an advisory attached. `check` reports that row,
         // so `fix` cannot answer it with "everything is already up to date".
         if new_constraint == item.version_constraint {
+            // An exact pin `is_pinned` does not recognise — npm's bare `"1.0.0"`,
+            // PEP 440's `==1.0.0` — lands here rather than at the pin guard. Where
+            // `--all` would write a newer release, that is the action to name and
+            // the release to name with it; the one already in force is not
+            // "available" in any sense the author can use.
+            let beyond = result.latest_available.as_ref().filter(|beyond| {
+                !all && *beyond != target
+                    && rewrite_constraint(&item.version_constraint, beyond, ecosystem)
+                        .is_ok_and(|rewritten| rewritten != item.version_constraint)
+            });
+            if let Some(beyond) = beyond {
+                declined.push(Declined {
+                    name: item.name.clone(),
+                    constraint: item.version_constraint.clone(),
+                    target: Some(beyond.clone()),
+                    reason: DeclineReason::NeedsAll,
+                });
+                continue;
+            }
             declined.push(Declined {
                 name: item.name.clone(),
                 constraint: item.version_constraint.clone(),
@@ -439,8 +504,9 @@ fn plan_fixes(
 /// a `||` alternation (`^1 || ^2`), a dist-tag (`latest`), anything carrying an
 /// `@` (a Composer stability flag such as `@dev` or `^1.0@beta`, an npm alias
 /// such as `npm:pkg@1.0.0`), a partial version behind a tilde operator (`~1`,
-/// `~> 1.0`, `~=1.4`), and — depending on `ecosystem` — a wildcard (`*`, `1.x`,
-/// `1.*`) or a partial version (npm `"16"`, Cargo `"0"`).
+/// `~> 1.0`, `~=1.4`) or a lone `=` (`=1.2`), an all-zero partial behind a caret
+/// (`^0`, `^0.0`), and — depending on `ecosystem` — a wildcard (`*`, `1.x`,
+/// `1.*`) or a partial version (npm `"16"` or `"v16"`, Cargo `"0"`).
 ///
 /// The error is a [`DeclineReason`] and not a bare `None`, because *which* guard
 /// fired is the only thing that makes the resulting note actionable, and this is
@@ -572,7 +638,16 @@ fn rewrite_constraint(
             return Err(DeclineReason::CaretBoundNarrows);
         }
     } else if is_partial_version(rest) {
-        if prefix.is_empty() {
+        // The prefix collected above also swallows a leading `v` and whitespace,
+        // neither of which is an operator: node-semver reads `"v16"` exactly as it
+        // reads `"16"` — the X-range `16.x` — so a `v` must not be what carries a
+        // partial past the bare-version guard below. Strip both and ask which
+        // operator, if any, the author actually wrote.
+        let operator: String = prefix
+            .chars()
+            .filter(|c| !matches!(c, 'v' | 'V' | ' ' | '\t'))
+            .collect();
+        if operator.is_empty() {
             // The same harm one wildcard character away, reached under two of the
             // three readings — and under two different reasons, because the two
             // readings lose two different things.
@@ -610,7 +685,30 @@ fn rewrite_constraint(
             if bare == BareVersion::Caret && !caret_bound_survives_substitution(rest) {
                 return Err(DeclineReason::CaretBoundNarrows);
             }
-        } else if prefix.contains('~') {
+        } else if operator == "^" {
+            // A written caret keys its bound off the leftmost non-zero component
+            // in every ecosystem that has one, so it carries the all-zero hazard
+            // the bare Cargo form does: Cargo's `^0` *is* the bare `0` declined
+            // above, and npm's `^0` (`<1.0.0`) and `^0.0` (`<0.1.0`) reach further
+            // than any `^0.y.z` or `^0.0.z` written back. A non-zero component
+            // anywhere keeps the bound, so `^16` and `^0.9` stay rewritable.
+            if !caret_bound_survives_substitution(rest) {
+                return Err(DeclineReason::CaretBoundNarrows);
+            }
+        } else if operator == "=" {
+            // A lone `=` in front of a partial is a range, not a pin, in both
+            // ecosystems that write it: Cargo's `=1.2` is `>=1.2.0, <1.3.0` and
+            // node-semver's `=16` is the X-range `16.x`. Substituting the
+            // three-component version narrows either to one release — the same
+            // harm as the bare npm partial, behind an operator. `==` (PEP 440,
+            // Hex) is not this operator and pads a partial with zeros instead, so
+            // moving it forward only moves a pin.
+            //
+            // Its own reason, for the reason the tilde below has one: the operator
+            // is what makes the partial a range here, and a note about a bare
+            // X-range would describe a constraint the author did not write.
+            return Err(DeclineReason::EqualsPartial);
+        } else if operator.contains('~') {
             // A tilde operator reads its upper bound off the *number of
             // components* it was given, so substituting the three-component
             // version `fix` writes back collapses the range the author asked for.
@@ -1222,6 +1320,120 @@ mod tests {
         assert!(rewrite_constraint("16", "16.14.0", None).is_err());
     }
 
+    /// A leading `v` is spelling, not an operator: node-semver reads `"v16"` as
+    /// it reads `"16"`, the X-range `16.x`. The prefix the rewrite preserves
+    /// swallows the `v` along with real operators, so a guard asking only whether
+    /// that prefix is empty let `"v16"` through to the pin `"v16.14.0"`.
+    #[test]
+    fn rewrite_declines_a_partial_version_behind_a_bare_v() {
+        let npm = Some(Ecosystem::Npm);
+        assert_eq!(
+            rewrite_constraint("v16", "16.14.0", npm),
+            Err(DeclineReason::PartialVersion)
+        );
+        assert_eq!(
+            rewrite_constraint("V1.0", "1.5.0", npm),
+            Err(DeclineReason::PartialVersion)
+        );
+        assert_eq!(
+            rewrite_constraint("v16", "16.14.0", None),
+            Err(DeclineReason::PartialVersion)
+        );
+        // A full `v`-led version is a pin, and moving it forward is still `fix`'s
+        // job; a `v` behind a real operator is that operator's question.
+        assert_eq!(
+            rewrite_constraint("v16.0.0", "16.14.0", npm).as_deref(),
+            Ok("v16.14.0")
+        );
+        assert_eq!(
+            rewrite_constraint("^v16", "16.14.0", npm).as_deref(),
+            Ok("^v16.14.0")
+        );
+        // Where a partial is safe bare, it is safe `v`-led too.
+        assert_eq!(
+            rewrite_constraint("v1.0", "1.5.0", Some(Ecosystem::Rust)).as_deref(),
+            Ok("v1.5.0")
+        );
+    }
+
+    /// A written caret keys its bound off the leftmost non-zero component in
+    /// every ecosystem that has one, so the all-zero hazard the bare Cargo `0`
+    /// carries follows the caret wherever it is spelled out. Cargo's `^0` is the
+    /// bare `0` itself; npm's `^0` is `<1.0.0` and `^0.0` is `<0.1.0`, and no
+    /// `^0.y.z` or `^0.0.z` written back reaches either.
+    #[test]
+    fn rewrite_declines_an_all_zero_partial_behind_a_caret() {
+        for ecosystem in EVERY_ECOSYSTEM {
+            let it = Some(ecosystem);
+            assert_eq!(
+                rewrite_constraint("^0", "0.10.0", it),
+                Err(DeclineReason::CaretBoundNarrows),
+                "{ecosystem:?}"
+            );
+            assert_eq!(
+                rewrite_constraint("^0.0", "0.0.9", it),
+                Err(DeclineReason::CaretBoundNarrows),
+                "{ecosystem:?}"
+            );
+            // A non-zero component anywhere keeps the bound: `^0.9` and
+            // `^0.9.5` both stop below `0.10.0`, `^16` and `^16.14.0` below `17`.
+            assert_eq!(
+                rewrite_constraint("^0.9", "0.9.5", it).as_deref(),
+                Ok("^0.9.5"),
+                "{ecosystem:?}"
+            );
+            assert_eq!(
+                rewrite_constraint("^16", "16.14.0", it).as_deref(),
+                Ok("^16.14.0"),
+                "{ecosystem:?}"
+            );
+            // Full arity names every component, so the bound already matches.
+            assert_eq!(
+                rewrite_constraint("^0.0.1", "0.0.3", it).as_deref(),
+                Ok("^0.0.3"),
+                "{ecosystem:?}"
+            );
+        }
+    }
+
+    /// A lone `=` in front of a partial is a range in both ecosystems that write
+    /// it — Cargo's `=1.2` is `>=1.2.0, <1.3.0`, node-semver's `=16` is `16.x` —
+    /// so substituting a three-component version narrows it to one release.
+    #[test]
+    fn rewrite_declines_a_partial_version_behind_a_lone_equals() {
+        for ecosystem in EVERY_ECOSYSTEM {
+            let it = Some(ecosystem);
+            assert_eq!(
+                rewrite_constraint("=1.2", "1.2.5", it),
+                Err(DeclineReason::EqualsPartial),
+                "{ecosystem:?}"
+            );
+            assert_eq!(
+                rewrite_constraint("=16", "16.14.0", it),
+                Err(DeclineReason::EqualsPartial),
+                "{ecosystem:?}"
+            );
+            assert_eq!(
+                rewrite_constraint("=v16", "16.14.0", it),
+                Err(DeclineReason::EqualsPartial),
+                "{ecosystem:?}"
+            );
+            // A full version behind `=` is a pin and moves forward as before.
+            assert_eq!(
+                rewrite_constraint("=1.2.0", "1.5.0", it).as_deref(),
+                Ok("=1.5.0"),
+                "{ecosystem:?}"
+            );
+            // `==` pads a partial with zeros (PEP 440), so it names one release
+            // already and moving it forward only moves a pin.
+            assert_eq!(
+                rewrite_constraint("==1.4", "1.4.2", it).as_deref(),
+                Ok("==1.4.2"),
+                "{ecosystem:?}"
+            );
+        }
+    }
+
     /// A wildcard segment is not always the whole dot-segment. Composer allows a
     /// stability flag after the constraint, so `"symfony/symfony": "2.8.*@dev"`
     /// splits into `["2", "8", "*@dev"]` — no segment *equals* a wildcard, and a
@@ -1608,6 +1820,88 @@ mod tests {
                 constraint: "1.0.0".to_string(),
                 target: Some("1.0.0".to_string()),
                 reason: DeclineReason::AlreadyAtTarget,
+            }]
+        );
+    }
+
+    /// An exact pin `is_pinned` does not recognise — npm's bare `"1.0.0"`, PEP
+    /// 440's `==1.0.0` — has its newest compatible release already in force, so
+    /// it reaches the already-at-target branch. `--all` rewrites it, so the note
+    /// names `--all` and the release it would write, not the installed one.
+    #[test]
+    fn an_exact_pin_is_pinned_misses_names_all_and_the_newer_release() {
+        let cases = [
+            (
+                ManifestKind::PackageJson,
+                "{\n  \"name\": \"demo\",\n  \"dependencies\": {\n    \"lodash\": \"1.0.0\"\n  }\n}\n",
+                "lodash",
+                "1.0.0",
+                "\"lodash\": \"2.0.0\"",
+            ),
+            (
+                ManifestKind::RequirementsTxt,
+                "requests==1.0.0\n",
+                "requests",
+                "==1.0.0",
+                "requests==2.0.0",
+            ),
+        ];
+        for (kind, content, name, constraint, moved) in cases {
+            let mut results = results_for(kind, content, &[(name, "1.0.0")]);
+            results[0].latest_available = Some("2.0.0".to_string());
+
+            let (updated, records, declined) =
+                plan_fixes(content, &results, false, Some(kind.ecosystem()))
+                    .expect("the plan applies");
+            assert_eq!(updated, content, "{kind:?}");
+            assert!(records.is_empty(), "{kind:?}");
+            assert_eq!(
+                declined,
+                vec![Declined {
+                    name: name.to_string(),
+                    constraint: constraint.to_string(),
+                    target: Some("2.0.0".to_string()),
+                    reason: DeclineReason::NeedsAll,
+                }],
+                "{kind:?}"
+            );
+            assert!(DeclineReason::NeedsAll.explain().contains("--all"));
+
+            // And `--all` does what the note says, with nothing left to say.
+            let (updated, records, declined) =
+                plan_fixes(content, &results, true, Some(kind.ecosystem()))
+                    .expect("the plan applies");
+            assert!(updated.contains(moved), "{kind:?}: {updated}");
+            assert_eq!(records.len(), 1, "{kind:?}");
+            assert!(declined.is_empty(), "{kind:?}: {declined:?}");
+        }
+    }
+
+    /// The same declined constraint under `[dependencies]` and
+    /// `[dev-dependencies]` is one fact about one constraint, so it is one note.
+    #[test]
+    fn a_decline_in_two_sections_is_one_note() {
+        let content = "[dependencies]\nserde = \">=1.0, <2.0\"\n\n\
+                       [dev-dependencies]\nserde = \">=1.0, <2.0\"\n";
+        let results = results_for(ManifestKind::CargoToml, content, &[("serde", "1.0.219")]);
+        assert_eq!(results.len(), 2, "both sections must reach the planner");
+
+        let (updated, records, declined) = plan_fixes(
+            content,
+            &results,
+            false,
+            Some(ManifestKind::CargoToml.ecosystem()),
+        )
+        .expect("the plan applies");
+        assert_eq!(updated, content);
+        assert!(records.is_empty());
+        assert_eq!(
+            declined,
+            vec![Declined {
+                name: "serde".to_string(),
+                constraint: ">=1.0, <2.0".to_string(),
+                target: Some("1.0.219".to_string()),
+                reason: DeclineReason::CommaRange,
             }]
         );
     }
@@ -2083,6 +2377,49 @@ mod tests {
         );
     }
 
+    /// `plan` is where the ecosystem comes from in a real run: it reads the
+    /// manifest's file name, not a value a caller hands it. The same `"1.*"`
+    /// written to a `Cargo.toml` and to a `package.json` must get opposite
+    /// verdicts through `plan` itself, so detection that answered `None` (or the
+    /// wrong kind) fails here rather than passing every `plan_fixes` test.
+    #[test]
+    fn plan_reads_the_ecosystem_from_the_manifest_file_name() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+
+        let cargo_content = "[dependencies]\nserde = \"1.*\"\n";
+        let cargo_path = dir.path().join("Cargo.toml");
+        std::fs::write(&cargo_path, cargo_content).expect("write Cargo.toml");
+        let cargo_results = results_for(
+            ManifestKind::CargoToml,
+            cargo_content,
+            &[("serde", "1.0.219")],
+        );
+        assert_eq!(cargo_results.len(), 1, "the fixture must produce one item");
+        let planned = plan(&cargo_path, &cargo_results, false).expect("the plan applies");
+        assert_eq!(
+            planned
+                .records
+                .iter()
+                .map(|record| (record.name.as_str(), record.to.as_str()))
+                .collect::<Vec<_>>(),
+            [("serde", "1.0.219")]
+        );
+        assert_eq!(planned.updated, "[dependencies]\nserde = \"1.0.219\"\n");
+
+        let npm_content = "{\n  \"dependencies\": {\n    \"lodash\": \"1.*\"\n  }\n}\n";
+        let npm_path = dir.path().join("package.json");
+        std::fs::write(&npm_path, npm_content).expect("write package.json");
+        let npm_results = results_for(
+            ManifestKind::PackageJson,
+            npm_content,
+            &[("lodash", "1.9.0")],
+        );
+        assert_eq!(npm_results.len(), 1, "the fixture must produce one item");
+        let planned = plan(&npm_path, &npm_results, false).expect("the plan applies");
+        assert!(planned.records.is_empty(), "{:?}", planned.records);
+        assert_eq!(planned.updated, npm_content);
+    }
+
     /// The same manifest shape in the ecosystem that must still decline it: npm
     /// reads a bare `1.0.219` as that release and nothing else, so the identical
     /// rewrite would destroy the range. One ecosystem apart, opposite verdicts —
@@ -2164,5 +2501,130 @@ mod tests {
             rewrite_constraint("1.0.0", "1.5.0", None).as_deref(),
             Ok("1.5.0")
         );
+    }
+
+    const PACKAGE_JSON: &str = "{\n  \"dependencies\": {\n    \"react\": \"^18.0.0\"\n  }\n}\n";
+    const PACKAGE_JSON_FIXED: &str =
+        "{\n  \"dependencies\": {\n    \"react\": \"^18.2.0\"\n  }\n}\n";
+
+    /// Write `PACKAGE_JSON` to `path` and plan a rewrite of it to `^18.2.0`.
+    fn planned_at(path: &Path) -> PlannedFix {
+        std::fs::write(path, PACKAGE_JSON).unwrap();
+        let results = results_for(
+            ManifestKind::PackageJson,
+            PACKAGE_JSON,
+            &[("react", "18.2.0")],
+        );
+        let planned = plan(path, &results, false).expect("the plan applies");
+        assert_eq!(planned.records.len(), 1, "the fixture must plan one edit");
+        planned
+    }
+
+    /// The write path itself: `commit` publishes the planned bytes, leaves no temporary
+    /// file behind, and keeps the manifest's permissions rather than the temporary
+    /// file's `0600`.
+    #[test]
+    fn commit_writes_the_planned_contents_and_keeps_the_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("package.json");
+        let planned = planned_at(&manifest);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(0o640)).unwrap();
+        }
+
+        commit(&planned).expect("the commit succeeds");
+
+        assert_eq!(
+            std::fs::read_to_string(&manifest).unwrap(),
+            PACKAGE_JSON_FIXED
+        );
+        let entries: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert_eq!(entries.len(), 1, "a temporary file was left behind");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&manifest).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o640);
+        }
+    }
+
+    /// An edit landing between the plan and the write — an editor save, a `cargo add`,
+    /// a concurrent `fix` — is kept, and the write is refused rather than overwriting it.
+    #[test]
+    fn commit_refuses_a_manifest_changed_after_it_was_planned() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("package.json");
+        let planned = planned_at(&manifest);
+        let edited = PACKAGE_JSON.replace("react", "preact");
+        std::fs::write(&manifest, &edited).unwrap();
+
+        let error = commit(&planned).expect_err("a changed manifest must be refused");
+
+        assert!(error.to_string().contains("changed"), "{error:#}");
+        assert_eq!(std::fs::read_to_string(&manifest).unwrap(), edited);
+    }
+
+    /// A symlinked manifest is written through: the link stays a link and its target
+    /// carries the rewrite.
+    #[cfg(unix)]
+    #[test]
+    fn commit_writes_through_a_symlinked_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let target = real.join("package.json");
+        let link = dir.path().join("package.json");
+        std::fs::write(&target, PACKAGE_JSON).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let results = results_for(
+            ManifestKind::PackageJson,
+            PACKAGE_JSON,
+            &[("react", "18.2.0")],
+        );
+        let planned = plan(&link, &results, false).expect("the plan applies");
+
+        commit(&planned).expect("the commit succeeds");
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link was replaced by a regular file"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            PACKAGE_JSON_FIXED
+        );
+    }
+
+    /// A manifest in a directory that cannot be written to fails loudly and is left
+    /// intact — the rename never publishes a partial file.
+    #[cfg(unix)]
+    #[test]
+    fn commit_into_an_unwritable_directory_fails_and_leaves_the_manifest_intact() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("locked");
+        std::fs::create_dir(&sub).unwrap();
+        let manifest = sub.join("package.json");
+        let planned = planned_at(&manifest);
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let outcome = commit(&planned);
+        // Restore before asserting, so the scratch directory can be removed.
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Root ignores directory permissions; there the write simply succeeds.
+        if outcome.is_err() {
+            assert_eq!(std::fs::read_to_string(&manifest).unwrap(), PACKAGE_JSON);
+        } else {
+            assert_eq!(
+                std::fs::read_to_string(&manifest).unwrap(),
+                PACKAGE_JSON_FIXED
+            );
+        }
     }
 }

@@ -522,14 +522,19 @@ fn counted(count: usize, singular: &str, plural: &str) -> String {
 }
 
 /// The totals line, from the same [`Summary`] the table renderer uses.
+///
+/// `undetermined` is counted beside `errors` because its rows sit in the same table;
+/// leaving it out made a summary listing undetermined rows say `0 errors` and nothing
+/// else about them.
 fn totals(reports: &[ManifestReport]) -> String {
     let summary = Summary::of(reports);
     format!(
-        "{} checked — {} vulnerable, {} outdated, {}, {} up to date.",
+        "{} checked — {} vulnerable, {} outdated, {}, {} undetermined, {} up to date.",
         counted(summary.total, "dependency", "dependencies"),
         summary.vulnerable,
         summary.outdated + summary.update_available,
         counted(summary.error, "error", "errors"),
+        summary.undetermined,
         summary.up_to_date + summary.patch_available
     )
 }
@@ -1070,6 +1075,22 @@ mod tests {
         assert!(markdown.starts_with("## dependable\n"));
         assert!(markdown.contains("1 dependency checked"), "{markdown}");
         assert!(markdown.contains("No outdated or vulnerable dependencies found."));
+    }
+
+    /// An undetermined row lands in the errors table, so the totals line has to count
+    /// it too, or the table and the line above it disagree.
+    #[test]
+    fn the_totals_line_counts_undetermined_rows() {
+        let reports = vec![report(
+            "/w/package.json",
+            vec![
+                CheckResult::new(item("next-thing", 1), DependencyStatus::Undetermined),
+                CheckResult::new(item("b", 2), DependencyStatus::UpToDate),
+            ],
+        )];
+        let line = totals(&reports);
+        assert!(line.contains("1 undetermined"), "{line}");
+        assert!(line.contains("0 errors"), "{line}");
     }
 
     #[test]

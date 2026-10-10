@@ -225,7 +225,9 @@ impl From<&FetchError> for FetchFailure {
     fn from(error: &FetchError) -> Self {
         Self {
             origin: match error {
-                FetchError::NotFound(_) => ErrorOrigin::NotFound,
+                // A 404, and a crate whose every release is yanked: both permanent
+                // answers about this one package.
+                e if e.is_permanent_absence() => ErrorOrigin::NotFound,
                 // Everything else is a request that produced no usable answer: a
                 // timeout, a refused connection, a 5xx, an undecodable body, a document
                 // listing no versions at all.
@@ -556,22 +558,27 @@ impl Checker {
     /// difference that the answer is on local disk, so it only ever showed up as CPU. A
     /// 500-crate workspace parsed one root manifest 500 times.
     ///
-    /// Locating the root is still done per manifest: it is the walk that produces the key
-    /// this is cached on, and it is the cheap half.
+    /// Locating the root is still done per manifest: it is the walk that produces the
+    /// `(path, kind)` key this is cached on, and it is the cheap half.
     async fn workspace_source(
         &self,
         path: &Path,
         kind: ManifestKind,
         manifest: &str,
     ) -> Option<(PathBuf, Arc<Vec<Item>>)> {
-        let (root, root_content) = crate::discover::workspace_root_of(path, kind, manifest)?;
-        if let Some(hit) = self.workspace_cache.get(&root).await {
+        let (root, root_kind, root_content) =
+            crate::discover::workspace_root_of(path, kind, manifest)?;
+        // Keyed on the kind as well as the path: the same file can be a candidate root
+        // for two kinds, and the declarations are whatever that kind's parser saw.
+        let key = (root.clone(), root_kind);
+        if let Some(hit) = self.workspace_cache.get(&key).await {
             return Some((root, hit));
         }
-        let declarations = Arc::new(crate::discover::workspace_declarations(kind, &root_content));
-        self.workspace_cache
-            .insert(root.clone(), declarations.clone())
-            .await;
+        let declarations = Arc::new(crate::discover::workspace_declarations(
+            root_kind,
+            &root_content,
+        ));
+        self.workspace_cache.insert(key, declarations.clone()).await;
         Some((root, declarations))
     }
 
@@ -826,7 +833,7 @@ impl Checker {
                 }
             }
             if let Err(e) = &result
-                && !matches!(e, FetchError::NotFound(_))
+                && !e.is_permanent_absence()
             {
                 registry_unreachable = true;
             }
@@ -1181,8 +1188,14 @@ async fn scan_vulnerabilities(
         if let Some(ids) = osv_results.get(query_idx)
             && !ids.is_empty()
         {
-            results[result_idx].current_vulnerabilities = ids.clone();
-            results[result_idx].status = DependencyStatus::Vulnerable;
+            let result = &mut results[result_idx];
+            result.current_vulnerabilities = ids.clone();
+            result.status = DependencyStatus::Vulnerable;
+            // `Vulnerable` is a real status, established from the lockfile even where
+            // the registry fetch failed. Keeping the fetch's origin made the gate read
+            // the result as still errored — a not-found it ignores, or an unevaluated
+            // dependency that turned exit 1 into exit 2.
+            result.error_origin = ErrorOrigin::None;
         }
     }
     Ok(())
@@ -1345,11 +1358,13 @@ impl CheckerBuilder {
         self
     }
 
-    /// Enable or disable the persistent on-disk registry cache (default: enabled).
-    /// When enabled, registry version lists are cached under the OS cache directory
-    /// with a short TTL so repeat and CI runs avoid re-fetching. Maps to `--no-cache`.
-    /// Turn the on-disk cache on or off explicitly. An explicit choice always wins,
-    /// whatever order the builder is called in.
+    /// Turn the persistent on-disk registry cache on or off explicitly (default: off
+    /// unless [`CheckerBuilder::disk_cache_dir`] names a directory). An explicit choice
+    /// always wins, whatever order the builder is called in. Maps to `--no-cache`.
+    ///
+    /// When on, registry version lists are cached with a short TTL so repeat and CI runs
+    /// avoid re-fetching — under the directory [`CheckerBuilder::disk_cache_dir`] named,
+    /// or, when `true` is passed with no directory named, under the OS cache directory.
     ///
     /// Unset, the cache is on only when [`CheckerBuilder::disk_cache_dir`] named a
     /// directory. It used to default to on *with the shared OS cache directory*, so

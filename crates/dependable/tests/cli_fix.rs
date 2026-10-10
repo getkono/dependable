@@ -2,7 +2,11 @@
 //! user's files, and the one that had no test asserting the bytes it produces.
 //!
 //! Hermetic: every fixture declares path dependencies only, so no registry request is
-//! made. That is enough to exercise the write path, which is what these cover.
+//! made — and so nothing is ever planned for rewriting, and `fix::commit` returns
+//! before it writes. These cover the paths that must leave a manifest alone. The write
+//! itself (temporary file, sync, permission copy, rename, the changed-since-planned
+//! refusal, and writing through a symlink) is covered by the unit tests in
+//! `src/fix.rs`, which drive `commit` with a real plan.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -124,9 +128,9 @@ fn no_temporary_files_are_left_beside_the_manifest() {
     );
 }
 
-/// A read-only manifest must fail loudly rather than truncating it. `fs::write` opens
-/// with `O_TRUNC`, so the pre-atomic path destroyed the file before discovering it
-/// could not write.
+/// A read-only manifest with nothing to rewrite is left byte-identical. This reaches
+/// no write — the fixture plans no edit — so it pins the no-op path only; the atomic
+/// write that keeps a manifest intact on failure is covered by `fix.rs`'s unit tests.
 #[cfg(unix)]
 #[test]
 fn a_read_only_manifest_is_not_destroyed() {
@@ -580,9 +584,9 @@ fn a_pin_held_back_for_want_of_all_is_reported() {
 
 /// The constraint already names the only version in range, and a newer release
 /// exists outside it. Nothing to write, and — until now — nothing said: the
-/// clean line went out over an update `check` had just reported. The same
-/// `continue` carries a `Vulnerable` row whose only fixed release is the one
-/// already in force.
+/// clean line went out over an update `check` had just reported. npm's bare
+/// `"1.0.0"` is an exact pin `is_pinned` does not recognise, so the note names
+/// the release `--all` would write and `--all` itself, not the installed one.
 #[test]
 fn a_constraint_already_at_its_target_is_reported() {
     let dir = workdir("fix_already_at_target");
@@ -604,8 +608,8 @@ fn a_constraint_already_at_its_target_is_reported() {
     assert!(
         stderr.contains("note: left lodash = 1.0.0 alone in ")
             && stderr.contains(
-                "1.0.0 is available, but the constraint already names it, and nothing newer \
-                 satisfies the constraint"
+                "2.0.0 is available, but nothing newer satisfies the constraint, and only \
+                 `--all` writes a release beyond it"
             ),
         "stdout: {stdout}\nstderr: {stderr}"
     );
@@ -614,6 +618,18 @@ fn a_constraint_already_at_its_target_is_reported() {
         "{stdout}"
     );
     assert_eq!(fs::read_to_string(&manifest).unwrap(), original);
+
+    // And `--all` does the thing the note named, with nothing left to say.
+    let output = run_with_config(&dir, &config, &["--all"]);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(output.status.success(), "{stderr}");
+    assert!(!stderr.contains("note: left lodash"), "stderr: {stderr}");
+    assert!(
+        fs::read_to_string(&manifest)
+            .unwrap()
+            .contains("\"lodash\": \"2.0.0\""),
+        "`--all` did not move the pin"
+    );
 }
 
 /// The summary is on stdout and the notes are on stderr, so it has to say which
