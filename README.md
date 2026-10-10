@@ -286,8 +286,9 @@ the same reason `--manifest-glob` is, and it conflicts with `--manifest`. When i
 selects nothing, `dependable` says which ecosystems it searched and which it found
 instead, and still exits 0 — an unused ecosystem must not fail a per-ecosystem CI
 matrix job. `list --format json` prints a valid `dependable.list/v1` document with
-zero projects in that case, so a shard that pipes into `jq` gets something to
-parse rather than empty output.
+zero projects in that case, and `check --format json` / `--format sarif` print a
+document with zero results, so a shard that pipes into `jq` or uploads SARIF gets
+something to parse rather than empty output.
 
 It only ever **narrows** a run. Naming an ecosystem that `.dependable.toml` has
 switched off does not switch it back on: `check --ecosystem jvm` under
@@ -516,6 +517,28 @@ dependable tree --depth 1          # roots + their direct dependencies
 dependable tree --format json      # nodes + edges, for tooling / IDEs
 dependable tree --format dot | dot -Tsvg > deps.svg   # visual graph
 ```
+
+In `--format json`, a node's `version` is `null` when no version was read for it,
+and the `ascii` and `dot` renderers drop the `vX.Y.Z` suffix for the same node.
+A shallow tree — built from manifests, with no `Cargo.lock` to resolve against —
+still reports each **workspace member's** declared version, because a member is
+not resolved against anything and what its manifest declares is what the crate
+is. A **dependency** is `null` there, because a manifest usually declares a
+constraint rather than a resolution — with one exception: a constraint that
+admits exactly one release (`serde = "=1.0.200"`, a PEP 440 `==2.28.1`, a NuGet
+`[1.2.3]`, a bare Gradle or Hex version) has already resolved it, and the version
+reported is the one the manifest spells, not a normalized form of it. Whether a
+bare version is a pin is decided by the ecosystem's constraint translator, not
+the string's shape: Cargo and Python read `1.2.3` as a range, and NuGet reads it
+as a lower bound. npm and Dart read a bare version as exact, but this tree's
+translator currently reads it as a caret range for both, so their bare pins are
+`null` too (#155, #149). It
+is also `null` where the spelling itself is not a version the comparison engine
+can read as written — a two-segment `4.12`, a four-segment `1.2.3.4`, a Maven
+`6.4.4.Final` — because reporting one of those would put a string downstream that
+every consumer reads as no version at all. A git or path dependency is always
+`null`, whatever version sits beside it. A version is never the empty string: a
+blank one in a lockfile is read as no version at all.
 
 ```
 my-app v0.1.0 (workspace)
@@ -761,7 +784,7 @@ is a composite action that installs the released binary and runs the check:
 
 ```yaml
 - uses: actions/checkout@v4
-- uses: getkono/dependable/.github/actions/dependable-check@v0.1.3
+- uses: getkono/dependable/.github/actions/dependable-check@v0.1.4
   with:
     fail-on: vulnerable
 ```

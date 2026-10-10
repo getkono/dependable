@@ -67,7 +67,7 @@ pub fn parse_composer_lock_graph(content: &str) -> Result<ResolvedLockfile, Pars
         .filter_map(|key| {
             let entry = &entries[key];
             let name = entry.name.clone()?;
-            let version = strip_v(entry.version.as_deref().unwrap_or_default());
+            let version = entry.version.as_deref().map(strip_v);
             Some(LockedPackage::new(
                 name,
                 version,
@@ -165,7 +165,7 @@ mod tests {
             .iter()
             .find(|p| p.name == "psr/log")
             .expect("psr/log");
-        assert_eq!(psr.version, "1.1.4");
+        assert_eq!(psr.version.as_deref(), Some("1.1.4"));
     }
 
     #[test]

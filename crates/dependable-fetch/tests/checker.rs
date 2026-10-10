@@ -110,6 +110,42 @@ async fn check_manifest_classifies_and_scans() {
     assert_eq!(by_name("local-thing").status, DependencyStatus::Local);
 }
 
+/// A dependency whose registry fetch failed but whose locked version OSV flags is
+/// `Vulnerable` — a real status — so it must not keep the fetch's error origin. Keeping
+/// it made the gate read the result as not-found (ignored) or unevaluated (exit 2).
+#[tokio::test]
+async fn a_vulnerable_result_drops_the_error_origin_of_its_failed_fetch() {
+    let server = MockServer::start().await;
+    // No index route for `time`: the fetch is a 404, which records `NotFound`.
+    Mock::given(method("POST"))
+        .and(path("/v1/querybatch"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"results":[{"vulns":[{"id":"RUSTSEC-2020-0071"}]}]}"#),
+        )
+        .mount(&server)
+        .await;
+    let checker = Checker::builder()
+        .http_client(build_client().unwrap())
+        .rust_registry(server.uri(), None)
+        .osv_url(format!("{}/v1/querybatch", server.uri()))
+        .build()
+        .unwrap();
+
+    let check = checker
+        .check_manifest(
+            ManifestKind::CargoToml,
+            "[dependencies]\ntime = \"0.2\"\n",
+            Some("[[package]]\nname = \"time\"\nversion = \"0.2.7\"\n"),
+        )
+        .await
+        .unwrap();
+
+    let time = &check.results[0];
+    assert_eq!(time.status, DependencyStatus::Vulnerable);
+    assert_eq!(time.error_origin, dependable_fetch::ErrorOrigin::None);
+}
+
 #[tokio::test]
 async fn check_requirements_txt_pep440() {
     let server = MockServer::start().await;
