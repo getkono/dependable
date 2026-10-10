@@ -116,7 +116,11 @@ fn level_of(status: &DependencyStatus) -> Option<Level> {
     match status {
         DependencyStatus::Vulnerable => Some(Level::Error),
         DependencyStatus::Outdated | DependencyStatus::UpdateAvailable => Some(Level::Warning),
-        DependencyStatus::Error(_) => Some(Level::Notice),
+        // Both are "this dependency was not checked": one because the registry or the
+        // fetch failed, one because the declared version could not be read. A plain
+        // `Error` got a notice and `Undetermined` got nothing at all, so the status made
+        // honest elsewhere was the one status a pull request never heard about.
+        DependencyStatus::Error(_) | DependencyStatus::Undetermined => Some(Level::Notice),
         _ => None,
     }
 }
@@ -381,6 +385,9 @@ fn message(finding: &Finding<'_>, level: Level) -> String {
         ),
         Level::Notice => match &result.status {
             DependencyStatus::Error(why) => format!("{name} could not be checked: {why}"),
+            DependencyStatus::Undetermined => {
+                format!("{name} could not be checked: its declared version could not be read")
+            }
             other => format!("{name}: {}", other.label()),
         },
     };
@@ -594,14 +601,22 @@ fn counted(count: usize, singular: &str, plural: &str) -> String {
 /// vanish into a row of zeros. A Swift project — every checkable pin of which is
 /// undetermined, because the ecosystem publishes no registry — would otherwise
 /// render as a fully checked project with nothing wrong.
+///
+/// The clause appears only when the count is non-zero. A run with no
+/// undetermined row has nothing to disclaim, and leaving its line exactly as it
+/// was keeps every such run's job summary byte-identical to before.
 fn totals(summary: &Summary) -> String {
+    let undetermined = if summary.undetermined == 0 {
+        String::new()
+    } else {
+        format!(", {} undetermined", summary.undetermined)
+    };
     format!(
-        "{} checked — {} vulnerable, {} outdated, {}, {} undetermined, {} up to date.",
+        "{} checked — {} vulnerable, {} outdated, {}{undetermined}, {} up to date.",
         counted(summary.total, "dependency", "dependencies"),
         summary.vulnerable,
         summary.outdated + summary.update_available,
         counted(summary.error, "error", "errors"),
-        summary.undetermined,
         summary.up_to_date + summary.patch_available
     )
 }
@@ -979,6 +994,7 @@ mod tests {
 
     fn report(path: &str, results: Vec<CheckResult>) -> ManifestReport {
         ManifestReport {
+            integrity: crate::output::ScanIntegrity::default(),
             path: PathBuf::from(path),
             ecosystem: Ecosystem::Rust,
             results,
@@ -1233,6 +1249,50 @@ mod tests {
         assert!(markdown.contains("No outdated or vulnerable dependencies found."));
     }
 
+    /// A run with nothing undetermined keeps the totals line it always had, so
+    /// the job summary of every such run is unchanged; one with an undetermined
+    /// row names the count.
+    #[test]
+    fn the_totals_line_names_undetermined_only_when_there_is_one() {
+        let clean = vec![report(
+            "/w/Cargo.toml",
+            vec![CheckResult::new(item("a", 1), DependencyStatus::UpToDate)],
+        )];
+        assert_eq!(
+            totals(&Summary::of(&clean)),
+            "1 dependency checked — 0 vulnerable, 0 outdated, 0 errors, 1 up to date."
+        );
+
+        let unknown = vec![report(
+            "/w/Cargo.toml",
+            vec![
+                CheckResult::new(item("a", 1), DependencyStatus::UpToDate),
+                CheckResult::new(item("b", 2), DependencyStatus::Undetermined),
+            ],
+        )];
+        assert_eq!(
+            totals(&Summary::of(&unknown)),
+            "2 dependencies checked — 0 vulnerable, 0 outdated, 0 errors, 1 undetermined, \
+             1 up to date."
+        );
+    }
+
+    /// An undetermined row lands in the errors table, so the totals line has to count
+    /// it too, or the table and the line above it disagree.
+    #[test]
+    fn the_totals_line_counts_undetermined_rows() {
+        let reports = vec![report(
+            "/w/package.json",
+            vec![
+                CheckResult::new(item("next-thing", 1), DependencyStatus::Undetermined),
+                CheckResult::new(item("b", 2), DependencyStatus::UpToDate),
+            ],
+        )];
+        let line = totals(&Summary::of(&reports));
+        assert!(line.contains("1 undetermined"), "{line}");
+        assert!(line.contains("0 errors"), "{line}");
+    }
+
     #[test]
     fn the_summary_tabulates_each_level() {
         let reports = vec![report(
@@ -1302,5 +1362,23 @@ mod tests {
     fn table_cells_cannot_break_the_table() {
         assert_eq!(cell("a|b\nc"), "a\\|b c");
         assert_eq!(code_cell("a`b`c"), "`abc`");
+    }
+
+    /// Both statuses mean "this dependency was not checked", and a pull request has to
+    /// hear about both. `Undetermined` produced no annotation at all while a plain
+    /// `Error` got a notice, so the one status that says "we could not read this" was
+    /// the one nobody saw.
+    #[test]
+    fn a_dependency_that_could_not_be_checked_is_annotated_either_way() {
+        assert_eq!(
+            level_of(&DependencyStatus::Undetermined),
+            Some(Level::Notice)
+        );
+        assert_eq!(
+            level_of(&DependencyStatus::Error("boom".to_owned())),
+            Some(Level::Notice)
+        );
+        assert_eq!(level_of(&DependencyStatus::UpToDate), None);
+        assert_eq!(level_of(&DependencyStatus::PatchAvailable), None);
     }
 }

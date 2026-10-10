@@ -292,6 +292,10 @@ fn source_token(source: PackageSource) -> &'static str {
         PackageSource::Inherited => "inherited",
         PackageSource::Locked => "locked",
         PackageSource::Unidentified => "unidentified",
+        // Its own token, not the catch-all: a dangling `$name` override is a real
+        // published package whose version this manifest does not state, and a consumer
+        // that cannot tell it from any other unknown source cannot report it.
+        PackageSource::Unresolved => "unresolved",
         _ => "unknown",
     }
 }
@@ -334,7 +338,27 @@ fn annotation(item: &Item) -> &'static str {
             DependencyKind::Peer => " (peer)",
             DependencyKind::Workspace => " (declared)",
             DependencyKind::Indirect => " (indirect)",
+            DependencyKind::Override => " (override)",
             _ => "",
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every source a manifest can state gets its own token. A dangling `$name` override
+    /// is a real published package whose version this manifest does not state, and it
+    /// serialized as `"unknown"` — indistinguishable, to a consumer of
+    /// `list --format json`, from any other source the tool has no name for.
+    #[test]
+    fn every_known_source_has_its_own_token() {
+        assert_eq!(source_token(PackageSource::Registry), "registry");
+        assert_eq!(source_token(PackageSource::Jsr), "jsr");
+        assert_eq!(source_token(PackageSource::Local), "local");
+        assert_eq!(source_token(PackageSource::Git), "git");
+        assert_eq!(source_token(PackageSource::Inherited), "inherited");
+        assert_eq!(source_token(PackageSource::Unresolved), "unresolved");
     }
 }

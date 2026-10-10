@@ -3,6 +3,11 @@
 //! Hermetic. The fixture's only dependency is a `path = "..."` one, which is a
 //! `Local` item and so fails `Item::is_checkable()` — no registry request is ever
 //! made — and `--no-vuln` skips OSV. Nothing here touches the network.
+//!
+//! SARIF rendering lives in `dependable-report`, so the format only exists in a build
+//! carrying the `report` feature; the file states that rather than failing a
+//! `--no-default-features` run for the absence of a renderer it never compiled.
+#![cfg(feature = "report")]
 
 use std::fs;
 use std::path::PathBuf;

@@ -9,7 +9,7 @@ use dependable_fetch::{
     Checker, DependencyStatus, Ecosystem, GoProxyFetcher, JsrFetcher, ManifestKind, NpmFetcher,
     PackageSource, PackagistFetcher, PyPiFetcher, build_client,
 };
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const MANIFEST: &str = r#"
@@ -108,6 +108,42 @@ async fn check_manifest_classifies_and_scans() {
     );
     // The path dependency is skipped, never fetched or queried.
     assert_eq!(by_name("local-thing").status, DependencyStatus::Local);
+}
+
+/// A dependency whose registry fetch failed but whose locked version OSV flags is
+/// `Vulnerable` — a real status — so it must not keep the fetch's error origin. Keeping
+/// it made the gate read the result as not-found (ignored) or unevaluated (exit 2).
+#[tokio::test]
+async fn a_vulnerable_result_drops_the_error_origin_of_its_failed_fetch() {
+    let server = MockServer::start().await;
+    // No index route for `time`: the fetch is a 404, which records `NotFound`.
+    Mock::given(method("POST"))
+        .and(path("/v1/querybatch"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"results":[{"vulns":[{"id":"RUSTSEC-2020-0071"}]}]}"#),
+        )
+        .mount(&server)
+        .await;
+    let checker = Checker::builder()
+        .http_client(build_client().unwrap())
+        .rust_registry(server.uri(), None)
+        .osv_url(format!("{}/v1/querybatch", server.uri()))
+        .build()
+        .unwrap();
+
+    let check = checker
+        .check_manifest(
+            ManifestKind::CargoToml,
+            "[dependencies]\ntime = \"0.2\"\n",
+            Some("[[package]]\nname = \"time\"\nversion = \"0.2.7\"\n"),
+        )
+        .await
+        .unwrap();
+
+    let time = &check.results[0];
+    assert_eq!(time.status, DependencyStatus::Vulnerable);
+    assert_eq!(time.error_origin, dependable_fetch::ErrorOrigin::None);
 }
 
 #[tokio::test]
@@ -1167,4 +1203,493 @@ async fn an_inherited_name_the_root_never_declared_is_reported() {
     for result in &check.results {
         assert_eq!(result.status, DependencyStatus::Undetermined);
     }
+}
+
+/// One Swift pin whose repository path is mixed-case, so it is asked about under
+/// two spellings: as written, and all-lowercase.
+const MIXED_CASE_PACKAGE_RESOLVED: &str = r#"{
+  "pins" : [
+    {
+      "identity" : "zipfoundation",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/Weichsel/ZIPFoundation.git",
+      "state" : { "revision" : "b979e8b52c7ae7f3f39fa0182e738e9e7257eb78", "version" : "0.9.0" }
+    }
+  ],
+  "version" : 2
+}"#;
+
+/// The detail record for one advisory ID, as `/v1/query` returns it.
+fn swift_detail(ids: &[&str]) -> String {
+    let vulns: Vec<String> = ids
+        .iter()
+        .map(|id| format!(r#"{{"id":"{id}","summary":"advisory {id}"}}"#))
+        .collect();
+    format!(r#"{{"vulns":[{}]}}"#, vulns.join(","))
+}
+
+/// A Swift pin whose path is not lowercase is queried under both spellings, and the
+/// two answers are folded into one result. The spellings overlap here on purpose —
+/// `GHSA-bbbb` comes back under both — so the union has to deduplicate as it
+/// merges, in the batch scan's IDs and in the enriched advisories alike, and the
+/// one result is neither short an ID nor carrying one twice.
+#[tokio::test]
+async fn a_mixed_case_swift_pin_unions_both_spellings_without_duplicates() {
+    const AS_WRITTEN: &str = "github.com/Weichsel/ZIPFoundation";
+    const LOWERCASE: &str = "github.com/weichsel/zipfoundation";
+
+    let server = MockServer::start().await;
+    // Slot 0 is the spelling as written, slot 1 the lowercase variant.
+    Mock::given(method("POST"))
+        .and(path("/v1/querybatch"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"results":[
+                {"vulns":[{"id":"GHSA-aaaa-aaaa-aaaa"},{"id":"GHSA-bbbb-bbbb-bbbb"}]},
+                {"vulns":[{"id":"GHSA-bbbb-bbbb-bbbb"},{"id":"GHSA-cccc-cccc-cccc"}]}
+            ]}"#,
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    for (name, ids) in [
+        (AS_WRITTEN, ["GHSA-aaaa-aaaa-aaaa", "GHSA-bbbb-bbbb-bbbb"]),
+        (LOWERCASE, ["GHSA-bbbb-bbbb-bbbb", "GHSA-cccc-cccc-cccc"]),
+    ] {
+        Mock::given(method("POST"))
+            .and(path("/v1/query"))
+            .and(body_string_contains(format!("\"name\":\"{name}\"")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(swift_detail(&ids)))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    let checker = Checker::builder()
+        .http_client(build_client().unwrap())
+        .rust_registry("http://127.0.0.1:1".to_string(), None)
+        .registryless(Ecosystem::Swift)
+        .osv_url(format!("{}/v1/querybatch", server.uri()))
+        .include_ghsa(true)
+        .advisory_details(true)
+        .disk_cache(false)
+        .build()
+        .unwrap();
+
+    let check = checker
+        .check_manifest(
+            ManifestKind::PackageSwift,
+            "",
+            Some(MIXED_CASE_PACKAGE_RESOLVED),
+        )
+        .await
+        .unwrap();
+
+    // Both spellings went out in the one batch, as written first.
+    let requests = server.received_requests().await.unwrap();
+    let batch = requests
+        .iter()
+        .find(|request| request.url.path() == "/v1/querybatch")
+        .expect("one batch request");
+    let body = String::from_utf8_lossy(&batch.body);
+    let written_at = body.find(AS_WRITTEN).expect("the spelling as written");
+    let lower_at = body.find(LOWERCASE).expect("the lowercase spelling");
+    assert!(written_at < lower_at, "{body}");
+
+    assert_eq!(check.results.len(), 1, "two queries, one result");
+    let pin = &check.results[0];
+    assert_eq!(
+        pin.item.name, AS_WRITTEN,
+        "the result keeps the name as written"
+    );
+    assert_eq!(pin.status, DependencyStatus::Vulnerable);
+    assert_eq!(
+        pin.current_vulnerabilities,
+        [
+            "GHSA-aaaa-aaaa-aaaa",
+            "GHSA-bbbb-bbbb-bbbb",
+            "GHSA-cccc-cccc-cccc"
+        ],
+        "the union of both answers, deduplicated, in the order they arrived"
+    );
+
+    let mut advisories: Vec<&str> = pin.advisories.iter().map(|a| a.id.as_str()).collect();
+    advisories.sort_unstable();
+    assert_eq!(
+        advisories,
+        [
+            "GHSA-aaaa-aaaa-aaaa",
+            "GHSA-bbbb-bbbb-bbbb",
+            "GHSA-cccc-cccc-cccc"
+        ],
+        "each record once, from whichever spelling returned it"
+    );
+}
+
+/// One name, two registries, one manifest. The fetch map used to be keyed by name
+/// alone while the tasks were deduplicated by `(cache_key, name)`, so both routes
+/// landed in the same slot and whichever request finished last answered for both —
+/// non-deterministically, since they complete out of order.
+#[tokio::test]
+async fn a_name_published_to_two_registries_is_not_collapsed() {
+    let server = MockServer::start().await;
+    // The npm `foo` and the JSR `foo` are different packages with different versions.
+    Mock::given(method("GET"))
+        .and(path("/foo"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(r#"{"versions":{"1.0.0":{},"9.9.9":{}}}"#),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/foo/meta.json"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"latest":"2.0.0","versions":{"2.0.0":{}}}"#),
+        )
+        .mount(&server)
+        .await;
+
+    let client = build_client().unwrap();
+    let checker = Checker::builder()
+        .http_client(client.clone())
+        .registry(
+            Ecosystem::Npm,
+            Arc::new(NpmFetcher::with_registry(client.clone(), server.uri())),
+        )
+        .jsr_registry(Arc::new(JsrFetcher::with_registry(client, server.uri())))
+        .vulnerabilities(false)
+        .build()
+        .unwrap();
+
+    let manifest = r#"{ "imports": { "a": "npm:foo@^1.0.0", "b": "jsr:foo@^2.0.0" } }"#;
+    let check = checker
+        .check_manifest(ManifestKind::DenoJson, manifest, None)
+        .await
+        .unwrap();
+
+    let npm = check
+        .results
+        .iter()
+        .find(|r| r.item.name == "foo" && r.item.source == PackageSource::Registry)
+        .expect("npm foo");
+    let jsr = check
+        .results
+        .iter()
+        .find(|r| r.item.name == "foo" && r.item.source == PackageSource::Jsr)
+        .expect("jsr foo");
+
+    assert_eq!(npm.latest_available.as_deref(), Some("9.9.9"));
+    assert_eq!(jsr.latest_available.as_deref(), Some("2.0.0"));
+}
+
+/// A private index and the public registry publish different version lists for the same
+/// name. The on-disk entry records only `(key, name)`, so with the key naming just the
+/// ecosystem, one run's answers were served to the other — and the entry's name guard
+/// cannot catch it, because the name matches.
+#[tokio::test]
+async fn a_private_registry_does_not_share_disk_cache_entries_with_the_public_one() {
+    let private = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/se/rd/serde"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("{\"name\":\"serde\",\"vers\":\"0.0.1\",\"yanked\":false}\n"),
+        )
+        .mount(&private)
+        .await;
+
+    let public = MockServer::start().await;
+    mount_index(&public).await;
+
+    let dir = tempfile::tempdir().unwrap();
+
+    let build = |uri: String| {
+        Checker::builder()
+            .http_client(build_client().unwrap())
+            .rust_registry(uri, None)
+            .vulnerabilities(false)
+            .disk_cache_dir(dir.path())
+            .build()
+            .unwrap()
+    };
+
+    // Populate the cache from the private index first.
+    let from_private = build(private.uri())
+        .check_manifest(ManifestKind::CargoToml, MANIFEST, Some(LOCK))
+        .await
+        .unwrap();
+    let private_serde = from_private
+        .results
+        .iter()
+        .find(|r| r.item.name == "serde")
+        .expect("serde");
+    assert_eq!(private_serde.latest_available.as_deref(), Some("0.0.1"));
+
+    // A public run sharing the same cache directory must ask the public index, not read
+    // the private index's answer back out of the cache.
+    let from_public = build(public.uri())
+        .check_manifest(ManifestKind::CargoToml, MANIFEST, Some(LOCK))
+        .await
+        .unwrap();
+    let public_serde = from_public
+        .results
+        .iter()
+        .find(|r| r.item.name == "serde")
+        .expect("serde");
+    assert_ne!(
+        public_serde.latest_available.as_deref(),
+        Some("0.0.1"),
+        "the public run was served the private index's version list"
+    );
+    assert!(!public.received_requests().await.unwrap().is_empty());
+}
+
+/// The leak that started all of this: constructing a checker must not, on its own, give
+/// it write access to the cache directory shared by every run on the machine.
+#[test]
+fn a_default_checker_writes_to_no_shared_cache() {
+    let checker = Checker::builder()
+        .http_client(build_client().unwrap())
+        .vulnerabilities(false)
+        .build()
+        .unwrap();
+    assert!(
+        !checker.uses_disk_cache(),
+        "the disk cache must be opted into, not inherited"
+    );
+}
+
+/// #112: a manifest is not the routing unit, so "the registry did not answer" could not
+/// say which one. A `deno.json` reaches npm *and* JSR, and this is the case that
+/// distinguishes a per-registry answer from a per-ecosystem one end to end — both routes
+/// are `Ecosystem::Npm`, one answered and one did not, and only the routing key can tell
+/// them apart.
+#[tokio::test]
+async fn a_deno_manifest_names_the_jsr_registry_alone_when_only_jsr_declines() {
+    let npm = MockServer::start().await;
+    let jsr = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/chalk"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(r#"{"versions":{"5.0.0":{},"5.3.0":{}}}"#),
+        )
+        .mount(&npm)
+        .await;
+    // JSR declines to answer at all. `any()` rather than a path matcher because the
+    // failure must not depend on how the fetcher spells `@std/path` in a URL.
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&jsr)
+        .await;
+
+    let client = build_client().unwrap();
+    let checker = Checker::builder()
+        .http_client(client.clone())
+        .registry(
+            Ecosystem::Npm,
+            Arc::new(NpmFetcher::with_registry(client.clone(), npm.uri())),
+        )
+        .jsr_registry(Arc::new(JsrFetcher::with_registry(client, jsr.uri())))
+        .vulnerabilities(false)
+        .build()
+        .unwrap();
+
+    let manifest = r#"{ "imports": { "chalk": "npm:chalk@^5.0.0", "p": "jsr:@std/path@^1.0.0" } }"#;
+    let check = checker
+        .check_manifest(ManifestKind::DenoJson, manifest, None)
+        .await
+        .unwrap();
+
+    // The npm half is fully evaluated. Nothing about JSR's outage reaches it.
+    let chalk = check
+        .results
+        .iter()
+        .find(|r| r.item.name == "chalk")
+        .expect("the npm import");
+    assert_eq!(chalk.latest_available.as_deref(), Some("5.3.0"));
+    assert!(
+        !matches!(chalk.status, DependencyStatus::Error(_)),
+        "the npm route answered, so its result must not be an error: {:?}",
+        chalk.status
+    );
+
+    // Exactly one registry declined, and it is JSR — named by its own root, not by npm's.
+    assert_eq!(check.unreachable_registries.len(), 1, "{check:?}");
+    let declined = &check.unreachable_registries[0];
+    assert_eq!(declined.ecosystem, Ecosystem::Npm);
+    assert_eq!(declined.root.as_deref(), Some(jsr.uri().as_str()));
+    assert!(
+        !declined.is_default_root(),
+        "JSR is not npm's default registry"
+    );
+
+    // The label a refusal prints names the JSR host, and never the npm one.
+    let label = declined.label();
+    let jsr_authority = jsr.uri().trim_start_matches("http://").to_owned();
+    let npm_authority = npm.uri().trim_start_matches("http://").to_owned();
+    assert!(label.contains(&jsr_authority), "label was {label}");
+    assert!(!label.contains(&npm_authority), "label was {label}");
+
+    // The boolean still summarises the collection, and cannot disagree with it.
+    assert!(check.registry_unreachable);
+}
+
+/// #112: the order `ManifestCheck::unreachable_registries` is published in is a contract
+/// an embedding consumer reads straight off the value, so it is asserted where
+/// `fetch_all` produces it rather than over a vector a test sorted for itself.
+///
+/// `buffer_unordered` completes in arrival order and the outcomes are gathered in a
+/// `HashMap`, so without the sort in `fetch_all` the published order is whatever the
+/// network and the hasher did — and the sentence a `--fail-on` refusal prints would
+/// reorder itself between two runs of the same repository. Both routes here are
+/// `Ecosystem::Npm`, so it is the root that has to order them, and only `fetch_all` can
+/// do it.
+#[tokio::test]
+async fn a_deno_manifest_orders_both_declining_registries_by_root() {
+    /// Each `HashMap` draws its own seed, so one check would agree with the contract
+    /// half the time by luck. Repeating drives an unsorted `fetch_all`'s chance of
+    /// passing to 1 in 2^ATTEMPTS. The attempts run concurrently against the same two
+    /// servers, so the test still costs one round of retry backoff.
+    const ATTEMPTS: usize = 8;
+    const MANIFEST: &str =
+        r#"{ "imports": { "chalk": "npm:chalk@^5.0.0", "p": "jsr:@std/path@^1.0.0" } }"#;
+
+    let first = MockServer::start().await;
+    let second = MockServer::start().await;
+    // `any()` rather than a path matcher: the failure must not depend on how either
+    // fetcher spells a package name in a URL.
+    for server in [&first, &second] {
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(500))
+            .mount(server)
+            .await;
+    }
+    // The two roots differ only in an ephemeral port the OS chose, so the roles go to
+    // whichever server sorts first. That fixes the expected order without the test
+    // asserting anything about port allocation — and the servers are interchangeable,
+    // since both decline every request.
+    let (npm, jsr) = if first.uri() < second.uri() {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    let npm_root = npm.uri();
+    let jsr_root = jsr.uri();
+
+    let mut attempts = Vec::with_capacity(ATTEMPTS);
+    for _ in 0..ATTEMPTS {
+        let client = build_client().unwrap();
+        // A fresh `Checker` per attempt: a warm versions cache issues no request, so a
+        // reused one would decline nothing and prove nothing.
+        let checker = Checker::builder()
+            .http_client(client.clone())
+            .registry(
+                Ecosystem::Npm,
+                Arc::new(NpmFetcher::with_registry(client.clone(), npm_root.clone())),
+            )
+            .jsr_registry(Arc::new(JsrFetcher::with_registry(
+                client,
+                jsr_root.clone(),
+            )))
+            .vulnerabilities(false)
+            .build()
+            .unwrap();
+        attempts.push(tokio::spawn(async move {
+            checker
+                .check_manifest(ManifestKind::DenoJson, MANIFEST, None)
+                .await
+                .unwrap()
+        }));
+    }
+
+    for attempt in attempts {
+        let check = attempt.await.unwrap();
+
+        // Both registries declined, and they arrive in root order — asserted against the
+        // returned value itself, not against a vector this test sorted.
+        let roots: Vec<&str> = check
+            .unreachable_registries
+            .iter()
+            .map(|r| r.root.as_deref().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            roots,
+            [npm_root.as_str(), jsr_root.as_str()],
+            "unreachable_registries must arrive sorted by ecosystem then root: {check:?}"
+        );
+        assert!(
+            check
+                .unreachable_registries
+                .iter()
+                .all(|r| r.ecosystem == Ecosystem::Npm),
+            "both routes belong to the npm ecosystem: {check:?}"
+        );
+
+        // Neither route answered, so neither dependency could be evaluated, and the
+        // boolean still summarises the collection.
+        assert!(check.registry_unreachable);
+        assert_eq!(check.results.len(), 2, "{check:?}");
+        assert!(
+            check
+                .results
+                .iter()
+                .all(|r| matches!(r.status, DependencyStatus::Error(_))),
+            "{:?}",
+            check.results.iter().map(|r| &r.status).collect::<Vec<_>>()
+        );
+    }
+}
+
+/// #112: `ManifestCheck::unreachable_registries` is per *registry*, but `fetch_all`
+/// collects declines per cache key, and `route_item` gives each alternate-registry alias
+/// its own key. Two aliases naming one index URL are one registry reached by two routes,
+/// so when both decline the published list must hold that registry once — which only
+/// `fetch_all`'s dedup guarantees.
+#[tokio::test]
+async fn two_aliases_naming_one_declining_index_are_reported_once() {
+    let index = MockServer::start().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&index)
+        .await;
+
+    let checker = Checker::builder()
+        .http_client(build_client().unwrap())
+        .rust_alt_registry("first", index.uri(), None)
+        .rust_alt_registry("second", index.uri(), None)
+        .vulnerabilities(false)
+        .build()
+        .unwrap();
+
+    let manifest = r#"
+[dependencies]
+alpha = { version = "1", registry = "first" }
+beta = { version = "1", registry = "second" }
+"#;
+    let check = checker
+        .check_manifest(ManifestKind::CargoToml, manifest, None)
+        .await
+        .unwrap();
+
+    // Both routes were taken and both declined, so neither result was evaluated.
+    assert_eq!(check.results.len(), 2, "{check:?}");
+    assert!(
+        check
+            .results
+            .iter()
+            .all(|r| matches!(r.status, DependencyStatus::Error(_))),
+        "{:?}",
+        check.results.iter().map(|r| &r.status).collect::<Vec<_>>()
+    );
+
+    // One registry, however many aliases routed to it.
+    assert_eq!(check.unreachable_registries.len(), 1, "{check:?}");
+    let declined = &check.unreachable_registries[0];
+    assert_eq!(declined.ecosystem, Ecosystem::Rust);
+    assert_eq!(
+        declined.root.as_deref().map(|r| r.trim_end_matches('/')),
+        Some(index.uri().trim_end_matches('/'))
+    );
+    assert!(check.registry_unreachable);
 }

@@ -189,6 +189,7 @@ dependable check . --format json  # machine-readable output (also: text)
 dependable check . --fail-on vulnerable   # exit non-zero for CI
 dependable check . --annotations always   # GitHub Actions annotations + job summary
 dependable check . --manifest-glob 'services/*/Cargo.toml'  # one slice of a monorepo
+dependable check . --ecosystem rust               # one ecosystem of a polyglot repo
 dependable list .                 # every project and what it declares (offline)
 dependable tree .                 # render the dependency tree (Rust)
 dependable fix . --dry-run        # preview in-place upgrades
@@ -314,6 +315,32 @@ conflicts with `--manifest`, which names one file and skips discovery altogether
 It is available on `fix` for a reason: without it, `dependable fix` would rewrite
 manifests that the matching `dependable check` deliberately left out.
 
+To work on part of a *polyglot* repository, filter by ecosystem instead:
+
+```bash
+dependable check . --ecosystem rust
+dependable list . --ecosystem npm --ecosystem rust --format json
+dependable fix . --ecosystem rust --dry-run
+```
+
+`--ecosystem` narrows discovery to the manifests belonging to the ecosystems you
+name — `rust`, `go`, `npm`, `python`, `php`, `dart`, `csharp`, `elixir`, `jvm`, `swift`. It
+names the *ecosystem*, not a filename, so `--ecosystem npm` covers `package.json`,
+`deno.json`, and `pnpm-workspace.yaml` alike. The flag is repeatable and a manifest
+in any named ecosystem is kept, it is available on `check`, `list`, and `fix` for
+the same reason `--manifest-glob` is, and it conflicts with `--manifest`. When it
+selects nothing, `dependable` says which ecosystems it searched and which it found
+instead, and still exits 0 — an unused ecosystem must not fail a per-ecosystem CI
+matrix job. `list --format json` prints a valid `dependable.list/v1` document with
+zero projects in that case, and `check --format json` / `--format sarif` print a
+document with zero results, so a shard that pipes into `jq` or uploads SARIF gets
+something to parse rather than empty output.
+
+It only ever **narrows** a run. Naming an ecosystem that `.dependable.toml` has
+switched off does not switch it back on: `check --ecosystem jvm` under
+`[jvm] enabled = false` discovers the manifests and then reports them as skipped,
+exactly as it does without the flag.
+
 #### Inherited versions
 
 A Cargo workspace declares shared versions once, at the root, and members opt in by
@@ -354,6 +381,92 @@ the results that have one — an absolute, symlink-resolved path, because the ro
 by walking up rather than by anything the caller spelled, and a relative answer would be
 relative to a directory the caller never named. A dependency the root turns out not to
 declare gets no attribution at all, and a warning saying so.
+
+### Forced versions (overrides and resolutions)
+
+An npm-family `package.json` can force a version onto the *resolved* tree, past
+whatever the packages in it asked for: npm's `overrides`, Yarn's `resolutions`,
+and `pnpm.overrides` — including npm's nested form (`"overrides": { "parent":
+{ "child": "…" } }`) and pnpm's scoped keys (`"foo@2>bar"`, which forces a version
+onto **bar**). Those maps are the only ones any parser tags as a forced version,
+so **`package.json` is the only manifest this section's guarantee covers.**
+
+Other ecosystems have forcing mechanisms of their own. None of them is covered,
+and the two reasons for that are not the same — which is the part worth knowing:
+
+- **Never read, so nothing can rewrite them.** Cargo's `[patch]` and `[replace]`,
+  Composer's `replace` and `conflict`, and `pnpm-workspace.yaml`'s `overrides:`
+  (only its `catalog:` and `catalogs:` maps are read) are absent from every
+  parser. They are safe because nothing looks at them, not because anything
+  protects them.
+- **Read, but not yet recognised as forced.** A Gradle version catalog's rich
+  versions are read for their version string, and `strictly` — Gradle's pinning
+  form, and the usual shape of a JVM security pin — is recorded as an ordinary
+  constraint. A plain `dependable fix`, with no flags, will advance one. That is
+  [issue #147](https://github.com/getkono/dependable/issues/147), and until it is
+  fixed a Gradle `strictly` pin gets none of the protection described below.
+
+A forced version is usually there for a reason — most often a security pin,
+holding a transitive dependency above a vulnerable release — and the tool cannot
+tell that from a compatibility pin that has outlived its cause. So for the
+entries it does recognise, **`fix` never rewrites one by default**, `--all`
+included. It says so instead:
+
+```
+$ dependable fix .
+note: left lodash = 1.0.0 alone in package.json: 1.9.0 is available, but an override
+      forces this version onto the resolved tree; pass --overrides to advance it
+Nothing to rewrite. 1 available update left alone; see the notes on stderr.
+```
+
+That note is the point: a stale pin used to be skipped in silence, so a manifest
+whose only outdated entry was an override was reported by `check` and then
+answered by `fix` with "Everything is already up to date."
+
+`--overrides` is how you say yes:
+
+```bash
+dependable fix . --overrides             # advance forced versions within the range the tool reads
+dependable fix . --overrides --all       # …and beyond it, like --all everywhere else
+dependable fix . --overrides --dry-run   # see it first; nothing is written
+```
+
+"Within the range the tool reads" is the honest boundary, and for npm it is not
+always the range npm reads. The requirement is built with Cargo's `VersionReq`,
+which takes a bare `1.0.0` as `^1.0.0` — so `"overrides": { "lodash": "1.0.0" }`
+is advanced to `1.9.0` by `--overrides` alone, while npm reads that same string as
+exactly `1.0.0`, which is what `Ecosystem::bare_version` records for it. The two
+readings disagree, and closing that gap is
+[issue #118](https://github.com/getkono/dependable/issues/118) — it changes how
+every bare version is read, not just a forced one, so it is not settled here. A
+forced version spelled as a range (`"^1.0.0"`) or as an explicit pin (`"=1.0.0"`)
+carries no such ambiguity: the first advances within the range, the second needs
+`--all` like any other pin.
+
+Before you reach for it, check *why* each pin is there. `--overrides` is the
+destructive flag in this command, and here is what it cannot work out for you:
+
+- **Which release the pin was chosen for.** A forced version carries no record of
+  its reason, so whether the pin has outlived it is a question only the author can
+  answer.
+- **Whether the release it advances to is any safer.**
+  `CheckResult::all_vulnerabilities` is declared but nothing populates it yet, so
+  advisories are only known for the version currently declared. A pin can be moved
+  from one vulnerable release to another with no signal at all.
+- **Which direction the pin points.** A pnpm override can hold a package *below* a
+  release — a regression, a breaking change — and advancing that one walks straight
+  into what it was written to avoid.
+- **Whether the upper bound was the point.** For a compatibility pin it usually is,
+  and raising it is the whole of the damage.
+
+`--dry-run` prints every rewrite it would make without touching a file.
+
+Constraint rules still apply on top: `--overrides` lifts the rule about the kind
+of entry, not the rules about what a constraint means. An override written as a
+wildcard (`"resolutions": { "lodash": "1.x" }`) is still left alone and still
+reported, because pinning an npm wildcard to one release changes what the entry
+admits. An override written as a `$name` reference to another entry is never
+rewritten either — the version it names lives in the entry it points at.
 
 ## Project inventory (`list`)
 
@@ -465,6 +578,28 @@ dependable tree --depth 1          # roots + their direct dependencies
 dependable tree --format json      # nodes + edges, for tooling / IDEs
 dependable tree --format dot | dot -Tsvg > deps.svg   # visual graph
 ```
+
+In `--format json`, a node's `version` is `null` when no version was read for it,
+and the `ascii` and `dot` renderers drop the `vX.Y.Z` suffix for the same node.
+A shallow tree — built from manifests, with no `Cargo.lock` to resolve against —
+still reports each **workspace member's** declared version, because a member is
+not resolved against anything and what its manifest declares is what the crate
+is. A **dependency** is `null` there, because a manifest usually declares a
+constraint rather than a resolution — with one exception: a constraint that
+admits exactly one release (`serde = "=1.0.200"`, a PEP 440 `==2.28.1`, a NuGet
+`[1.2.3]`, a bare Gradle or Hex version) has already resolved it, and the version
+reported is the one the manifest spells, not a normalized form of it. Whether a
+bare version is a pin is decided by the ecosystem's constraint translator, not
+the string's shape: Cargo and Python read `1.2.3` as a range, and NuGet reads it
+as a lower bound. npm and Dart read a bare version as exact, but this tree's
+translator currently reads it as a caret range for both, so their bare pins are
+`null` too (#155, #149). It
+is also `null` where the spelling itself is not a version the comparison engine
+can read as written — a two-segment `4.12`, a four-segment `1.2.3.4`, a Maven
+`6.4.4.Final` — because reporting one of those would put a string downstream that
+every consumer reads as no version at all. A git or path dependency is always
+`null`, whatever version sits beside it. A version is never the empty string: a
+blank one in a lockfile is read as no version at all.
 
 ```
 my-app v0.1.0 (workspace)
@@ -611,6 +746,69 @@ skipped and transitive deps are never fetched), and the public API is
 forward-compatible: enums are `#[non_exhaustive]` and the registry layer routes
 per ecosystem, so future registries (npm, PyPI, Go, …) are additive.
 
+## Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| `0` | The run completed and no armed gate was tripped. |
+| `1` | A gate was tripped: `--fail-on` matched, or a `[policy]` rule was violated. |
+| `2` | The tool could not do the job — a config it cannot read, a policy it cannot enforce, or **a gate it cannot answer**. |
+
+That last case matters for CI. If you arm `--fail-on` (or a `[policy]` severity
+rule) and the run cannot establish what the gate needs — the vulnerability scan did
+not complete, or a registry never answered — `dependable` exits `2` and says so,
+rather than exiting `0`. A gate that reports success on the run it could not perform
+is worse than no gate at all. With no gate armed, an unreachable registry is still
+reported per dependency and the run exits `0`, because nothing was promised.
+
+A registry that *did* answer is a different thing. A package it reports as
+non-existent — an unpublished internal package, one served by a registry this run
+does not route to, a deleted package — is a permanent per-dependency fact, not a
+failure of the run: it appears in the table and in `--format json`, the run says on
+stderr how many were skipped, and the exit code is `0`. The same goes for a
+dependency whose declared version this run could not read, which is reported
+`undetermined`: `--fail-on vulnerable` promises something about vulnerabilities and
+`--fail-on outdated` something about staleness, and neither is a promise that every
+constraint was parseable. `--fail-on any` is that promise, and it fails on both.
+
+Arming a gate the run cannot enforce is a configuration error, caught before any
+network access: `--fail-on vulnerable` with vulnerability scanning switched off
+(`--no-vuln`, or `[vulnerability] enabled = false`) exits `2`, as a `[policy]`
+severity rule already did. Every advisory list would be empty and the gate could
+never fail — a gate is either enforceable or it is a mistake.
+
+The refusal names the registries that declined, not just the fact that one did:
+
+```console
+$ dependable check --fail-on vulnerable
+error: cannot honour --fail-on: the Go registry did not answer
+```
+
+```console
+$ dependable check --fail-on vulnerable
+error: cannot honour --fail-on: the Go and npm registries did not answer
+```
+
+A run reaches more than one registry — a polyglot repository has one per ecosystem,
+a `deno.json` reaches npm and JSR, and a `Cargo.toml` reaches crates.io alongside any
+alternate registry its dependencies name — so a registry that is not the ecosystem's
+default one is named beside it (`the npm (jsr.io) registry did not answer`). This line
+prints only the host and port, never the configured URL, because a registry root may
+carry credentials and the line lands in CI job output. Where host and port cannot be
+recovered with confidence — a root whose path contains an `@`, which an ordinary Nexus
+npm proxy path does — the reduction says *less* rather than guessing, and the line falls
+back to the bare ecosystem name (`the npm registry did not answer`), indistinguishable
+from a fetcher that names no root at all. (The per-dependency error text in the table is
+a separate matter: it carries whatever the HTTP client put in its message.)
+
+A registry that answered `404` (or, for a Go proxy, `410`) *answered*: a private,
+internal or deleted package is a per-dependency fact, reported in the table and noted
+on stderr, and it does not make a gate unanswerable.
+
+`.dependable.toml` is validated: an unknown key or a wrong-typed value is an error,
+not a silent fallback to defaults. One mistyped character used to reset
+`[global] fail_on` to `none` and disarm the gate with nothing on stderr.
+
 ## Development
 
 | Command              | Description                                  |
@@ -629,7 +827,10 @@ per ecosystem, so future registries (npm, PyPI, Go, …) are additive.
 - **`dependable-fetch`** — the high-level library: `Checker` ties parsing to async
   registry + OSV fetching and caching. The public end-to-end entry point for other
   tools; re-exports the core types so consumers need only this crate.
-- **`dependable`** — the CLI binary; a thin wrapper over `dependable-fetch`.
+- **`dependable-report`** — HTML, SARIF, and the `[policy]` engine, over the finished
+  report model. A library only.
+- **`dependable-tui`** — the interactive terminal UI (ratatui), driving `dependable-fetch`.
+- **`dependable`** — the CLI binary; a thin wrapper over the crates above.
 
 ## Git Hooks
 
@@ -670,7 +871,7 @@ both the annotations and the job summary. Annotations go to **stderr**, so
 stdout.
 
 This repository's own GitHub Actions workflow runs format checks, linting, and
-tests on pushes to `main` and on pull requests, plus a coverage job that uploads
+tests on pushes to `master` and on pull requests, plus a coverage job that uploads
 an `lcov.info` artifact.
 
 ## License
