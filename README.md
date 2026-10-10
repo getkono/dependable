@@ -529,10 +529,25 @@ such: `version_inherited` for a Cargo `version.workspace = true`, `inherited` fo
 constraint taken from `[workspace.dependencies]`, and `lockfile` for the lockfile that
 supplied the locked versions — a workspace keeps one at its root, above its members.
 
-A dependency's `source` is `registry`, `jsr`, `git`, `local` (a `path` entry), or
-`inherited` — a Cargo `dep.workspace = true`, whose version is declared once at the
-workspace root. An inherited dependency is checked wherever it is used and rewritten
-only where it is declared; see [Monorepos and workspaces](#monorepos-and-workspaces).
+A dependency's `source` is today `registry`, `jsr`, `git`, `local` (a `path` entry),
+`inherited`, or `locked`, plus `unknown` for anything this list does not name. That
+list is open, not closed: a new ecosystem may add a token to it within
+`dependable.list/v1`, which pins the document's *shape* — which fields exist and what
+type each holds — and not the token sets inside those fields. Match the ones you care
+about and let the rest fall through to a default; `unknown` is why exhaustive matching
+on `source` was never safe. `inherited` means the version is declared elsewhere in a
+manifest — a Cargo `dep.workspace = true` resolved against the workspace root, a
+Gradle `[versions]` alias, a shared Maven `<properties>` value — and such a dependency
+is checked wherever it is used and rewritten only where it is declared; see
+[Monorepos and workspaces](#monorepos-and-workspaces). An `inherited` entry whose
+version could not be found is the exception: a Cargo `dep.workspace = true` with no
+workspace root, or no matching `[workspace.dependencies]` entry, in reach, or a Maven
+dependency whose version comes from a parent POM or an imported BOM this tool does not
+read. It keeps the `inherited` source but has no `constraint`, is never checked or
+rewritten, and `check` reports it `undetermined`. `locked` means the version came
+from a lockfile and no manifest declares it at all, which today is a SwiftPM
+`Package.resolved` pin: it is checked and scanned like any other, but there is no
+declaration anywhere to point at or to rewrite, so `inherited` stays `false` for it.
 
 `license` appears only with `--licenses`, which — together with `--features` — is
 the one thing in `list` that touches the network: a license is published by the

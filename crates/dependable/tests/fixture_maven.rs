@@ -184,11 +184,15 @@ fn the_cli_lists_an_unresolvable_dependency_instead_of_omitting_it() {
     assert_eq!(guava["source"], "registry");
     assert_eq!(guava["inherited"], false, "its version is its own: {guava}");
 
-    // `source` and `inherited` describe the same fact, so they can never disagree
-    // on one object. They used to: the boolean was filled in only by Cargo
-    // workspace resolution, so every non-Cargo `"source": "inherited"` arrived
-    // beside `"inherited": false`, and a consumer reading both got a
-    // contradiction.
+    // `source: "inherited"` and `inherited: true` describe the same fact, so they can
+    // never disagree on one object. They used to: the boolean was filled in only by
+    // Cargo workspace resolution, so every non-Cargo `"source": "inherited"` arrived
+    // beside `"inherited": false`, and a consumer reading both got a contradiction.
+    //
+    // The implication runs one way only. `inherited: true` with some other `source`
+    // is legal — a root declaration supplying a `path` or `git` source replaces
+    // `source` outright — and `"source": "locked"` is deliberately *not* inherited,
+    // because a lockfile pin has no declaration anywhere to have been inherited from.
     for name in [
         "com.fasterxml.jackson.core:jackson-core",
         "com.fasterxml.jackson.core:jackson-databind",
