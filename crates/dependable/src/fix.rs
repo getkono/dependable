@@ -991,12 +991,13 @@ mod tests {
         );
     }
 
-    /// An override written as an explicit pin answers to two flags, and only one
-    /// of them moves it. `--all` is that one: the pin guard fires first, so
-    /// `--overrides` alone leaves the entry exactly where it is and a
-    /// [`DeclineReason::ForcedVersion`] note would name the flag that does not
-    /// act. The rule is the same one the wildcard case states — the reason that
-    /// survives `--overrides` is the reason the note carries.
+    /// An override written as an explicit pin answers to two flags, and it takes
+    /// both to move it: neither `--all` nor `--overrides` does on its own. The
+    /// pin guard fires first, so without `--all` the note is
+    /// [`DeclineReason::Pinned`] even when `--overrides` is given; with `--all`
+    /// alone the pin guard passes and the note becomes
+    /// [`DeclineReason::ForcedVersion`]. Each note names the next flag that has
+    /// to be lifted, and is true at the moment it is printed.
     #[test]
     fn an_override_that_is_also_a_pin_reports_the_pin() {
         let content = r#"{
@@ -1010,8 +1011,8 @@ mod tests {
         assert_eq!(results[0].item.kind, DependencyKind::Override);
         assert!(results[0].item.is_pinned(), "the fixture must be a pin");
 
-        // Even with `--overrides` asked for by name: the flag that would move this
-        // entry is `--all`, and that is what the note has to say.
+        // Even with `--overrides` asked for by name: the next flag to lift for
+        // this entry is `--all`, and that is what the note has to say.
         for overrides in [false, true] {
             let (updated, records, declined) = plan_fixes(
                 content,
