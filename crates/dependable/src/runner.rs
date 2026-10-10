@@ -1697,28 +1697,21 @@ fn gate_is_answerable(reports: &[ManifestReport], fail_on: FailOn) -> Result<(),
 ///
 /// The union across manifests, because the sentence the gate prints is about the run: a
 /// polyglot repository is many [`ManifestReport`]s, and the same unreachable registry is
-/// one fact however many manifests routed to it. Each check already sorts its own list,
-/// but a union of sorted lists is not sorted, so this re-sorts on the same key.
+/// one fact however many manifests routed to it. A union of sorted lists is not sorted,
+/// so this sorts the result itself.
 fn unanswered_registries(reports: &[ManifestReport]) -> Vec<String> {
-    let mut all: Vec<&dependable_fetch::UnreachableRegistry> = reports
+    let mut labels: Vec<String> = reports
         .iter()
         .flat_map(|r| r.integrity.registry_unreachable.iter())
+        .map(dependable_fetch::UnreachableRegistry::label)
         .collect();
-    all.sort_by_key(|r| {
-        (
-            r.ecosystem.display_name(),
-            r.root.clone().unwrap_or_default(),
-        )
-    });
-    all.dedup();
-    let mut labels: Vec<String> = all.iter().map(|r| r.label()).collect();
-    // Sorted *again*, by label, before deduplicating. Several roots reduce to one printed
+    // Sorted and deduplicated by *label*, not by root. Several roots reduce to one printed
     // label — an unnamed root and the ecosystem's own default both print the bare
     // ecosystem name, and two paths on one host share an authority — and those roots need
-    // not be adjacent under the root-ordered sort above. Three Rust registries at
+    // not be adjacent under a root-ordered sort. Three Rust registries at
     // `http://nexus.corp/a`, `http://other.host/x` and `https://nexus.corp/b` sort in
     // exactly that order (`:` sorts before `s`, so `http://` precedes `https://`), and an
-    // adjacency-only dedup left the sentence naming `nexus.corp` twice.
+    // adjacency-only dedup over roots left the sentence naming `nexus.corp` twice.
     //
     // It also makes the printed order the order a reader sees, rather than the order of
     // roots they are never shown.
