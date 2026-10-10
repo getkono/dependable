@@ -8,9 +8,10 @@
 //!
 //! When no `Cargo.lock` is present it degrades to a **shallow** graph built from
 //! the manifests alone (members plus their direct declared dependencies), flagged
-//! via [`GraphSource::Manifests`]. Such a dependency's version is normally unknown
-//! — a manifest declares a constraint, not a resolution — except where the
-//! constraint names exactly one release, which [`declared_pin`] reads off it.
+//! via [`GraphSource::Manifests`]. Members keep the version their manifest
+//! declares. A dependency's version is normally unknown — a manifest declares a
+//! constraint, not a resolution — except where the constraint names exactly one
+//! release, which [`declared_pin`] reads off it.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -34,7 +35,9 @@ pub enum GraphSource {
     /// The full resolved transitive graph, read from the ecosystem's lockfile.
     Lockfile,
     /// A shallow graph from manifests only — no lockfile was found, so this is
-    /// members plus their *direct* declared dependencies, versions unresolved.
+    /// members plus their *direct* declared dependencies. Members report the
+    /// version their manifest declares; a dependency's version is unresolved
+    /// unless its constraint names exactly one release.
     Manifests,
     /// A shallow graph because the ecosystem's lockfile **cannot** express edges.
     ///
@@ -410,11 +413,20 @@ pub fn build_project_graph(
     let root_version: Option<String> = meta.literal_version().map(str::to_owned);
 
     // The project's own declared dependencies, used as the root's edges whenever the
-    // lockfile carries no entry for the project itself. Kept as whole items: a
-    // constraint that names one release is the only version a manifest-only graph
-    // will ever have for these, and mapping to bare names here would discard it.
+    // lockfile carries no entry for the project itself. Only dependencies the project
+    // itself pulls in: an override forces a version somewhere in the tree, a catalog
+    // entry is a declaration members opt into, and neither is an edge from the root.
+    // Kept as whole items: a constraint that names one release is the only version a
+    // manifest-only graph will ever have for these, and mapping to bare names here
+    // would discard it.
     let direct: Vec<Item> = parse(kind, &content)
-        .map(|parsed| parsed.items)
+        .map(|parsed| {
+            parsed
+                .items
+                .into_iter()
+                .filter(|i| i.kind.is_direct())
+                .collect()
+        })
         .unwrap_or_default();
     let direct_names: Vec<String> = direct.iter().map(|item| item.name.clone()).collect();
 
@@ -474,7 +486,26 @@ pub fn build_project_graph(
         });
     };
 
-    let resolved = parser(&read(&lock_path)?)?;
+    // A lockfile we cannot read is not a reason to fail the command. The manifests still
+    // describe the direct dependencies, and `UnreadableLockfile` is how the caller tells
+    // the user that a lockfile is sitting there unread — which is the actionable half.
+    let resolved = match parser(&read(&lock_path)?) {
+        Ok(resolved) => resolved,
+        Err(_) => {
+            let graph = direct_graph(
+                &root_name,
+                root_version.as_deref(),
+                &direct,
+                kind.ecosystem(),
+                &workspace_names,
+                &roots,
+            );
+            return Ok(WorkspaceGraph {
+                graph,
+                source: GraphSource::UnreadableLockfile,
+            });
+        }
+    };
     let resolved = with_root(resolved, &root_name, root_version.as_deref(), direct_names);
     Ok(WorkspaceGraph {
         graph: DependencyGraph::from_resolved(&resolved, &workspace_names, &roots),

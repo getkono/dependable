@@ -39,6 +39,9 @@ pub struct Summary {
     pub vulnerable: usize,
     /// [`DependencyStatus::Error`] count.
     pub error: usize,
+    /// [`DependencyStatus::Undetermined`] count: real packages whose declared
+    /// version this run could not read.
+    pub undetermined: usize,
     /// [`DependencyStatus::Local`] count.
     pub local: usize,
     /// [`DependencyStatus::Git`] count.
@@ -207,6 +210,7 @@ impl Report {
                     DependencyStatus::Outdated => summary.outdated += 1,
                     DependencyStatus::Vulnerable => summary.vulnerable += 1,
                     DependencyStatus::Error(_) => summary.error += 1,
+                    DependencyStatus::Undetermined => summary.undetermined += 1,
                     DependencyStatus::Local => summary.local += 1,
                     DependencyStatus::Git => summary.git += 1,
                     // `DependencyStatus` is `#[non_exhaustive]`; an unrecognized

@@ -497,6 +497,34 @@ fn a_missing_lockfile_falls_back_to_direct_dependencies() {
     assert_eq!(flatten(&built.graph), vec!["app", "react"]);
 }
 
+/// An `overrides`/`resolutions`/`pnpm.overrides` entry forces a version somewhere in
+/// the tree; it is not a dependency of the root, so the fallback graph must not draw
+/// it as one.
+#[test]
+fn the_fallback_graph_does_not_draw_overrides_as_direct_dependencies() {
+    let dir = TempDir::new().expect("tempdir");
+    write(
+        &dir.path().join("package.json"),
+        r#"{
+  "name": "app",
+  "version": "1.0.0",
+  "dependencies": { "react": "^18.0.0" },
+  "overrides": { "semver": "7.5.4" },
+  "resolutions": { "lodash": "4.17.21" },
+  "pnpm": { "overrides": { "minimist": "1.2.8" } }
+}"#,
+    );
+
+    let built = build_project_graph(
+        &dir.path().join("package.json"),
+        &WorkspaceGraphOptions::default(),
+    )
+    .expect("graph");
+
+    assert_eq!(built.source, GraphSource::Manifests);
+    assert_eq!(flatten(&built.graph), vec!["app", "react"]);
+}
+
 #[test]
 fn builds_the_committed_fixtures_end_to_end() {
     for (dir, manifest, root) in [
