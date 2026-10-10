@@ -1466,3 +1466,56 @@ async fn a_deno_manifest_orders_both_declining_registries_by_root() {
         );
     }
 }
+
+/// #112: `ManifestCheck::unreachable_registries` is per *registry*, but `fetch_all`
+/// collects declines per cache key, and `route_item` gives each alternate-registry alias
+/// its own key. Two aliases naming one index URL are one registry reached by two routes,
+/// so when both decline the published list must hold that registry once — which only
+/// `fetch_all`'s dedup guarantees.
+#[tokio::test]
+async fn two_aliases_naming_one_declining_index_are_reported_once() {
+    let index = MockServer::start().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&index)
+        .await;
+
+    let checker = Checker::builder()
+        .http_client(build_client().unwrap())
+        .rust_alt_registry("first", index.uri(), None)
+        .rust_alt_registry("second", index.uri(), None)
+        .vulnerabilities(false)
+        .build()
+        .unwrap();
+
+    let manifest = r#"
+[dependencies]
+alpha = { version = "1", registry = "first" }
+beta = { version = "1", registry = "second" }
+"#;
+    let check = checker
+        .check_manifest(ManifestKind::CargoToml, manifest, None)
+        .await
+        .unwrap();
+
+    // Both routes were taken and both declined, so neither result was evaluated.
+    assert_eq!(check.results.len(), 2, "{check:?}");
+    assert!(
+        check
+            .results
+            .iter()
+            .all(|r| matches!(r.status, DependencyStatus::Error(_))),
+        "{:?}",
+        check.results.iter().map(|r| &r.status).collect::<Vec<_>>()
+    );
+
+    // One registry, however many aliases routed to it.
+    assert_eq!(check.unreachable_registries.len(), 1, "{check:?}");
+    let declined = &check.unreachable_registries[0];
+    assert_eq!(declined.ecosystem, Ecosystem::Rust);
+    assert_eq!(
+        declined.root.as_deref().map(|r| r.trim_end_matches('/')),
+        Some(index.uri().trim_end_matches('/'))
+    );
+    assert!(check.registry_unreachable);
+}
