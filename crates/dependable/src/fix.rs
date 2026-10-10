@@ -32,11 +32,12 @@ pub struct FixRecord {
 /// Why `fix` left an update alone that `check` reported.
 ///
 /// Most of these are [`rewrite_constraint`] refusing to substitute a new version
-/// into a constraint. The last three are [`plan_fixes`] itself, which drops a row
+/// into a constraint. The last four are [`plan_fixes`] itself, which drops a row
 /// before the constraint is ever consulted — a pin held back for want of `--all`,
 /// a row with no version resolved to write, and a row whose constraint already
-/// names the target. Those three were silent, and silence is issue #93's exact
-/// symptom: `check` reports an update, `fix` says everything is up to date. An
+/// names the target, split by whether `--all` would move it. Those were silent,
+/// and silence is issue #93's exact symptom: `check` reports an update, `fix`
+/// says everything is up to date. An
 /// override is the one skip still not on this list, and [`plan_fixes`] says why.
 ///
 /// Carried out of the planner rather than recomputed, because the answer is only
@@ -96,6 +97,13 @@ pub enum DeclineReason {
     /// Reached most sharply by a `Vulnerable` row whose only fixed release is the
     /// one already in force: there is an update to report and nothing to write.
     AlreadyAtTarget,
+    /// The constraint already names the newest release it admits, a newer one
+    /// exists beyond it, and `--all` would write that one. The exact pins
+    /// [`Item::is_pinned`](dependable_fetch::core::Item::is_pinned)
+    /// does not recognise reach this — npm's bare `"1.0.0"`, PEP 440's `==1.0.0` —
+    /// so, like [`Self::Pinned`], the note names `--all` and the release it would
+    /// write rather than the one already in force.
+    NeedsAll,
 }
 
 impl DeclineReason {
@@ -154,6 +162,10 @@ impl DeclineReason {
             }
             Self::AlreadyAtTarget => {
                 "the constraint already names it, and nothing newer satisfies the constraint"
+            }
+            Self::NeedsAll => {
+                "nothing newer satisfies the constraint, and only `--all` writes a release beyond \
+                 it"
             }
         }
     }
@@ -397,6 +409,25 @@ fn plan_fixes(
         // force reaches it with an advisory attached. `check` reports that row,
         // so `fix` cannot answer it with "everything is already up to date".
         if new_constraint == item.version_constraint {
+            // An exact pin `is_pinned` does not recognise — npm's bare `"1.0.0"`,
+            // PEP 440's `==1.0.0` — lands here rather than at the pin guard. Where
+            // `--all` would write a newer release, that is the action to name and
+            // the release to name with it; the one already in force is not
+            // "available" in any sense the author can use.
+            let beyond = result.latest_available.as_ref().filter(|beyond| {
+                !all && *beyond != target
+                    && rewrite_constraint(&item.version_constraint, beyond, ecosystem)
+                        .is_ok_and(|rewritten| rewritten != item.version_constraint)
+            });
+            if let Some(beyond) = beyond {
+                declined.push(Declined {
+                    name: item.name.clone(),
+                    constraint: item.version_constraint.clone(),
+                    target: Some(beyond.clone()),
+                    reason: DeclineReason::NeedsAll,
+                });
+                continue;
+            }
             declined.push(Declined {
                 name: item.name.clone(),
                 constraint: item.version_constraint.clone(),
@@ -1608,6 +1639,88 @@ mod tests {
                 constraint: "1.0.0".to_string(),
                 target: Some("1.0.0".to_string()),
                 reason: DeclineReason::AlreadyAtTarget,
+            }]
+        );
+    }
+
+    /// An exact pin `is_pinned` does not recognise — npm's bare `"1.0.0"`, PEP
+    /// 440's `==1.0.0` — has its newest compatible release already in force, so
+    /// it reaches the already-at-target branch. `--all` rewrites it, so the note
+    /// names `--all` and the release it would write, not the installed one.
+    #[test]
+    fn an_exact_pin_is_pinned_misses_names_all_and_the_newer_release() {
+        let cases = [
+            (
+                ManifestKind::PackageJson,
+                "{\n  \"name\": \"demo\",\n  \"dependencies\": {\n    \"lodash\": \"1.0.0\"\n  }\n}\n",
+                "lodash",
+                "1.0.0",
+                "\"lodash\": \"2.0.0\"",
+            ),
+            (
+                ManifestKind::RequirementsTxt,
+                "requests==1.0.0\n",
+                "requests",
+                "==1.0.0",
+                "requests==2.0.0",
+            ),
+        ];
+        for (kind, content, name, constraint, moved) in cases {
+            let mut results = results_for(kind, content, &[(name, "1.0.0")]);
+            results[0].latest_available = Some("2.0.0".to_string());
+
+            let (updated, records, declined) =
+                plan_fixes(content, &results, false, Some(kind.ecosystem()))
+                    .expect("the plan applies");
+            assert_eq!(updated, content, "{kind:?}");
+            assert!(records.is_empty(), "{kind:?}");
+            assert_eq!(
+                declined,
+                vec![Declined {
+                    name: name.to_string(),
+                    constraint: constraint.to_string(),
+                    target: Some("2.0.0".to_string()),
+                    reason: DeclineReason::NeedsAll,
+                }],
+                "{kind:?}"
+            );
+            assert!(DeclineReason::NeedsAll.explain().contains("--all"));
+
+            // And `--all` does what the note says, with nothing left to say.
+            let (updated, records, declined) =
+                plan_fixes(content, &results, true, Some(kind.ecosystem()))
+                    .expect("the plan applies");
+            assert!(updated.contains(moved), "{kind:?}: {updated}");
+            assert_eq!(records.len(), 1, "{kind:?}");
+            assert!(declined.is_empty(), "{kind:?}: {declined:?}");
+        }
+    }
+
+    /// The same declined constraint under `[dependencies]` and
+    /// `[dev-dependencies]` is one fact about one constraint, so it is one note.
+    #[test]
+    fn a_decline_in_two_sections_is_one_note() {
+        let content = "[dependencies]\nserde = \">=1.0, <2.0\"\n\n\
+                       [dev-dependencies]\nserde = \">=1.0, <2.0\"\n";
+        let results = results_for(ManifestKind::CargoToml, content, &[("serde", "1.0.219")]);
+        assert_eq!(results.len(), 2, "both sections must reach the planner");
+
+        let (updated, records, declined) = plan_fixes(
+            content,
+            &results,
+            false,
+            Some(ManifestKind::CargoToml.ecosystem()),
+        )
+        .expect("the plan applies");
+        assert_eq!(updated, content);
+        assert!(records.is_empty());
+        assert_eq!(
+            declined,
+            vec![Declined {
+                name: "serde".to_string(),
+                constraint: ">=1.0, <2.0".to_string(),
+                target: Some("1.0.219".to_string()),
+                reason: DeclineReason::CommaRange,
             }]
         );
     }

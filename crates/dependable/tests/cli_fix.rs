@@ -580,9 +580,9 @@ fn a_pin_held_back_for_want_of_all_is_reported() {
 
 /// The constraint already names the only version in range, and a newer release
 /// exists outside it. Nothing to write, and — until now — nothing said: the
-/// clean line went out over an update `check` had just reported. The same
-/// `continue` carries a `Vulnerable` row whose only fixed release is the one
-/// already in force.
+/// clean line went out over an update `check` had just reported. npm's bare
+/// `"1.0.0"` is an exact pin `is_pinned` does not recognise, so the note names
+/// the release `--all` would write and `--all` itself, not the installed one.
 #[test]
 fn a_constraint_already_at_its_target_is_reported() {
     let dir = workdir("fix_already_at_target");
@@ -604,8 +604,8 @@ fn a_constraint_already_at_its_target_is_reported() {
     assert!(
         stderr.contains("note: left lodash = 1.0.0 alone in ")
             && stderr.contains(
-                "1.0.0 is available, but the constraint already names it, and nothing newer \
-                 satisfies the constraint"
+                "2.0.0 is available, but nothing newer satisfies the constraint, and only \
+                 `--all` writes a release beyond it"
             ),
         "stdout: {stdout}\nstderr: {stderr}"
     );
@@ -614,6 +614,18 @@ fn a_constraint_already_at_its_target_is_reported() {
         "{stdout}"
     );
     assert_eq!(fs::read_to_string(&manifest).unwrap(), original);
+
+    // And `--all` does the thing the note named, with nothing left to say.
+    let output = run_with_config(&dir, &config, &["--all"]);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(output.status.success(), "{stderr}");
+    assert!(!stderr.contains("note: left lodash"), "stderr: {stderr}");
+    assert!(
+        fs::read_to_string(&manifest)
+            .unwrap()
+            .contains("\"lodash\": \"2.0.0\""),
+        "`--all` did not move the pin"
+    );
 }
 
 /// The summary is on stdout and the notes are on stderr, so it has to say which
