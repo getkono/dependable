@@ -2,7 +2,11 @@
 //! user's files, and the one that had no test asserting the bytes it produces.
 //!
 //! Hermetic: every fixture declares path dependencies only, so no registry request is
-//! made. That is enough to exercise the write path, which is what these cover.
+//! made — and so nothing is ever planned for rewriting, and `fix::commit` returns
+//! before it writes. These cover the paths that must leave a manifest alone. The write
+//! itself (temporary file, sync, permission copy, rename, the changed-since-planned
+//! refusal, and writing through a symlink) is covered by the unit tests in
+//! `src/fix.rs`, which drive `commit` with a real plan.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -124,9 +128,9 @@ fn no_temporary_files_are_left_beside_the_manifest() {
     );
 }
 
-/// A read-only manifest must fail loudly rather than truncating it. `fs::write` opens
-/// with `O_TRUNC`, so the pre-atomic path destroyed the file before discovering it
-/// could not write.
+/// A read-only manifest with nothing to rewrite is left byte-identical. This reaches
+/// no write — the fixture plans no edit — so it pins the no-op path only; the atomic
+/// write that keeps a manifest intact on failure is covered by `fix.rs`'s unit tests.
 #[cfg(unix)]
 #[test]
 fn a_read_only_manifest_is_not_destroyed() {
