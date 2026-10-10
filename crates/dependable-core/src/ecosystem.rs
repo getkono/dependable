@@ -49,6 +49,32 @@ pub enum Ecosystem {
 }
 
 impl Ecosystem {
+    /// Every variant, in declaration order.
+    ///
+    /// Hand-written, because there is no stable way to enumerate an enum's
+    /// variants and `#[non_exhaustive]` puts an exhaustive match out of reach of
+    /// every other crate. What keeps it honest is *where it sits*: every method
+    /// below matches on `self` exhaustively, so adding a variant stops this file
+    /// compiling, and this list is in front of whoever fixes that. That is a
+    /// prompt, not a proof — nothing forces the list to grow, so keep it in step
+    /// with the enum by hand.
+    ///
+    /// It exists to be pinned against. A frontend that has to cover every
+    /// ecosystem — the `--ecosystem` values of the `dependable` binary, for one —
+    /// asserts its own coverage equals this list, so an ecosystem missing from it
+    /// is an ecosystem that silently reaches no user.
+    pub const ALL: [Self; 9] = [
+        Ecosystem::Rust,
+        Ecosystem::Go,
+        Ecosystem::Npm,
+        Ecosystem::Python,
+        Ecosystem::Php,
+        Ecosystem::Dart,
+        Ecosystem::CSharp,
+        Ecosystem::Elixir,
+        Ecosystem::Jvm,
+    ];
+
     /// The `package.ecosystem` string used in OSV vulnerability queries.
     #[must_use]
     pub fn osv_name(self) -> &'static str {
@@ -227,23 +253,9 @@ impl Ecosystem {
 mod tests {
     use super::*;
 
-    /// Every variant, so a new ecosystem cannot be added without being given
-    /// its pages.
-    const ALL: [Ecosystem; 9] = [
-        Ecosystem::Rust,
-        Ecosystem::Go,
-        Ecosystem::Npm,
-        Ecosystem::Python,
-        Ecosystem::Php,
-        Ecosystem::Dart,
-        Ecosystem::CSharp,
-        Ecosystem::Elixir,
-        Ecosystem::Jvm,
-    ];
-
     #[test]
     fn every_ecosystem_can_name_a_page_for_a_package() {
-        for ecosystem in ALL {
+        for ecosystem in Ecosystem::ALL {
             let url = ecosystem.package_url("serde");
             assert!(url.starts_with("https://"), "{ecosystem:?}: {url}");
             assert!(url.contains("serde"), "{ecosystem:?}: {url}");
@@ -350,7 +362,11 @@ mod tests {
             // conflict resolution.
             (Ecosystem::Jvm, BareVersion::Minimum),
         ];
-        assert_eq!(expected.len(), ALL.len(), "every variant must be listed");
+        assert_eq!(
+            expected.len(),
+            Ecosystem::ALL.len(),
+            "every variant must be listed"
+        );
         for (ecosystem, reading) in expected {
             assert_eq!(ecosystem.bare_version(), reading, "{ecosystem:?}");
         }
@@ -360,7 +376,7 @@ mod tests {
     /// terms of the other, and this pins that they stay that way.
     #[test]
     fn the_exactness_shorthand_agrees_with_the_full_reading() {
-        for ecosystem in ALL {
+        for ecosystem in Ecosystem::ALL {
             assert_eq!(
                 ecosystem.bare_version_is_exact(),
                 ecosystem.bare_version() == BareVersion::Exact,
