@@ -15,7 +15,7 @@ pub mod parsers;
 pub mod result;
 pub mod semver;
 
-pub use ecosystem::Ecosystem;
+pub use ecosystem::{BareVersion, Ecosystem};
 pub use error::ParseError;
 pub use graph::{
     DependencyGraph, Node, NodeKind, PathPredicate, Placement, Tree, TreeNode, TreeOptions, Visit,
@@ -46,6 +46,6 @@ pub use parsers::{
 };
 pub use result::{CheckResult, DependencyStatus, ErrorOrigin};
 pub use semver::{
-    Evaluation, UnstableFilter, check_version, check_version_for, is_prerelease,
+    Evaluation, UnstableFilter, check_version, check_version_for, exact_pin, is_prerelease,
     to_semver_constraint, try_to_semver_constraint,
 };

@@ -5,13 +5,21 @@
 //! surrounding formatting and comments untouched. The leading operator/`v` prefix
 //! is preserved (`^1.0` → `^1.5.0`, `v1.2.3` → `v1.5.0`) so a constraint's meaning
 //! is not silently changed (e.g. an npm caret range is not turned into a pin).
+//!
+//! Preserving the operator is not enough on its own, because a constraint that
+//! carried no operator is written back as a bare version — and what a bare
+//! version means is an ecosystem question, not a string one. Cargo's `1.*` and
+//! npm's `1.x` are the same shape and opposite calls: `1.0.219` is `^1.0.219` in
+//! one and one release in the other. The manifest path answers it, via
+//! [`Ecosystem::bare_version`]; see [`rewrite_constraint`].
 
 use std::collections::HashMap;
 use std::io::Write as _;
 use std::path::Path;
 
 use anyhow::Context;
-use dependable_fetch::{CheckResult, DependencyKind, DependencyStatus};
+use dependable_fetch::core::{BareVersion, Ecosystem, ManifestKind};
+use dependable_fetch::{CheckResult, DependencyKind};
 
 /// A single applied (or would-be-applied) version change.
 #[derive(Debug, Clone)]
@@ -19,6 +27,205 @@ pub struct FixRecord {
     pub name: String,
     pub from: String,
     pub to: String,
+}
+
+/// Why `fix` left an update alone that `check` reported.
+///
+/// Most of these are [`rewrite_constraint`] refusing to substitute a new version
+/// into a constraint. The last five are [`plan_fixes`] itself, and none of them
+/// is a property of the constraint's shape: a pin held back for want of `--all`,
+/// a row with no version resolved to write, a row whose constraint already names
+/// the target, split by whether `--all` would move it, and — the one the
+/// constraint would have taken outright — an `overrides` / `resolutions` entry
+/// held back for want of `--overrides`. All five were silent once, and silence
+/// is issue #93's exact symptom: `check` reports an update, `fix` says
+/// everything is up to date.
+///
+/// Carried out of the planner rather than recomputed, because the answer is only
+/// live at the point the guard fires: reconstructing it later would mean a second
+/// copy of every guard below, kept in step with this one by hope. It reaches the
+/// user as the second half of a `note:` line — see [`DeclineReason::explain`] —
+/// so a dependency `check` reports an update for and `fix` leaves alone says so
+/// instead of vanishing into "everything is already up to date".
+///
+/// `#[non_exhaustive]`: match with a wildcard arm so a new guard is additive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
+pub enum DeclineReason {
+    /// A comma-separated range: Cargo's `>=1.0, <2.0`.
+    CommaRange,
+    /// A space- or `|`-separated range: `>=1.0.0 <2.0.0`, `^1 || ^2`.
+    MultiClause,
+    /// An `@` qualifier: a Composer stability flag (`@dev`, `^1.0@beta`) or an
+    /// npm alias (`npm:pkg@1.0.0`).
+    Qualifier,
+    /// A dist-tag or channel name: `latest`, `next`.
+    DistTag,
+    /// A Maven interval with no comma: `[1.0]`, Maven's hard requirement, which a
+    /// bare version would soften into one any transitive declaration may outvote.
+    Interval,
+    /// A wildcard behind an operator (`^1.x`, `=1.*`), whose rewrite would not be
+    /// a bare version at all.
+    WildcardOperator,
+    /// A wildcard in an ecosystem that reads a bare version as one release:
+    /// npm's `"lodash": "1.x"`.
+    WildcardPins,
+    /// A wildcard in an ecosystem that reads a bare version as a minimum:
+    /// NuGet's `1.*`, Gradle's `1.+`.
+    WildcardUnbounds,
+    /// A wildcard whose shape no bare version reproduces even where the bare
+    /// reading is a caret: `*`, `1.2.*`, `1.+`.
+    WildcardShape,
+    /// A constraint whose every written component is zero, read as a caret —
+    /// where a bare version is one (Cargo's `0.*`, `0`, `0.0`) or behind a
+    /// written caret in any ecosystem (`^0`, `^0.0`). The shape is one a caret
+    /// otherwise reproduces; what does not survive is the *bound*, because a
+    /// caret is minor-scoped below 1.0.0.
+    CaretBoundNarrows,
+    /// A partial version, which is an X-range wherever a bare version is exact:
+    /// npm's `"react": "16"`.
+    PartialVersion,
+    /// A partial version behind a lone `=`, which is a range rather than a pin:
+    /// Cargo's `=1.2` is `>=1.2.0, <1.3.0`, node-semver's `=16` is `16.x`.
+    EqualsPartial,
+    /// A partial version behind a tilde operator, which reads its upper bound off
+    /// the number of components it was given: `~1`, `~> 1.0`, `~=1.4`.
+    TildeArity,
+    /// An exact pin (`=1.0.100`) with no `--all` to authorise moving it. Not a
+    /// refusal by the constraint's *shape* — the rewrite would succeed — but the
+    /// author holds the version deliberately, and the action that changes it is a
+    /// flag rather than a rewrite of the constraint.
+    Pinned,
+    /// No version resolved to write: the row has an update and neither
+    /// `latest_compatible` (the default target) nor `latest_available` (under
+    /// `--all`) named one. The usual cause is a constraint no published release
+    /// satisfies, whose newer releases are all beyond it.
+    NoTarget,
+    /// The constraint already names the version that would have been written.
+    /// Reached most sharply by a `Vulnerable` row whose only fixed release is the
+    /// one already in force: there is an update to report and nothing to write.
+    AlreadyAtTarget,
+    /// The constraint already names the newest release it admits, a newer one
+    /// exists beyond it, and `--all` would write that one. The exact pins
+    /// [`Item::is_pinned`](dependable_fetch::core::Item::is_pinned)
+    /// does not recognise reach this — npm's bare `"1.0.0"`, PEP 440's `==1.0.0` —
+    /// so, like [`Self::Pinned`], the note names `--all` and the release it would
+    /// write rather than the one already in force.
+    NeedsAll,
+    /// Not the constraint at all: the entry is an `overrides` / `resolutions`
+    /// value, a version the manifest forces onto the resolved tree. `fix` moves
+    /// one only when `--overrides` asks it to.
+    ///
+    /// Last, and asked last: every reason above it would still stand with
+    /// `--overrides` turned on, so any of them that fits an override is the one
+    /// worth reporting — see the ordering [`plan_fixes`] holds them in.
+    ForcedVersion,
+}
+
+impl DeclineReason {
+    /// The clause that completes a `note:` line, reading on from
+    /// "… is available, but " — or, for a decline with no version to name, from
+    /// "an update was reported, but ". [`crate::runner`] picks the opening; every
+    /// clause here has to read after either.
+    ///
+    /// Every reason says what the entry *is*, not that a rule fired — the point
+    /// of the note is to let the author decide what to do about it, and a rule
+    /// name would not help them do that. For a constraint reason that means
+    /// deciding whether to widen the constraint by hand; for
+    /// [`ForcedVersion`](Self::ForcedVersion) the decision is whether the pin has
+    /// outlived its reason, so that clause names the flag that acts on the
+    /// answer.
+    #[must_use]
+    pub fn explain(self) -> &'static str {
+        match self {
+            Self::CommaRange => {
+                "a comma-separated range has two bounds and one version cannot carry both"
+            }
+            Self::MultiClause => {
+                "a space- or `||`-separated range has more than one clause and one version \
+                 cannot carry them all"
+            }
+            Self::Qualifier => {
+                "an `@` qualifier — a stability flag or an alias — describes the range, not the \
+                 version"
+            }
+            Self::DistTag => "a dist-tag names a release channel, not a version",
+            Self::Interval => {
+                "a bracketed interval is a hard requirement, and a bare version here would \
+                 soften it into one any transitive declaration may outvote"
+            }
+            Self::WildcardOperator => {
+                "an operator in front of a wildcard is a range the new version would not reproduce"
+            }
+            Self::WildcardPins => {
+                "a wildcard already tracks new releases, and a bare version here would pin it to \
+                 one"
+            }
+            Self::WildcardUnbounds => {
+                "a wildcard already tracks new releases, and a bare version here would drop its \
+                 upper bound"
+            }
+            Self::WildcardShape => {
+                "a wildcard already tracks new releases, and no bare version covers the same range"
+            }
+            Self::CaretBoundNarrows => {
+                "every component it writes is zero, and below 1.0.0 a caret is minor-scoped, so \
+                 a concrete release here would sit under the upper bound the constraint already \
+                 reaches"
+            }
+            Self::PartialVersion => {
+                "a partial version is an X-range that already tracks new releases"
+            }
+            Self::EqualsPartial => {
+                "an `=` in front of a partial version is a range that already tracks new \
+                 releases, and a full version here would pin it to one"
+            }
+            Self::TildeArity => {
+                "a tilde reads its upper bound off the number of components it was given, and a \
+                 full version here would narrow that bound"
+            }
+            Self::Pinned => "the constraint pins one release, and only `--all` moves a pin",
+            Self::NoTarget => {
+                "no release the constraint admits was resolved, so there is nothing to write"
+            }
+            Self::AlreadyAtTarget => {
+                "the constraint already names it, and nothing newer satisfies the constraint"
+            }
+            Self::NeedsAll => {
+                "nothing newer satisfies the constraint, and only `--all` writes a release beyond \
+                 it"
+            }
+            Self::ForcedVersion => {
+                "an override forces this version onto the resolved tree; pass --overrides to \
+                 advance it"
+            }
+        }
+    }
+}
+
+/// An update `check` reports that `fix` will not write: either a constraint
+/// refused the rewrite, or the entry is a version this manifest forces onto the
+/// resolved tree and no `--overrides` was given.
+///
+/// The whole point of recording it: without one, a declined update and a
+/// dependency with nothing to do are the same empty result, and `fix` answers
+/// "everything is already up to date" to a manifest `check` just said had an
+/// update waiting.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Declined {
+    /// The dependency's name.
+    pub name: String,
+    /// The constraint left in place, verbatim.
+    pub constraint: String,
+    /// The version that would have been written had nothing refused it.
+    ///
+    /// [`None`] where there was no such version to name —
+    /// [`DeclineReason::NoTarget`] is exactly that case. The note then opens "an
+    /// update was reported, but …" instead of naming a release, because printing
+    /// an invented or empty version would be worse than printing none.
+    pub target: Option<String>,
+    /// Why it was not.
+    pub reason: DeclineReason,
 }
 
 /// A byte-range replacement within one line of the manifest.
@@ -50,13 +257,17 @@ pub struct PlannedFix {
     original: String,
     /// What changed, for reporting.
     pub records: Vec<FixRecord>,
+    /// The updates this rewrite declined to make, and why — reported so `check`
+    /// and `fix` do not appear to contradict each other.
+    pub declined: Vec<Declined>,
 }
 
 /// Compute the rewrite for `manifest` without touching it.
 ///
 /// Pinned (`=x.y.z`) deps are skipped unless `all` is set; multi-constraint forms
 /// (containing `,`) are skipped because they can't be rewritten to a single
-/// version.
+/// version. An `overrides` / `resolutions` entry is left alone — and reported —
+/// unless `overrides` is set.
 ///
 /// Planning is separated from writing so a multi-manifest run can compute every rewrite
 /// before it writes any. Writing as it went left the tree half-rewritten when the third
@@ -65,16 +276,27 @@ pub struct PlannedFix {
 /// # Errors
 /// Returns an error if the manifest cannot be read, or if a recorded span no longer
 /// holds the constraint it was planned against.
-pub fn plan(manifest: &Path, results: &[CheckResult], all: bool) -> anyhow::Result<PlannedFix> {
+pub fn plan(
+    manifest: &Path,
+    results: &[CheckResult],
+    all: bool,
+    overrides: bool,
+) -> anyhow::Result<PlannedFix> {
     let content = std::fs::read_to_string(manifest)
         .with_context(|| format!("reading {}", manifest.display()))?;
-    let (updated, records) = plan_fixes(&content, results, all)
+    // What a rewritten constraint *means* is an ecosystem question, and the file
+    // name is where the answer is. `None` — a manifest discovery surfaced but
+    // `detect` does not recognize — is not an error here: the rewrite still runs,
+    // under the reading that declines the most (see [`rewrite_constraint`]).
+    let ecosystem = ManifestKind::detect(manifest).map(ManifestKind::ecosystem);
+    let (updated, records, declined) = plan_fixes(&content, results, all, overrides, ecosystem)
         .with_context(|| format!("rewriting {}", manifest.display()))?;
     Ok(PlannedFix {
         path: manifest.to_path_buf(),
         updated,
         original: content,
         records,
+        declined,
     })
 }
 
@@ -141,16 +363,42 @@ pub fn commit(planned: &PlannedFix) -> anyhow::Result<()> {
 }
 
 /// Compute the rewritten manifest and the applied records from `content` and the
-/// check `results`, with no filesystem IO (the file boundary lives in
-/// [`apply_fixes`]). Format-agnostic: it edits each recorded version span in place,
-/// so JSON, YAML, and TOML manifests are rewritten without reformatting.
+/// check `results`, with no filesystem IO (the file boundary lives in [`plan`]).
+/// Format-agnostic: it edits each recorded version span in place, so JSON, YAML,
+/// and TOML manifests are rewritten without reformatting.
+///
+/// `ecosystem` decides which constraints are safe to rewrite at all —
+/// [`rewrite_constraint`] explains what turns on it — and `None` means the
+/// manifest kind was not recognized, which is treated as the most restrictive
+/// answer rather than as permission.
+///
+/// `overrides` opts into rewriting an `overrides` / `resolutions` entry, which is
+/// otherwise reported and left in place; see the guard in the loop below.
+///
+/// Returns the rewritten content, the changes made, and the changes *not* made:
+/// every dependency with an update available that this loop left alone, whether
+/// [`rewrite_constraint`] declined it or the loop itself dropped it — a pin
+/// without `--all`, a row with no version resolved to write, a constraint
+/// already naming the target, or a forced version without `--overrides`. The
+/// third list exists because it cannot be recovered afterwards — the caller would
+/// have to redo the rewritability, pinning, and target selection above *and*
+/// every guard inside [`rewrite_constraint`] to learn what this loop already knew
+/// and threw away.
+///
+/// The plan set and the declined set together account for every `has_update()`
+/// row that is rewritable. That is the invariant the summary line in
+/// [`crate::runner`] rests on: "everything is already up to date" is only
+/// printable when both are empty.
 fn plan_fixes(
     content: &str,
     results: &[CheckResult],
     all: bool,
-) -> anyhow::Result<(String, Vec<FixRecord>)> {
+    overrides: bool,
+    ecosystem: Option<Ecosystem>,
+) -> anyhow::Result<(String, Vec<FixRecord>, Vec<Declined>)> {
     let mut edits: Vec<Edit> = Vec::new();
     let mut records = Vec::new();
+    let mut declined = Vec::new();
     for result in results {
         let item = &result.item;
         // `is_rewritable` and not `is_checkable`: a workspace member inheriting a
@@ -160,22 +408,33 @@ fn plan_fixes(
         if !item.is_rewritable() {
             continue;
         }
-        // An override is a version this manifest deliberately forces onto the resolved
-        // tree — very often a security pin holding a transitive dependency above a
-        // vulnerable release. Reporting that a newer version exists is useful; rewriting
-        // the pin to it defeats the reason the entry was written, so `fix` declines the
-        // whole kind rather than trying to guess which overrides are safe to move.
-        if item.kind == DependencyKind::Override {
+        if !result.status.has_update() {
             continue;
         }
-        let updatable = matches!(
-            result.status,
-            DependencyStatus::PatchAvailable
-                | DependencyStatus::UpdateAvailable
-                | DependencyStatus::Outdated
-                | DependencyStatus::Vulnerable
-        );
-        if !updatable || (item.is_pinned() && !all) {
+        // A pin is a constraint, and it refused. Recorded rather than dropped:
+        // this is the single most common way a dependency is deliberately held
+        // back, so leaving it silent reproduces issue #93's symptom — `check`
+        // reports the update, `fix` prints "everything is already up to date" —
+        // by default configuration, on the path a user is likeliest to hit. The
+        // version named is the one `--all` would write, because `--all` is the
+        // action the note points at.
+        //
+        // Ahead of the `forced` guard below, and so this is also the reason an
+        // `overrides` entry written as an explicit pin (`=1.2.3`) reports the pin:
+        // `--overrides` on its own would still leave it exactly where it is, so
+        // the flag worth naming is the next one that has to be lifted, not one
+        // that finishes the job. For that entry it takes both, and the notes
+        // disclose them one at a time — with `--all` the pin guard passes and the
+        // `forced` guard below names `--overrides` in turn. Each note is true at
+        // the moment it is printed, which is what
+        // `an_override_that_is_also_a_pin_reports_the_pin` walks through.
+        if item.is_pinned() && !all {
+            declined.push(Declined {
+                name: item.name.clone(),
+                constraint: item.version_constraint.clone(),
+                target: result.latest_available.clone(),
+                reason: DeclineReason::Pinned,
+            });
             continue;
         }
 
@@ -184,11 +443,93 @@ fn plan_fixes(
         } else {
             result.latest_compatible.as_ref()
         };
-        let Some(target) = target else { continue };
-        let Some(new_constraint) = rewrite_constraint(&item.version_constraint, target) else {
+        // An update with nothing to write it from: the row is `has_update()` and
+        // the target this run would have used is absent. Usually a constraint no
+        // published release satisfies, whose newer releases all sit beyond it.
+        // Also a decline — `check` said something, so `fix` has to.
+        let Some(target) = target else {
+            declined.push(Declined {
+                name: item.name.clone(),
+                constraint: item.version_constraint.clone(),
+                target: None,
+                reason: DeclineReason::NoTarget,
+            });
             continue;
         };
+        // An override is a version this manifest deliberately forces onto the resolved
+        // tree — very often a security pin holding a transitive dependency above a
+        // vulnerable release. Rewriting it to the newest release defeats the reason the
+        // entry was written, so the default is still never to write over one; `fix`
+        // moves it only when `--overrides` asks for it by name.
+        //
+        // Decided *here*, after target selection, and not as an early `continue` at the
+        // top of the loop: the note this produces names a concrete version that is
+        // actually available, so the question it puts to the author — has this pin
+        // outlived its reason? — is one they can answer. Skipped before that, an
+        // override with an update waiting was indistinguishable from one with nothing
+        // to do, which is the same contradiction with `check` that `declined` exists to
+        // remove.
+        let forced = item.kind == DependencyKind::Override && !overrides;
+        let new_constraint = match rewrite_constraint(&item.version_constraint, target, ecosystem) {
+            Ok(new_constraint) => new_constraint,
+            // Before the `forced` guard, deliberately: a constraint that refuses the
+            // rewrite refuses it whether or not `--overrides` was passed, so an override
+            // carrying a wildcard reports the wildcard — the reason that would still
+            // stand with the flag turned on — rather than a flag that would not help.
+            Err(reason) => {
+                declined.push(Declined {
+                    name: item.name.clone(),
+                    constraint: item.version_constraint.clone(),
+                    target: Some(target.clone()),
+                    reason,
+                });
+                continue;
+            }
+        };
+        // Already at the target: nothing to write, and — until this was recorded
+        // — nothing said either. The constraint would have accepted the rewrite,
+        // which is why this is not a shape refusal; what refused is the range,
+        // and a `Vulnerable` row whose only fixed release is the one already in
+        // force reaches it with an advisory attached. `check` reports that row,
+        // so `fix` cannot answer it with "everything is already up to date".
         if new_constraint == item.version_constraint {
+            // An exact pin `is_pinned` does not recognise — npm's bare `"1.0.0"`,
+            // PEP 440's `==1.0.0` — lands here rather than at the pin guard. Where
+            // `--all` would write a newer release, that is the action to name and
+            // the release to name with it; the one already in force is not
+            // "available" in any sense the author can use.
+            let beyond = result.latest_available.as_ref().filter(|beyond| {
+                !all && *beyond != target
+                    && rewrite_constraint(&item.version_constraint, beyond, ecosystem)
+                        .is_ok_and(|rewritten| rewritten != item.version_constraint)
+            });
+            if let Some(beyond) = beyond {
+                declined.push(Declined {
+                    name: item.name.clone(),
+                    constraint: item.version_constraint.clone(),
+                    target: Some(beyond.clone()),
+                    reason: DeclineReason::NeedsAll,
+                });
+                continue;
+            }
+            declined.push(Declined {
+                name: item.name.clone(),
+                constraint: item.version_constraint.clone(),
+                target: Some(target.clone()),
+                reason: DeclineReason::AlreadyAtTarget,
+            });
+            continue;
+        }
+        // Last of the guards, so every reason above it wins over this one: each of
+        // them would still stand with `--overrides` turned on, and this one names
+        // a flag that would then not be the flag to reach for.
+        if forced {
+            declined.push(Declined {
+                name: item.name.clone(),
+                constraint: item.version_constraint.clone(),
+                target: Some(target.clone()),
+                reason: DeclineReason::ForcedVersion,
+            });
             continue;
         }
 
@@ -211,21 +552,48 @@ fn plan_fixes(
     } else {
         apply_edits(content, &edits)?
     };
-    Ok((updated, records))
+    // One note per distinct decline: the same crate under `[dependencies]` and
+    // `[dev-dependencies]` is one fact about one constraint, not two.
+    declined.sort();
+    declined.dedup();
+    Ok((updated, records, declined))
 }
 
 /// Build a new constraint from `original`, preserving its leading operator/`v`
-/// prefix and substituting `new_version`. Returns `None` for the forms that
-/// can't be rewritten to a single version without changing their meaning: a
-/// comma-separated range (Cargo `>=1.0, <2.0`), a space-separated range
-/// (npm/pubspec `>=1.0.0 <2.0.0`), a `||` alternation (`^1 || ^2`), a dist-tag
-/// (`latest`), a wildcard (`*`, `1.x`, `1.*`), or anything carrying an `@`
-/// (a Composer stability flag such as `@dev` or `^1.0@beta`, an npm alias such
-/// as `npm:pkg@1.0.0`), or a Maven interval (`[1.0]`, `(,2.0)`).
-fn rewrite_constraint(original: &str, new_version: &str) -> Option<String> {
+/// prefix and substituting `new_version`. Returns [`Err`] for the forms that
+/// can't be rewritten without changing their meaning: a comma-separated range
+/// (Cargo `>=1.0, <2.0`), a space-separated range (npm/pubspec `>=1.0.0 <2.0.0`),
+/// a `||` alternation (`^1 || ^2`), a dist-tag (`latest`), anything carrying an
+/// `@` (a Composer stability flag such as `@dev` or `^1.0@beta`, an npm alias
+/// such as `npm:pkg@1.0.0`), a Maven interval (`[1.0]`, `(,2.0)`), a partial
+/// version behind a tilde operator (`~1`, `~> 1.0`, `~=1.4`) or a lone `=`
+/// (`=1.2`), an all-zero partial behind a caret (`^0`, `^0.0`), and — depending
+/// on `ecosystem` — a wildcard (`*`, `1.x`, `1.*`) or a partial version (npm
+/// `"16"` or `"v16"`, Cargo `"0"`).
+///
+/// The error is a [`DeclineReason`] and not a bare `None`, because *which* guard
+/// fired is the only thing that makes the resulting note actionable, and this is
+/// the sole place that knows it. An `Option` return threw that away at the one
+/// boundary where it was still free.
+///
+/// `ecosystem` is what the wildcard and partial-version guards turn on, because
+/// both ask the same question: the rewrite writes the new version back bare, so
+/// is a bare version in this ecosystem still the range the author had? `None`
+/// means the manifest kind was not recognized; it is read as
+/// [`BareVersion::Exact`], which declines strictly more than either other
+/// reading, so an unknown manifest is never rewritten into something a known one
+/// would have refused.
+///
+/// # Errors
+/// Returns the [`DeclineReason`] for the first guard that refuses the rewrite.
+fn rewrite_constraint(
+    original: &str,
+    new_version: &str,
+    ecosystem: Option<Ecosystem>,
+) -> Result<String, DeclineReason> {
     let trimmed = original.trim();
     if trimmed.contains(',') {
-        return None;
+        return Err(DeclineReason::CommaRange);
     }
     const OP_CHARS: &[char] = &['^', '~', '>', '<', '=', '!', 'v', 'V', ' ', '\t'];
     let prefix: String = trimmed
@@ -236,7 +604,7 @@ fn rewrite_constraint(original: &str, new_version: &str) -> Option<String> {
     // clause (range upper bound or alternative) we'd silently drop — leave it be.
     let rest = &trimmed[prefix.len()..];
     if rest.contains([' ', '\t', '|']) {
-        return None;
+        return Err(DeclineReason::MultiClause);
     }
     // An `@` never belongs to a version: it introduces a Composer stability flag
     // (`@dev`, `2.8.*@dev`, `^1.0@beta`) or an npm alias target (`npm:pkg@1.0.0`).
@@ -246,13 +614,13 @@ fn rewrite_constraint(original: &str, new_version: &str) -> Option<String> {
     // pin. That is the harm of #87, so take the same call already taken for a
     // dist-tag and decline.
     if rest.contains('@') {
-        return None;
+        return Err(DeclineReason::Qualifier);
     }
     // A dist-tag / channel name (`latest`, `next`, `beta`, …) starts with a letter
     // once any operator prefix is removed — it names a channel, not a version
     // range, so it must never be pinned to a concrete version (npm D8).
     if rest.starts_with(|c: char| c.is_ascii_alphabetic()) {
-        return None;
+        return Err(DeclineReason::DistTag);
     }
     // A Maven interval — `[1.0]`, `[1.0,2.0)`, `(,1.0]` — states its bounds in
     // brackets rather than with an operator, and `[1.0]` in particular is Maven's
@@ -262,20 +630,253 @@ fn rewrite_constraint(original: &str, new_version: &str) -> Option<String> {
     // as the semantics change it is. A range with a comma is already declined above;
     // the single-version form has no comma to catch it.
     if rest.starts_with(['[', '(']) {
-        return None;
+        return Err(DeclineReason::Interval);
     }
-    // A wildcard (`*`, `1.x`, `1.*`, Gradle's `1.+`) is a range the author chose,
-    // not a version — substituting a concrete release narrows it to a pin (#87).
-    // The decline is deliberately blanket rather than per-ecosystem: substituting
-    // is safe where a bare version is a caret or an inclusive minimum (Cargo, Go,
-    // Dart) and unsafe where it is an exact pin (npm, Composer, Hex), and this
-    // signature carries no `Ecosystem` to tell them apart. `apply_fixes` does hold
-    // the manifest path and could supply one — #92 tracks narrowing the decline to
-    // the ecosystems that need it. Until then, decline as a dist-tag is declined.
+
+    let bare = ecosystem.map_or(BareVersion::Exact, Ecosystem::bare_version);
+
     if is_wildcard(rest) {
-        return None;
+        // A wildcard (`*`, `1.x`, `1.*`, Gradle's `1.+`) is a range the author
+        // chose, not a version. Substituting a concrete release preserves it in
+        // exactly one situation: the constraint carries no operator, the wildcard
+        // sits in the minor position over a major a caret can key its bound off,
+        // and the ecosystem reads the bare version we write back as a caret range.
+        // Then `1.*` (`>=1.0.0, <2.0.0`) becomes `1.0.219` (`>=1.0.219, <2.0.0`)
+        // — the floor is raised, which is what `fix` does to every other
+        // constraint, and the author's upper bound survives.
+        //
+        // That last guarantee belongs to the default path. Under `--all` the
+        // target is `latest_available` rather than `latest_compatible`, so
+        // `serde = "1.*"` becomes `serde = "3.4.0"` and the author's upper bound
+        // does *not* survive. Deliberate: `--all` is documented as updating
+        // "beyond the declared constraint" and already does exactly this to
+        // `^1.0`, so carving wildcards out of it would make one flag mean two
+        // things.
+        //
+        // Every other combination changes what the constraint admits (#87, #92):
+        //
+        // - [`BareVersion::Exact`] collapses the range to one release: npm's
+        //   `"lodash": "1.x"` would become `"1.9.0"`, and Composer and Hex read a
+        //   bare version the same way.
+        // - [`BareVersion::Minimum`] loses the upper bound instead: NuGet's `1.*`
+        //   is any 1.x resolved to the newest, while a bare `1.9.0` is `>= 1.9.0`
+        //   resolved to the *oldest* — a different range and a different pick.
+        //   Gradle's `1.+` against its `require` semantics is the same trade.
+        // - A bare `*` is every version, and any concrete release confines it to
+        //   one major — a narrowing even where the bare form is a caret.
+        // - `1.2.*` is `>=1.2.0, <1.3.0`, and a caret over any 1.2.z release
+        //   reaches to `<2.0.0` — a widening even where the bare form is a caret.
+        // - `0.*` is `>=0.0.0, <1.0.0`, but a caret is *minor*-scoped below
+        //   1.0.0: the `0.y.z` written back is `^0.y.z`, which reaches only to
+        //   `<0.(y+1).0`. A manifest that admitted `0.11.0` stops admitting it —
+        //   a narrowing, and the one shape `is_minor_wildcard` would otherwise
+        //   wave through.
+        // - An operator in front (`^1.x`, `=1.*`, Python's `==1.*`) means the
+        //   result is not a bare version at all, so the caret reading that
+        //   justifies the rewrite does not apply to it.
+        //
+        // The three conditions are checked in order of what the note should say,
+        // not in the order they were written: an operator answers for the whole
+        // constraint whatever the ecosystem reads a bare version as, and the
+        // ecosystem's reading answers before the wildcard's shape because it is
+        // the more specific harm.
+        if !prefix.is_empty() {
+            return Err(DeclineReason::WildcardOperator);
+        }
+        match bare {
+            BareVersion::Exact => return Err(DeclineReason::WildcardPins),
+            BareVersion::Minimum => return Err(DeclineReason::WildcardUnbounds),
+            BareVersion::Caret => {}
+            // A reading added since this was written. Decline, as every non-caret
+            // reading already does, under the reason that names no particular
+            // harm — inventing one for a reading this code has never seen would
+            // be worse than saying only that the shapes do not correspond.
+            _ => return Err(DeclineReason::WildcardShape),
+        }
+        if !is_minor_wildcard(rest) {
+            return Err(DeclineReason::WildcardShape);
+        }
+        // Shape is settled and the bound is not. `0.*` is the one minor wildcard
+        // a caret reproduces the *shape* of and not the *range*: it means
+        // `>=0.0.0, <1.0.0`, and the `0.y.z` written back is `^0.y.z`, which
+        // reaches only to `<0.(y+1).0`. A manifest that admitted `0.11.0` stops
+        // admitting it.
+        //
+        // Asked after the shape guard, and reported under its own reason rather
+        // than folded into `is_minor_wildcard`: a constraint that refuses for its
+        // shape should say so, and `0.*` does not refuse for its shape. A note
+        // reading "no bare version covers the same range" would send the author
+        // looking for the wrong thing.
+        if !caret_bound_survives_substitution(rest.split('.').next().unwrap_or_default()) {
+            return Err(DeclineReason::CaretBoundNarrows);
+        }
+    } else if is_partial_version(rest) {
+        // The prefix collected above also swallows a leading `v` and whitespace,
+        // neither of which is an operator: node-semver reads `"v16"` exactly as it
+        // reads `"16"` — the X-range `16.x` — so a `v` must not be what carries a
+        // partial past the bare-version guard below. Strip both and ask which
+        // operator, if any, the author actually wrote.
+        let operator: String = prefix
+            .chars()
+            .filter(|c| !matches!(c, 'v' | 'V' | ' ' | '\t'))
+            .collect();
+        if operator.is_empty() {
+            // The same harm one wildcard character away, reached under two of the
+            // three readings — and under two different reasons, because the two
+            // readings lose two different things.
+            //
+            // Where a bare version is exact, npm treats a partial version as an
+            // X-range — `"react": "16"` is `16.x`, `"1.0"` is `1.0.x` — so
+            // rewriting it to `"16.14.0"` pins a dependency that was tracking a
+            // line of releases, with no `*` anywhere for `is_wildcard` to see.
+            // Guarded for every ecosystem that reads a bare version exactly, not
+            // just npm: Composer normalizes a partial to a full version and Hex
+            // and pub reject one outright, so there the rewrite would have been
+            // harmless — but "harmless" is the whole claim being made, and
+            // declining costs a fix on a constraint that already pins while a
+            // wrong `true` costs the author their range.
+            //
+            // Where a bare version is a *caret*, a partial is usually safe —
+            // Cargo's `1.0` is `^1.0` and `1.5.0` is `^1.5.0`, so the floor rises
+            // and `<2.0.0` holds — and stays rewritable, except where every
+            // component the author wrote is zero. `0` is `^0` (`<1.0.0`) and
+            // `0.0` is `^0.0` (`<0.1.0`), bounds no concrete release reproduces:
+            // see [`caret_bound_survives_substitution`]. That is not the X-range
+            // harm above and does not borrow its note; it is the bound, not the
+            // shape.
+            //
+            // [`BareVersion::Minimum`] keeps the rewrite unconditionally. NuGet's
+            // `1.0` is `>=1.0` and its `0` is `>=0.0.0`; both are floors with no
+            // upper bound to lose, and raising a floor is exactly what `fix` is.
+            //
+            // The exactness question is asked through the predicate the enum
+            // exports for it rather than by comparing the enum here, so an
+            // unrecognized manifest (`None`) answers it the declining way.
+            if ecosystem.is_none_or(Ecosystem::bare_version_is_exact) {
+                return Err(DeclineReason::PartialVersion);
+            }
+            if bare == BareVersion::Caret && !caret_bound_survives_substitution(rest) {
+                return Err(DeclineReason::CaretBoundNarrows);
+            }
+        } else if operator == "^" {
+            // A written caret keys its bound off the leftmost non-zero component
+            // in every ecosystem that has one, so it carries the all-zero hazard
+            // the bare Cargo form does: Cargo's `^0` *is* the bare `0` declined
+            // above, and npm's `^0` (`<1.0.0`) and `^0.0` (`<0.1.0`) reach further
+            // than any `^0.y.z` or `^0.0.z` written back. A non-zero component
+            // anywhere keeps the bound, so `^16` and `^0.9` stay rewritable.
+            if !caret_bound_survives_substitution(rest) {
+                return Err(DeclineReason::CaretBoundNarrows);
+            }
+        } else if operator == "=" {
+            // A lone `=` in front of a partial is a range, not a pin, in both
+            // ecosystems that write it: Cargo's `=1.2` is `>=1.2.0, <1.3.0` and
+            // node-semver's `=16` is the X-range `16.x`. Substituting the
+            // three-component version narrows either to one release — the same
+            // harm as the bare npm partial, behind an operator. `==` (PEP 440,
+            // Hex) is not this operator and pads a partial with zeros instead, so
+            // moving it forward only moves a pin.
+            //
+            // Its own reason, for the reason the tilde below has one: the operator
+            // is what makes the partial a range here, and a note about a bare
+            // X-range would describe a constraint the author did not write.
+            return Err(DeclineReason::EqualsPartial);
+        } else if operator.contains('~') {
+            // A tilde operator reads its upper bound off the *number of
+            // components* it was given, so substituting the three-component
+            // version `fix` writes back collapses the range the author asked for.
+            // Hex's `~> 1.0` is `>=1.0.0, <2.0.0` while `~> 1.7.10` is
+            // `>=1.7.10, <1.8.0`; PEP 440's `~=1.4` is `>=1.4.0, <2.0.0` while
+            // `~=1.5.0` is `>=1.5.0, <1.6.0`; npm's and Cargo's `~1` is
+            // major-wide while `~1.5.0` is minor-wide. That is #87's harm behind
+            // an operator instead of a wildcard.
+            //
+            // Declined for `~`, `~>` and `~=` alike, in every ecosystem — `~` is
+            // the only operator character any of the three carries. The arity
+            // each is sensitive at differs (npm's `~1.2` is already minor-wide),
+            // and declining a form that happened to be safe costs a fix while
+            // permitting one that is not costs the author their range: the same
+            // call already taken for `1.2.*`.
+            //
+            // A full-arity `~1.0.0` is untouched — `is_partial_version` is false
+            // for it — which is what keeps ordinary tilde constraints rewritable.
+            //
+            // Its own reason, not [`DeclineReason::PartialVersion`]: the arity is
+            // only a harm because the operator reads it, and a note about an
+            // X-range would describe a constraint the author did not write.
+            return Err(DeclineReason::TildeArity);
+        }
     }
-    Some(format!("{prefix}{new_version}"))
+    Ok(format!("{prefix}{new_version}"))
+}
+
+/// Whether `rest` — a wildcard constraint with its operator prefix already
+/// stripped — is the one wildcard *shape* a caret reading reproduces: a numeric
+/// major followed by a wildcard in the minor position, `1.*` or `1.x`.
+///
+/// Deliberately narrow. `*`, `1.2.*`, and NuGet's `1.0.0.*` are all wildcards
+/// too, and a caret over a concrete release matches none of their ranges. The
+/// wildcard character must be `*`, `x`, or `X`: Gradle's `+` is a prefix range
+/// with its own resolution rules and no ecosystem that reads a bare version as a
+/// caret accepts it.
+///
+/// Shape only. `0.*` has the right shape and still loses the author's upper
+/// bound, because a caret is *minor*-scoped below 1.0.0; that is a separate
+/// question, asked separately by the caller through
+/// [`caret_bound_survives_substitution`] so the two refusals can report the two
+/// different reasons.
+fn is_minor_wildcard(rest: &str) -> bool {
+    let mut segments = rest.split('.');
+    let (Some(major), Some(minor), None) = (segments.next(), segments.next(), segments.next())
+    else {
+        return false;
+    };
+    !major.is_empty()
+        && major.bytes().all(|b| b.is_ascii_digit())
+        && matches!(minor, "*" | "x" | "X")
+}
+
+/// Whether a caret reading of the concrete release written back reproduces the
+/// upper bound of a constraint that supplied only `components` — the dotted
+/// numeric prefix of a minor wildcard (`1`, of `1.*`) or the whole of a partial
+/// version (`1.0`, or `0`).
+///
+/// A caret keys its bound off the **leftmost non-zero component**: `^1`, `^1.2`
+/// and `^1.2.3` all stop below `2.0.0`, while `^0.9` stops below `0.10.0` and
+/// `^0.0.5` below `0.0.6`. So a constraint that wrote a non-zero component keeps
+/// its bound under substitution — every release the constraint admits agrees
+/// with it up to and including that component, so the release written back keys
+/// its own caret off the same one.
+///
+/// A constraint whose components are *all zero* has no such component, and takes
+/// its bound from a position it never wrote — always wider than any concrete
+/// release can reproduce. `0.*` and a bare `0` are both `<1.0.0` while every
+/// `0.y.z` reaches at most `<0.(y+1).0`; `0.0` is `<0.1.0` while every `0.0.z`
+/// reaches only `<0.0.(z+1)`. Substituting narrows all three — issue #87's harm
+/// arriving through the door #92 opened.
+///
+/// Callers pass components already known to be non-empty and all-digit. An empty
+/// segment would answer `false` here, which declines, so the failure direction
+/// is the safe one either way.
+fn caret_bound_survives_substitution(components: &str) -> bool {
+    components
+        .split('.')
+        .any(|segment| segment.bytes().any(|byte| byte != b'0'))
+}
+
+/// Whether `rest` — a constraint with its operator prefix already stripped, and
+/// already known to hold no wildcard — names fewer components than a full
+/// version: `16` or `1.0` rather than `1.0.0`.
+///
+/// Every component must be pure digits, which is what keeps the concrete forms
+/// out: Python's `1!2.0` carries an epoch, semver build metadata and prereleases
+/// put non-digits in the last component, and NuGet's `1.0.0.4` has four.
+fn is_partial_version(rest: &str) -> bool {
+    let segments: Vec<&str> = rest.split('.').collect();
+    segments.len() < 3
+        && segments
+            .iter()
+            .all(|segment| !segment.is_empty() && segment.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Whether `rest` — a constraint with its leading operator prefix already
@@ -366,9 +967,16 @@ mod tests {
             "the fixture must produce an override item"
         );
 
-        let (updated, records) = plan_fixes(content, &results, true).expect("the plan applies");
+        let (updated, records, declined) = plan_fixes(
+            content,
+            &results,
+            true,
+            false,
+            Some(ManifestKind::PackageJson.ecosystem()),
+        )
+        .expect("the plan applies");
 
-        // The override is declined; its non-override neighbour is still fixed, so this
+        // The override is skipped; its non-override neighbour is still fixed, so this
         // asserts the guard rather than a `--all` path that happens to do nothing.
         assert_eq!(
             records
@@ -382,74 +990,878 @@ mod tests {
             updated.contains(r#""minimist": "1.2.6""#),
             "the override was rewritten: {updated}"
         );
+        // And it is left alone *out loud* (#111). It used to be skipped before the
+        // update filter ever ran, which made an override with a newer release waiting
+        // indistinguishable from one with nothing to do — so `fix` answered "everything
+        // is already up to date" over a version `check` had just reported. The note is
+        // what the author needs to decide whether the pin has outlived its reason.
+        assert_eq!(
+            declined,
+            [Declined {
+                name: "minimist".to_string(),
+                constraint: "1.2.6".to_string(),
+                target: Some("1.2.8".to_string()),
+                reason: DeclineReason::ForcedVersion,
+            }],
+            "the forced version was not reported"
+        );
     }
 
+    /// [`DeclineReason::ForcedVersion`]'s note offers `--overrides` as the way to
+    /// advance the pin. An override already at the newest release has nothing to
+    /// advance *to*, so that offer must not be made — otherwise every current
+    /// override in the tree invites a flag that would do nothing to it.
+    ///
+    /// What it reports instead is [`DeclineReason::AlreadyAtTarget`], and that is
+    /// the whole of the precedence rule in one row: the reason that would still
+    /// stand with `--overrides` turned on is the one worth printing.
+    #[test]
+    fn an_override_with_nothing_available_reports_the_range_not_the_flag() {
+        let content = r#"{
+  "overrides": {
+    "minimist": "1.2.6"
+  }
+}
+"#;
+        // The same version the override already forces: `plan_fixes` reaches the
+        // rewrite, produces the constraint that is already there, and stops before
+        // the `forced` guard ever runs.
+        let results = results_for(ManifestKind::PackageJson, content, &[("minimist", "1.2.6")]);
+        assert_eq!(results.len(), 1, "the fixture must produce one item");
+
+        let (updated, records, declined) = plan_fixes(
+            content,
+            &results,
+            true,
+            false,
+            Some(ManifestKind::PackageJson.ecosystem()),
+        )
+        .expect("the plan applies");
+        assert_eq!(updated, content);
+        assert!(records.is_empty(), "{records:?}");
+        assert_eq!(
+            declined.iter().map(|item| item.reason).collect::<Vec<_>>(),
+            [DeclineReason::AlreadyAtTarget],
+            "an override with nothing to advance to must not be offered --overrides: {declined:?}"
+        );
+    }
+
+    /// The ordering rule: a constraint that refuses the rewrite refuses it with or
+    /// without `--overrides`, so it — and not the flag — is what the note names.
+    /// Reporting `ForcedVersion` here would point the author at a flag that would
+    /// leave the wildcard exactly where it is.
+    #[test]
+    fn an_override_whose_constraint_also_refuses_reports_the_constraint() {
+        let content = r#"{
+  "resolutions": {
+    "lodash": "1.x"
+  }
+}
+"#;
+        let results = results_for(ManifestKind::PackageJson, content, &[("lodash", "1.9.0")]);
+        assert_eq!(results.len(), 1, "the fixture must produce one item");
+        assert_eq!(results[0].item.kind, DependencyKind::Override);
+
+        let (_, records, declined) = plan_fixes(
+            content,
+            &results,
+            false,
+            false,
+            Some(ManifestKind::PackageJson.ecosystem()),
+        )
+        .expect("the plan applies");
+        assert!(records.is_empty(), "{records:?}");
+        assert_eq!(
+            declined.iter().map(|item| item.reason).collect::<Vec<_>>(),
+            [DeclineReason::WildcardPins],
+            "{declined:?}"
+        );
+    }
+
+    /// …and it still holds when the flag *is* set: `--overrides` lifts the kind
+    /// guard, not the constraint guards.
+    #[test]
+    fn a_requested_override_still_obeys_its_constraint() {
+        let content = r#"{
+  "resolutions": {
+    "lodash": "1.x"
+  }
+}
+"#;
+        let results = results_for(ManifestKind::PackageJson, content, &[("lodash", "1.9.0")]);
+
+        let (updated, records, declined) = plan_fixes(
+            content,
+            &results,
+            false,
+            true,
+            Some(ManifestKind::PackageJson.ecosystem()),
+        )
+        .expect("the plan applies");
+        assert_eq!(updated, content, "the wildcard was pinned");
+        assert!(records.is_empty(), "{records:?}");
+        assert_eq!(
+            declined.iter().map(|item| item.reason).collect::<Vec<_>>(),
+            [DeclineReason::WildcardPins],
+            "{declined:?}"
+        );
+    }
+
+    /// An override written as an explicit pin answers to two flags, and it takes
+    /// both to move it: neither `--all` nor `--overrides` does on its own. The
+    /// pin guard fires first, so without `--all` the note is
+    /// [`DeclineReason::Pinned`] even when `--overrides` is given; with `--all`
+    /// alone the pin guard passes and the note becomes
+    /// [`DeclineReason::ForcedVersion`]. Each note names the next flag that has
+    /// to be lifted, and is true at the moment it is printed.
+    #[test]
+    fn an_override_that_is_also_a_pin_reports_the_pin() {
+        let content = r#"{
+  "overrides": {
+    "lodash": "=1.0.0"
+  }
+}
+"#;
+        let results = results_for(ManifestKind::PackageJson, content, &[("lodash", "1.9.0")]);
+        assert_eq!(results.len(), 1, "the fixture must produce one item");
+        assert_eq!(results[0].item.kind, DependencyKind::Override);
+        assert!(results[0].item.is_pinned(), "the fixture must be a pin");
+
+        // Even with `--overrides` asked for by name: the next flag to lift for
+        // this entry is `--all`, and that is what the note has to say.
+        for overrides in [false, true] {
+            let (updated, records, declined) = plan_fixes(
+                content,
+                &results,
+                false,
+                overrides,
+                Some(ManifestKind::PackageJson.ecosystem()),
+            )
+            .expect("the plan applies");
+            assert_eq!(updated, content, "the pin was rewritten without `--all`");
+            assert!(records.is_empty(), "{records:?}");
+            assert_eq!(
+                declined.iter().map(|item| item.reason).collect::<Vec<_>>(),
+                [DeclineReason::Pinned],
+                "overrides={overrides}: {declined:?}"
+            );
+        }
+
+        // With `--all` the pin guard passes and the override guard is reached, so
+        // the note moves on to the flag that is now the one still holding it back.
+        let (updated, records, declined) = plan_fixes(
+            content,
+            &results,
+            true,
+            false,
+            Some(ManifestKind::PackageJson.ecosystem()),
+        )
+        .expect("the plan applies");
+        assert_eq!(updated, content, "`--all` alone rewrote a forced version");
+        assert!(records.is_empty(), "{records:?}");
+        assert_eq!(
+            declined.iter().map(|item| item.reason).collect::<Vec<_>>(),
+            [DeclineReason::ForcedVersion],
+            "{declined:?}"
+        );
+
+        // Both flags, and it moves.
+        let (updated, records, declined) = plan_fixes(
+            content,
+            &results,
+            true,
+            true,
+            Some(ManifestKind::PackageJson.ecosystem()),
+        )
+        .expect("the plan applies");
+        assert!(
+            updated.contains(r#""lodash": "=1.9.0""#),
+            "the override was not advanced: {updated}"
+        );
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert!(declined.is_empty(), "{declined:?}");
+    }
+
+    /// A `$name` override is a reference to another entry's constraint, and the
+    /// parser records a zero-width span for it precisely so nothing can splice a
+    /// version over the reference. It is therefore not a decline either: `fix`
+    /// declining to advance it would offer a flag that still could not write it.
+    #[test]
+    fn a_dollar_reference_override_is_never_a_decline_and_never_rewritten() {
+        let content = r#"{
+  "dependencies": {
+    "semver": "^7.5.0"
+  },
+  "overrides": {
+    "semver": "$semver"
+  }
+}
+"#;
+        let results = results_for(ManifestKind::PackageJson, content, &[("semver", "7.6.0")]);
+        assert!(
+            results
+                .iter()
+                .any(|r| r.item.kind == DependencyKind::Override && !r.item.is_rewritable()),
+            "the fixture must produce an unrewritable override"
+        );
+
+        let (updated, records, declined) = plan_fixes(
+            content,
+            &results,
+            true,
+            true,
+            Some(ManifestKind::PackageJson.ecosystem()),
+        )
+        .expect("the plan applies");
+        assert!(
+            updated.contains(r#""semver": "$semver""#),
+            "the reference was overwritten: {updated}"
+        );
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.name.as_str())
+                .collect::<Vec<_>>(),
+            ["semver"],
+            "only the declaration the reference points at is rewritable: {records:?}"
+        );
+        assert!(declined.is_empty(), "{declined:?}");
+    }
+
+    /// The whole point of the flag: asked for by name, the forced version moves.
+    #[test]
+    fn an_override_is_rewritten_when_overrides_are_requested() {
+        let content = r#"{
+  "dependencies": {
+    "monolog": "^2.0"
+  },
+  "overrides": {
+    "minimist": "1.2.6"
+  }
+}
+"#;
+        let results = results_for(
+            ManifestKind::PackageJson,
+            content,
+            &[("minimist", "1.2.8"), ("monolog", "2.9.1")],
+        );
+
+        let (updated, records, declined) = plan_fixes(
+            content,
+            &results,
+            true,
+            true,
+            Some(ManifestKind::PackageJson.ecosystem()),
+        )
+        .expect("the plan applies");
+        assert!(
+            updated.contains(r#""minimist": "1.2.8""#),
+            "the override was not advanced: {updated}"
+        );
+        let mut names: Vec<&str> = records.iter().map(|record| record.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["minimist", "monolog"], "{records:?}");
+        assert!(declined.is_empty(), "{declined:?}");
+    }
+
+    /// `--overrides` *without* `--all`, which is the combination the README
+    /// recommends first and the one every other test here reaches only to watch
+    /// it decline. The write path for it was unpinned: each of the two cases
+    /// passing `all = false, overrides = true` ends in a decline, and every case
+    /// that produces a record passes `all = true`.
+    ///
+    /// A range-form override is the honest fixture for "advances within its
+    /// constraint": `^1.0.0` admits `1.9.0` and refuses `2.0.0`, so the target
+    /// this run picks is visible in the result rather than assumed. Written with
+    /// `latest_available` deliberately *past* `latest_compatible` — with the two
+    /// equal, an `--all` path that ignored the compatible target would pass this
+    /// test unchanged.
+    #[test]
+    fn an_override_advances_within_its_range_without_all() {
+        let content = r#"{
+  "overrides": {
+    "lodash": "^1.0.0"
+  }
+}
+"#;
+        let mut results = results_for(ManifestKind::PackageJson, content, &[("lodash", "1.9.0")]);
+        assert_eq!(results.len(), 1, "the fixture must produce one item");
+        assert_eq!(results[0].item.kind, DependencyKind::Override);
+        assert!(
+            !results[0].item.is_pinned(),
+            "a range-form override must not be a pin, or the pin guard answers first"
+        );
+        results[0].latest_available = Some("2.0.0".to_string());
+
+        let (updated, records, declined) = plan_fixes(
+            content,
+            &results,
+            false,
+            true,
+            Some(ManifestKind::PackageJson.ecosystem()),
+        )
+        .expect("the plan applies");
+
+        assert!(
+            updated.contains(r#""lodash": "^1.9.0""#),
+            "the override was not advanced without `--all`: {updated}"
+        );
+        assert!(
+            !updated.contains("2.0.0"),
+            "`--overrides` alone reached past the constraint: {updated}"
+        );
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| (
+                    record.name.as_str(),
+                    record.from.as_str(),
+                    record.to.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            [("lodash", "^1.0.0", "^1.9.0")],
+            "{records:?}"
+        );
+        assert!(declined.is_empty(), "{declined:?}");
+    }
+
+    /// A pnpm key scopes an override to the parent that pulls the package in:
+    /// `"foo@2>bar"` forces a version onto **bar**. The rewrite must land on that
+    /// entry's own value span — the defect the kind guard originally hid was a
+    /// rewrite aimed at an unrelated package's newest release.
+    #[test]
+    fn a_scoped_pnpm_override_rewrites_the_package_it_names() {
+        let content = r#"{
+  "pnpm": {
+    "overrides": {
+      "foo@2>bar": "1.0.0"
+    }
+  }
+}
+"#;
+        let results = results_for(ManifestKind::PackageJson, content, &[("bar", "1.5.0")]);
+        assert_eq!(results.len(), 1, "the fixture must produce one item");
+        assert_eq!(results[0].item.name, "bar");
+
+        let (updated, records, _declined) = plan_fixes(
+            content,
+            &results,
+            true,
+            true,
+            Some(ManifestKind::PackageJson.ecosystem()),
+        )
+        .expect("the plan applies");
+        assert!(
+            updated.contains(r#""foo@2>bar": "1.5.0""#),
+            "the value span was not the one rewritten: {updated}"
+        );
+        assert_eq!(records.len(), 1, "{records:?}");
+    }
+
+    /// Every ecosystem, so a guard that is ecosystem-independent is asserted
+    /// against all of them rather than against a convenient one — and so a new
+    /// variant cannot quietly opt out of a claim made here.
+    const EVERY_ECOSYSTEM: [Ecosystem; 9] = [
+        Ecosystem::Rust,
+        Ecosystem::Go,
+        Ecosystem::Npm,
+        Ecosystem::Python,
+        Ecosystem::Php,
+        Ecosystem::Dart,
+        Ecosystem::CSharp,
+        Ecosystem::Elixir,
+        Ecosystem::Jvm,
+    ];
+
+    /// Preserving the operator prefix has nothing to do with the ecosystem: every
+    /// form here either carries an operator or is a full concrete version, so what
+    /// a *bare* version means cannot bear on it. Asserted against all nine rather
+    /// than one, which is what makes that a claim instead of an assumption.
     #[test]
     fn rewrite_preserves_operator_prefix() {
-        assert_eq!(
-            rewrite_constraint("^1.0", "1.5.0").as_deref(),
-            Some("^1.5.0")
-        );
-        assert_eq!(
-            rewrite_constraint("~1.0", "1.5.0").as_deref(),
-            Some("~1.5.0")
-        );
-        assert_eq!(
-            rewrite_constraint(">=1.0", "1.5.0").as_deref(),
-            Some(">=1.5.0")
-        );
-        assert_eq!(
-            rewrite_constraint("v1.2.3", "1.5.0").as_deref(),
-            Some("v1.5.0")
-        );
-        assert_eq!(
-            rewrite_constraint("1.0.0", "1.5.0").as_deref(),
-            Some("1.5.0")
-        );
-        assert_eq!(
-            rewrite_constraint("=1.2.0", "1.5.0").as_deref(),
-            Some("=1.5.0")
-        );
-        // The bare wildcard `*` is a range, not a version — see
-        // `rewrite_never_narrows_a_wildcard_to_a_pin`.
-        assert_eq!(rewrite_constraint("*", "1.5.0"), None);
+        for ecosystem in EVERY_ECOSYSTEM {
+            let it = Some(ecosystem);
+            assert_eq!(
+                rewrite_constraint("^1.0", "1.5.0", it).as_deref(),
+                Ok("^1.5.0"),
+                "{ecosystem:?}"
+            );
+            // Full arity, because a tilde reads its upper bound off the number of
+            // components it was given: a partial `~1.0` is declined by the arity
+            // guard, which is `rewrite_declines_a_partial_version_behind_a_tilde`'s
+            // claim, not this test's.
+            assert_eq!(
+                rewrite_constraint("~1.0.0", "1.5.0", it).as_deref(),
+                Ok("~1.5.0"),
+                "{ecosystem:?}"
+            );
+            assert_eq!(
+                rewrite_constraint(">=1.0", "1.5.0", it).as_deref(),
+                Ok(">=1.5.0"),
+                "{ecosystem:?}"
+            );
+            assert_eq!(
+                rewrite_constraint("v1.2.3", "1.5.0", it).as_deref(),
+                Ok("v1.5.0"),
+                "{ecosystem:?}"
+            );
+            // A full bare version names one release under every reading, and
+            // moving it forward is what `fix` is for.
+            assert_eq!(
+                rewrite_constraint("1.0.0", "1.5.0", it).as_deref(),
+                Ok("1.5.0"),
+                "{ecosystem:?}"
+            );
+            assert_eq!(
+                rewrite_constraint("=1.2.0", "1.5.0", it).as_deref(),
+                Ok("=1.5.0"),
+                "{ecosystem:?}"
+            );
+            // The bare wildcard `*` is a range, not a version — see
+            // `rewrite_never_narrows_a_wildcard_to_a_pin`. Declined everywhere,
+            // Cargo included: `*` admits every major and a caret admits one.
+            assert!(
+                rewrite_constraint("*", "1.5.0", it).is_err(),
+                "{ecosystem:?}"
+            );
+        }
     }
 
     #[test]
     fn rewrite_skips_multi_constraint() {
-        assert_eq!(rewrite_constraint(">=1.0,<2.0", "1.5.0"), None);
+        for ecosystem in EVERY_ECOSYSTEM {
+            assert!(
+                rewrite_constraint(">=1.0,<2.0", "1.5.0", Some(ecosystem)).is_err(),
+                "{ecosystem:?}"
+            );
+        }
     }
 
     #[test]
     fn rewrite_skips_dist_tags() {
         // npm dist-tags / channels are not version ranges — never pin them, so a
-        // `"latest"` dependency keeps tracking the channel after `--fix`.
-        assert_eq!(rewrite_constraint("latest", "2.3.0"), None);
-        assert_eq!(rewrite_constraint("next", "2.3.0"), None);
-        assert_eq!(rewrite_constraint("beta", "2.3.0"), None);
-        // The wildcard `*` is declined for the same reason: it is a range the
-        // author chose, and pinning it would narrow their manifest (issue #87).
-        assert_eq!(rewrite_constraint("*", "2.3.0"), None);
+        // `"latest"` dependency keeps tracking the channel after `--fix`. The
+        // guard is a leading-letter test, so it fires for every ecosystem, and a
+        // channel name means the same thing wherever one is written.
+        for ecosystem in EVERY_ECOSYSTEM {
+            let it = Some(ecosystem);
+            assert!(
+                rewrite_constraint("latest", "2.3.0", it).is_err(),
+                "{ecosystem:?}"
+            );
+            assert!(
+                rewrite_constraint("next", "2.3.0", it).is_err(),
+                "{ecosystem:?}"
+            );
+            assert!(
+                rewrite_constraint("beta", "2.3.0", it).is_err(),
+                "{ecosystem:?}"
+            );
+            // The bare wildcard `*` is declined for the same reason: it is a range
+            // the author chose, and pinning it would narrow their manifest (#87).
+            assert!(
+                rewrite_constraint("*", "2.3.0", it).is_err(),
+                "{ecosystem:?}"
+            );
+        }
     }
 
     /// Issue #87: a wildcard is a range, not a version. Rewriting `1.x` to a
     /// concrete release narrows what the author wrote into a pin — in npm a bare
     /// version is an exact match, so the floating constraint is destroyed. None of
-    /// the three existing guards sees a wildcard: there is no comma, no space or
-    /// `|` after the (empty) operator prefix, and `1.x` starts with a digit so the
-    /// dist-tag guard passes it through.
+    /// the other guards sees a wildcard: there is no comma, no space or `|` after
+    /// the (empty) operator prefix, and `1.x` starts with a digit so the dist-tag
+    /// guard passes it through.
+    ///
+    /// Issue #92 narrowed the decline to the ecosystems that need it, so the rule
+    /// is now asserted in two halves. Wherever a bare version is *not* a caret
+    /// range, every wildcard shape is still declined; and where it is — Cargo
+    /// alone — every shape a caret does not reproduce is still declined too. The
+    /// one shape that survives has its own test.
     #[test]
     fn rewrite_never_narrows_a_wildcard_to_a_pin() {
-        assert_eq!(rewrite_constraint("1.x", "2.0.0"), None);
-        assert_eq!(rewrite_constraint("1.*", "2.0.0"), None);
-        assert_eq!(rewrite_constraint("1.X", "2.0.0"), None);
-        // Gradle's dynamic version has the same shape (issue #87), and NuGet's
-        // floating `1.*` resolves differently from a bare `2.0.0`.
-        assert_eq!(rewrite_constraint("1.+", "2.0.0"), None);
-        assert_eq!(rewrite_constraint("^1.x", "2.0.0"), None);
-        assert_eq!(rewrite_constraint("1.2.x", "2.0.0"), None);
-        // The bare wildcard is the same kind of thing.
-        assert_eq!(rewrite_constraint("*", "2.0.0"), None);
+        for ecosystem in EVERY_ECOSYSTEM {
+            if ecosystem.bare_version() == BareVersion::Caret {
+                continue;
+            }
+            let it = Some(ecosystem);
+            assert!(
+                rewrite_constraint("1.x", "2.0.0", it).is_err(),
+                "{ecosystem:?}"
+            );
+            assert!(
+                rewrite_constraint("1.*", "2.0.0", it).is_err(),
+                "{ecosystem:?}"
+            );
+            assert!(
+                rewrite_constraint("1.X", "2.0.0", it).is_err(),
+                "{ecosystem:?}"
+            );
+            // Gradle's dynamic version has the same shape (issue #87), and NuGet's
+            // floating `1.*` resolves differently from a bare `2.0.0`.
+            assert!(
+                rewrite_constraint("1.+", "2.0.0", it).is_err(),
+                "{ecosystem:?}"
+            );
+            assert!(
+                rewrite_constraint("^1.x", "2.0.0", it).is_err(),
+                "{ecosystem:?}"
+            );
+            assert!(
+                rewrite_constraint("1.2.x", "2.0.0", it).is_err(),
+                "{ecosystem:?}"
+            );
+            // The bare wildcard is the same kind of thing.
+            assert!(
+                rewrite_constraint("*", "2.0.0", it).is_err(),
+                "{ecosystem:?}"
+            );
+        }
+
+        // Cargo reads a bare version as a caret, which reproduces exactly one
+        // wildcard shape. The rest are declined there too, each for its own reason.
+        let cargo = Some(Ecosystem::Rust);
+        // Gradle's `+` is a prefix range with its own resolution rules, and no
+        // caret-reading ecosystem accepts it as a wildcard at all.
+        assert!(rewrite_constraint("1.+", "2.0.0", cargo).is_err());
+        // An operator means what gets written back is not a bare version, so the
+        // caret reading that would justify the rewrite does not apply to it.
+        assert!(rewrite_constraint("^1.x", "2.0.0", cargo).is_err());
+        assert!(rewrite_constraint("=1.*", "2.0.0", cargo).is_err());
+        // `1.2.*` is `>=1.2.0, <1.3.0`; a caret over any 1.2.z release reaches to
+        // `<2.0.0`, so substituting *widens* what the author admitted.
+        assert!(rewrite_constraint("1.2.x", "2.0.0", cargo).is_err());
+        // `*` is every version; any concrete release confines it to one major.
+        assert!(rewrite_constraint("*", "2.0.0", cargo).is_err());
+    }
+
+    /// The other side of issue #92: declining every wildcard was conservatism, not
+    /// necessity. Where the ecosystem reads a bare version as a caret range, `1.*`
+    /// and `1.0.219` are the same *kind* of constraint — `>=1.0.0, <2.0.0` and
+    /// `>=1.0.219, <2.0.0` — so substituting raises the floor exactly as it does
+    /// for `^1.0`, and the manifest keeps a range in the form the Cargo book calls
+    /// equivalent. Before this, `serde = "1.*"` was simply left behind by `fix`.
+    #[test]
+    fn rewrite_updates_a_minor_wildcard_where_a_bare_version_is_a_caret() {
+        let cargo = Some(Ecosystem::Rust);
+        assert_eq!(
+            rewrite_constraint("1.*", "1.0.219", cargo).as_deref(),
+            Ok("1.0.219")
+        );
+        assert_eq!(
+            rewrite_constraint("1.x", "1.0.219", cargo).as_deref(),
+            Ok("1.0.219")
+        );
+        assert_eq!(
+            rewrite_constraint("1.X", "1.0.219", cargo).as_deref(),
+            Ok("1.0.219")
+        );
+        // The same input is declined for every ecosystem that reads a bare version
+        // any other way — the whole point of asking which one this is.
+        for ecosystem in EVERY_ECOSYSTEM {
+            if ecosystem == Ecosystem::Rust {
+                continue;
+            }
+            assert!(
+                rewrite_constraint("1.*", "1.0.219", Some(ecosystem)).is_err(),
+                "{ecosystem:?}"
+            );
+        }
+        // And a manifest whose kind was not recognized gets the reading that
+        // declines the most, never the one that permits the most.
+        assert!(rewrite_constraint("1.*", "1.0.219", None).is_err());
+    }
+
+    /// The zero-major hole in that permit. Cargo's caret is *minor*-scoped below
+    /// 1.0.0, so the guarantee the wildcard rewrite is justified by — the author's
+    /// upper bound survives — does not hold there. `0.*` is `>=0.0.0, <1.0.0`, and
+    /// the release written back is some `0.y.z`, which as a bare version is
+    /// `^0.y.z` and reaches only to `<0.(y+1).0`. A manifest that admitted
+    /// `0.11.0` stops admitting it: issue #87's harm, reached through the door
+    /// issue #92 opened, and declined for the same reason `1.2.*` and `*` are.
+    ///
+    /// The bare partial forms reach it without a wildcard character and are
+    /// declined by the same predicate: `0` is `^0` (`<1.0.0`) and `0.0` is `^0.0`
+    /// (`<0.1.0`), and no concrete release reproduces either bound.
+    #[test]
+    fn rewrite_declines_a_zero_major_wildcard_and_partial() {
+        let cargo = Some(Ecosystem::Rust);
+        // The wildcard forms, in all three spellings the permit accepts. The
+        // reason is its own and not `WildcardShape`: the shape is fine, and a
+        // note saying "no bare version covers the same range" would point the
+        // author at the wrong half of the constraint.
+        for original in ["0.*", "0.x", "0.X"] {
+            assert_eq!(
+                rewrite_constraint(original, "0.10.0", cargo),
+                Err(DeclineReason::CaretBoundNarrows),
+                "{original}"
+            );
+        }
+        // The partial forms, which carry no wildcard character for `is_wildcard`
+        // to see at all.
+        assert_eq!(
+            rewrite_constraint("0", "0.10.0", cargo),
+            Err(DeclineReason::CaretBoundNarrows)
+        );
+        assert_eq!(
+            rewrite_constraint("0.0", "0.0.9", cargo),
+            Err(DeclineReason::CaretBoundNarrows)
+        );
+        // A non-zero component anywhere restores the guarantee, so the common
+        // pre-1.0 Cargo constraint stays rewritable: `^0.9` and `^0.9.5` both stop
+        // below `0.10.0`. Declining these too would cost real fixes for nothing.
+        assert_eq!(
+            rewrite_constraint("0.9", "0.9.5", cargo).as_deref(),
+            Ok("0.9.5")
+        );
+        assert_eq!(
+            rewrite_constraint("0.9.1", "0.9.5", cargo).as_deref(),
+            Ok("0.9.5")
+        );
+        // The wildcard forms are declined in every other ecosystem too, each for
+        // the reason that already applied: none of them reads a bare version as a
+        // caret, so no wildcard survives substitution there — and the note they
+        // get names *that*, which is why the reason is asked for rather than the
+        // bare refusal.
+        for ecosystem in EVERY_ECOSYSTEM {
+            if ecosystem == Ecosystem::Rust {
+                continue;
+            }
+            let expected = if ecosystem.bare_version_is_exact() {
+                DeclineReason::WildcardPins
+            } else {
+                DeclineReason::WildcardUnbounds
+            };
+            for original in ["0.*", "0.x", "0.X"] {
+                assert_eq!(
+                    rewrite_constraint(original, "0.10.0", Some(ecosystem)),
+                    Err(expected),
+                    "{ecosystem:?} {original}"
+                );
+            }
+        }
+        // A bare `0` is a different question under each reading, and only the
+        // caret one is harmed. Where a bare version is exact the partial-version
+        // guard already declined it — under its own reason, not this one; where it
+        // is a minimum, `0` is `>=0.0.0` and `0.10.0` is `>=0.10.0` — a raised
+        // floor with no upper bound on either side, which is what `fix` is for.
+        assert_eq!(
+            rewrite_constraint("0", "0.10.0", Some(Ecosystem::Npm)),
+            Err(DeclineReason::PartialVersion)
+        );
+        assert_eq!(
+            rewrite_constraint("0", "0.10.0", Some(Ecosystem::CSharp)).as_deref(),
+            Ok("0.10.0")
+        );
+    }
+
+    /// A tilde operator reads its upper bound off the *number of components* it
+    /// was given, so a partial version behind one describes a wider range than the
+    /// three-component version `fix` writes back. This repository's own
+    /// translators pin the arities rather than leaving them to memory:
+    /// `semver::elixir` expands `~> a.b` to `>=a.b.0, <(a+1).0.0` against
+    /// `~> a.b.c`'s `<a.(b+1).0`, and `semver::python` expands `~=1.4` to
+    /// `>=1.4.0, <2.0.0` against `~=1.4.2`'s `>=1.4.2, <1.5.0`.
+    ///
+    /// So `{:phoenix, "~> 1.0"}` rewritten to `~> 1.7.10` turns the author's 1.x
+    /// range into a 1.7.x one — issue #87's harm behind an operator instead of a
+    /// wildcard. Declined for `~`, `~>` and `~=` alike and in every ecosystem: the
+    /// arity each is sensitive at differs, and declining a form that happened to
+    /// be safe costs a fix while permitting one that is not costs the author their
+    /// range — the call already taken for `1.2.*`.
+    #[test]
+    fn rewrite_declines_a_partial_version_behind_a_tilde() {
+        for ecosystem in EVERY_ECOSYSTEM {
+            let it = Some(ecosystem);
+            // Hex: `~> 1.0` is `>=1.0.0, <2.0.0`; `~> 1.7.10` is `>=1.7.10, <1.8.0`.
+            // The reason is the arity one in every ecosystem, because the operator
+            // is what makes the arity matter — a note about an X-range would
+            // describe a constraint the author did not write.
+            for original in ["~> 1.0", "~> 1", "~1", "~1.0"] {
+                assert_eq!(
+                    rewrite_constraint(original, "1.7.10", it),
+                    Err(DeclineReason::TildeArity),
+                    "{ecosystem:?} {original}"
+                );
+            }
+            // PEP 440: `~=1.4` is `>=1.4.0, <2.0.0`; `~=1.5.0` is `>=1.5.0, <1.6.0`.
+            assert_eq!(
+                rewrite_constraint("~=1.4", "1.5.0", it),
+                Err(DeclineReason::TildeArity),
+                "{ecosystem:?}"
+            );
+            // Full arity supplies every component the rewrite writes back, so it
+            // stays rewritable — the guard must not swallow ordinary constraints.
+            assert_eq!(
+                rewrite_constraint("~1.0.0", "1.5.0", it).as_deref(),
+                Ok("~1.5.0"),
+                "{ecosystem:?}"
+            );
+            assert_eq!(
+                rewrite_constraint("~> 1.0.0", "1.5.0", it).as_deref(),
+                Ok("~> 1.5.0"),
+                "{ecosystem:?}"
+            );
+            // Bounded to the tilde family. `>=1.0` means `>=1.0.0` at any arity,
+            // so raising its floor is safe and this guard leaves it alone.
+            assert_eq!(
+                rewrite_constraint(">=1.0", "1.5.0", it).as_deref(),
+                Ok(">=1.5.0"),
+                "{ecosystem:?}"
+            );
+        }
+    }
+
+    /// Issue #92's second gap, and the one with no `*` in it. npm reads a partial
+    /// version as an X-range — `"react": "16"` is `16.x`, `"1.0"` is `1.0.x` — so
+    /// rewriting one to `"16.14.0"` pins a dependency that was tracking a line of
+    /// releases. `is_wildcard` sees nothing to object to, and the only thing
+    /// separating it from Cargo's `"1.0"`, where that rewrite is correct, is which
+    /// ecosystem is being written.
+    #[test]
+    fn rewrite_declines_a_partial_version_where_a_bare_version_is_exact() {
+        let npm = Some(Ecosystem::Npm);
+        assert!(rewrite_constraint("16", "16.14.0", npm).is_err());
+        assert!(rewrite_constraint("1.0", "1.5.0", npm).is_err());
+        // Cargo's `1.0` is `^1.0` and `1.5.0` is `^1.5.0`: the floor rises and the
+        // upper bound holds, which is what every other `fix` rewrite does.
+        assert_eq!(
+            rewrite_constraint("1.0", "1.5.0", Some(Ecosystem::Rust)).as_deref(),
+            Ok("1.5.0")
+        );
+        // NuGet's `1.0` is `>= 1.0` and `1.5.0` is `>= 1.5.0` — a raised floor too.
+        assert_eq!(
+            rewrite_constraint("1.0", "1.5.0", Some(Ecosystem::CSharp)).as_deref(),
+            Ok("1.5.0")
+        );
+        // Only the *partial* form is a range. A full bare version is a pin, and
+        // moving a pin forward is exactly what `fix` is asked to do.
+        assert_eq!(
+            rewrite_constraint("16.0.0", "16.14.0", npm).as_deref(),
+            Ok("16.14.0")
+        );
+        // An operator makes it a range in its own right, npm included: `^16` is a
+        // caret range and `^16.14.0` is that range with a raised floor.
+        assert_eq!(
+            rewrite_constraint("^16", "16.14.0", npm).as_deref(),
+            Ok("^16.14.0")
+        );
+        // An unrecognized manifest declines, like every exact reading.
+        assert!(rewrite_constraint("16", "16.14.0", None).is_err());
+    }
+
+    /// A leading `v` is spelling, not an operator: node-semver reads `"v16"` as
+    /// it reads `"16"`, the X-range `16.x`. The prefix the rewrite preserves
+    /// swallows the `v` along with real operators, so a guard asking only whether
+    /// that prefix is empty let `"v16"` through to the pin `"v16.14.0"`.
+    #[test]
+    fn rewrite_declines_a_partial_version_behind_a_bare_v() {
+        let npm = Some(Ecosystem::Npm);
+        assert_eq!(
+            rewrite_constraint("v16", "16.14.0", npm),
+            Err(DeclineReason::PartialVersion)
+        );
+        assert_eq!(
+            rewrite_constraint("V1.0", "1.5.0", npm),
+            Err(DeclineReason::PartialVersion)
+        );
+        assert_eq!(
+            rewrite_constraint("v16", "16.14.0", None),
+            Err(DeclineReason::PartialVersion)
+        );
+        // A full `v`-led version is a pin, and moving it forward is still `fix`'s
+        // job; a `v` behind a real operator is that operator's question.
+        assert_eq!(
+            rewrite_constraint("v16.0.0", "16.14.0", npm).as_deref(),
+            Ok("v16.14.0")
+        );
+        assert_eq!(
+            rewrite_constraint("^v16", "16.14.0", npm).as_deref(),
+            Ok("^v16.14.0")
+        );
+        // Where a partial is safe bare, it is safe `v`-led too.
+        assert_eq!(
+            rewrite_constraint("v1.0", "1.5.0", Some(Ecosystem::Rust)).as_deref(),
+            Ok("v1.5.0")
+        );
+    }
+
+    /// A written caret keys its bound off the leftmost non-zero component in
+    /// every ecosystem that has one, so the all-zero hazard the bare Cargo `0`
+    /// carries follows the caret wherever it is spelled out. Cargo's `^0` is the
+    /// bare `0` itself; npm's `^0` is `<1.0.0` and `^0.0` is `<0.1.0`, and no
+    /// `^0.y.z` or `^0.0.z` written back reaches either.
+    #[test]
+    fn rewrite_declines_an_all_zero_partial_behind_a_caret() {
+        for ecosystem in EVERY_ECOSYSTEM {
+            let it = Some(ecosystem);
+            assert_eq!(
+                rewrite_constraint("^0", "0.10.0", it),
+                Err(DeclineReason::CaretBoundNarrows),
+                "{ecosystem:?}"
+            );
+            assert_eq!(
+                rewrite_constraint("^0.0", "0.0.9", it),
+                Err(DeclineReason::CaretBoundNarrows),
+                "{ecosystem:?}"
+            );
+            // A non-zero component anywhere keeps the bound: `^0.9` and
+            // `^0.9.5` both stop below `0.10.0`, `^16` and `^16.14.0` below `17`.
+            assert_eq!(
+                rewrite_constraint("^0.9", "0.9.5", it).as_deref(),
+                Ok("^0.9.5"),
+                "{ecosystem:?}"
+            );
+            assert_eq!(
+                rewrite_constraint("^16", "16.14.0", it).as_deref(),
+                Ok("^16.14.0"),
+                "{ecosystem:?}"
+            );
+            // Full arity names every component, so the bound already matches.
+            assert_eq!(
+                rewrite_constraint("^0.0.1", "0.0.3", it).as_deref(),
+                Ok("^0.0.3"),
+                "{ecosystem:?}"
+            );
+        }
+    }
+
+    /// A lone `=` in front of a partial is a range in both ecosystems that write
+    /// it — Cargo's `=1.2` is `>=1.2.0, <1.3.0`, node-semver's `=16` is `16.x` —
+    /// so substituting a three-component version narrows it to one release.
+    #[test]
+    fn rewrite_declines_a_partial_version_behind_a_lone_equals() {
+        for ecosystem in EVERY_ECOSYSTEM {
+            let it = Some(ecosystem);
+            assert_eq!(
+                rewrite_constraint("=1.2", "1.2.5", it),
+                Err(DeclineReason::EqualsPartial),
+                "{ecosystem:?}"
+            );
+            assert_eq!(
+                rewrite_constraint("=16", "16.14.0", it),
+                Err(DeclineReason::EqualsPartial),
+                "{ecosystem:?}"
+            );
+            assert_eq!(
+                rewrite_constraint("=v16", "16.14.0", it),
+                Err(DeclineReason::EqualsPartial),
+                "{ecosystem:?}"
+            );
+            // A full version behind `=` is a pin and moves forward as before.
+            assert_eq!(
+                rewrite_constraint("=1.2.0", "1.5.0", it).as_deref(),
+                Ok("=1.5.0"),
+                "{ecosystem:?}"
+            );
+            // `==` pads a partial with zeros (PEP 440), so it names one release
+            // already and moving it forward only moves a pin.
+            assert_eq!(
+                rewrite_constraint("==1.4", "1.4.2", it).as_deref(),
+                Ok("==1.4.2"),
+                "{ecosystem:?}"
+            );
+        }
     }
 
     /// A Maven interval states its bounds in brackets, and `[1.0]` is Maven's only
@@ -460,15 +1872,28 @@ mod tests {
     /// other guard misses it: no comma, no space or `|` after the empty operator
     /// prefix, no `@`, it starts with `[` rather than a letter, and `is_wildcard`
     /// splits it into `["[1", "0]"]`, neither of which is `x`/`X` nor starts with
-    /// `*`/`+`.
+    /// `*`/`+`. The guard runs before the ecosystem is consulted, so the verdict
+    /// is the same under every reading, and for an unrecognized manifest.
     #[test]
     fn rewrite_never_softens_a_maven_interval() {
-        assert_eq!(rewrite_constraint("[1.0]", "2.0.0"), None);
-        assert_eq!(rewrite_constraint("[1.0,2.0)", "2.0.0"), None);
-        assert_eq!(rewrite_constraint("(,1.0]", "2.0.0"), None);
-        assert_eq!(rewrite_constraint("[1.0,)", "2.0.0"), None);
-        // Whitespace before the bracket is still a bracket.
-        assert_eq!(rewrite_constraint(" [1.0] ", "2.0.0"), None);
+        for it in EVERY_ECOSYSTEM.map(Some).into_iter().chain([None]) {
+            let interval = Err(DeclineReason::Interval);
+            let comma = Err(DeclineReason::CommaRange);
+            assert_eq!(rewrite_constraint("[1.0]", "2.0.0", it), interval, "{it:?}");
+            assert_eq!(
+                rewrite_constraint("[1.0,2.0)", "2.0.0", it),
+                comma,
+                "{it:?}"
+            );
+            assert_eq!(rewrite_constraint("(,1.0]", "2.0.0", it), comma, "{it:?}");
+            assert_eq!(rewrite_constraint("[1.0,)", "2.0.0", it), comma, "{it:?}");
+            // Whitespace before the bracket is still a bracket.
+            assert_eq!(
+                rewrite_constraint(" [1.0] ", "2.0.0", it),
+                interval,
+                "{it:?}"
+            );
+        }
     }
 
     /// A wildcard segment is not always the whole dot-segment. Composer allows a
@@ -477,13 +1902,35 @@ mod tests {
     /// whole-segment guard hands back `7.0.0`, an exact pin in Composer that
     /// destroys both the wildcard and the stability flag. That is issue #87 one
     /// flag away from the guard.
+    ///
+    /// The `@` guard that catches these runs before the ecosystem is consulted, so
+    /// the verdict is the same for all nine — including Cargo, where the wildcard
+    /// alone would now be rewritten.
     #[test]
     fn rewrite_declines_a_wildcard_wearing_a_stability_flag() {
-        assert_eq!(rewrite_constraint("2.8.*@dev", "7.0.0"), None);
-        assert_eq!(rewrite_constraint("2.8.x@dev", "7.0.0"), None);
-        assert_eq!(rewrite_constraint("1.*@stable", "7.0.0"), None);
-        assert_eq!(rewrite_constraint("*@dev", "7.0.0"), None);
-        assert_eq!(rewrite_constraint("^2.8.*@dev", "7.0.0"), None);
+        for ecosystem in EVERY_ECOSYSTEM {
+            let it = Some(ecosystem);
+            assert!(
+                rewrite_constraint("2.8.*@dev", "7.0.0", it).is_err(),
+                "{ecosystem:?}"
+            );
+            assert!(
+                rewrite_constraint("2.8.x@dev", "7.0.0", it).is_err(),
+                "{ecosystem:?}"
+            );
+            assert!(
+                rewrite_constraint("1.*@stable", "7.0.0", it).is_err(),
+                "{ecosystem:?}"
+            );
+            assert!(
+                rewrite_constraint("*@dev", "7.0.0", it).is_err(),
+                "{ecosystem:?}"
+            );
+            assert!(
+                rewrite_constraint("^2.8.*@dev", "7.0.0", it).is_err(),
+                "{ecosystem:?}"
+            );
+        }
     }
 
     /// A Composer stability flag qualifies the range, and nothing in a rewritten
@@ -492,19 +1939,38 @@ mod tests {
     /// version used to pass every guard and be rewritten flag-free — `">=2.8@dev"`
     /// became `">=7.0.0"`, and the unbounded `"@dev"` ("any version, dev
     /// stability") became the exact pin `"7.0.0"`: issue #87's harm again, reached
-    /// without a wildcard. An `@` never belongs to a version, so decline the lot.
+    /// without a wildcard. An `@` never belongs to a version, so decline the lot,
+    /// in every ecosystem — the guard runs before the ecosystem is consulted.
     #[test]
     fn rewrite_declines_a_stability_flag_on_a_plain_version() {
-        // The bare flag: a range over every version, collapsed to a pin.
-        assert_eq!(rewrite_constraint("@dev", "7.0.0"), None);
-        // Flag on an operator-led constraint, and on a bare version.
-        assert_eq!(rewrite_constraint(">=2.8@dev", "7.0.0"), None);
-        assert_eq!(rewrite_constraint("2.8@dev", "7.0.0"), None);
-        assert_eq!(rewrite_constraint("^1.0@beta", "7.0.0"), None);
-        // npm's alias form carries an `@` too. The dist-tag guard caught it only
-        // incidentally, because `npm:` happens to start with a letter; now it is
-        // declined for the reason that actually applies.
-        assert_eq!(rewrite_constraint("npm:pkg@1.0.0", "7.0.0"), None);
+        for ecosystem in EVERY_ECOSYSTEM {
+            let it = Some(ecosystem);
+            // The bare flag: a range over every version, collapsed to a pin.
+            assert!(
+                rewrite_constraint("@dev", "7.0.0", it).is_err(),
+                "{ecosystem:?}"
+            );
+            // Flag on an operator-led constraint, and on a bare version.
+            assert!(
+                rewrite_constraint(">=2.8@dev", "7.0.0", it).is_err(),
+                "{ecosystem:?}"
+            );
+            assert!(
+                rewrite_constraint("2.8@dev", "7.0.0", it).is_err(),
+                "{ecosystem:?}"
+            );
+            assert!(
+                rewrite_constraint("^1.0@beta", "7.0.0", it).is_err(),
+                "{ecosystem:?}"
+            );
+            // npm's alias form carries an `@` too. The dist-tag guard caught it only
+            // incidentally, because `npm:` happens to start with a letter; now it is
+            // declined for the reason that actually applies.
+            assert!(
+                rewrite_constraint("npm:pkg@1.0.0", "7.0.0", it).is_err(),
+                "{ecosystem:?}"
+            );
+        }
     }
 
     /// The other side of the guard: every concrete form the shipped parsers
@@ -513,69 +1979,425 @@ mod tests {
     /// silently stop `fix` from working on ordinary dependencies, so each shape
     /// is asserted by name. None of them contains an `@`, which is what makes
     /// declining every `@` form safe.
+    ///
+    /// Each shape is now asserted against the ecosystem that actually writes it,
+    /// which is a stronger claim than the single-ecosystem version it replaces: a
+    /// partial-version or wildcard guard that fired on the wrong reading would
+    /// take one of these with it.
     #[test]
     fn rewrite_leaves_every_concrete_version_form_rewritable() {
+        let go = Some(Ecosystem::Go);
+        let rust = Some(Ecosystem::Rust);
+        let nuget = Some(Ecosystem::CSharp);
+        let python = Some(Ecosystem::Python);
+        let hex = Some(Ecosystem::Elixir);
+
         // Go: a pseudo-version and the `+incompatible` marker.
         assert_eq!(
-            rewrite_constraint("v0.0.0-20191109021931-daa7c04131f5", "1.5.0").as_deref(),
-            Some("v1.5.0")
+            rewrite_constraint("v0.0.0-20191109021931-daa7c04131f5", "1.5.0", go).as_deref(),
+            Ok("v1.5.0")
         );
         assert_eq!(
-            rewrite_constraint("v2.0.0+incompatible", "1.5.0").as_deref(),
-            Some("v1.5.0")
+            rewrite_constraint("v2.0.0+incompatible", "1.5.0", go).as_deref(),
+            Ok("v1.5.0")
         );
         // Semver build metadata and prereleases — note the dotted identifiers,
         // which a leading-character test for `x` would have to survive.
         assert_eq!(
-            rewrite_constraint("1.2.3+build.5", "1.5.0").as_deref(),
-            Some("1.5.0")
+            rewrite_constraint("1.2.3+build.5", "1.5.0", rust).as_deref(),
+            Ok("1.5.0")
         );
         assert_eq!(
-            rewrite_constraint("1.0.0-alpha+exp.sha.5114f85", "1.5.0").as_deref(),
-            Some("1.5.0")
+            rewrite_constraint("1.0.0-alpha+exp.sha.5114f85", "1.5.0", rust).as_deref(),
+            Ok("1.5.0")
         );
         // From the semver spec itself: a prerelease whose identifiers include `x`.
         assert_eq!(
-            rewrite_constraint("1.0.0-x.7.z.92", "1.5.0").as_deref(),
-            Some("1.5.0")
+            rewrite_constraint("1.0.0-x.7.z.92", "1.5.0", rust).as_deref(),
+            Ok("1.5.0")
         );
-        // NuGet's four-part version.
+        // NuGet's four-part version — four numeric segments, which the
+        // partial-version guard must not mistake for a truncated one.
         assert_eq!(
-            rewrite_constraint("1.0.0.4", "1.5.0").as_deref(),
-            Some("1.5.0")
+            rewrite_constraint("1.0.0.4", "1.5.0", nuget).as_deref(),
+            Ok("1.5.0")
         );
         // Python epochs and compatible-release operators.
         assert_eq!(
-            rewrite_constraint("1!2.0", "1.5.0").as_deref(),
-            Some("1.5.0")
+            rewrite_constraint("1!2.0", "1.5.0", python).as_deref(),
+            Ok("1.5.0")
         );
+        // At full arity: `~=1.4` and `~> 1.0` are *partial*, and a tilde reads its
+        // upper bound off the number of components it was given, so those two are
+        // declined by the arity guard rather than concrete forms this test speaks
+        // for. See `rewrite_declines_a_partial_version_behind_a_tilde`.
         assert_eq!(
-            rewrite_constraint("~=1.4", "1.5.0").as_deref(),
-            Some("~=1.5.0")
+            rewrite_constraint("~=1.4.2", "1.5.0", python).as_deref(),
+            Ok("~=1.5.0")
         );
         // Hex's `~>`, whose space belongs to the operator prefix.
         assert_eq!(
-            rewrite_constraint("~> 1.0", "1.5.0").as_deref(),
-            Some("~> 1.5.0")
+            rewrite_constraint("~> 1.0.0", "1.5.0", hex).as_deref(),
+            Ok("~> 1.5.0")
         );
         // Declined already, and for a different reason: NuGet's bracketed range
         // holds a comma. The wildcard guard must not change that verdict.
-        assert_eq!(rewrite_constraint("[1.0,2.0)", "1.5.0"), None);
-        // Python's `==1.*` is a wildcard, and stays declined.
-        assert_eq!(rewrite_constraint("==1.*", "1.5.0"), None);
+        assert!(rewrite_constraint("[1.0,2.0)", "1.5.0", nuget).is_err());
+        // Python's `==1.*` is a wildcard, and stays declined — twice over: Python
+        // reads a bare version exactly, and the `==` means the rewrite would not
+        // have produced a bare version anyway.
+        assert!(rewrite_constraint("==1.*", "1.5.0", python).is_err());
     }
 
     #[test]
     fn rewrite_skips_space_and_pipe_compound_constraints() {
         // npm / pubspec space-separated ranges and `||` alternations can't collapse
         // to a single version without dropping a clause, so they are left untouched.
-        assert_eq!(rewrite_constraint(">=1.0.0 <2.0.0", "1.5.0"), None);
-        assert_eq!(rewrite_constraint("^1.0.0 || ^2.0.0", "1.5.0"), None);
-        // A single constraint that merely spaces its operator is still rewritten.
+        // Dropping a clause is a loss in every ecosystem, so assert it in all nine.
+        for ecosystem in EVERY_ECOSYSTEM {
+            let it = Some(ecosystem);
+            assert!(
+                rewrite_constraint(">=1.0.0 <2.0.0", "1.5.0", it).is_err(),
+                "{ecosystem:?}"
+            );
+            assert!(
+                rewrite_constraint("^1.0.0 || ^2.0.0", "1.5.0", it).is_err(),
+                "{ecosystem:?}"
+            );
+            // A single constraint that merely spaces its operator is still rewritten.
+            assert_eq!(
+                rewrite_constraint(">= 1.0.0", "1.5.0", it).as_deref(),
+                Ok(">= 1.5.0"),
+                "{ecosystem:?}"
+            );
+        }
+    }
+
+    /// A decline is only worth carrying out of the planner if it says which
+    /// guard fired, because that is the whole content of the note the user sees.
+    /// One assertion per variant, so a guard that starts answering under another
+    /// reason changes a test rather than quietly changing what `fix` tells people.
+    #[test]
+    fn a_decline_names_the_guard_that_refused_it() {
+        let cargo = Some(Ecosystem::Rust);
+        let npm = Some(Ecosystem::Npm);
+        let nuget = Some(Ecosystem::CSharp);
+
+        let reason = |original, ecosystem| rewrite_constraint(original, "2.0.0", ecosystem).err();
+
+        assert_eq!(reason(">=1.0,<2.0", cargo), Some(DeclineReason::CommaRange));
         assert_eq!(
-            rewrite_constraint(">= 1.0.0", "1.5.0").as_deref(),
-            Some(">= 1.5.0")
+            reason(">=1.0.0 <2.0.0", npm),
+            Some(DeclineReason::MultiClause)
         );
+        assert_eq!(
+            reason("^1.0.0 || ^2.0.0", npm),
+            Some(DeclineReason::MultiClause)
+        );
+        assert_eq!(reason("2.8.*@dev", cargo), Some(DeclineReason::Qualifier));
+        assert_eq!(reason("latest", npm), Some(DeclineReason::DistTag));
+
+        // The wildcard family, whose reason is the point of #92: the same three
+        // characters are declined for three different harms.
+        //
+        // An operator answers first, and for every ecosystem — with one in front,
+        // what gets written back is not a bare version at all, so what a bare
+        // version *means* here cannot be the reason.
+        assert_eq!(reason("^1.x", cargo), Some(DeclineReason::WildcardOperator));
+        assert_eq!(reason("^1.x", npm), Some(DeclineReason::WildcardOperator));
+        // Then the ecosystem's reading, which is the more specific harm than the
+        // shape: npm pins, NuGet loses the upper bound.
+        assert_eq!(reason("1.x", npm), Some(DeclineReason::WildcardPins));
+        assert_eq!(reason("1.*", nuget), Some(DeclineReason::WildcardUnbounds));
+        // And only where a bare version is already a caret does the shape get to
+        // be the reason — there the reading is fine and the wildcard is not.
+        assert_eq!(reason("1.2.*", cargo), Some(DeclineReason::WildcardShape));
+        assert_eq!(reason("*", cargo), Some(DeclineReason::WildcardShape));
+
+        assert_eq!(reason("16", npm), Some(DeclineReason::PartialVersion));
+
+        // An unrecognized manifest reads a bare version exactly, so it declines
+        // under that reading rather than under a reason of its own.
+        assert_eq!(reason("1.x", None), Some(DeclineReason::WildcardPins));
+    }
+
+    /// The issue #93 defect at the planner's own boundary: `plan_fixes` used to
+    /// return an empty record list for a wildcard it declined, which is the same
+    /// answer it returns for a manifest with nothing to do. The declined list is
+    /// what tells those two apart.
+    #[test]
+    fn a_declined_constraint_leaves_a_record_of_what_was_not_done() {
+        let content = r#"{
+  "name": "demo",
+  "dependencies": {
+    "lodash": "1.x",
+    "react": "^18.0.0"
+  }
+}
+"#;
+        let results = results_for(
+            ManifestKind::PackageJson,
+            content,
+            &[("lodash", "1.9.0"), ("react", "18.2.0")],
+        );
+        let (updated, records, declined) = plan_fixes(
+            content,
+            &results,
+            false,
+            false,
+            Some(ManifestKind::PackageJson.ecosystem()),
+        )
+        .expect("the plan applies");
+
+        // The wildcard is untouched and the ordinary caret is rewritten: the
+        // decline is a record, not a refusal to plan the rest of the manifest.
+        assert!(updated.contains(r#""lodash": "1.x""#));
+        assert!(updated.contains(r#""react": "^18.2.0""#));
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            declined,
+            vec![Declined {
+                name: "lodash".to_string(),
+                constraint: "1.x".to_string(),
+                target: Some("1.9.0".to_string()),
+                reason: DeclineReason::WildcardPins,
+            }]
+        );
+    }
+
+    /// A pin is a constraint, and `fix` refusing to move it without `--all` is a
+    /// refusal the author can act on. Silent, it was issue #93's symptom reached
+    /// by default configuration on the single most common way a dependency is
+    /// deliberately held back.
+    #[test]
+    fn a_pin_held_back_for_want_of_all_is_recorded() {
+        let content = "[dependencies]\nserde = \"=1.0.100\"\n";
+        let results = results_for(ManifestKind::CargoToml, content, &[("serde", "1.0.219")]);
+
+        let (updated, records, declined) = plan_fixes(
+            content,
+            &results,
+            false,
+            false,
+            Some(ManifestKind::CargoToml.ecosystem()),
+        )
+        .expect("the plan applies");
+        assert_eq!(updated, content, "the pin was rewritten without `--all`");
+        assert!(records.is_empty());
+        assert_eq!(
+            declined,
+            vec![Declined {
+                name: "serde".to_string(),
+                constraint: "=1.0.100".to_string(),
+                // What `--all` would write, because `--all` is what the note points at.
+                target: Some("1.0.219".to_string()),
+                reason: DeclineReason::Pinned,
+            }]
+        );
+        assert!(
+            DeclineReason::Pinned.explain().contains("--all"),
+            "the note must name the action that moves a pin"
+        );
+
+        // With `--all` the pin is rewritten, and there is nothing left to say.
+        let (updated, records, declined) = plan_fixes(
+            content,
+            &results,
+            true,
+            false,
+            Some(ManifestKind::CargoToml.ecosystem()),
+        )
+        .expect("the plan applies");
+        assert!(updated.contains("serde = \"=1.0.219\""));
+        assert_eq!(records.len(), 1);
+        assert!(declined.is_empty(), "{declined:?}");
+    }
+
+    /// `check` reported an update and the run resolved no version to write it
+    /// from — a constraint no published release satisfies, whose newer releases
+    /// all sit beyond it. The note has no version to name, so it opens on the fact
+    /// it does have.
+    #[test]
+    fn an_update_with_no_resolved_target_is_recorded() {
+        let content = "[dependencies]\nserde = \"^1.0\"\n";
+        let mut results: Vec<CheckResult> = parse(ManifestKind::CargoToml, content)
+            .unwrap()
+            .items
+            .into_iter()
+            .map(|item| CheckResult::new(item, DependencyStatus::UpdateAvailable))
+            .collect();
+        // Neither field: the default path reads `latest_compatible` and `--all`
+        // reads `latest_available`, and this row answers neither.
+        for result in &mut results {
+            result.latest_compatible = None;
+            result.latest_available = None;
+        }
+
+        let (updated, records, declined) = plan_fixes(
+            content,
+            &results,
+            false,
+            false,
+            Some(ManifestKind::CargoToml.ecosystem()),
+        )
+        .expect("the plan applies");
+        assert_eq!(updated, content);
+        assert!(records.is_empty());
+        assert_eq!(
+            declined,
+            vec![Declined {
+                name: "serde".to_string(),
+                constraint: "^1.0".to_string(),
+                target: None,
+                reason: DeclineReason::NoTarget,
+            }]
+        );
+    }
+
+    /// The constraint already names the version that would have been written.
+    /// Reached most sharply by a `Vulnerable` row whose only fixed release is the
+    /// one already in force: `check` reports it, so `fix` cannot answer with
+    /// "everything is already up to date".
+    #[test]
+    fn a_constraint_already_at_its_target_is_recorded() {
+        let content = r#"{
+  "name": "demo",
+  "dependencies": {
+    "lodash": "1.0.0"
+  }
+}
+"#;
+        let mut results = results_for(ManifestKind::PackageJson, content, &[("lodash", "1.0.0")]);
+        results[0].status = DependencyStatus::Vulnerable;
+
+        let (updated, records, declined) = plan_fixes(
+            content,
+            &results,
+            false,
+            false,
+            Some(ManifestKind::PackageJson.ecosystem()),
+        )
+        .expect("the plan applies");
+        assert_eq!(updated, content);
+        assert!(records.is_empty());
+        assert_eq!(
+            declined,
+            vec![Declined {
+                name: "lodash".to_string(),
+                constraint: "1.0.0".to_string(),
+                target: Some("1.0.0".to_string()),
+                reason: DeclineReason::AlreadyAtTarget,
+            }]
+        );
+    }
+
+    /// An exact pin `is_pinned` does not recognise — npm's bare `"1.0.0"`, PEP
+    /// 440's `==1.0.0` — has its newest compatible release already in force, so
+    /// it reaches the already-at-target branch. `--all` rewrites it, so the note
+    /// names `--all` and the release it would write, not the installed one.
+    #[test]
+    fn an_exact_pin_is_pinned_misses_names_all_and_the_newer_release() {
+        let cases = [
+            (
+                ManifestKind::PackageJson,
+                "{\n  \"name\": \"demo\",\n  \"dependencies\": {\n    \"lodash\": \"1.0.0\"\n  }\n}\n",
+                "lodash",
+                "1.0.0",
+                "\"lodash\": \"2.0.0\"",
+            ),
+            (
+                ManifestKind::RequirementsTxt,
+                "requests==1.0.0\n",
+                "requests",
+                "==1.0.0",
+                "requests==2.0.0",
+            ),
+        ];
+        for (kind, content, name, constraint, moved) in cases {
+            let mut results = results_for(kind, content, &[(name, "1.0.0")]);
+            results[0].latest_available = Some("2.0.0".to_string());
+
+            let (updated, records, declined) =
+                plan_fixes(content, &results, false, false, Some(kind.ecosystem()))
+                    .expect("the plan applies");
+            assert_eq!(updated, content, "{kind:?}");
+            assert!(records.is_empty(), "{kind:?}");
+            assert_eq!(
+                declined,
+                vec![Declined {
+                    name: name.to_string(),
+                    constraint: constraint.to_string(),
+                    target: Some("2.0.0".to_string()),
+                    reason: DeclineReason::NeedsAll,
+                }],
+                "{kind:?}"
+            );
+            assert!(DeclineReason::NeedsAll.explain().contains("--all"));
+
+            // And `--all` does what the note says, with nothing left to say.
+            let (updated, records, declined) =
+                plan_fixes(content, &results, true, false, Some(kind.ecosystem()))
+                    .expect("the plan applies");
+            assert!(updated.contains(moved), "{kind:?}: {updated}");
+            assert_eq!(records.len(), 1, "{kind:?}");
+            assert!(declined.is_empty(), "{kind:?}: {declined:?}");
+        }
+    }
+
+    /// The same declined constraint under `[dependencies]` and
+    /// `[dev-dependencies]` is one fact about one constraint, so it is one note.
+    #[test]
+    fn a_decline_in_two_sections_is_one_note() {
+        let content = "[dependencies]\nserde = \">=1.0, <2.0\"\n\n\
+                       [dev-dependencies]\nserde = \">=1.0, <2.0\"\n";
+        let results = results_for(ManifestKind::CargoToml, content, &[("serde", "1.0.219")]);
+        assert_eq!(results.len(), 2, "both sections must reach the planner");
+
+        let (updated, records, declined) = plan_fixes(
+            content,
+            &results,
+            false,
+            false,
+            Some(ManifestKind::CargoToml.ecosystem()),
+        )
+        .expect("the plan applies");
+        assert_eq!(updated, content);
+        assert!(records.is_empty());
+        assert_eq!(
+            declined,
+            vec![Declined {
+                name: "serde".to_string(),
+                constraint: ">=1.0, <2.0".to_string(),
+                target: Some("1.0.219".to_string()),
+                reason: DeclineReason::CommaRange,
+            }]
+        );
+    }
+
+    /// A dependency with nothing available must not be reported as left alone —
+    /// the note claims `check` had something to say, so anything up to date has
+    /// to be filtered out before the constraint is ever consulted.
+    #[test]
+    fn an_up_to_date_dependency_is_not_a_decline() {
+        let content = r#"{
+  "name": "demo",
+  "dependencies": {
+    "lodash": "1.x"
+  }
+}
+"#;
+        // `results_for` marks its targets `UpdateAvailable`; naming none leaves
+        // the manifest's only dependency with no result at all.
+        let (_, records, declined) = plan_fixes(
+            content,
+            &results_for(ManifestKind::PackageJson, content, &[]),
+            false,
+            false,
+            Some(ManifestKind::PackageJson.ecosystem()),
+        )
+        .expect("the plan applies");
+        assert!(records.is_empty());
+        assert!(declined.is_empty());
     }
 
     #[test]
@@ -617,9 +2439,8 @@ mod tests {
         assert_eq!(out, "a=1.9 b=2.9\n");
     }
 
-    use dependable_fetch::core::{
-        DependencyKind, ManifestKind, parse, resolve_workspace_inheritance,
-    };
+    use dependable_fetch::DependencyStatus;
+    use dependable_fetch::core::{DependencyKind, parse, resolve_workspace_inheritance};
 
     /// Parse `content`, then build an `UpdateAvailable` result with the given
     /// target for each named dependency — enough to drive `plan_fixes`. The target
@@ -667,7 +2488,14 @@ mod tests {
             content,
             &[("react", "18.2.0"), ("typescript", "5.4.5")],
         );
-        let (updated, records) = plan_fixes(content, &results, false).expect("the plan applies");
+        let (updated, records, _declined) = plan_fixes(
+            content,
+            &results,
+            false,
+            false,
+            Some(ManifestKind::PackageJson.ecosystem()),
+        )
+        .expect("the plan applies");
 
         assert_eq!(
             updated,
@@ -705,7 +2533,14 @@ mod tests {
             content,
             &[("monolog/monolog", "2.9.1")],
         );
-        let (updated, records) = plan_fixes(content, &results, false).expect("the plan applies");
+        let (updated, records, _declined) = plan_fixes(
+            content,
+            &results,
+            false,
+            false,
+            Some(ManifestKind::ComposerJson.ecosystem()),
+        )
+        .expect("the plan applies");
 
         assert_eq!(
             updated,
@@ -731,7 +2566,14 @@ mod tests {
             content,
             &[("http", "1.2.0"), ("provider", "6.1.0")],
         );
-        let (updated, records) = plan_fixes(content, &results, false).expect("the plan applies");
+        let (updated, records, _declined) = plan_fixes(
+            content,
+            &results,
+            false,
+            false,
+            Some(ManifestKind::PubspecYaml.ecosystem()),
+        )
+        .expect("the plan applies");
 
         // Versions bumped, indentation and the trailing comment untouched.
         assert_eq!(
@@ -775,7 +2617,14 @@ mod tests {
             "the old guards would both have passed"
         );
 
-        let (updated, records) = plan_fixes(member, &results, false).expect("the plan applies");
+        let (updated, records, _declined) = plan_fixes(
+            member,
+            &results,
+            false,
+            false,
+            Some(ManifestKind::CargoToml.ecosystem()),
+        )
+        .expect("the plan applies");
 
         assert!(records.is_empty(), "{records:?}");
         assert_eq!(
@@ -804,7 +2653,14 @@ mod tests {
         );
         assert_eq!(declaration.version_line, 1, "and the span points at it");
 
-        let (updated, records) = plan_fixes(root, &results, false).expect("the plan applies");
+        let (updated, records, _declined) = plan_fixes(
+            root,
+            &results,
+            false,
+            false,
+            Some(ManifestKind::CargoToml.ecosystem()),
+        )
+        .expect("the plan applies");
 
         assert_eq!(records.len(), 1, "{records:?}");
         assert_eq!(updated, "[workspace.dependencies]\nserde = \"1.0.219\"\n");
@@ -880,7 +2736,14 @@ mod tests {
             "the fixture must produce a checkable item"
         );
 
-        let (updated, records) = plan_fixes(content, &results, false).expect("the plan applies");
+        let (updated, records, _declined) = plan_fixes(
+            content,
+            &results,
+            false,
+            false,
+            Some(ManifestKind::PackageJson.ecosystem()),
+        )
+        .expect("the plan applies");
 
         assert!(records.is_empty(), "{records:?}");
         assert_eq!(updated, content, "the manifest must be byte-identical");
@@ -916,7 +2779,14 @@ mod tests {
             "the `--all` branch reads `latest_available`, so the fixture must set it"
         );
 
-        let (updated, records) = plan_fixes(content, &results, true).expect("the plan applies");
+        let (updated, records, _declined) = plan_fixes(
+            content,
+            &results,
+            true,
+            false,
+            Some(ManifestKind::ComposerJson.ecosystem()),
+        )
+        .expect("the plan applies");
 
         // The wildcard is declined; its non-wildcard neighbour still gets fixed, so
         // this asserts the guard and not a `--all` path that simply does nothing.
@@ -940,6 +2810,178 @@ mod tests {
         );
     }
 
+    /// Issue #92 end to end, and the case the issue was opened for.
+    ///
+    /// `serde = "1.*"` locked at `1.0.100` with `1.0.219` published: `check`
+    /// reports an upgrade, and before #92 `fix` declined it because the guard from
+    /// #87 could not tell Cargo from npm. Cargo reads a bare version as a caret, so
+    /// `1.0.219` here *is* `^1.0.219` — still a range, still bounded below 2.0, and
+    /// the form the Cargo book calls equivalent to what was written.
+    ///
+    /// The `1.2.*` neighbour is the boundary: its range stops at `1.3.0` and a
+    /// caret does not, so it stays untouched in the same file, under the same
+    /// ecosystem, on the same run.
+    #[test]
+    fn a_cargo_minor_wildcard_is_updated_by_fix() {
+        let content = "[dependencies]\nserde = \"1.*\"\nclap = \"1.2.*\"\n";
+        let results = results_for(
+            ManifestKind::CargoToml,
+            content,
+            &[("serde", "1.0.219"), ("clap", "1.2.9")],
+        );
+        assert_eq!(results.len(), 2, "the fixture must produce two items");
+
+        let (updated, records, _declined) = plan_fixes(
+            content,
+            &results,
+            false,
+            false,
+            Some(ManifestKind::CargoToml.ecosystem()),
+        )
+        .expect("the plan applies");
+
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| (record.name.as_str(), record.to.as_str()))
+                .collect::<Vec<_>>(),
+            [("serde", "1.0.219")],
+            "{records:?}"
+        );
+        assert_eq!(
+            updated,
+            "[dependencies]\nserde = \"1.0.219\"\nclap = \"1.2.*\"\n"
+        );
+    }
+
+    /// `plan` is where the ecosystem comes from in a real run: it reads the
+    /// manifest's file name, not a value a caller hands it. The same `"1.*"`
+    /// written to a `Cargo.toml` and to a `package.json` must get opposite
+    /// verdicts through `plan` itself, so detection that answered `None` (or the
+    /// wrong kind) fails here rather than passing every `plan_fixes` test.
+    #[test]
+    fn plan_reads_the_ecosystem_from_the_manifest_file_name() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+
+        let cargo_content = "[dependencies]\nserde = \"1.*\"\n";
+        let cargo_path = dir.path().join("Cargo.toml");
+        std::fs::write(&cargo_path, cargo_content).expect("write Cargo.toml");
+        let cargo_results = results_for(
+            ManifestKind::CargoToml,
+            cargo_content,
+            &[("serde", "1.0.219")],
+        );
+        assert_eq!(cargo_results.len(), 1, "the fixture must produce one item");
+        let planned = plan(&cargo_path, &cargo_results, false, false).expect("the plan applies");
+        assert_eq!(
+            planned
+                .records
+                .iter()
+                .map(|record| (record.name.as_str(), record.to.as_str()))
+                .collect::<Vec<_>>(),
+            [("serde", "1.0.219")]
+        );
+        assert_eq!(planned.updated, "[dependencies]\nserde = \"1.0.219\"\n");
+
+        let npm_content = "{\n  \"dependencies\": {\n    \"lodash\": \"1.*\"\n  }\n}\n";
+        let npm_path = dir.path().join("package.json");
+        std::fs::write(&npm_path, npm_content).expect("write package.json");
+        let npm_results = results_for(
+            ManifestKind::PackageJson,
+            npm_content,
+            &[("lodash", "1.9.0")],
+        );
+        assert_eq!(npm_results.len(), 1, "the fixture must produce one item");
+        let planned = plan(&npm_path, &npm_results, false, false).expect("the plan applies");
+        assert!(planned.records.is_empty(), "{:?}", planned.records);
+        assert_eq!(planned.updated, npm_content);
+    }
+
+    /// The same manifest shape in the ecosystem that must still decline it: npm
+    /// reads a bare `1.0.219` as that release and nothing else, so the identical
+    /// rewrite would destroy the range. One ecosystem apart, opposite verdicts —
+    /// which is the whole of #92.
+    #[test]
+    fn the_same_wildcard_is_still_declined_for_npm() {
+        let content = "{\n  \"dependencies\": {\n    \"lodash\": \"1.*\"\n  }\n}\n";
+        let results = results_for(ManifestKind::PackageJson, content, &[("lodash", "1.9.0")]);
+        assert_eq!(results.len(), 1, "the fixture must produce one item");
+
+        let (updated, records, _declined) = plan_fixes(
+            content,
+            &results,
+            false,
+            false,
+            Some(ManifestKind::PackageJson.ecosystem()),
+        )
+        .expect("the plan applies");
+
+        assert!(records.is_empty(), "{records:?}");
+        assert_eq!(updated, content, "the manifest must be byte-identical");
+    }
+
+    /// Issue #92's second gap, end to end: npm reads `"react": "16"` as `16.x`,
+    /// and `fix` used to write `"16.14.0"` into it — a pin, with no wildcard
+    /// character anywhere for the #87 guard to catch. Its `^18.0.0` neighbour is
+    /// rewritten on the same run, so this asserts the new guard rather than a path
+    /// that quietly does nothing.
+    #[test]
+    fn an_npm_partial_version_is_left_untouched_by_fix() {
+        let content =
+            "{\n  \"dependencies\": {\n    \"react\": \"16\",\n    \"vue\": \"^3.0.0\"\n  }\n}\n";
+        let results = results_for(
+            ManifestKind::PackageJson,
+            content,
+            &[("react", "16.14.0"), ("vue", "3.4.21")],
+        );
+        assert_eq!(results.len(), 2, "the fixture must produce two items");
+
+        let (updated, records, _declined) = plan_fixes(
+            content,
+            &results,
+            false,
+            false,
+            Some(ManifestKind::PackageJson.ecosystem()),
+        )
+        .expect("the plan applies");
+
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.name.as_str())
+                .collect::<Vec<_>>(),
+            ["vue"],
+            "{records:?}"
+        );
+        assert_eq!(
+            updated,
+            "{\n  \"dependencies\": {\n    \"react\": \"16\",\n    \"vue\": \"^3.4.21\"\n  }\n}\n"
+        );
+    }
+
+    /// A manifest whose kind `ManifestKind::detect` does not recognize reaches the
+    /// rewriter with no ecosystem, and the answer is to decline, not to guess:
+    /// every reading that could apply is one where at least one of these rewrites
+    /// destroys the constraint. The `^1.0` neighbour still moves, so the decline is
+    /// scoped to the forms whose meaning depends on the ecosystem.
+    #[test]
+    fn an_unrecognized_manifest_kind_declines_every_ecosystem_dependent_form() {
+        assert!(rewrite_constraint("1.*", "1.5.0", None).is_err());
+        assert!(rewrite_constraint("1.x", "1.5.0", None).is_err());
+        assert!(rewrite_constraint("1.0", "1.5.0", None).is_err());
+        assert!(rewrite_constraint("16", "16.14.0", None).is_err());
+        // Not ecosystem-dependent: an operator-led range and a full bare version
+        // mean the same thing everywhere, so they are still rewritten.
+        assert_eq!(
+            rewrite_constraint("^1.0", "1.5.0", None).as_deref(),
+            Ok("^1.5.0")
+        );
+        assert_eq!(
+            rewrite_constraint("1.0.0", "1.5.0", None).as_deref(),
+            Ok("1.5.0")
+        );
+    }
+
     const PACKAGE_JSON: &str = "{\n  \"dependencies\": {\n    \"react\": \"^18.0.0\"\n  }\n}\n";
     const PACKAGE_JSON_FIXED: &str =
         "{\n  \"dependencies\": {\n    \"react\": \"^18.2.0\"\n  }\n}\n";
@@ -952,7 +2994,7 @@ mod tests {
             PACKAGE_JSON,
             &[("react", "18.2.0")],
         );
-        let planned = plan(path, &results, false).expect("the plan applies");
+        let planned = plan(path, &results, false, false).expect("the plan applies");
         assert_eq!(planned.records.len(), 1, "the fixture must plan one edit");
         planned
     }
@@ -1020,7 +3062,7 @@ mod tests {
             PACKAGE_JSON,
             &[("react", "18.2.0")],
         );
-        let planned = plan(&link, &results, false).expect("the plan applies");
+        let planned = plan(&link, &results, false, false).expect("the plan applies");
 
         commit(&planned).expect("the commit succeeds");
 

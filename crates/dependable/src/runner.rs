@@ -26,7 +26,9 @@ use dependable_tui::TuiOptions;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use indicatif::{ProgressBar, ProgressStyle};
 
-use crate::cli::{CheckArgs, FailOn, FixArgs, ListArgs, TreeArgs, TuiArgs};
+use crate::cli::{
+    CheckArgs, CheckFormat, EcosystemArg, FailOn, FixArgs, Format, ListArgs, TreeArgs, TuiArgs,
+};
 use crate::config::{Config, load_config};
 #[cfg(feature = "report")]
 use crate::config::{PolicySource, load_policy};
@@ -311,7 +313,7 @@ impl Engine {
                 };
                 let integrity = ScanIntegrity {
                     vulnerability_scan_failed: check.vulnerability_scan_failed,
-                    registry_unreachable: check.registry_unreachable,
+                    registry_unreachable: check.unreachable_registries.clone(),
                     unresolved: count(ErrorOrigin::NotFound),
                     unevaluated: count(ErrorOrigin::Local),
                 };
@@ -419,15 +421,28 @@ pub async fn run_check(args: CheckArgs) -> anyhow::Result<ExitCode> {
     #[cfg(not(feature = "report"))]
     warn_policy_ignored(&args.config);
 
+    let ecosystems = requested_ecosystems(&args.ecosystem);
     let manifests = collect_manifests(
         args.manifest.as_deref(),
         args.path.as_deref(),
         settings.depth,
         &args.manifest_glob,
+        &ecosystems,
         &|ecosystem| cfg.ecosystem_enabled(ecosystem),
     )?;
     if manifests.is_empty() {
-        eprintln!("No supported manifests found.");
+        report_no_manifests(&ecosystems);
+        // The same contract `run_list` keeps: an empty selection still owes a
+        // machine-readable format a document. `json` and `sarif` are what a CI
+        // step captures to a file (the bundled action's `json-path`, a SARIF
+        // upload), and byte-empty stdout there is a parse failure on exactly the
+        // runs exit 0 was chosen to keep green. Both renderers already produce a
+        // valid zero-result document from no reports.
+        //
+        // `table` and `text` keep returning early: a human wants the stderr line.
+        if !matches!(args.format, CheckFormat::Table | CheckFormat::Text) {
+            output::render(args.format, &[], args.quiet)?;
+        }
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -714,15 +729,28 @@ pub async fn run_list(args: ListArgs) -> anyhow::Result<ExitCode> {
     // replaced by defaults that enable all of them.
     let cfg =
         load_config(&args.config).with_context(|| format!("reading {}", args.config.display()))?;
+    let ecosystems = requested_ecosystems(&args.ecosystem);
     let manifests = collect_manifests(
         args.manifest.as_deref(),
         args.path.as_deref(),
         args.depth,
         &args.manifest_glob,
+        &ecosystems,
         &|ecosystem| cfg.ecosystem_enabled(ecosystem),
     )?;
     if manifests.is_empty() {
-        eprintln!("No supported manifests found.");
+        report_no_manifests(&ecosystems);
+        // An empty selection still owes a machine-readable format a document.
+        // Exiting 0 with byte-empty stdout is what `list --ecosystem csharp
+        // --format json | jq ...` sees in a per-ecosystem CI matrix, and `jq`
+        // fails to parse nothing — on precisely the ecosystems exit 0 was chosen
+        // to keep green. The stderr line above is not machine-readable.
+        //
+        // `table` and `text` keep returning early: a human handed an empty table
+        // wants the stderr line, not a blank one.
+        if matches!(args.format, Format::Json) {
+            output::list::render(args.format, &[], &root)?;
+        }
         return Ok(ExitCode::SUCCESS);
     }
     let mut reports = Vec::new();
@@ -1024,15 +1052,17 @@ pub async fn run_fix(args: FixArgs) -> anyhow::Result<ExitCode> {
         registry: cfg.rust.registry.clone(),
         osv_url: cfg.vulnerability.osv_batch_url.clone(),
     };
+    let ecosystems = requested_ecosystems(&args.ecosystem);
     let manifests = collect_manifests(
         args.manifest.as_deref(),
         args.path.as_deref(),
         settings.depth,
         &args.manifest_glob,
+        &ecosystems,
         &|ecosystem| cfg.ecosystem_enabled(ecosystem),
     )?;
     if manifests.is_empty() {
-        eprintln!("No supported manifests found.");
+        report_no_manifests(&ecosystems);
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -1050,11 +1080,12 @@ pub async fn run_fix(args: FixArgs) -> anyhow::Result<ExitCode> {
     // *after* each write, the failing iteration also destroyed the record of what had
     // already changed.
     let mut planned = Vec::new();
+    let mut inherited = 0usize;
     for manifest in &manifests {
         let Some(report) = engine.check_manifest(manifest).await? else {
             continue;
         };
-        report_inherited_skips(manifest, &report);
+        inherited += report_inherited_skips(manifest, &report);
         if report.dependencies_unread {
             unread += 1;
         }
@@ -1063,7 +1094,9 @@ pub async fn run_fix(args: FixArgs) -> anyhow::Result<ExitCode> {
             .iter()
             .filter(|result| result.status == DependencyStatus::Undetermined)
             .count();
-        planned.push(fix::plan(manifest, &report.results, args.all)?);
+        let plan = fix::plan(manifest, &report.results, args.all, args.overrides)?;
+        report_declined_fixes(manifest, &plan.declined);
+        planned.push(plan);
     }
 
     let mut total = 0;
@@ -1084,44 +1117,62 @@ pub async fn run_fix(args: FixArgs) -> anyhow::Result<ExitCode> {
             total += 1;
         }
     }
-    if total == 0 && unchecked == 0 && unread == 0 {
+    let declined: usize = planned.iter().map(|plan| plan.declined.len()).sum();
+    // Every category this run emitted a note for, not just the constraint
+    // declines. An inherited dependency is left behind in exactly the sense the
+    // line below means, and counting only one of the two categories printed the
+    // clean line on stdout directly over an inherited-skip note on stderr.
+    let left_alone = declined + inherited;
+    if total == 0 && left_alone == 0 && unchecked == 0 && unread == 0 {
         println!("Everything is already up to date.");
     } else if total == 0 {
-        // "Up to date" is a claim about versions that were compared against a
-        // registry. Where none could be — an ecosystem that publishes no registry
-        // at all, or an entry whose version this manifest never states — nothing
-        // was established, and printing the clean line anyway turns "we did not
+        // "Everything is already up to date" is only true when nothing was left
+        // behind and everything was looked at. Saying it over an update this run
+        // declined to write is the contradiction with `check` that this path
+        // exists to remove; saying it where no version could be compared against
+        // a registry — an ecosystem that publishes no registry at all, or an
+        // entry whose version this manifest never states — turns "we did not
         // look" into "we looked and found nothing", which is the one thing a fix
         // run must never say.
         //
-        // The two reasons are worded apart because they are different facts: an
-        // undetermined dependency *was* read and could not be checked, while an
-        // unread dependency list was never read, so there is not even a list of
-        // dependencies to have failed to check.
-        let undetermined_phrase = |count: usize| {
-            format!(
-                "{count} dependenc{} could not be checked for a newer version",
-                if count == 1 { "y" } else { "ies" }
-            )
-        };
-        let unread_phrase = |count: usize, lead: &str| {
-            format!(
-                "{lead} dependency list for {count} manifest{} could not be read, so nothing \
+        // The reasons are worded apart because they are different facts: an
+        // update left alone was found and declined, an undetermined dependency
+        // *was* read and could not be checked, and an unread dependency list was
+        // never read, so there is not even a list of dependencies to have failed
+        // to check.
+        //
+        // The notes and warnings are on stderr and this line is on stdout, so it
+        // says *where*: `dependable fix > fix.log` puts the summary in the log and
+        // the notes on the terminal, and "see the notes above" would name nothing
+        // the reader of either stream can find.
+        let mut reasons: Vec<String> = Vec::new();
+        if left_alone > 0 {
+            reasons.push(format!(
+                "{left_alone} available update{} left alone",
+                if left_alone == 1 { "" } else { "s" }
+            ));
+        }
+        if unchecked > 0 {
+            reasons.push(format!(
+                "{unchecked} dependenc{} could not be checked for a newer version",
+                if unchecked == 1 { "y" } else { "ies" }
+            ));
+        }
+        if unread > 0 {
+            reasons.push(format!(
+                "{} dependency list for {unread} manifest{} could not be read, so nothing \
                  in {} was checked",
-                if count == 1 { "" } else { "s" },
-                if count == 1 { "it" } else { "them" }
-            )
+                if reasons.is_empty() { "The" } else { "the" },
+                if unread == 1 { "" } else { "s" },
+                if unread == 1 { "it" } else { "them" }
+            ));
+        }
+        let why = match reasons.split_last() {
+            Some((last, [])) => last.clone(),
+            Some((last, rest)) => format!("{}, and {last}", rest.join(", ")),
+            None => unreachable!("a run that rewrote nothing names at least one reason"),
         };
-        let why = match (unchecked, unread) {
-            (0, unread) => unread_phrase(unread, "The"),
-            (unchecked, 0) => undetermined_phrase(unchecked),
-            (unchecked, unread) => format!(
-                "{}, and {}",
-                undetermined_phrase(unchecked),
-                unread_phrase(unread, "the")
-            ),
-        };
-        println!("Nothing to rewrite. {why}; see the warnings above.");
+        println!("Nothing to rewrite. {why}; see the notes on stderr.");
     } else if !args.dry_run {
         println!(
             "\nUpdated {total} dependenc{}.",
@@ -1176,29 +1227,29 @@ fn resolve_report_settings(args: &crate::cli::ReportArgs, cfg: &Config) -> Setti
 /// silently left alone by `fix`, because the version string is in the workspace root and
 /// there is no line here to rewrite. Without this the two commands appear to contradict
 /// each other, and nothing points at the file that can actually be changed.
-fn report_inherited_skips(manifest: &Path, report: &ManifestReport) {
+///
+/// Returns how many it named, because the summary line has to know. These never
+/// reach [`fix::plan`]'s declined list — the item is not rewritable, so the
+/// planner drops it before any constraint is consulted — and a summary counting
+/// only that list printed "Everything is already up to date." on stdout over the
+/// note this function had just written to stderr.
+#[must_use]
+fn report_inherited_skips(manifest: &Path, report: &ManifestReport) -> usize {
     let Some(root) = &report.workspace_root else {
-        return;
+        return 0;
     };
     let mut names: Vec<&str> = report
         .results
         .iter()
         .filter(|result| {
-            result.item.source == PackageSource::Inherited
-                && matches!(
-                    result.status,
-                    DependencyStatus::PatchAvailable
-                        | DependencyStatus::UpdateAvailable
-                        | DependencyStatus::Outdated
-                        | DependencyStatus::Vulnerable
-                )
+            result.item.source == PackageSource::Inherited && result.status.has_update()
         })
         .map(|result| result.item.name.as_str())
         .collect();
     names.sort_unstable();
     names.dedup();
     if names.is_empty() {
-        return;
+        return 0;
     }
     eprintln!(
         "note: {} inherits {} from the workspace; upgrade {} in {}",
@@ -1207,6 +1258,37 @@ fn report_inherited_skips(manifest: &Path, report: &ManifestReport) {
         if names.len() == 1 { "it" } else { "them" },
         root.display()
     );
+    names.len()
+}
+
+/// Say which available updates this manifest's own constraints refused, and why.
+///
+/// The sibling of [`report_inherited_skips`], for the other way `fix` can decline
+/// an upgrade `check` just reported: there the version string lives in another
+/// file, here it lives in a constraint that a concrete version would not
+/// reproduce — a wildcard, a dist-tag, a two-bound range. Both are silent skips,
+/// and silence is what makes the two commands look like they disagree.
+///
+/// stderr, like its sibling: a note is not part of the record of what `fix`
+/// changed, and piping stdout must not swallow it or mix it into that record.
+fn report_declined_fixes(manifest: &Path, declined: &[fix::Declined]) {
+    for item in declined {
+        // A decline usually knows the release it would have written, and naming it
+        // is half the note's value. [`fix::DeclineReason::NoTarget`] is the case
+        // that does not, and an empty or invented version there would be worse
+        // than an opening that claims less.
+        let available = match &item.target {
+            Some(target) => format!("{target} is available"),
+            None => "an update was reported".to_string(),
+        };
+        eprintln!(
+            "note: left {} = {} alone in {}: {available}, but {}",
+            item.name,
+            item.constraint,
+            manifest.display(),
+            item.reason.explain()
+        );
+    }
 }
 
 /// Read whole-template overrides from `<root>/dependable-templates/`.
@@ -1307,10 +1389,13 @@ pub async fn run_report(args: crate::cli::ReportArgs) -> anyhow::Result<ExitCode
         Some(&root),
         settings.depth,
         &[],
+        &[],
         &|ecosystem| cfg.ecosystem_enabled(ecosystem),
     )?;
     if manifests.is_empty() {
-        eprintln!("No supported manifests found.");
+        // `report` has no `--ecosystem`, so there is never a specific line to
+        // print instead.
+        report_no_manifests(&[]);
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -1396,34 +1481,72 @@ fn lockfile_notes(manifest: &Path) -> Vec<String> {
 }
 
 /// The manifests a command should act on: the one named by `--manifest`, else the
-/// depth-limited walk of `path`, narrowed by any `--manifest-glob` patterns.
+/// depth-limited walk of `path`, narrowed by any `--ecosystem` values and then by
+/// any `--manifest-glob` patterns.
 ///
-/// The globs filter *after* the walk rather than pruning inside it: `path` still
-/// roots the scan and `--depth` still bounds it, so the three compose instead of
+/// Both filters run *after* the walk rather than pruning inside it: `path` still
+/// roots the scan and `--depth` still bounds it, so they compose instead of
 /// competing, and there stays exactly one walk implementation — in
 /// `dependable-fetch`, which knows nothing about globs.
+///
+/// `ecosystems` empty means unrestricted. When it is not, it does two distinct
+/// things, and both are required for the flag to mean what it says:
+///
+/// - It narrows the returned set. `dependable_fetch::discover` documents that its
+///   `enabled` predicate "gates the notices only — discovery still returns every
+///   manifest it recognizes, and narrowing that set stays the caller's job", so
+///   composing the request into that predicate alone would suppress warnings and
+///   change nothing a command actually reads.
+/// - It is composed into that predicate all the same, so `--ecosystem rust` does
+///   not also print advice about the Gradle build it just excluded.
+///
+/// The filter re-derives each manifest's ecosystem from its path. Discovery only
+/// ever returns paths [`ManifestKind::detect`] recognized, so the `None` arm is
+/// unreachable in practice; a path that somehow failed to detect is dropped,
+/// because an ecosystem nothing can name is not one of the ones asked for.
+///
+/// The ecosystem filter runs **before** the glob filter so that the glob's
+/// "matched nothing" line counts only the manifests still in play.
 fn collect_manifests(
     manifest: Option<&Path>,
     path: Option<&Path>,
     depth: usize,
     globs: &[String],
+    ecosystems: &[Ecosystem],
     enabled: &dyn Fn(Ecosystem) -> bool,
 ) -> anyhow::Result<Vec<PathBuf>> {
     if let Some(manifest) = manifest {
         // `--manifest` names one exact file and bypasses discovery entirely, so
-        // there is no discovered set for a glob to filter. clap rejects the
-        // combination rather than letting one of them be silently ignored.
+        // there is no discovered set for a glob or an ecosystem to filter. clap
+        // rejects both combinations rather than letting one be silently ignored.
         return Ok(vec![manifest.to_path_buf()]);
     }
     let root = path.map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    let requested = |ecosystem: Ecosystem| ecosystems.is_empty() || ecosystems.contains(&ecosystem);
     // One walk for both answers. Manifests we recognise but cannot read produce
     // nothing for the walk to return, so this is the only point at which their
     // absence can be reported at all.
-    let found = dependable_fetch::discover(&root, depth, enabled);
+    let found = dependable_fetch::discover(&root, depth, |ecosystem| {
+        enabled(ecosystem) && requested(ecosystem)
+    });
     for notice in &found.notices {
         eprintln!("warning: {notice}");
     }
-    let found = found.manifests;
+    let mut found = found.manifests;
+    if !ecosystems.is_empty() {
+        let kept: Vec<PathBuf> = found
+            .iter()
+            .filter(|manifest| {
+                ManifestKind::detect(manifest)
+                    .is_some_and(|kind| ecosystems.contains(&kind.ecosystem()))
+            })
+            .cloned()
+            .collect();
+        if kept.is_empty() {
+            eprintln!("{}", no_ecosystem_match(ecosystems, &found, depth));
+        }
+        found = kept;
+    }
     if globs.is_empty() {
         return Ok(found);
     }
@@ -1445,6 +1568,87 @@ fn collect_manifests(
         );
     }
     Ok(kept)
+}
+
+/// The ecosystems `--ecosystem` asked for, as the core type. Empty means
+/// unrestricted, which is what an absent flag produces.
+///
+/// Deduplicated, in first-named order. clap's `Vec<T>` keeps every repeat, so
+/// `--ecosystem rust --ecosystem rust` arrived as two values and
+/// [`no_ecosystem_match`] read them back as `no manifest for Rust, Rust`.
+/// Selection never cared — it is a `contains` — so this is the diagnostic alone.
+/// Dedupe by membership rather than by sorting: [`Ecosystem`] is `Eq` and not
+/// `Ord`, and the order the user named them in is the order to say them back.
+fn requested_ecosystems(args: &[EcosystemArg]) -> Vec<Ecosystem> {
+    let mut requested: Vec<Ecosystem> = Vec::new();
+    for ecosystem in args.iter().copied().map(Ecosystem::from) {
+        if !requested.contains(&ecosystem) {
+            requested.push(ecosystem);
+        }
+    }
+    requested
+}
+
+/// Why an `--ecosystem` filter came back empty: what was asked for, how much was
+/// searched, and which ecosystems were there instead.
+///
+/// This *replaces* the generic "No supported manifests found." rather than joining
+/// it — see [`report_no_manifests`]. Naming what was found is the whole point: the
+/// two answers a user needs to tell apart are "this repository has no Rust in it"
+/// and "the filter removed everything", and the generic line says neither.
+fn no_ecosystem_match(requested: &[Ecosystem], searched: &[PathBuf], depth: usize) -> String {
+    // Discovery returns a sorted list, so first-seen order is deterministic.
+    // `Ecosystem` is `Eq` but not `Ord`, so dedupe by membership rather than sort.
+    let mut present: Vec<Ecosystem> = Vec::new();
+    for kind in searched.iter().filter_map(|m| ManifestKind::detect(m)) {
+        let ecosystem = kind.ecosystem();
+        if !present.contains(&ecosystem) {
+            present.push(ecosystem);
+        }
+    }
+    let count = searched.len();
+    let plural = if count == 1 { "" } else { "s" };
+    let asked = ecosystem_names(requested);
+    if present.is_empty() {
+        format!("no manifest for {asked} (searched {count} manifest{plural} up to --depth {depth})")
+    } else {
+        format!(
+            "no manifest for {asked} (searched {count} manifest{plural} up to --depth {depth}; found {})",
+            ecosystem_names(&present)
+        )
+    }
+}
+
+/// Ecosystems as a human-readable list, in the order given.
+fn ecosystem_names(ecosystems: &[Ecosystem]) -> String {
+    ecosystems
+        .iter()
+        .map(|ecosystem| ecosystem.display_name())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The line a command prints when discovery came back with nothing to do.
+///
+/// Silent whenever an `--ecosystem` filter was in force, which is what
+/// `ecosystems` non-empty tests — not whether that filter is what emptied the
+/// set. The two come apart: `--ecosystem rust --manifest-glob 'nope/*'` over a
+/// repository that does contain Rust is emptied by the glob, which printed its
+/// own line, while [`collect_manifests`]' ecosystem explanation never ran. The
+/// generic line is suppressed there too, and deliberately: the glob line is the
+/// specific answer in that case, and "No supported manifests found." is a
+/// falsehood in a repository full of manifests some filter removed. The
+/// predicate is the coarse one because a caller cannot tell the two apart
+/// without [`collect_manifests`] reporting back which filter emptied the set,
+/// and that return type is deliberately still `Vec<PathBuf>`.
+///
+/// Either way the exit code is 0 — an empty selection is an answer, not a tool
+/// error, and a per-ecosystem CI matrix job must not fail on the ecosystems a
+/// repository does not use.
+fn report_no_manifests(ecosystems: &[Ecosystem]) {
+    if ecosystems.is_empty() {
+        eprintln!("No supported manifests found.");
+    }
 }
 
 /// Compile `--manifest-glob` patterns into a matcher over manifest paths, with
@@ -1619,8 +1823,11 @@ fn gate_is_answerable(reports: &[ManifestReport], fail_on: FailOn) -> Result<(),
     // settings match specific statuses and skip errors entirely, which is where a run
     // that established nothing could still be reported as clean.
     if fail_on != FailOn::Any {
-        if reports.iter().any(|r| r.integrity.registry_unreachable) {
-            reasons.push("the registry did not answer".to_owned());
+        let unanswered = unanswered_registries(reports);
+        // Empty pushes nothing at all — which is what keeps the 404 carve-out and the
+        // locally-unevaluable dependency below reaching the gate on their own terms.
+        if !unanswered.is_empty() {
+            reasons.push(name_unanswered(&unanswered));
         }
         let unevaluated: usize = reports.iter().map(|r| r.integrity.unevaluated).sum();
         if unevaluated > 0 {
@@ -1634,6 +1841,57 @@ fn gate_is_answerable(reports: &[ManifestReport], fail_on: FailOn) -> Result<(),
         return Ok(());
     }
     Err(join_reasons(&reasons))
+}
+
+/// Every registry that declined to answer anywhere in the run, deduplicated, in a stable
+/// order, rendered as labels.
+///
+/// The union across manifests, because the sentence the gate prints is about the run: a
+/// polyglot repository is many [`ManifestReport`]s, and the same unreachable registry is
+/// one fact however many manifests routed to it. A union of sorted lists is not sorted,
+/// so this sorts the result itself.
+fn unanswered_registries(reports: &[ManifestReport]) -> Vec<String> {
+    let mut labels: Vec<String> = reports
+        .iter()
+        .flat_map(|r| r.integrity.registry_unreachable.iter())
+        .map(dependable_fetch::UnreachableRegistry::label)
+        .collect();
+    // Sorted and deduplicated by *label*, not by root. Several roots reduce to one printed
+    // label — an unnamed root and the ecosystem's own default both print the bare
+    // ecosystem name, and two paths on one host share an authority — and those roots need
+    // not be adjacent under a root-ordered sort. Three Rust registries at
+    // `http://nexus.corp/a`, `http://other.host/x` and `https://nexus.corp/b` sort in
+    // exactly that order (`:` sorts before `s`, so `http://` precedes `https://`), and an
+    // adjacency-only dedup over roots left the sentence naming `nexus.corp` twice.
+    //
+    // It also makes the printed order the order a reader sees, rather than the order of
+    // roots they are never shown.
+    labels.sort();
+    labels.dedup();
+    labels
+}
+
+/// `the a registry did not answer`, `the a and b registries did not answer`,
+/// `the a, b and c registries did not answer`.
+///
+/// The same connective grammar as [`join_reasons`], deliberately not the same function:
+/// this string is one *element* of that list, and `join_reasons` over the registry labels
+/// alone would render three of them as a bare `Go, JVM and npm` with no sentence round it.
+///
+/// The nesting is accepted rather than avoided. With three registries and another reason
+/// the commas do belong to two lists at once — `the vulnerability scan did not complete,
+/// the Go, JVM and npm registries did not answer and 2 dependencies could not be
+/// evaluated` — which reads worse than either list alone, and better than a run that
+/// cannot say which registry declined.
+fn name_unanswered(labels: &[String]) -> String {
+    match labels {
+        [] => String::new(),
+        [only] => format!("the {only} registry did not answer"),
+        [rest @ .., last] => format!(
+            "the {} and {last} registries did not answer",
+            rest.join(", ")
+        ),
+    }
 }
 
 /// `a`, `a and b`, `a, b and c` — the gate's reasons read as a sentence.
@@ -1845,14 +2103,25 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample-monorepo")
     }
 
-    fn matched(globs: &[&str]) -> Vec<String> {
+    /// A polyglot fixture: `services/api/Cargo.toml` beside `services/sync/go.mod`,
+    /// so an ecosystem filter has something of another ecosystem to remove.
+    fn polyglot() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample-polyglot")
+    }
+
+    /// The manifests `collect_manifests` keeps under both filters, relative to
+    /// `root` and `/`-separated so an assertion does not depend on the platform.
+    fn matched_under(root: &Path, globs: &[&str], ecosystems: &[Ecosystem]) -> Vec<String> {
         let globs: Vec<String> = globs.iter().map(|g| (*g).to_string()).collect();
-        let root = monorepo();
-        collect_manifests(None, Some(&root), 4, &globs, &|_| true)
+        collect_manifests(None, Some(root), 4, &globs, ecosystems, &|_| true)
             .expect("the patterns are valid")
             .iter()
-            .map(|m| output::posix(&relative_to(&root, m)))
+            .map(|m| output::posix(&relative_to(root, m)))
             .collect()
+    }
+
+    fn matched(globs: &[&str]) -> Vec<String> {
+        matched_under(&monorepo(), globs, &[])
     }
 
     #[test]
@@ -1894,14 +2163,67 @@ mod tests {
         assert!(matched(&["apps/*/Cargo.toml"]).is_empty());
     }
 
+    /// A flag repeated is one request, not two. clap's `Vec<T>` keeps every
+    /// repeat, so `--ecosystem rust --ecosystem rust` reached the empty-selection
+    /// line as `no manifest for Rust, Rust`. Selection was never affected — it is
+    /// a `contains` — so this is the diagnostic alone.
+    #[test]
+    fn a_repeated_ecosystem_is_named_once() {
+        use crate::cli::EcosystemArg;
+
+        assert_eq!(
+            requested_ecosystems(&[EcosystemArg::Rust, EcosystemArg::Rust]),
+            vec![Ecosystem::Rust]
+        );
+        assert_eq!(
+            ecosystem_names(&requested_ecosystems(&[
+                EcosystemArg::Npm,
+                EcosystemArg::Rust,
+                EcosystemArg::Npm,
+            ])),
+            "npm, Rust",
+            "first-named order survives, and nothing is said twice"
+        );
+        // An absent flag is still the unrestricted answer.
+        assert!(requested_ecosystems(&[]).is_empty());
+    }
+
+    /// Both filters at once, which nothing else exercises: `--ecosystem` and
+    /// `--manifest-glob` intersect rather than override, whichever is narrower.
+    ///
+    /// This pins the *set*, and the set alone cannot pin the order the two run
+    /// in — an intersection is commutative, so both orders return this. What the
+    /// order changes is the diagnostic each filter prints, which is asserted end
+    /// to end in `tests/cli_ecosystem.rs`.
+    #[test]
+    fn an_ecosystem_and_a_glob_narrow_the_same_set() {
+        let root = polyglot();
+        assert_eq!(
+            matched_under(&root, &["services/*/*"], &[]),
+            vec!["services/api/Cargo.toml", "services/sync/go.mod"],
+            "the glob alone keeps both services"
+        );
+        assert_eq!(
+            matched_under(&root, &["services/*/*"], &[Ecosystem::Rust]),
+            vec!["services/api/Cargo.toml"],
+            "adding the ecosystem removes the Go module the glob had kept"
+        );
+        assert!(
+            matched_under(&root, &["services/sync/go.mod"], &[Ecosystem::Rust]).is_empty(),
+            "and a glob naming only an excluded manifest keeps nothing"
+        );
+    }
+
     #[test]
     fn an_explicit_manifest_is_returned_whatever_the_patterns() {
         // clap rejects the combination, so this only documents that the glob
         // never silently filters away a file the user named outright.
         let named = PathBuf::from("some/other/Cargo.toml");
         assert_eq!(
-            collect_manifests(Some(&named), None, 3, &["nope/*".to_string()], &|_| true)
-                .expect("the pattern is valid"),
+            collect_manifests(Some(&named), None, 3, &["nope/*".to_string()], &[], &|_| {
+                true
+            })
+            .expect("the pattern is valid"),
             vec![named]
         );
     }
@@ -1910,8 +2232,15 @@ mod tests {
     fn an_unparseable_pattern_is_an_error_not_an_empty_result() {
         let root = monorepo();
         assert!(
-            collect_manifests(None, Some(&root), 4, &["services/[".to_string()], &|_| true)
-                .is_err()
+            collect_manifests(
+                None,
+                Some(&root),
+                4,
+                &["services/[".to_string()],
+                &[],
+                &|_| true
+            )
+            .is_err()
         );
     }
 
@@ -1951,6 +2280,12 @@ mod tests {
         )
     }
 
+    /// A registry named only by its ecosystem — what a fetcher that opts out of
+    /// `registry_root` yields, and what the gate prints as a bare ecosystem name.
+    fn unreachable_default(ecosystem: Ecosystem) -> dependable_fetch::UnreachableRegistry {
+        dependable_fetch::UnreachableRegistry::new(ecosystem, None)
+    }
+
     fn report_of(
         integrity: ScanIntegrity,
         results: Vec<dependable_fetch::CheckResult>,
@@ -1983,7 +2318,7 @@ mod tests {
         let reports = vec![report_with(
             ScanIntegrity {
                 vulnerability_scan_failed: true,
-                registry_unreachable: false,
+                registry_unreachable: Vec::new(),
                 unresolved: 0,
                 unevaluated: 0,
             },
@@ -2004,7 +2339,7 @@ mod tests {
         let reports = vec![report_with(
             ScanIntegrity {
                 vulnerability_scan_failed: false,
-                registry_unreachable: true,
+                registry_unreachable: vec![unreachable_default(Ecosystem::Rust)],
                 unresolved: 0,
                 unevaluated: 0,
             },
@@ -2044,7 +2379,7 @@ mod tests {
         let reports = vec![report_of(
             ScanIntegrity {
                 vulnerability_scan_failed: false,
-                registry_unreachable: false,
+                registry_unreachable: Vec::new(),
                 unresolved: 1,
                 unevaluated: 0,
             },
@@ -2088,7 +2423,7 @@ mod tests {
         let reports = vec![report_of(
             ScanIntegrity {
                 vulnerability_scan_failed: false,
-                registry_unreachable: false,
+                registry_unreachable: Vec::new(),
                 unresolved: 0,
                 unevaluated: 1,
             },
@@ -2120,7 +2455,7 @@ mod tests {
         let reports = vec![report_of(
             ScanIntegrity {
                 vulnerability_scan_failed: true,
-                registry_unreachable: true,
+                registry_unreachable: vec![unreachable_default(Ecosystem::Rust)],
                 unresolved: 0,
                 unevaluated: 2,
             },
@@ -2128,8 +2463,159 @@ mod tests {
         )];
         assert_eq!(
             gate_is_answerable(&reports, FailOn::Vulnerable).unwrap_err(),
-            "the vulnerability scan did not complete, the registry did not answer and 2 \
+            "the vulnerability scan did not complete, the Rust registry did not answer and 2 \
              dependencies could not be evaluated"
+        );
+    }
+
+    /// The defect #112 was filed for. A run reaching two registries could say only that
+    /// "the registry" did not answer, so a polyglot repository whose Go proxy was down
+    /// while npm answered every request read as a run that had established nothing —
+    /// and named no host anyone could go and check.
+    #[test]
+    fn the_refusal_names_each_registry_that_declined() {
+        // A fresh report per call: `ManifestReport` is not `Clone`, and a shared fixture
+        // would say nothing about how a union across *separate* manifests behaves.
+        let report = |ecosystem| {
+            report_of(
+                ScanIntegrity {
+                    vulnerability_scan_failed: false,
+                    registry_unreachable: vec![unreachable_default(ecosystem)],
+                    unresolved: 0,
+                    unevaluated: 0,
+                },
+                vec![],
+            )
+        };
+
+        // One registry, one name.
+        assert_eq!(
+            gate_is_answerable(&[report(Ecosystem::Go)], FailOn::Vulnerable).unwrap_err(),
+            "the Go registry did not answer"
+        );
+
+        // The union across manifests, in sorted order rather than in arrival order —
+        // and reversing the reports must not reverse the sentence.
+        let both = [report(Ecosystem::Npm), report(Ecosystem::Go)];
+        let reversed = [report(Ecosystem::Go), report(Ecosystem::Npm)];
+        assert_eq!(
+            gate_is_answerable(&both, FailOn::Vulnerable).unwrap_err(),
+            "the Go and npm registries did not answer"
+        );
+        assert_eq!(
+            gate_is_answerable(&reversed, FailOn::Vulnerable).unwrap_err(),
+            gate_is_answerable(&both, FailOn::Vulnerable).unwrap_err()
+        );
+
+        // The same registry reached from two manifests is one fact, not two.
+        let twice = [report(Ecosystem::Go), report(Ecosystem::Go)];
+        assert_eq!(
+            gate_is_answerable(&twice, FailOn::Vulnerable).unwrap_err(),
+            "the Go registry did not answer"
+        );
+
+        // Three read as a list.
+        let three = [
+            report(Ecosystem::Go),
+            report(Ecosystem::Npm),
+            report(Ecosystem::Jvm),
+        ];
+        assert_eq!(
+            gate_is_answerable(&three, FailOn::Vulnerable).unwrap_err(),
+            "the Go, JVM and npm registries did not answer"
+        );
+
+        // The settings that were never blocked by this reason still are not.
+        assert!(gate_is_answerable(&both, FailOn::Any).is_ok());
+        assert!(gate_is_answerable(&both, FailOn::None).is_ok());
+    }
+
+    /// Several roots reduce to one printed label, and under a root-ordered sort they need
+    /// not be adjacent: `http://nexus.corp/a`, `http://other.host/x` and
+    /// `https://nexus.corp/b` sort in exactly that order, because `:` sorts before `s`.
+    /// An adjacency-only dedup named `nexus.corp` twice in one sentence.
+    #[test]
+    fn one_registry_is_never_named_twice_however_its_roots_sort() {
+        let rust = |root: &str| {
+            dependable_fetch::UnreachableRegistry::new(Ecosystem::Rust, Some(root.to_owned()))
+        };
+        let reports = [report_of(
+            ScanIntegrity {
+                vulnerability_scan_failed: false,
+                registry_unreachable: vec![
+                    rust("http://nexus.corp/a"),
+                    rust("http://other.host/x"),
+                    rust("https://nexus.corp/b"),
+                ],
+                unresolved: 0,
+                unevaluated: 0,
+            },
+            vec![],
+        )];
+        assert_eq!(
+            gate_is_answerable(&reports, FailOn::Vulnerable).unwrap_err(),
+            "the Rust (nexus.corp) and Rust (other.host) registries did not answer"
+        );
+    }
+
+    /// A non-default root is named by its host, so two registries inside one ecosystem
+    /// are told apart — the `deno.json` case, where npm answers and JSR does not.
+    #[test]
+    fn a_registry_that_is_not_the_ecosystems_default_is_named_by_its_host() {
+        let reports = vec![report_of(
+            ScanIntegrity {
+                vulnerability_scan_failed: false,
+                registry_unreachable: vec![dependable_fetch::UnreachableRegistry::new(
+                    Ecosystem::Npm,
+                    Some("https://jsr.io".to_owned()),
+                )],
+                unresolved: 0,
+                unevaluated: 0,
+            },
+            vec![],
+        )];
+        assert_eq!(
+            gate_is_answerable(&reports, FailOn::Vulnerable).unwrap_err(),
+            "the npm (jsr.io) registry did not answer"
+        );
+    }
+
+    /// An empty collection pushes no reason at all. Without that the 404 carve-out and
+    /// the locally-unevaluable dependency would both be swallowed by a sentence about a
+    /// registry nothing had gone wrong with.
+    #[test]
+    fn no_unreachable_registry_contributes_no_reason() {
+        let reports = vec![report_of(
+            ScanIntegrity {
+                vulnerability_scan_failed: false,
+                registry_unreachable: Vec::new(),
+                unresolved: 3,
+                unevaluated: 1,
+            },
+            vec![],
+        )];
+        assert_eq!(
+            gate_is_answerable(&reports, FailOn::Vulnerable).unwrap_err(),
+            "1 dependency could not be evaluated"
+        );
+    }
+
+    /// The sentence fragments, in isolation, so the grammar is pinned without a gate
+    /// around it.
+    #[test]
+    fn the_unanswered_registries_read_as_a_sentence() {
+        let name = |labels: &[&str]| {
+            name_unanswered(&labels.iter().map(|l| (*l).to_owned()).collect::<Vec<_>>())
+        };
+        assert_eq!(name(&[]), "");
+        assert_eq!(name(&["Go"]), "the Go registry did not answer");
+        assert_eq!(
+            name(&["Go", "npm"]),
+            "the Go and npm registries did not answer"
+        );
+        assert_eq!(
+            name(&["Go", "JVM", "npm"]),
+            "the Go, JVM and npm registries did not answer"
         );
     }
 

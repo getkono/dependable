@@ -48,7 +48,9 @@ mod retry;
 pub mod tree;
 
 // High-level entry point (recommended for embedding).
-pub use check::{CheckError, Checker, CheckerBuilder, ManifestCheck, ProgressEvent};
+pub use check::{
+    CheckError, Checker, CheckerBuilder, ManifestCheck, ProgressEvent, UnreachableRegistry,
+};
 
 // Manifest discovery (filesystem; shared by every frontend).
 pub use discover::{
@@ -78,10 +80,11 @@ pub use registries::{
 // parsers, `check_version`, ...).
 pub use dependable_core as core;
 pub use dependable_core::{
-    CheckResult, DependencyGraph, DependencyKind, DependencyStatus, Ecosystem, ErrorOrigin,
-    Evaluation, Item, LockfileKind, ManifestKind, Node, NodeKind, PackageSource, ParseError,
-    ParsedManifest, PathPredicate, Placement, Tree, TreeNode, TreeOptions, UnstableFilter, Visit,
-    Visitor, WalkOptions, WalkStats, WorkspaceDecl, resolve_workspace_inheritance,
+    BareVersion, CheckResult, DependencyGraph, DependencyKind, DependencyStatus, Ecosystem,
+    ErrorOrigin, Evaluation, Item, LockfileKind, ManifestKind, Node, NodeKind, PackageSource,
+    ParseError, ParsedManifest, PathPredicate, Placement, Tree, TreeNode, TreeOptions,
+    UnstableFilter, Visit, Visitor, WalkOptions, WalkStats, WorkspaceDecl,
+    resolve_workspace_inheritance,
 };
 
 /// One-import convenience for consumers: `use dependable_fetch::prelude::*;`.
