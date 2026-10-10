@@ -241,8 +241,9 @@ fn plan_fixes(
 /// a `||` alternation (`^1 || ^2`), a dist-tag (`latest`), anything carrying an
 /// `@` (a Composer stability flag such as `@dev` or `^1.0@beta`, an npm alias
 /// such as `npm:pkg@1.0.0`), a partial version behind a tilde operator (`~1`,
-/// `~> 1.0`, `~=1.4`), and — depending on `ecosystem` — a wildcard (`*`, `1.x`,
-/// `1.*`) or a partial version (npm `"16"`, Cargo `"0"`).
+/// `~> 1.0`, `~=1.4`) or a lone `=` (`=1.2`), an all-zero partial behind a caret
+/// (`^0`, `^0.0`), and — depending on `ecosystem` — a wildcard (`*`, `1.x`,
+/// `1.*`) or a partial version (npm `"16"` or `"v16"`, Cargo `"0"`).
 ///
 /// `ecosystem` is what the wildcard and partial-version guards turn on, because
 /// both ask the same question: the rewrite writes the new version back bare, so
@@ -333,7 +334,16 @@ fn rewrite_constraint(
             return None;
         }
     } else if is_partial_version(rest) {
-        if prefix.is_empty() {
+        // The prefix collected above also swallows a leading `v` and whitespace,
+        // neither of which is an operator: node-semver reads `"v16"` exactly as it
+        // reads `"16"` — the X-range `16.x` — so a `v` must not be what carries a
+        // partial past the bare-version guard below. Strip both and ask which
+        // operator, if any, the author actually wrote.
+        let operator: String = prefix
+            .chars()
+            .filter(|c| !matches!(c, 'v' | 'V' | ' ' | '\t'))
+            .collect();
+        if operator.is_empty() {
             // The same harm one wildcard character away, reached under two of the
             // three readings.
             //
@@ -367,7 +377,26 @@ fn rewrite_constraint(
             {
                 return None;
             }
-        } else if prefix.contains('~') {
+        } else if operator == "^" {
+            // A written caret keys its bound off the leftmost non-zero component
+            // in every ecosystem that has one, so it carries the all-zero hazard
+            // the bare Cargo form does: Cargo's `^0` *is* the bare `0` declined
+            // above, and npm's `^0` (`<1.0.0`) and `^0.0` (`<0.1.0`) reach further
+            // than any `^0.y.z` or `^0.0.z` written back. A non-zero component
+            // anywhere keeps the bound, so `^16` and `^0.9` stay rewritable.
+            if !caret_bound_survives_substitution(rest) {
+                return None;
+            }
+        } else if operator == "=" {
+            // A lone `=` in front of a partial is a range, not a pin, in both
+            // ecosystems that write it: Cargo's `=1.2` is `>=1.2.0, <1.3.0` and
+            // node-semver's `=16` is the X-range `16.x`. Substituting the
+            // three-component version narrows either to one release — the same
+            // harm as the bare npm partial, behind an operator. `==` (PEP 440,
+            // Hex) is not this operator and pads a partial with zeros instead, so
+            // moving it forward only moves a pin.
+            return None;
+        } else if operator.contains('~') {
             // A tilde operator reads its upper bound off the *number of
             // components* it was given, so substituting the three-component
             // version `fix` writes back collapses the range the author asked for.
@@ -950,6 +979,111 @@ mod tests {
         );
         // An unrecognized manifest declines, like every exact reading.
         assert_eq!(rewrite_constraint("16", "16.14.0", None), None);
+    }
+
+    /// A leading `v` is spelling, not an operator: node-semver reads `"v16"` as
+    /// it reads `"16"`, the X-range `16.x`. The prefix the rewrite preserves
+    /// swallows the `v` along with real operators, so a guard asking only whether
+    /// that prefix is empty let `"v16"` through to the pin `"v16.14.0"`.
+    #[test]
+    fn rewrite_declines_a_partial_version_behind_a_bare_v() {
+        let npm = Some(Ecosystem::Npm);
+        assert_eq!(rewrite_constraint("v16", "16.14.0", npm), None);
+        assert_eq!(rewrite_constraint("V1.0", "1.5.0", npm), None);
+        assert_eq!(rewrite_constraint("v16", "16.14.0", None), None);
+        // A full `v`-led version is a pin, and moving it forward is still `fix`'s
+        // job; a `v` behind a real operator is that operator's question.
+        assert_eq!(
+            rewrite_constraint("v16.0.0", "16.14.0", npm).as_deref(),
+            Some("v16.14.0")
+        );
+        assert_eq!(
+            rewrite_constraint("^v16", "16.14.0", npm).as_deref(),
+            Some("^v16.14.0")
+        );
+        // Where a partial is safe bare, it is safe `v`-led too.
+        assert_eq!(
+            rewrite_constraint("v1.0", "1.5.0", Some(Ecosystem::Rust)).as_deref(),
+            Some("v1.5.0")
+        );
+    }
+
+    /// A written caret keys its bound off the leftmost non-zero component in
+    /// every ecosystem that has one, so the all-zero hazard the bare Cargo `0`
+    /// carries follows the caret wherever it is spelled out. Cargo's `^0` is the
+    /// bare `0` itself; npm's `^0` is `<1.0.0` and `^0.0` is `<0.1.0`, and no
+    /// `^0.y.z` or `^0.0.z` written back reaches either.
+    #[test]
+    fn rewrite_declines_an_all_zero_partial_behind_a_caret() {
+        for ecosystem in EVERY_ECOSYSTEM {
+            let it = Some(ecosystem);
+            assert_eq!(
+                rewrite_constraint("^0", "0.10.0", it),
+                None,
+                "{ecosystem:?}"
+            );
+            assert_eq!(
+                rewrite_constraint("^0.0", "0.0.9", it),
+                None,
+                "{ecosystem:?}"
+            );
+            // A non-zero component anywhere keeps the bound: `^0.9` and
+            // `^0.9.5` both stop below `0.10.0`, `^16` and `^16.14.0` below `17`.
+            assert_eq!(
+                rewrite_constraint("^0.9", "0.9.5", it).as_deref(),
+                Some("^0.9.5"),
+                "{ecosystem:?}"
+            );
+            assert_eq!(
+                rewrite_constraint("^16", "16.14.0", it).as_deref(),
+                Some("^16.14.0"),
+                "{ecosystem:?}"
+            );
+            // Full arity names every component, so the bound already matches.
+            assert_eq!(
+                rewrite_constraint("^0.0.1", "0.0.3", it).as_deref(),
+                Some("^0.0.3"),
+                "{ecosystem:?}"
+            );
+        }
+    }
+
+    /// A lone `=` in front of a partial is a range in both ecosystems that write
+    /// it — Cargo's `=1.2` is `>=1.2.0, <1.3.0`, node-semver's `=16` is `16.x` —
+    /// so substituting a three-component version narrows it to one release.
+    #[test]
+    fn rewrite_declines_a_partial_version_behind_a_lone_equals() {
+        for ecosystem in EVERY_ECOSYSTEM {
+            let it = Some(ecosystem);
+            assert_eq!(
+                rewrite_constraint("=1.2", "1.2.5", it),
+                None,
+                "{ecosystem:?}"
+            );
+            assert_eq!(
+                rewrite_constraint("=16", "16.14.0", it),
+                None,
+                "{ecosystem:?}"
+            );
+            assert_eq!(
+                rewrite_constraint("=v16", "16.14.0", it),
+                None,
+                "{ecosystem:?}"
+            );
+            // A full version behind `=` is a pin and moves forward as before.
+            assert_eq!(
+                rewrite_constraint("=1.2.0", "1.5.0", it).as_deref(),
+                Some("=1.5.0"),
+                "{ecosystem:?}"
+            );
+            // `==` pads a partial with zeros (PEP 440), so it names one release
+            // already and moving it forward only moves a pin.
+            assert_eq!(
+                rewrite_constraint("==1.4", "1.4.2", it).as_deref(),
+                Some("==1.4.2"),
+                "{ecosystem:?}"
+            );
+        }
     }
 
     /// A wildcard segment is not always the whole dot-segment. Composer allows a
