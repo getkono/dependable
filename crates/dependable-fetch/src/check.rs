@@ -3289,7 +3289,10 @@ mod tests {
             let (fetcher, cache_key) = checker.route_item(item, default, ecosystem);
             (
                 cache_key,
-                UnreachableRegistry::new(ecosystem, fetcher.registry_root().map(str::to_owned)),
+                UnreachableRegistry::new(
+                    ecosystem,
+                    fetcher.registry_root_for(&item.name).map(str::to_owned),
+                ),
             )
         };
         let npm_default = checker
@@ -3327,6 +3330,81 @@ mod tests {
         );
         assert_eq!(rootless.label(), "Go");
         assert_eq!(rootless.root, None);
+    }
+
+    /// #143: `NpmFetcher` sends an `@scope` package to the registry `.npmrc` names for
+    /// that scope, so when only that registry declines, the report must name it — not
+    /// the default registry, which answered every request it was given.
+    #[tokio::test]
+    async fn a_failing_scoped_npm_registry_is_reported_under_its_own_root() {
+        use crate::ScopedRegistry;
+        use crate::registries::NpmFetcher;
+        use wiremock::matchers::{any, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let default = MockServer::start().await;
+        let nexus = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/chalk"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"versions":{"5.0.0":{},"5.3.0":{}}}"#),
+            )
+            .mount(&default)
+            .await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&nexus)
+            .await;
+
+        // What an `.npmrc` line `@acme:registry=<nexus>` builds.
+        let client = crate::build_client().expect("a client");
+        let scopes = HashMap::from([(
+            "@acme".to_owned(),
+            ScopedRegistry {
+                registry: nexus.uri(),
+                token: None,
+            },
+        )]);
+        let fetcher =
+            NpmFetcher::with_registry(client.clone(), default.uri()).with_auth(None, scopes);
+        let checker = Checker::builder()
+            .http_client(client)
+            .registry(Ecosystem::Npm, Arc::new(fetcher))
+            .vulnerabilities(false)
+            .build()
+            .expect("a checker");
+
+        let check = checker
+            .check_manifest(
+                ManifestKind::PackageJson,
+                r#"{ "dependencies": { "chalk": "^5.0.0", "@acme/thing": "^1.0.0" } }"#,
+                None,
+            )
+            .await
+            .expect("the check runs");
+
+        // The default registry answered.
+        let chalk = check
+            .results
+            .iter()
+            .find(|r| r.item.name == "chalk")
+            .expect("chalk");
+        assert_eq!(chalk.latest_available.as_deref(), Some("5.3.0"));
+        assert!(!nexus.received_requests().await.unwrap().is_empty());
+
+        // Exactly one registry declined, and it is the scoped one.
+        assert_eq!(check.unreachable_registries.len(), 1, "{check:?}");
+        let declined = &check.unreachable_registries[0];
+        assert_eq!(declined.ecosystem, Ecosystem::Npm);
+        assert_eq!(declined.root.as_deref(), Some(nexus.uri().as_str()));
+
+        // The label a `--fail-on` refusal prints names the scoped host, never the default.
+        let label = declined.label();
+        let nexus_authority = nexus.uri().trim_start_matches("http://").to_owned();
+        let default_authority = default.uri().trim_start_matches("http://").to_owned();
+        assert!(label.contains(&nexus_authority), "label was {label}");
+        assert!(!label.contains(&default_authority), "label was {label}");
     }
 
     /// Only a root that is not the ecosystem's own says anything the ecosystem name does
