@@ -189,6 +189,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_unreadable_lockfile_is_named_in_the_caveat() {
+        let project = Project {
+            manifest: PathBuf::from("package.json"),
+            label: "package.json".to_owned(),
+            ecosystem: Ecosystem::Npm,
+            graph: DependencyGraph::default(),
+            source: GraphSource::UnreadableLockfile,
+        };
+
+        let caveat = project.caveat().expect("a shallow graph carries a caveat");
+        assert!(
+            caveat.contains("could not be read"),
+            "the user must be told a lockfile is present but unread, got {caveat:?}"
+        );
+        assert!(
+            !caveat.starts_with("no lockfile found"),
+            "an unread lockfile must not be reported as a missing one"
+        );
+    }
+
+    #[test]
     fn compact_counts_read_at_a_glance() {
         assert_eq!(compact_count(42), "42");
         assert_eq!(compact_count(12_345), "12.3k");
