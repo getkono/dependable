@@ -270,6 +270,32 @@ pub struct WorkspaceRoots {
     pub self_governing: bool,
 }
 
+impl WorkspaceRoots {
+    /// A descriptor no [`ManifestKind`] ships, for tests that drive the root walk with it.
+    ///
+    /// [`ManifestKind::workspace_roots`] is the only real source of descriptors, and the
+    /// only one it returns today pairs Cargo's one name with Cargo's own kind. The code
+    /// that exists to make a *heterogeneous* descriptor safe — one whose candidates are
+    /// read by a kind other than the kind that went looking — would otherwise have
+    /// nothing that reaches it until a second ecosystem's descriptor lands. The struct is
+    /// `#[non_exhaustive]`, so a crate driving that walk cannot write one out itself.
+    ///
+    /// Hidden because nothing outside a test consumes a descriptor directly: every walk
+    /// takes a kind and looks its descriptor up. No invariant is checked here, so a test
+    /// can build exactly the descriptor [`WorkspaceRoots::self_governing`] forbids.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn new(
+        root_names: &'static [(&'static str, ManifestKind)],
+        self_governing: bool,
+    ) -> Self {
+        Self {
+            root_names,
+            self_governing,
+        }
+    }
+}
+
 /// A lockfile format we recognise but cannot read, and what to do about it.
 ///
 /// Recognising these is what separates "no lockfile here" from "a lockfile we
@@ -654,6 +680,35 @@ mod tests {
                 roots.root_names
             );
         }
+    }
+
+    /// The test-only constructor builds the descriptor it is given, field for field, and
+    /// is what a real descriptor would compare equal to.
+    #[test]
+    fn a_constructed_descriptor_is_the_one_described() {
+        let cargo = ManifestKind::CargoToml
+            .workspace_roots()
+            .expect("Cargo inherits");
+        assert_eq!(
+            WorkspaceRoots::new(&[("Cargo.toml", ManifestKind::CargoToml)], true),
+            cargo
+        );
+
+        let mixed = WorkspaceRoots::new(
+            &[
+                ("pnpm-workspace.yaml", ManifestKind::PnpmWorkspaceYaml),
+                ("package.json", ManifestKind::PackageJson),
+            ],
+            false,
+        );
+        assert_eq!(
+            mixed.root_names,
+            [
+                ("pnpm-workspace.yaml", ManifestKind::PnpmWorkspaceYaml),
+                ("package.json", ManifestKind::PackageJson),
+            ]
+        );
+        assert!(!mixed.self_governing);
     }
 
     /// Recognition has to stay the same predicate the walk used before, or a root
