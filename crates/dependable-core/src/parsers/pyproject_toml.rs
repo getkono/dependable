@@ -2,8 +2,10 @@
 //!
 //! Handles Poetry tables (`[tool.poetry.dependencies]`, groups, legacy
 //! dev-dependencies), PEP 621 `[project.dependencies]` / optional-dependencies
-//! arrays, PEP 735 `[dependency-groups]`, and pixi's top-level `[dependencies]`.
+//! arrays, PEP 735 `[dependency-groups]`, and pixi's `[pypi-dependencies]` (top-level
+//! in `pixi.toml`, `[tool.pixi.pypi-dependencies]` in `pyproject.toml`).
 //! `python`/`requires-python` and `{path=…}`/`{git=…}`/`{url=…}` deps are skipped.
+//! pixi's `[dependencies]` tables are conda packages, not PyPI ones, and are not read.
 
 use std::ops::Range;
 
@@ -80,16 +82,16 @@ impl Parser for PyprojectTomlParser {
             }
         }
 
-        // pixi: top-level [dependencies] (name = "version-spec"), and the same tables
-        // nested under [tool.pixi] in a pyproject.toml.
-        if let Some(t) = root.get("dependencies").and_then(TomlItem::as_table_like) {
-            collect_table_deps(t, DependencyKind::Normal, &starts, &mut items);
-        }
+        // pixi: only `pypi-dependencies` are PyPI packages — top-level in a pixi.toml,
+        // under [tool.pixi] in a pyproject.toml. pixi's `[dependencies]` are conda
+        // packages resolved from a conda channel, with conda matchspecs rather than
+        // PEP 440 specifiers; asking PyPI about them checks the wrong registry (or the
+        // wrong project of the same name), so they are deliberately not collected.
         for path in [
-            ["tool", "pixi", "dependencies"],
-            ["tool", "pixi", "pypi-dependencies"],
+            &["pypi-dependencies"][..],
+            &["tool", "pixi", "pypi-dependencies"][..],
         ] {
-            if let Some(t) = nav(root, &path).and_then(TomlItem::as_table_like) {
+            if let Some(t) = nav(root, path).and_then(TomlItem::as_table_like) {
                 collect_table_deps(t, DependencyKind::Normal, &starts, &mut items);
             }
         }
@@ -393,13 +395,62 @@ mod tests {
             "requests = \">=2.31\"\n",
         );
         let m = PyprojectTomlParser.parse(content).expect("valid TOML");
-        for name in ["pytest", "coverage", "numpy", "requests"] {
+        for name in ["pytest", "coverage", "requests"] {
             assert!(m.items.iter().any(|i| i.name == name), "{name} missing");
         }
         assert_eq!(
             m.items.iter().find(|i| i.name == "pytest").unwrap().kind,
             DependencyKind::Dev
         );
+        // [tool.pixi.dependencies] is a conda table, not a PyPI one.
+        assert!(m.items.iter().all(|i| i.name != "numpy"));
+    }
+
+    /// A pixi.toml's `[dependencies]` are conda packages resolved from a conda channel;
+    /// only `[pypi-dependencies]` are PyPI packages. Checking the conda table against
+    /// PyPI asks the wrong registry (or about an unrelated project of the same name).
+    #[test]
+    fn pixi_toml_reads_pypi_dependencies_and_not_conda_dependencies() {
+        let content = concat!(
+            "[workspace]\n",
+            "channels = [\"conda-forge\"]\n",
+            "platforms = [\"linux-64\"]\n\n",
+            "[dependencies]\n",
+            "python = \">=3.11\"\n",
+            "pytorch = \"2.3.*\"\n",
+            "libgdal = \">=3.8,<4\"\n",
+            "numpy = { version = \">=1.26\", build = \"py311*\" }\n\n",
+            "[pypi-dependencies]\n",
+            "requests = \">=2.31\"\n",
+            "flask = { version = \"~=3.0\", extras = [\"async\"] }\n",
+            "local = { path = \"./local\", editable = true }\n",
+        );
+        let m = parse(content);
+        let mut names: Vec<&str> = m.items.iter().map(|i| i.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["flask", "local", "requests"]);
+        let requests = find(&m, "requests");
+        assert_eq!(requests.kind, DependencyKind::Normal);
+        assert_eq!(requests.source, PackageSource::Registry);
+        assert_eq!(sliced(content, requests), ">=2.31");
+        assert_eq!(sliced(content, find(&m, "flask")), "~=3.0");
+        assert_eq!(find(&m, "local").source, PackageSource::Local);
+    }
+
+    /// The same split under `[tool.pixi]` in a pyproject.toml: the conda table is not
+    /// read, the PyPI table is.
+    #[test]
+    fn pyproject_tool_pixi_reads_only_pypi_dependencies() {
+        let content = concat!(
+            "[tool.pixi.dependencies]\n",
+            "cudatoolkit = \"11.8.*\"\n\n",
+            "[tool.pixi.pypi-dependencies]\n",
+            "httpx = \">=0.27\"\n",
+        );
+        let m = parse(content);
+        let names: Vec<&str> = m.items.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, ["httpx"]);
+        assert_eq!(sliced(content, find(&m, "httpx")), ">=0.27");
     }
 
     /// Poetry's array-of-tables form used to fall through every branch and vanish — no
