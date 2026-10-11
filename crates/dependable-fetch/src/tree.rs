@@ -70,10 +70,9 @@ pub struct WorkspaceGraph {
     pub graph: DependencyGraph,
     /// Whether the graph is the full resolved one or the shallow fallback.
     pub source: GraphSource,
-    /// The [`NodeKind::Workspace`] nodes that
-    /// belong to a *nested* workspace rather than the scanned one, each mapped to
-    /// that nested root's directory relative to the scanned root (`fuzz`,
-    /// `examples/demo`).
+    /// The [`NodeKind::Workspace`] nodes that belong to a *nested* workspace rather
+    /// than the scanned one, each mapped to that nested root's directory relative
+    /// to the scanned root (`fuzz`, `examples/demo`).
     ///
     /// A scan descends into a `fuzz/` or `examples/` tree with its own `[workspace]`
     /// table, and the crates there are workspace crates — just not *this*
@@ -181,9 +180,10 @@ pub fn build_workspace_graph(
 /// Which of `graph`'s workspace nodes a nested root governs, and where that root
 /// is relative to `root_dir`: the value of [`WorkspaceGraph::nested_roots`].
 ///
-/// Matched by name, which is unambiguous for a workspace node: the member walk
-/// keeps one crate per `[package] name`, and a dependency sharing a member's name
-/// is classified as that member rather than as a second node.
+/// Matched by name among the workspace nodes only. The member walk keeps one crate
+/// per `[package] name`, so a name names one member and one governing root; a
+/// registry or git package that shares the name is never a workspace node, so it
+/// is never listed.
 fn nested_roots(
     graph: &DependencyGraph,
     members: &[Member],
