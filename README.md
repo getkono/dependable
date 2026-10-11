@@ -388,23 +388,19 @@ An npm-family `package.json` can force a version onto the *resolved* tree, past
 whatever the packages in it asked for: npm's `overrides`, Yarn's `resolutions`,
 and `pnpm.overrides` — including npm's nested form (`"overrides": { "parent":
 { "child": "…" } }`) and pnpm's scoped keys (`"foo@2>bar"`, which forces a version
-onto **bar**). Those maps are the only ones any parser tags as a forced version,
-so **`package.json` is the only manifest this section's guarantee covers.**
+onto **bar**). A Gradle version catalog (`gradle/libs.versions.toml`) can too:
+a `strictly` rich version (`junit = { strictly = "5.10.0" }`) is Gradle's forced
+version, and the usual shape of a JVM security pin. Its `require` and `prefer`
+forms are not forced — a floor and a soft preference — and are treated as
+ordinary constraints. Those are the only entries any parser tags as a forced
+version, so **`package.json` and a Gradle catalog's `strictly` versions are
+what this section's guarantee covers.**
 
-Other ecosystems have forcing mechanisms of their own. None of them is covered,
-and the two reasons for that are not the same — which is the part worth knowing:
-
-- **Never read, so nothing can rewrite them.** Cargo's `[patch]` and `[replace]`,
-  Composer's `replace` and `conflict`, and `pnpm-workspace.yaml`'s `overrides:`
-  (only its `catalog:` and `catalogs:` maps are read) are absent from every
-  parser. They are safe because nothing looks at them, not because anything
-  protects them.
-- **Read, but not yet recognised as forced.** A Gradle version catalog's rich
-  versions are read for their version string, and `strictly` — Gradle's pinning
-  form, and the usual shape of a JVM security pin — is recorded as an ordinary
-  constraint. A plain `dependable fix`, with no flags, will advance one. That is
-  [issue #147](https://github.com/getkono/dependable/issues/147), and until it is
-  fixed a Gradle `strictly` pin gets none of the protection described below.
+Other ecosystems have forcing mechanisms of their own. None of them is covered:
+Cargo's `[patch]` and `[replace]`, Composer's `replace` and `conflict`, and
+`pnpm-workspace.yaml`'s `overrides:` (only its `catalog:` and `catalogs:` maps are
+read) are absent from every parser. They are safe because nothing looks at them,
+not because anything protects them.
 
 A forced version is usually there for a reason — most often a security pin,
 holding a transitive dependency above a vulnerable release — and the tool cannot
