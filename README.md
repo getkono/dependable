@@ -614,13 +614,13 @@ not resolved against anything and what its manifest declares is what the crate
 is. A **dependency** is `null` there, because a manifest usually declares a
 constraint rather than a resolution — with one exception: a constraint that
 admits exactly one release (`serde = "=1.0.200"`, a PEP 440 `==2.28.1`, a NuGet
-`[1.2.3]`, a bare Gradle or Hex version) has already resolved it, and the version
-reported is the one the manifest spells, not a normalized form of it. Whether a
-bare version is a pin is decided by the ecosystem's constraint translator, not
-the string's shape: Cargo and Python read `1.2.3` as a range, and NuGet reads it
-as a lower bound. npm and Dart read a bare version as exact, but this tree's
-translator currently reads it as a caret range for both, so their bare pins are
-`null` too (#155, #149). It
+`[1.2.3]`, a bare Gradle, Hex, or pubspec version) has already resolved it, and
+the version reported is the one the manifest spells, not a normalized form of it.
+Whether a bare version is a pin is decided by the ecosystem's constraint
+translator, not the string's shape: Cargo and Python read `1.2.3` as a range, and
+NuGet reads it as a lower bound. npm reads a bare version as exact, but this
+tree's translator currently reads it as a caret range, so a bare npm pin is
+`null` too (#155). It
 is also `null` where the spelling itself is not a version the comparison engine
 can read as written — a two-segment `4.12`, a four-segment `1.2.3.4`, a Maven
 `6.4.4.Final` — because reporting one of those would put a string downstream that
