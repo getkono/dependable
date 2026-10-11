@@ -99,8 +99,8 @@ fn convert_suffix(suffix: &str) -> (String, String) {
 /// Convert a PEP 440 (or Poetry) constraint into a `semver::VersionReq` string.
 ///
 /// Splits on commas, strips `;` environment markers, and converts each clause.
-/// Poetry's `^`/`~`/`*` and the comparison operators pass through; `~=` and `==…*`
-/// expand to ranges; `!=` is dropped (semver can't express exclusion).
+/// Poetry's `^`/`~`/`*` and the comparison operators pass through; `~=`, `==…*`, and
+/// a bare `….*` expand to ranges; `!=` is dropped (semver can't express exclusion).
 #[must_use]
 pub fn pep440_constraint_to_semver(constraint: &str) -> String {
     let clauses: Vec<String> = constraint
@@ -129,6 +129,13 @@ fn convert_clause(clause: &str) -> Option<String> {
         if let Some(rest) = clause.strip_prefix(op) {
             return convert_op(op, rest.trim());
         }
+    }
+    // A bare prefix wildcard (`1.2.*`, the pixi/conda matchspec norm) is the same
+    // prefix match `==1.2.*` spells. Handed to `pep440_to_semver` it lost its `*` and
+    // came back as the bare `1.2.0`, which `VersionReq` reads as the caret `^1.2.0` —
+    // admitting `1.26.0` under a declaration of `1.20.*`.
+    if let Some(prefix) = clause.strip_suffix(".*") {
+        return wildcard_range(prefix);
     }
     // A bare version (`1.2.3`) — treat like Poetry/Cargo caret semantics.
     pep440_to_semver(clause)
@@ -171,13 +178,21 @@ fn is_plain_release(version: &str) -> bool {
             .all(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// `==1.0.*` → `>=1.0.0, <1.1.0` (the next release of the last specified segment).
+/// `==1.0.*` (or a bare `1.0.*`) → `>=1.0.0, <1.1.0` (the next release of the last
+/// specified segment).
+///
+/// A prefix of more than three segments (`2.7.6.1.*`) has no semver range: both
+/// bounds keep only three segments, so it came back as the unsatisfiable
+/// `>=2.7.6, <2.7.6`. It is dropped instead, like a non-numeric prefix.
 fn wildcard_range(prefix: &str) -> Option<String> {
     let nums: Vec<u64> = prefix
         .split('.')
         .filter(|s| !s.is_empty())
         .map(|s| s.parse().ok())
         .collect::<Option<_>>()?;
+    if nums.len() > 3 {
+        return None;
+    }
     let lower = pad_to_semver(&nums);
     let upper = bump_last(&nums)?;
     Some(format!(">={lower}, <{upper}"))
@@ -406,6 +421,60 @@ mod tests {
                 "{constraint} -> {converted} admitted {rejects}"
             );
         }
+    }
+
+    /// A bare prefix wildcard is the prefix match `==` spells, not a caret: `1.20.*`
+    /// used to translate to `1.20.0`, which `VersionReq` reads as `^1.20.0` and so
+    /// admitted `1.26.0`.
+    #[test]
+    fn a_bare_prefix_wildcard_is_a_prefix_match_not_a_caret() {
+        let v = |s: &str| ::semver::Version::parse(s).unwrap();
+        // (constraint, admitted, rejected)
+        for (constraint, admits, rejects) in [
+            ("1.2.*", "1.2.9", "1.3.0"),
+            ("1.*", "1.9.0", "2.0.0"),
+            ("1.20.*", "1.20.5", "1.26.0"),
+            ("1.20.*", "1.20.0", "1.19.9"),
+        ] {
+            let converted = pep440_constraint_to_semver(constraint);
+            let req = ::semver::VersionReq::parse(&converted)
+                .unwrap_or_else(|e| panic!("{constraint} -> {converted} does not parse: {e}"));
+            assert!(
+                req.matches(&v(admits)),
+                "{constraint} -> {converted} rejected {admits}"
+            );
+            assert!(
+                !req.matches(&v(rejects)),
+                "{constraint} -> {converted} admitted {rejects}"
+            );
+            assert_eq!(
+                converted,
+                pep440_constraint_to_semver(&format!("=={constraint}")),
+                "{constraint} differs from its `==` spelling"
+            );
+        }
+        assert_eq!(pep440_constraint_to_semver("1.20.*"), ">=1.20.0, <1.21.0");
+    }
+
+    /// A bare wildcard whose prefix is not a plain release is dropped, as its `==`
+    /// spelling is, rather than read as the caret it used to become: the translation
+    /// is empty, which the checker reports as undetermined.
+    #[test]
+    fn a_bare_wildcard_with_a_non_numeric_prefix_is_dropped() {
+        assert_eq!(pep440_constraint_to_semver("1.0rc1.*"), "");
+        assert_eq!(pep440_constraint_to_semver("==1.0rc1.*"), "");
+        // Another clause still stands on its own.
+        assert_eq!(pep440_constraint_to_semver(">=1.0, 1.0rc1.*"), ">=1.0.0");
+    }
+
+    /// A prefix of four or more segments has no semver range: both bounds kept three
+    /// segments, giving the unsatisfiable `>=2.7.6, <2.7.6`. The clause is dropped.
+    #[test]
+    fn a_wildcard_past_three_segments_is_dropped_not_unsatisfiable() {
+        for constraint in ["2.7.6.1.*", "==2.7.6.1.*", "1.2.3.4.5.*"] {
+            assert_eq!(pep440_constraint_to_semver(constraint), "", "{constraint}");
+        }
+        assert_eq!(pep440_constraint_to_semver("1.2.3.*"), ">=1.2.3, <1.2.4");
     }
 
     /// Reachable straight from a requirements file; `+ 1` on a parsed segment panicked
