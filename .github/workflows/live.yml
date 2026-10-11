@@ -1,0 +1,35 @@
+# The `#[ignore]`d network tests, on a schedule.
+#
+# `mise run test` is hermetic by design, so the entire network-facing surface —
+# the crates.io sparse index, npm, PyPI, Packagist, pub.dev, NuGet, Hex, JSR and
+# OSV — is never exercised by CI. Those are also the least-covered modules in the
+# workspace, and the ones whose correctness depends on a schema this repository
+# does not control: when a registry changes a response shape, nothing here notices
+# until a user reports a wrong answer.
+#
+# Deliberately not part of the PR gate. These tests fail for reasons a contributor
+# cannot fix — an outage, a rate limit — and a gate that cries wolf gets ignored,
+# including on the day it is right.
+name: Live
+
+on:
+  schedule:
+    # 05:00 UTC daily, off the top of the hour to avoid the cron stampede.
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  live:
+    name: Live registry + OSV smoke tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Materialize Rust toolchain
+        run: rustup show active-toolchain || rustup show
+      - uses: Swatinem/rust-cache@v2
+      - uses: jdx/mise-action@v2
+      - name: Run the live tests
+        run: mise run test:live

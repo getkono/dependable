@@ -50,6 +50,13 @@ fn ascii(graph: &DependencyGraph, opts: &TreeOptions) -> String {
         }
         write_node(&mut out, graph, root, "", true, true);
     }
+    // A tree that ran out of budget is a prefix, and a prefix that does not say so reads
+    // as the whole graph. `--no-dedupe` on a large lockfile is how a reader gets here.
+    if tree.truncated {
+        out.push_str(
+            "\n(tree truncated: too many paths to draw — narrow it with --depth, or drop --no-dedupe)\n",
+        );
+    }
     out
 }
 
@@ -89,10 +96,9 @@ fn write_node(
 /// yellow, registry plain) and dimmed wherever it is collapsed.
 fn label(graph: &DependencyGraph, node: &TreeNode) -> String {
     let n = &graph.nodes()[node.node];
-    let mut text = if n.version.is_empty() {
-        n.name.clone()
-    } else {
-        format!("{} v{}", n.name, n.version)
+    let mut text = match n.version.as_deref() {
+        Some(version) => format!("{} v{}", n.name, version),
+        None => n.name.clone(),
     };
     match n.kind {
         NodeKind::Workspace => text.push_str(" (workspace)"),
@@ -134,6 +140,13 @@ struct FlatGraph {
     edges: Vec<(usize, usize)>,
     /// Compact ids of the roots.
     roots: Vec<usize>,
+    /// Whether the walk ran out of budget, so this graph is a prefix of the real one.
+    ///
+    /// The ASCII renderer prints a notice for this; JSON and DOT have to carry it too,
+    /// and they are the formats whose consumer cannot eyeball the difference. A
+    /// truncated machine-readable graph that does not say so is byte-indistinguishable
+    /// from a complete one.
+    truncated: bool,
 }
 
 fn flatten(graph: &DependencyGraph, opts: &TreeOptions) -> FlatGraph {
@@ -171,6 +184,7 @@ fn flatten(graph: &DependencyGraph, opts: &TreeOptions) -> FlatGraph {
         order,
         edges,
         roots,
+        truncated: tree.truncated,
     }
 }
 
@@ -189,13 +203,23 @@ struct GraphDto<'a> {
     roots: Vec<usize>,
     nodes: Vec<NodeDto<'a>>,
     edges: Vec<EdgeDto>,
+    /// Additive: `true` when the walk ran out of budget and this graph is a prefix of
+    /// the real one. Always present, so a consumer can require it rather than infer
+    /// completeness from its absence.
+    truncated: bool,
 }
 
 #[derive(Serialize)]
 struct NodeDto<'a> {
     id: usize,
     name: &'a str,
-    version: &'a str,
+    /// `null` when no version was ever read for this node — a graph built from
+    /// manifests alone resolves a dependency's version only where its constraint
+    /// names exactly one release, though a workspace member still reports the
+    /// version its manifest declares. Emitted rather than omitted so every node
+    /// has the same shape and a consumer never has to tell an absent key from an
+    /// absent version.
+    version: Option<&'a str>,
     kind: &'static str,
 }
 
@@ -216,7 +240,7 @@ fn json(graph: &DependencyGraph, opts: &TreeOptions) -> anyhow::Result<String> {
             NodeDto {
                 id,
                 name: &n.name,
-                version: &n.version,
+                version: n.version.as_deref(),
                 kind: kind_str(n.kind),
             }
         })
@@ -230,6 +254,7 @@ fn json(graph: &DependencyGraph, opts: &TreeOptions) -> anyhow::Result<String> {
         roots: flat.roots,
         nodes,
         edges,
+        truncated: flat.truncated,
     };
     Ok(serde_json::to_string_pretty(&dto)?)
 }
@@ -240,12 +265,18 @@ fn dot(graph: &DependencyGraph, opts: &TreeOptions) -> String {
     let mut out = String::from(
         "digraph dependencies {\n  rankdir=LR;\n  node [shape=box, fontname=\"monospace\"];\n",
     );
+    // A graph attribute rather than only a comment, so a tool reading the DOT — and not
+    // just a person reading the file — can see that this is a prefix of the real graph.
+    if flat.truncated {
+        out.push_str(
+            "  // tree truncated: too many paths to draw — narrow it with --depth, or drop --no-dedupe\n  dependable_truncated=true;\n",
+        );
+    }
     for (id, &orig) in flat.order.iter().enumerate() {
         let n = &graph.nodes()[orig];
-        let label = if n.version.is_empty() {
-            n.name.clone()
-        } else {
-            format!("{} v{}", n.name, n.version)
+        let label = match n.version.as_deref() {
+            Some(version) => format!("{} v{}", n.name, version),
+            None => n.name.clone(),
         };
         let escaped = label.replace('"', "\\\"");
         let attrs = match n.kind {
@@ -267,7 +298,7 @@ fn dot(graph: &DependencyGraph, opts: &TreeOptions) -> String {
 mod tests {
     use super::*;
     use dependable_fetch::DependencyGraph;
-    use dependable_fetch::core::parse_cargo_lock_graph;
+    use dependable_fetch::core::{LockedPackage, ResolvedLockfile, parse_cargo_lock_graph};
 
     /// app (workspace) -> serde (registry) -> serde_derive; and app -> serde too,
     /// so serde is deduped on its second appearance.
@@ -294,10 +325,85 @@ source = "registry+https://x"
         DependencyGraph::from_resolved(&resolved, &names, &["app".to_owned()])
     }
 
+    /// `raw` with any terminal styling removed.
+    ///
+    /// [`label`] colours through `if_supports_color`, which asks the ambient
+    /// environment whether stdout can take ANSI — and `FORCE_COLOR`, which a
+    /// terminal multiplexer or a task runner may well export, answers yes even
+    /// under a captured test harness. These tests assert on the shape of the
+    /// tree, never on its colour, so a styled run must not fail them; stripping
+    /// here is what states that, rather than leaving it to whatever the process
+    /// happened to inherit.
+    ///
+    /// The contract is two escape forms, which is what `owo-colors` emits:
+    ///
+    /// - a CSI sequence, `ESC [` then parameter and intermediate bytes then a
+    ///   final byte in `@..=~` — dropped whole, final byte included;
+    /// - any other escape, treated as the two-character form `ESC` + one byte
+    ///   and dropped whole.
+    ///
+    /// A string escape (OSC, DCS, APC …) carries a payload terminated by BEL or
+    /// `ESC \\` rather than a single byte, so it is *not* in the contract: this
+    /// would drop its introducer and leave the payload as text. Nothing here
+    /// emits one; a styling path that starts to (a hyperlink, say) has to teach
+    /// this function about it.
+    fn strip_ansi(raw: &str) -> String {
+        let mut out = String::with_capacity(raw.len());
+        let mut chars = raw.chars();
+        while let Some(c) = chars.next() {
+            if c != '\u{1b}' {
+                out.push(c);
+                continue;
+            }
+            if chars.next() != Some('[') {
+                continue;
+            }
+            for c in chars.by_ref() {
+                if matches!(c, '@'..='~') {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn strip_ansi_drops_a_csi_sequence_whole() {
+        assert_eq!(
+            strip_ansi("\u{1b}[36;1mserde\u{1b}[0m v1.0.0"),
+            "serde v1.0.0"
+        );
+    }
+
+    /// A CSI whose final byte is not `m`: still terminated by the first byte in
+    /// `@..=~`, because parameter (`0x30..=0x3F`) and intermediate (`0x20..=0x2F`)
+    /// bytes all sort below that range.
+    #[test]
+    fn strip_ansi_ends_a_csi_at_a_final_byte_other_than_m() {
+        assert_eq!(strip_ansi("a\u{1b}[2Kb\u{1b}[1;31Hc"), "abc");
+    }
+
+    /// A two-character escape — `ESC c` (RIS) — loses both characters.
+    #[test]
+    fn strip_ansi_drops_a_two_character_escape() {
+        assert_eq!(strip_ansi("a\u{1b}cb"), "ab");
+    }
+
+    /// A lone trailing `ESC` has nothing after it: the iterator ends and the
+    /// escape is dropped rather than emitted as text.
+    #[test]
+    fn strip_ansi_drops_a_lone_trailing_escape() {
+        assert_eq!(strip_ansi("serde\u{1b}"), "serde");
+    }
+
+    #[test]
+    fn strip_ansi_leaves_unstyled_text_alone() {
+        assert_eq!(strip_ansi("├── serde v1.0.0 (*)"), "├── serde v1.0.0 (*)");
+    }
+
     #[test]
     fn ascii_marks_workspace_and_dedupe() {
-        // Color is disabled in the test harness (not a TTY), so labels are plain.
-        let out = ascii(&sample(), &TreeOptions::default());
+        let out = strip_ansi(&ascii(&sample(), &TreeOptions::default()));
         assert!(out.contains("app v0.1.0 (workspace)"));
         assert!(out.contains("├── serde v1.0.0"));
         assert!(out.contains("└── ")); // last-child connector
@@ -329,7 +435,7 @@ source = "registry+https://x"
 
     #[test]
     fn ascii_points_a_member_at_its_own_tree() {
-        let out = ascii(&workspace(), &TreeOptions::default());
+        let out = strip_ansi(&ascii(&workspace(), &TreeOptions::default()));
         assert!(
             out.contains("└── lib v0.1.0 (workspace) (see root)"),
             "under `app`, `lib` is a pointer rather than a copy; {out}"
@@ -352,7 +458,7 @@ source = "registry+https://x"
             collapse_roots: false,
             ..TreeOptions::default()
         };
-        let out = ascii(&workspace(), &opts);
+        let out = strip_ansi(&ascii(&workspace(), &opts));
         assert!(!out.contains("(see root)"), "{out}");
         assert_eq!(out.matches("serde v1.0.0").count(), 2, "{out}");
     }
@@ -364,9 +470,65 @@ source = "registry+https://x"
             dedupe: true,
             ..TreeOptions::default()
         };
-        let out = ascii(&sample(), &opts);
+        let out = strip_ansi(&ascii(&sample(), &opts));
         assert!(out.contains("app v0.1.0 (workspace)"));
         assert!(!out.contains("serde"));
+    }
+
+    /// A chain longer than the walk's hard recursion ceiling, so every renderer sees a
+    /// tree that stopped short.
+    fn deep_chain() -> DependencyGraph {
+        const DEPTH: usize = 600;
+        let mut lock = String::new();
+        for n in 0..DEPTH {
+            lock.push_str("[[package]]\n");
+            let _ = writeln!(lock, "name = \"c{n}\"");
+            lock.push_str("version = \"1.0.0\"\n");
+            if n > 0 {
+                lock.push_str("source = \"registry+https://x\"\n");
+            }
+            if n + 1 < DEPTH {
+                let _ = writeln!(lock, "dependencies = [\"c{}\"]", n + 1);
+            }
+            lock.push('\n');
+        }
+        let resolved = parse_cargo_lock_graph(&lock).unwrap();
+        let names = ["c0".to_owned()].into_iter().collect();
+        DependencyGraph::from_resolved(&resolved, &names, &["c0".to_owned()])
+    }
+
+    /// The ASCII renderer says a truncated walk is truncated. So must the machine
+    /// formats — they are the ones whose consumer cannot see the difference, and a JSON
+    /// graph that stopped short used to be byte-indistinguishable from a complete one.
+    #[test]
+    fn every_format_reports_a_truncated_walk() {
+        let graph = deep_chain();
+        let opts = TreeOptions::default();
+        assert!(
+            flatten(&graph, &opts).truncated,
+            "the fixture must actually truncate, or the assertions below prove nothing"
+        );
+
+        let ascii = ascii(&graph, &opts);
+        assert!(ascii.contains("(tree truncated"), "{ascii}");
+
+        let json = json(&graph, &opts).unwrap();
+        assert!(json.contains("\"truncated\": true"), "{json}");
+
+        let dot = dot(&graph, &opts);
+        assert!(dot.contains("dependable_truncated=true;"), "{dot}");
+        assert!(dot.contains("// tree truncated"), "{dot}");
+    }
+
+    /// And a complete walk says so too, rather than leaving the key out — a consumer
+    /// must be able to require the flag, not infer completeness from its absence.
+    #[test]
+    fn a_complete_walk_reports_itself_complete() {
+        let json = json(&sample(), &TreeOptions::default()).unwrap();
+        assert!(json.contains("\"truncated\": false"), "{json}");
+
+        let dot = dot(&sample(), &TreeOptions::default());
+        assert!(!dot.contains("dependable_truncated"), "{dot}");
     }
 
     #[test]
@@ -376,6 +538,69 @@ source = "registry+https://x"
         assert!(out.contains("\"kind\": \"workspace\""));
         assert!(out.contains("\"kind\": \"registry\""));
         assert!(out.contains("\"from\""));
+        assert!(out.contains("\"version\": \"1.0.0\""));
+    }
+
+    /// A graph built from manifests alone resolves no versions. Emitting `""`
+    /// there tells a consumer the package is at the empty version; `null` tells
+    /// it the truth, which is that nobody read one.
+    #[test]
+    fn json_reports_an_unread_version_as_null() {
+        let packages = vec![
+            LockedPackage::new("app".to_owned(), None, None, vec!["serde".to_owned()]),
+            LockedPackage::new(
+                "serde".to_owned(),
+                None,
+                Some("registry+".to_owned()),
+                Vec::new(),
+            ),
+        ];
+        let resolved = ResolvedLockfile::from_packages(packages);
+        let names = ["app".to_owned()].into_iter().collect();
+        let graph = DependencyGraph::from_resolved(&resolved, &names, &["app".to_owned()]);
+
+        let out = json(&graph, &TreeOptions::default()).unwrap();
+        assert!(out.contains("\"version\": null"), "{out}");
+        assert!(!out.contains("\"version\": \"\""), "{out}");
+    }
+
+    /// A hand-edited or generator-produced lockfile can carry `version = ""`.
+    /// That is not a version, and no renderer may print it as one: the label
+    /// `serde v` claims a version whose text happens to be empty. The empty
+    /// string is normalized away when the entry is built, so every renderer sees
+    /// the same absence a manifest-only graph produces.
+    #[test]
+    fn an_empty_version_in_a_lockfile_is_never_rendered_as_a_version() {
+        let graph = {
+            let lock = parse_cargo_lock_graph(
+                r#"
+[[package]]
+name = "app"
+version = "0.1.0"
+dependencies = ["serde"]
+
+[[package]]
+name = "serde"
+version = ""
+source = "registry+https://example.com"
+"#,
+            )
+            .unwrap();
+            let names = ["app".to_owned()].into_iter().collect();
+            DependencyGraph::from_resolved(&lock, &names, &["app".to_owned()])
+        };
+        let opts = TreeOptions::default();
+
+        let text = ascii(&graph, &opts);
+        assert!(text.contains("\u{2514}\u{2500}\u{2500} serde\n"), "{text}");
+        assert!(!text.contains("serde v"), "no trailing `v`: {text}");
+
+        let out = dot(&graph, &opts);
+        assert!(out.contains("[label=\"serde\"]"), "{out}");
+
+        let out = json(&graph, &opts).unwrap();
+        assert!(out.contains("\"version\": null"), "{out}");
+        assert!(!out.contains("\"version\": \"\""), "{out}");
     }
 
     #[test]

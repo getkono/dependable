@@ -195,6 +195,55 @@ async fn query_detail_skips_the_request_when_the_batch_found_nothing() {
     assert!(advisories.is_empty());
 }
 
+/// A `querybatch` that fails transiently once is retried, and the scan completes on the
+/// answer rather than failing the run's vulnerability gate.
+#[tokio::test]
+async fn query_batch_retries_a_transient_failure() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/querybatch"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/querybatch"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"results":[{"vulns":[{"id":"RUSTSEC-2020-0071"}]}]}"#),
+        )
+        .with_priority(2)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let ids = client(&server, false)
+        .query_batch(std::slice::from_ref(&query()))
+        .await
+        .expect("the retry answers");
+    assert_eq!(ids, vec![vec!["RUSTSEC-2020-0071".to_string()]]);
+}
+
+/// A `querybatch` that keeps failing is attempted three times and then surfaces the
+/// error, rather than looping or reporting a clean bill.
+#[tokio::test]
+async fn query_batch_gives_up_after_three_attempts() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/querybatch"))
+        .respond_with(ResponseTemplate::new(502))
+        .expect(3)
+        .mount(&server)
+        .await;
+
+    let result = client(&server, false)
+        .query_batch(std::slice::from_ref(&query()))
+        .await;
+    assert!(result.is_err(), "{result:?}");
+}
+
 #[tokio::test]
 async fn query_detail_follows_pagination() {
     let server = MockServer::start().await;
@@ -293,4 +342,45 @@ async fn live_query_detail_enriches_a_known_advisory() {
             );
         }
     }
+}
+
+/// The API answers one result per query, in order. A short body used to leave the
+/// unanswered slots empty — recorded as "no vulnerabilities" *and cached as clean* for
+/// ten minutes, so even a retry in the same process could not recover.
+#[tokio::test]
+async fn a_short_querybatch_response_is_an_error_not_a_clean_bill() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/querybatch"))
+        // Two queries go out; one result comes back.
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"results":[{"vulns":[{"id":"RUSTSEC-2020-0071"}]}]}"#),
+        )
+        .mount(&server)
+        .await;
+
+    let client = OsvClient::with_url(
+        build_client().unwrap(),
+        format!("{}/v1/querybatch", server.uri()),
+        false,
+    );
+    let queries = vec![
+        OsvQuery {
+            ecosystem: "crates.io".into(),
+            name: "time".into(),
+            version: "0.2.7".into(),
+        },
+        OsvQuery {
+            ecosystem: "crates.io".into(),
+            name: "serde".into(),
+            version: "1.0.0".into(),
+        },
+    ];
+
+    let result = client.query_batch(&queries).await;
+    assert!(
+        result.is_err(),
+        "a truncated batch response was accepted as a complete answer"
+    );
 }

@@ -264,7 +264,7 @@ mod tests {
                 project: 0,
                 node: None,
                 name: format!("pkg-{i}"),
-                version: String::new(),
+                version: None,
                 node_kind: None,
                 has_children: true,
                 redirect: None,

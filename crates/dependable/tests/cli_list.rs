@@ -280,6 +280,85 @@ fn a_path_override_is_not_treated_as_inherited() {
     assert_eq!(util["constraint"], Value::Null);
 }
 
+/// A Cargo root that is also a package inherits its scalars from its **own**
+/// `[workspace.package]` table — the table is legal there, and the crate declaring
+/// `version.workspace = true` is the same file that holds it. A walk that excludes the
+/// asking manifest never finds it, and reports the version as unknown while still
+/// flagging it inherited: the inventory says both "there is no version" and "the version
+/// came from somewhere else". Dependency inheritance already resolves this case; the
+/// scalar axis has to agree.
+#[test]
+fn a_root_that_is_also_a_package_inherits_its_version_from_itself() {
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    std::fs::write(
+        tmp.path().join("Cargo.toml"),
+        r#"
+[workspace]
+
+[workspace.package]
+version = "9.9.9"
+
+[package]
+name = "selfroot"
+version.workspace = true
+
+[dependencies]
+serde = "1"
+"#,
+    )
+    .expect("write manifest");
+
+    let doc = list_json(tmp.path(), &[]);
+    let root = project(&doc, "selfroot");
+    assert_eq!(root["version"], "9.9.9");
+    assert_eq!(root["version_inherited"], true);
+}
+
+/// A nested Cargo root that is also a package is governed by its **own**
+/// `[workspace.package]` table, even when that table has no `version`. Cargo does not
+/// fall through to an outer workspace for a field the governing root leaves out, so the
+/// inventory reports the version as unknown — still flagged inherited — rather than
+/// borrowing the outer root's.
+#[test]
+fn a_nested_root_without_a_version_does_not_borrow_an_outer_roots() {
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    std::fs::write(
+        tmp.path().join("Cargo.toml"),
+        r#"
+[workspace]
+exclude = ["inner"]
+
+[workspace.package]
+version = "1.2.3"
+"#,
+    )
+    .expect("write outer manifest");
+    let inner = tmp.path().join("inner");
+    std::fs::create_dir(&inner).expect("create inner dir");
+    std::fs::write(
+        inner.join("Cargo.toml"),
+        r#"
+[workspace]
+
+[workspace.package]
+edition = "2021"
+
+[package]
+name = "innerroot"
+version.workspace = true
+
+[dependencies]
+serde = "1"
+"#,
+    )
+    .expect("write inner manifest");
+
+    let doc = list_json(tmp.path(), &[]);
+    let inner = project(&doc, "innerroot");
+    assert_eq!(inner["version"], Value::Null);
+    assert_eq!(inner["version_inherited"], true);
+}
+
 /// The root's `[workspace.dependencies]` are central declarations, not dependencies of
 /// the root — and it inherits nothing, because it is what everything else inherits from.
 #[test]
@@ -325,4 +404,46 @@ fn a_disabled_ecosystem_is_not_warned_about() {
         !disabled.contains("build.gradle"),
         "`[jvm] enabled = false` is an answer, not a question: {disabled}"
     );
+}
+
+/// An empty selection is exit 0 — and under `--format json` it is still a
+/// document.
+///
+/// `list --ecosystem csharp --format json | jq '.summary.projects'` is the shape
+/// this flag exists for: one shard per ecosystem in a CI matrix. Returning
+/// before the document was built made every shard whose ecosystem the repository
+/// does not use exit 0 with byte-empty stdout, so `jq` failed to parse — on
+/// precisely the ecosystems exit 0 was chosen to keep green. The stderr line
+/// saying what was searched is not machine-readable.
+///
+/// `table` and `text` are unchanged: a human handed an empty table wants the
+/// stderr line, not a blank one.
+#[test]
+fn an_empty_selection_is_an_empty_document_not_empty_stdout() {
+    let npm = fixture("sample-npm");
+
+    let filtered = list_json(&npm, &["--ecosystem", "rust"]);
+    assert_eq!(filtered["schema"], "dependable.list/v1");
+    assert_eq!(filtered["summary"]["projects"], 0);
+    assert_eq!(filtered["summary"]["dependencies"], 0);
+    assert_eq!(filtered["summary"]["by_ecosystem"], serde_json::json!({}));
+    assert!(
+        filtered["projects"]
+            .as_array()
+            .expect("projects array")
+            .is_empty()
+    );
+
+    // The other way a selection empties: the glob path, which prints its own
+    // diagnostic and reached the same byte-empty stdout.
+    let globbed = list_json(&npm, &["--manifest-glob", "nope/*"]);
+    assert_eq!(globbed["summary"]["projects"], 0);
+
+    let path = npm.to_str().expect("utf-8 path");
+    for format in ["table", "text"] {
+        assert!(
+            run(&["list", path, "--format", format, "--ecosystem", "rust"]).is_empty(),
+            "{format} says nothing on stdout when nothing was selected"
+        );
+    }
 }

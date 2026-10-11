@@ -18,8 +18,21 @@ use crate::error::ParseError;
 pub struct LockedPackage {
     /// Package name.
     pub name: String,
-    /// Exact resolved version.
-    pub version: String,
+    /// Exact resolved version, or `None` when no version was read for this
+    /// package at all.
+    ///
+    /// `None` is carried by a *synthesized* entry — a manifest-only graph, or a
+    /// project whose manifest declares no version of its own — and also by the
+    /// entries a lockfile records without one: an npm or Bun workspace link is
+    /// a location (`workspace:packages/lib`), not a version, so parsing one
+    /// yields `None` too.
+    ///
+    /// It is never `Some("")`. [`LockedPackage::new`] normalizes an empty
+    /// version to `None`, so a blank field in a hand-edited or
+    /// generator-produced lockfile cannot reach a consumer as a version that
+    /// happens to be empty — a string every version comparison silently
+    /// mishandles.
+    pub version: Option<String>,
     /// Package source (`registry+https://…`, `git+…`, `sparse+…`). `None` for
     /// path/workspace packages — that absence is how local crates are told apart
     /// from external ones.
@@ -41,18 +54,25 @@ pub struct ResolvedLockfile {
 }
 
 impl LockedPackage {
-    /// Construct a package entry directly — used when synthesizing a graph from
-    /// manifests (e.g. the shallow fallback when no `Cargo.lock` is present).
+    /// Construct a package entry directly — used both by the lockfile parsers
+    /// and when synthesizing a graph from manifests (e.g. the shallow fallback
+    /// when no `Cargo.lock` is present).
+    ///
+    /// An empty `version` becomes [`None`]. This is the one choke point every
+    /// package entry passes through, which is what makes `Some("")`
+    /// unrepresentable rather than merely discouraged: a blank version is not a
+    /// version, and each consumer re-deriving that from an `is_empty()` check is
+    /// how the distinction gets lost again.
     #[must_use]
     pub fn new(
         name: String,
-        version: String,
+        version: Option<String>,
         source: Option<String>,
         dependencies: Vec<String>,
     ) -> Self {
         Self {
             name,
-            version,
+            version: version.filter(|v| !v.is_empty()),
             source,
             dependencies,
         }
@@ -88,7 +108,7 @@ impl ResolvedLockfile {
             Some(version) => candidates
                 .iter()
                 .copied()
-                .find(|&i| self.packages[i].version == version),
+                .find(|&i| self.packages[i].version.as_deref() == Some(version)),
         }
     }
 }
@@ -124,7 +144,7 @@ pub fn parse_cargo_lock_graph(content: &str) -> Result<ResolvedLockfile, ParseEr
                 .unwrap_or_default();
             packages.push(LockedPackage::new(
                 name.to_owned(),
-                version.to_owned(),
+                Some(version.to_owned()),
                 source,
                 dependencies,
             ));
@@ -184,6 +204,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
     }
 
     #[test]
+    fn an_empty_version_is_recorded_as_no_version_at_all() {
+        // A blank `version` is not a version, and every consumer that compares
+        // versions mishandles the empty string: `Version::parse("")` fails, so a
+        // freshness check falls through to "no locked version" and answers
+        // "up to date" about a package nobody read a version for. Normalizing
+        // here, at the single constructor every parser and every synthesized
+        // entry passes through, is what makes `Some("")` unrepresentable.
+        let lock = parse_cargo_lock_graph(
+            r#"
+version = 4
+
+[[package]]
+name = "serde"
+version = ""
+source = "registry+https://github.com/rust-lang/crates.io-index"
+"#,
+        )
+        .unwrap();
+        assert_eq!(lock.packages[0].version, None);
+        assert_eq!(
+            LockedPackage::new("x".to_owned(), Some(String::new()), None, Vec::new()).version,
+            None,
+            "a synthesized entry is normalized the same way"
+        );
+    }
+
+    #[test]
     fn resolves_bare_name_to_unique_package() {
         let lock = parse_cargo_lock_graph(LOCK).unwrap();
         let idx = lock.resolve("serde").unwrap();
@@ -194,10 +241,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
     fn resolves_disambiguated_name_and_version() {
         let lock = parse_cargo_lock_graph(LOCK).unwrap();
         let idx = lock.resolve("getrandom 0.2.17").unwrap();
-        assert_eq!(lock.packages[idx].version, "0.2.17");
+        assert_eq!(lock.packages[idx].version.as_deref(), Some("0.2.17"));
         // The other version is a distinct package, resolvable on its own.
         let other = lock.resolve("getrandom 0.3.4").unwrap();
-        assert_eq!(lock.packages[other].version, "0.3.4");
+        assert_eq!(lock.packages[other].version.as_deref(), Some("0.3.4"));
     }
 
     #[test]
@@ -206,7 +253,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
         let idx = lock
             .resolve("getrandom 0.2.17 (registry+https://github.com/rust-lang/crates.io-index)")
             .unwrap();
-        assert_eq!(lock.packages[idx].version, "0.2.17");
+        assert_eq!(lock.packages[idx].version.as_deref(), Some("0.2.17"));
     }
 
     #[test]

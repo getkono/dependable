@@ -9,7 +9,8 @@
 # crates.io publishing is enabled: every crate is published so both library
 # consumers (dependable-core, dependable-fetch) and `cargo install dependable`
 # work. release-plz publishes in dependency order
-# (core → fetch → tui → dependable).
+# (core → report → fetch → tui → dependable) — `dependable` depends on
+# `dependable-report` by version, so that crate has to exist on crates.io first.
 #
 # Auth is crates.io Trusted Publishing (OIDC) only — the `release` job carries
 # `id-token: write` and release-plz mints a short-lived token per run. We never

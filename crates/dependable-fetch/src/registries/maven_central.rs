@@ -50,6 +50,10 @@ impl MavenCentralFetcher {
 }
 
 impl RegistryFetcher for MavenCentralFetcher {
+    fn registry_root(&self) -> Option<&str> {
+        Some(&self.base_url)
+    }
+
     fn fetch_versions<'a>(
         &'a self,
         name: &'a str,
@@ -124,8 +128,14 @@ fn parse_metadata(body: &str, package: &str) -> Result<FetchedVersions, FetchErr
         .filter(|v| !v.is_empty())
         .map(str::to_owned)
         .collect();
+    // A document that parsed but names no version is *not* the repository saying the
+    // artifact does not exist — a Nexus/Artifactory group repo whose upstream proxy is
+    // down serves exactly this for an artifact that does exist. Reporting it as a 404
+    // exempted it from the gate; reporting it distinctly keeps the gate honest.
     if versions.is_empty() {
-        return Err(FetchError::NotFound(package.to_string()));
+        return Err(FetchError::EmptyVersionList {
+            package: package.to_string(),
+        });
     }
     sort_desc(&mut versions);
 
@@ -220,13 +230,21 @@ mod tests {
         );
     }
 
+    /// This pinned the opposite: an empty document was reported as `NotFound`. Once a
+    /// 404 became a per-dependency carve-out from the `--fail-on` gate, that spelling
+    /// silently exempted a repository that had answered without naming a version — a
+    /// group repo with a dead upstream — from being gated on at all.
     #[test]
-    fn a_document_with_no_versions_is_the_same_as_no_package() {
+    fn a_document_with_no_versions_is_not_the_same_as_no_package() {
         let body = "<metadata><versioning><versions/></versioning></metadata>";
-        assert!(matches!(
-            parse_metadata(body, "org.example:demo"),
-            Err(FetchError::NotFound(_))
-        ));
+        let error = parse_metadata(body, "org.example:demo").expect_err("no versions to report");
+        assert!(
+            matches!(error, FetchError::EmptyVersionList { .. }),
+            "an empty list came back as {error:?}, which the gate exempts as a 404"
+        );
+        // Well-formed and empty parses the same way next time, so there is nothing to
+        // retry — but it is still not a 404, so the gate refuses to certify through it.
+        assert!(!error.is_transient());
     }
 
     #[test]

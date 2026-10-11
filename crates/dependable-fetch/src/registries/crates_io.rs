@@ -188,6 +188,10 @@ impl ApiOwner {
 }
 
 impl RegistryFetcher for CratesIoFetcher {
+    fn registry_root(&self) -> Option<&str> {
+        Some(&self.base_url)
+    }
+
     fn fetch_versions<'a>(
         &'a self,
         name: &'a str,
@@ -200,7 +204,7 @@ impl RegistryFetcher for CratesIoFetcher {
             }
             let resp = req.send().await?;
             let status = resp.status();
-            if status == reqwest::StatusCode::NOT_FOUND {
+            if is_absent(status) {
                 return Err(FetchError::NotFound(name.to_string()));
             }
             if !status.is_success() {
@@ -210,7 +214,17 @@ impl RegistryFetcher for CratesIoFetcher {
                 });
             }
             let body = resp.text().await?;
-            Ok(parse_index(&body))
+            parse_index(&body).map_err(|error| match error {
+                // The package name is only known here, at the call site.
+                FetchError::Decode { detail, .. } => FetchError::Decode {
+                    package: name.to_owned(),
+                    detail,
+                },
+                FetchError::AllYanked { .. } => FetchError::AllYanked {
+                    package: name.to_owned(),
+                },
+                other => other,
+            })
         }
         .boxed()
     }
@@ -231,7 +245,7 @@ impl RegistryFetcher for CratesIoFetcher {
                 .send()
                 .await?;
             let status = resp.status();
-            if status == reqwest::StatusCode::NOT_FOUND {
+            if is_absent(status) {
                 return Err(FetchError::NotFound(name.to_string()));
             }
             if !status.is_success() {
@@ -299,23 +313,65 @@ impl RegistryFetcher for CratesIoFetcher {
     }
 }
 
+/// Whether a registry response means "this crate does not exist", as opposed to the
+/// registry failing to answer.
+///
+/// Cargo's sparse-index protocol treats `404`, `410` and `451` alike as "crate does
+/// not exist". Only `404` was recognised, so a `410` or `451` marked the whole
+/// registry unreachable and turned a `--fail-on` gate into exit 2 over one crate.
+fn is_absent(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::NOT_FOUND
+            | reqwest::StatusCode::GONE
+            | reqwest::StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS
+    )
+}
+
 /// Parse the newline-delimited JSON index body into versions, newest-first, with
 /// yanked releases filtered out. The newest version's declared feature flags are
 /// attached for `list --features`.
-fn parse_index(body: &str) -> FetchedVersions {
+fn parse_index(body: &str) -> Result<FetchedVersions, FetchError> {
+    let mut malformed = 0usize;
+    let mut listed = 0usize;
     let mut entries: Vec<IndexLine> = body
         .lines()
         .filter(|line| !line.trim().is_empty())
-        .filter_map(|line| serde_json::from_str::<IndexLine>(line).ok())
+        .filter_map(|line| match serde_json::from_str::<IndexLine>(line) {
+            Ok(entry) => Some(entry),
+            Err(_) => {
+                malformed += 1;
+                None
+            }
+        })
+        .inspect(|_| listed += 1)
         .filter(|line| !line.yanked)
         .collect();
+    // A partially corrupt body is the dangerous case, not a wholly broken one: dropping
+    // the bad lines leaves a plausible-looking but *short* version list, and if the
+    // newest release was among them the dependency reports up to date. A body we cannot
+    // read in full is an error, so the caller retries or reports rather than believing it.
+    if malformed > 0 {
+        return Err(FetchError::Decode {
+            package: String::new(),
+            detail: format!("{malformed} malformed line(s) in the sparse index response"),
+        });
+    }
+    // Every listed release yanked is the registry's permanent answer about this crate,
+    // not a short or failed response: an empty list here reached the checker as "no
+    // parseable versions", which no registry was blamed for, and failed the gate.
+    if listed > 0 && entries.is_empty() {
+        return Err(FetchError::AllYanked {
+            package: String::new(),
+        });
+    }
     entries.sort_by(|a, b| cmp_vers_desc(&a.vers, &b.vers));
     let features = entries
         .first()
         .map(IndexLine::feature_names)
         .unwrap_or_default();
     let versions: Vec<String> = entries.into_iter().map(|line| line.vers).collect();
-    FetchedVersions::new(versions).with_features(features)
+    Ok(FetchedVersions::new(versions).with_features(features))
 }
 
 /// Order two version strings newest-first, falling back to reverse lexical order
@@ -361,7 +417,7 @@ mod tests {
             "{\"name\":\"x\",\"vers\":\"1.1.0\",\"yanked\":true}\n",
             "{\"name\":\"x\",\"vers\":\"1.2.0\",\"yanked\":false}\n",
         );
-        let fetched = parse_index(body);
+        let fetched = parse_index(body).expect("a well-formed index body");
         assert_eq!(fetched.versions, vec!["1.2.0", "1.0.0"]);
         assert_eq!(fetched.latest_tag.as_deref(), Some("1.2.0"));
         assert!(fetched.features.is_empty()); // no features declared
@@ -373,9 +429,69 @@ mod tests {
             "{\"name\":\"x\",\"vers\":\"1.0.0\",\"yanked\":false,\"features\":{\"legacy\":[]}}\n",
             "{\"name\":\"x\",\"vers\":\"2.0.0\",\"yanked\":false,\"features\":{\"default\":[\"std\"],\"derive\":[\"x-derive\"]},\"features2\":{\"rc\":[\"dep:rc\"]}}\n",
         );
-        let fetched = parse_index(body);
+        let fetched = parse_index(body).expect("a well-formed index body");
         assert_eq!(fetched.versions, vec!["2.0.0", "1.0.0"]);
         // Newest version (2.0.0) only, merging `features` + `features2`, sorted.
         assert_eq!(fetched.features, vec!["default", "derive", "rc"]);
+    }
+
+    /// A partially corrupt body is the dangerous case: dropping the unreadable lines
+    /// leaves a plausible-looking but short version list, and if the newest release was
+    /// among them the dependency reports up to date.
+    #[test]
+    fn a_malformed_index_line_is_an_error_not_a_shorter_list() {
+        let body = concat!(
+            "{\"name\":\"serde\",\"vers\":\"1.0.0\",\"yanked\":false}\n",
+            "{\"name\":\"serde\",\"vers\":\"1.2.0\",\"yank\n",
+        );
+        assert!(
+            parse_index(body).is_err(),
+            "a truncated line was silently dropped"
+        );
+    }
+
+    /// Cargo's three "crate does not exist" answers, and nothing else.
+    #[test]
+    fn the_sparse_index_not_found_answers_are_absence() {
+        use reqwest::StatusCode;
+        for status in [
+            StatusCode::NOT_FOUND,
+            StatusCode::GONE,
+            StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS,
+        ] {
+            assert!(is_absent(status), "{status}");
+        }
+        for status in [
+            StatusCode::OK,
+            StatusCode::FORBIDDEN,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::BAD_GATEWAY,
+        ] {
+            assert!(!is_absent(status), "{status}");
+        }
+    }
+
+    /// A crate whose every release is yanked is the registry's permanent answer, not
+    /// an empty list the checker then cannot attribute to anyone.
+    #[test]
+    fn an_index_of_only_yanked_releases_is_a_permanent_absence() {
+        let body = concat!(
+            "{\"name\":\"x\",\"vers\":\"1.0.0\",\"yanked\":true}\n",
+            "{\"name\":\"x\",\"vers\":\"1.1.0\",\"yanked\":true}\n",
+        );
+        let error = parse_index(body).expect_err("nothing installable is listed");
+        assert!(matches!(error, FetchError::AllYanked { .. }), "{error:?}");
+        assert!(error.is_permanent_absence());
+        assert!(!error.is_transient());
+        // An empty body lists nothing at all, which is not the same answer.
+        assert!(parse_index("").is_ok_and(|f| f.versions.is_empty()));
+    }
+
+    /// Blank lines are not corruption; the index body ends with one.
+    #[test]
+    fn blank_lines_are_not_treated_as_corruption() {
+        let body = "{\"name\":\"serde\",\"vers\":\"1.0.0\",\"yanked\":false}\n\n";
+        let fetched = parse_index(body).expect("a trailing newline is not a malformed line");
+        assert_eq!(fetched.versions, vec!["1.0.0"]);
     }
 }

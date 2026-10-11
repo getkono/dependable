@@ -1,6 +1,7 @@
 //! End-to-end: `dependable tree` over a committed workspace fixture. Fully
-//! offline — the graph comes from the fixture's `Cargo.lock`. Piped stdout is
-//! not a TTY, so labels are plain (uncolored) and assertable as text.
+//! offline — the graph comes from the fixture's `Cargo.lock`. Labels are
+//! asserted as plain text, which [`run`] pins the child's environment to make
+//! true rather than inferring it from the pipe.
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -9,9 +10,20 @@ fn fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample-workspace")
 }
 
+/// `dependable` with the given arguments, its output left unstyled.
+///
+/// A pipe is not a TTY, so the labels come out plain by default — but that is a
+/// default, not a guarantee. `FORCE_COLOR` overrides it, and the child inherits
+/// whatever exported it: a terminal multiplexer, a task runner, a CI image. The
+/// assertions below are about the shape of the tree rather than its colour, so
+/// the environment is pinned here instead of assumed, and the tests state the
+/// same thing in a coloured terminal as in a bare one.
 fn run(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_dependable"))
         .args(args)
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE")
+        .env("NO_COLOR", "1")
         .output()
         .expect("run dependable")
 }

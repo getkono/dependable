@@ -238,13 +238,13 @@ impl App {
     #[must_use]
     pub fn selected_key(&self) -> Option<PackageKey> {
         let row = self.selected()?;
-        if row.kind != RowKind::Package
-            || row.version.is_empty()
-            || row.node_kind != Some(NodeKind::Registry)
-        {
+        if row.kind != RowKind::Package || row.node_kind != Some(NodeKind::Registry) {
             return None;
         }
-        Some(key(self.ecosystem_of(row), &row.name, &row.version))
+        // A row with no version is not a lookup: every answer a registry gives
+        // is about a particular version, and we have none to ask about.
+        let version = row.version.as_deref()?;
+        Some(key(self.ecosystem_of(row), &row.name, version))
     }
 
     /// The ecosystem a row belongs to.
