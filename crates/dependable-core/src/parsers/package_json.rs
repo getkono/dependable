@@ -87,8 +87,13 @@ fn dependency_key(path: &[String]) -> Option<(&str, DependencyKind)> {
         [outer, inner, dep] if outer == "pnpm" && inner == "overrides" => {
             override_name(dep).map(|name| (name, DependencyKind::Override))
         }
-        [section, _parent, dep] if is_override_section(section) => {
-            override_name(dep).map(|name| (name, DependencyKind::Override))
+        // Inside that nested form, `"."` is the parent's *own* pin:
+        // `{"foo": {".": "1.2.3", "bar": "^2"}}` forces `foo` to `1.2.3`. It names the
+        // parent, so it resolves through the parent's key, and a parent key that names no
+        // package (`"*"`, `"."`) drops it rather than inventing one.
+        [section, parent, dep] if is_override_section(section) => {
+            let key = if dep == "." { parent } else { dep };
+            override_name(key).map(|name| (name, DependencyKind::Override))
         }
         _ => None,
     }
@@ -101,8 +106,10 @@ fn is_override_section(section: &str) -> bool {
 
 /// The package an override key names.
 ///
-/// Yarn `resolutions` keys carry a path (`parent/child`, `**/lodash`) and npm's nested
-/// form uses `"."` to mean "the parent entry itself", which names no new package.
+/// Yarn `resolutions` keys carry a path (`parent/child`, `**/lodash`). npm's nested form
+/// uses `"."` to mean "the parent entry itself"; on its own the key names nothing, so
+/// this declines it, and [`dependency_key`] resolves a nested `"."` through the parent's
+/// key instead.
 ///
 /// pnpm scopes an override to the parent that pulls the package in by joining the two
 /// with `>`: `"foo@2>bar"` forces a version onto **bar**, not onto `foo`. The overridden
@@ -589,14 +596,33 @@ mod tests {
     }
 
     /// npm's nested form scopes an override to the parent that pulls the package in, and
-    /// spells "the parent itself" as `"."`, which names no new package.
+    /// spells "the parent itself" as `"."` — a pin on the parent, which is reported under
+    /// the parent's name rather than dropped.
     #[test]
     fn nested_override_keys_resolve_to_the_package_they_name() {
-        let content = r#"{ "overrides": { "foo": { ".": "1.0.0", "bar": "2.0.0" } } }"#;
+        let content = r#"{"overrides":{"foo":{".":"1.2.3","bar":"^2"}}}"#;
         let m = PackageJsonParser.parse(content).expect("valid JSON");
         let names: Vec<&str> = m.items.iter().map(|i| i.name.as_str()).collect();
-        assert!(names.contains(&"bar"), "got {names:?}");
+        assert_eq!(names.len(), 2, "got {names:?}");
         assert!(!names.contains(&"."), "got {names:?}");
+        let foo = find(&m, "foo");
+        assert_eq!(foo.kind, DependencyKind::Override);
+        assert_eq!(foo.version_constraint, "1.2.3");
+        let bar = find(&m, "bar");
+        assert_eq!(bar.kind, DependencyKind::Override);
+        assert_eq!(bar.version_constraint, "^2");
+    }
+
+    /// A nested `"."` takes its name from the parent key, so a parent spelled with a
+    /// version selector resolves to the bare package, and a parent that names no package
+    /// drops the pin instead of reporting a nameless item.
+    #[test]
+    fn a_nested_dot_resolves_through_its_parent_key() {
+        let content = r#"{"overrides":{"foo@^1":{".":"1.2.3"},"*":{".":"9.9.9"}}}"#;
+        let m = PackageJsonParser.parse(content).expect("valid JSON");
+        let names: Vec<&str> = m.items.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, ["foo"]);
+        assert_eq!(find(&m, "foo").version_constraint, "1.2.3");
     }
 
     #[test]
