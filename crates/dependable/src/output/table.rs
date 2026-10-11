@@ -1,9 +1,9 @@
 //! Colored, TTY-aware table output (the default).
 
-use dependable_fetch::{CheckResult, DependencyStatus};
+use dependable_fetch::{CheckResult, DependencyStatus, Item};
 use owo_colors::{OwoColorize, Stream, Style};
 
-use super::{ManifestReport, Summary, current_display, latest_display};
+use super::{ManifestReport, Summary, current_display, kind_annotation, latest_display};
 
 /// Render all reports as tables, with a combined totals line for multi-manifest runs.
 ///
@@ -62,7 +62,7 @@ fn render_one(report: &ManifestReport) {
         .iter()
         .map(|r| {
             (
-                r.item.name.clone(),
+                package_cell(&r.item),
                 current_display(r),
                 latest_display(r),
                 r,
@@ -89,6 +89,18 @@ fn render_one(report: &ManifestReport) {
     }
     println!();
     print_totals(&Summary::of(std::slice::from_ref(report)));
+}
+
+/// The Package cell: the name, followed by its kind's label.
+///
+/// Every kind is labelled the way `list` labels it, from the same
+/// [`kind_annotation`], so the two commands never spell one kind two ways and no
+/// kind is special-cased: a forced version reads ` (override)` just as a dev
+/// dependency reads ` (dev)`, and a normal dependency stays bare. Only the kind is
+/// shown here, not `list`'s source labels: the Status column already names a
+/// `local` or `git` source.
+fn package_cell(item: &Item) -> String {
+    format!("{}{}", item.name, kind_annotation(item.kind))
 }
 
 fn width(lengths: impl Iterator<Item = usize>, header: &str) -> usize {

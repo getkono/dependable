@@ -423,6 +423,21 @@ That note is the point: a stale pin used to be skipped in silence, so a manifest
 whose only outdated entry was an override was reported by `check` and then
 answered by `fix` with "Everything is already up to date."
 
+`check` says so before you ever run `fix`: its default table labels a forced
+version in the Package column, in the same words `list` uses, and
+`--format json` carries it as `"kind": "override"`.
+
+```
+Package            Current  Latest   Status
+express            ^4.21.2  4.21.2   up to date
+lodash (override)  1.0.0    4.17.21  outdated
+```
+
+The label is not special to overrides: the `check` table labels every dependency
+kind the way `dependable list` does (` (dev)`, ` (build)`, ` (optional)`,
+` (peer)`, ` (declared)`, ` (indirect)`, ` (override)`), and leaves a normal
+dependency bare.
+
 `--overrides` is how you say yes:
 
 ```bash
