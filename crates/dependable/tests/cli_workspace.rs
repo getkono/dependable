@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde_json::Value;
+use tempfile::TempDir;
 
 const ROOT: &str = "[workspace]\nresolver = \"2\"\nmembers = [\"crates/app\"]\n\n[workspace.dependencies]\nserde = \"1.0.100\"\nhelper = { path = \"crates/helper\" }\n";
 
@@ -27,9 +28,22 @@ const MEMBER: &str = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[depende
 /// A registry nothing is listening on: `connect` fails at once.
 const CONFIG: &str = "[rust]\nregistry = \"http://127.0.0.1:1\"\n";
 
-fn workdir(name: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
-    let _ = fs::remove_dir_all(&dir);
+/// A fresh, empty scratch directory no other test process can pick, named after
+/// `name`.
+///
+/// The directory is removed when the returned guard drops, so bind it to a named
+/// variable (`_tmp`, not `_`) for the length of the test.
+fn scratch(name: &str) -> (TempDir, PathBuf) {
+    let tmp = tempfile::Builder::new()
+        .prefix(name)
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
+    let dir = tmp.path().to_path_buf();
+    (tmp, dir)
+}
+
+fn workdir(name: &str) -> (TempDir, PathBuf) {
+    let (tmp, dir) = scratch(name);
     fs::create_dir_all(dir.join("crates/app")).unwrap();
     // A repository boundary: without it both upward walks climb out of the temp dir and
     // into this repository, which has a `Cargo.lock` of its own.
@@ -37,7 +51,7 @@ fn workdir(name: &str) -> PathBuf {
     fs::write(dir.join("Cargo.toml"), ROOT).unwrap();
     fs::write(dir.join("crates/app/Cargo.toml"), MEMBER).unwrap();
     fs::write(dir.join("dependable.toml"), CONFIG).unwrap();
-    dir
+    (tmp, dir)
 }
 
 fn check_json(dir: &Path, args: &[&str]) -> Value {
@@ -70,7 +84,7 @@ fn result<'a>(doc: &'a Value, manifest_suffix: &str, name: &str) -> &'a Value {
 /// the run, and the crate went unchecked entirely.
 #[test]
 fn a_member_checked_on_its_own_still_gets_the_roots_constraint() {
-    let dir = workdir("workspace_member_alone");
+    let (_tmp, dir) = workdir("workspace_member_alone");
     let member = dir.join("crates/app/Cargo.toml");
 
     let doc = check_json(&dir, &["check", "--manifest", member.to_str().unwrap()]);
@@ -110,13 +124,15 @@ fn a_member_checked_on_its_own_still_gets_the_roots_constraint() {
 /// opts in — one entry per declaration, because each is a place a reader has to look.
 #[test]
 fn a_whole_workspace_scan_reports_the_root_and_the_member() {
-    let dir = workdir("workspace_whole_scan");
+    let (_tmp, dir) = workdir("workspace_whole_scan");
 
     let doc = check_json(&dir, &["check", dir.to_str().unwrap()]);
 
     // Not `/Cargo.toml`: the member's path ends with that too, so a suffix that loose
-    // picks whichever result happens to come first.
-    let declared = result(&doc, "workspace_whole_scan/Cargo.toml", "serde");
+    // picks whichever result happens to come first. The scratch directory's name is
+    // unique per run, so read it back rather than spelling it.
+    let root = format!("{}/Cargo.toml", dir.file_name().unwrap().to_str().unwrap());
+    let declared = result(&doc, &root, "serde");
     assert_eq!(declared["kind"], "workspace");
     assert!(
         declared["inherited_from"].is_null(),
@@ -149,11 +165,14 @@ fn a_relative_path_never_adopts_the_current_directorys_workspace() {
     const SIBLING_ROOT: &str =
         "[workspace]\nmembers = []\n\n[workspace.dependencies]\nserde = \"9.9.9\"\n";
 
-    let base = std::env::temp_dir().join("dependable-test-relative-workspace-escape");
-    let _ = fs::remove_dir_all(&base);
+    // Uniquely named, so no other test process can wipe it mid-run.
+    let tmp = tempfile::Builder::new()
+        .prefix("dependable-test-relative-workspace-escape")
+        .tempdir()
+        .unwrap();
+    let base = tmp.path().canonicalize().expect("canonical");
     fs::create_dir_all(base.join("myworkspace")).unwrap();
     fs::create_dir_all(base.join("standalone")).unwrap();
-    let base = base.canonicalize().expect("canonical");
 
     fs::write(base.join("myworkspace/Cargo.toml"), SIBLING_ROOT).unwrap();
     // A sibling of that workspace, belonging to nothing.
@@ -199,7 +218,7 @@ fn a_relative_path_never_adopts_the_current_directorys_workspace() {
 /// be worse than saying nothing, especially beside a warning that says the opposite.
 #[test]
 fn a_constraint_the_root_never_declared_is_attributed_to_nobody() {
-    let dir = workdir("workspace_undeclared_attribution");
+    let (_tmp, dir) = workdir("workspace_undeclared_attribution");
     fs::write(
         dir.join("crates/app/Cargo.toml"),
         "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\ntokio.workspace = true\n",
@@ -229,8 +248,7 @@ fn a_constraint_the_root_never_declared_is_attributed_to_nobody() {
 /// undetermined rather than local is the right call; doing it silently is not.
 #[test]
 fn a_package_inheriting_from_no_workspace_at_all_says_so() {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("workspace_detached_member");
-    let _ = fs::remove_dir_all(&dir);
+    let (_tmp, dir) = scratch("workspace_detached_member");
     fs::create_dir_all(dir.join(".git")).unwrap();
     // A package, not a workspace: nothing above it declares `serde`, and the `.git`
     // marker stops the walk before it reaches this repository's own root.

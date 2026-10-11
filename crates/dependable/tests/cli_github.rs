@@ -18,6 +18,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use tempfile::TempDir;
+
 /// Two registry dependencies, on known lines: `serde` is line 6 and `tokio`
 /// line 7, one-based, which is what the annotations must report.
 const CARGO_TOML: &str = "[package]\nname = \"sample\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1.0\"\ntokio = \"1.20\"\n";
@@ -25,13 +27,25 @@ const CARGO_TOML: &str = "[package]\nname = \"sample\"\nversion = \"0.1.0\"\n\n[
 /// A registry nothing is listening on: `connect` fails at once.
 const CONFIG: &str = "[rust]\nregistry = \"http://127.0.0.1:1\"\n";
 
-fn workdir(name: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
+/// A fresh, empty scratch directory no other test process can pick, named after
+/// `name`.
+///
+/// The directory is removed when the returned guard drops, so bind it to a named
+/// variable (`_tmp`, not `_`) for the length of the test.
+fn scratch(name: &str) -> (TempDir, PathBuf) {
+    let tmp = tempfile::Builder::new()
+        .prefix(name)
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
+    let dir = tmp.path().to_path_buf();
+    (tmp, dir)
+}
+
+fn workdir(name: &str) -> (TempDir, PathBuf) {
+    let (tmp, dir) = scratch(name);
     fs::write(dir.join("Cargo.toml"), CARGO_TOML).unwrap();
     fs::write(dir.join(".dependable.toml"), CONFIG).unwrap();
-    dir
+    (tmp, dir)
 }
 
 /// A `dependable check` over `dir` with the ambient GitHub variables cleared,
@@ -61,7 +75,7 @@ fn stderr_of(output: &Output) -> String {
 
 #[test]
 fn annotations_ride_stderr_so_stdout_stays_one_json_document() {
-    let dir = workdir("github_json_and_annotations");
+    let (_tmp, dir) = workdir("github_json_and_annotations");
     let output = check(
         &dir,
         &["--format", "json", "--annotations", "always"],
@@ -88,7 +102,7 @@ fn annotations_ride_stderr_so_stdout_stays_one_json_document() {
 
 #[test]
 fn annotations_carry_a_repo_relative_file_and_a_one_based_line() {
-    let dir = workdir("github_annotation_shape");
+    let (_tmp, dir) = workdir("github_annotation_shape");
     let output = check(
         &dir,
         &["--annotations", "always"],
@@ -114,7 +128,7 @@ fn annotations_carry_a_repo_relative_file_and_a_one_based_line() {
 
 #[test]
 fn never_silences_every_command() {
-    let dir = workdir("github_never");
+    let (_tmp, dir) = workdir("github_never");
     let output = check(
         &dir,
         &["--annotations", "never"],
@@ -126,7 +140,7 @@ fn never_silences_every_command() {
 
 #[test]
 fn auto_is_off_when_the_runner_is_not_present() {
-    let dir = workdir("github_auto_off");
+    let (_tmp, dir) = workdir("github_auto_off");
     let output = check(&dir, &[], &[]);
     let stderr = stderr_of(&output);
     assert!(!stderr.contains("::"), "{stderr}");
@@ -134,7 +148,7 @@ fn auto_is_off_when_the_runner_is_not_present() {
 
 #[test]
 fn auto_is_on_under_the_runner() {
-    let dir = workdir("github_auto_on");
+    let (_tmp, dir) = workdir("github_auto_on");
     let output = check(&dir, &[], &[("GITHUB_ACTIONS", "true")]);
     let stderr = stderr_of(&output);
     assert!(stderr.contains("::notice "), "{stderr}");
@@ -142,7 +156,7 @@ fn auto_is_on_under_the_runner() {
 
 #[test]
 fn the_step_summary_is_written_and_appended_to() {
-    let dir = workdir("github_summary");
+    let (_tmp, dir) = workdir("github_summary");
     let summary = dir.join("summary.md");
     let env = [
         ("GITHUB_WORKSPACE", dir.to_str().unwrap()),
@@ -165,7 +179,7 @@ fn the_step_summary_is_written_and_appended_to() {
 
 #[test]
 fn the_summary_is_not_written_when_annotations_are_off() {
-    let dir = workdir("github_summary_never");
+    let (_tmp, dir) = workdir("github_summary_never");
     let summary = dir.join("summary.md");
     check(
         &dir,
@@ -180,7 +194,7 @@ fn the_summary_is_not_written_when_annotations_are_off() {
 
 #[test]
 fn an_unwritable_summary_warns_without_changing_the_exit_code() {
-    let dir = workdir("github_summary_unwritable");
+    let (_tmp, dir) = workdir("github_summary_unwritable");
     // A directory, so opening it for append fails.
     let blocked = dir.join("blocked");
     fs::create_dir_all(&blocked).unwrap();
@@ -205,7 +219,7 @@ fn an_unwritable_summary_warns_without_changing_the_exit_code() {
 
 #[test]
 fn annotations_do_not_move_the_exit_code() {
-    let dir = workdir("github_exit_codes");
+    let (_tmp, dir) = workdir("github_exit_codes");
     let lenient = check(
         &dir,
         &["--annotations", "always", "--fail-on", "none"],
@@ -225,7 +239,7 @@ fn annotations_do_not_move_the_exit_code() {
 
 #[test]
 fn quiet_empties_stdout_but_keeps_the_annotations() {
-    let dir = workdir("github_quiet");
+    let (_tmp, dir) = workdir("github_quiet");
     let output = check(
         &dir,
         &["--quiet", "--annotations", "always"],
@@ -266,16 +280,14 @@ const PACKAGE_RESOLVED: &str = r#"{
 ///
 /// Deliberately *not* [`workdir`]: a `Cargo.toml` in the same directory would
 /// contribute rows of its own and the counts below would stop meaning anything.
-fn swift_workdir(name: &str, resolved: bool) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
+fn swift_workdir(name: &str, resolved: bool) -> (TempDir, PathBuf) {
+    let (tmp, dir) = scratch(name);
     fs::write(dir.join("Package.swift"), PACKAGE_SWIFT).unwrap();
     if resolved {
         fs::write(dir.join("Package.resolved"), PACKAGE_RESOLVED).unwrap();
     }
     fs::write(dir.join(".dependable.toml"), CONFIG).unwrap();
-    dir
+    (tmp, dir)
 }
 
 /// The undetermined case: the pins were read, and not one of them could be
@@ -288,7 +300,7 @@ fn swift_workdir(name: &str, resolved: bool) -> PathBuf {
 /// making; the job summary is the one a pull request actually renders.
 #[test]
 fn the_summary_never_calls_an_undetermined_swift_project_clean() {
-    let dir = swift_workdir("github_swift_undetermined", true);
+    let (_tmp, dir) = swift_workdir("github_swift_undetermined", true);
     let summary = dir.join("summary.md");
     let output = check(
         &dir,
@@ -323,7 +335,7 @@ fn the_summary_never_calls_an_undetermined_swift_project_clean() {
 /// identical to a project with no dependencies. Only the caveat separates them.
 #[test]
 fn the_summary_never_calls_an_unread_swift_project_clean() {
-    let dir = swift_workdir("github_swift_unread", false);
+    let (_tmp, dir) = swift_workdir("github_swift_unread", false);
     let summary = dir.join("summary.md");
     let output = check(
         &dir,
@@ -368,9 +380,7 @@ fn the_summary_never_calls_an_unread_swift_project_clean() {
 /// run that genuinely earned it.
 #[test]
 fn a_genuinely_clean_run_still_gets_the_all_clear() {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("github_clean_all_clear");
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
+    let (_tmp, dir) = scratch("github_clean_all_clear");
     // No dependencies at all: nothing to check, and nothing left unchecked.
     fs::write(
         dir.join("Cargo.toml"),
