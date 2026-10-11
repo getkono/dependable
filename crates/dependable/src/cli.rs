@@ -76,9 +76,10 @@ pub struct CheckArgs {
     /// registers no fetcher that was not already there.
     #[arg(long, value_enum, conflicts_with = "manifest")]
     pub ecosystem: Vec<EcosystemArg>,
-    /// Config file path.
-    #[arg(long, default_value = ".dependable.toml")]
-    pub config: PathBuf,
+    /// Config file path (default: `.dependable.toml`, skipped when absent). A file
+    /// named here must exist: a missing one is an error, not a silent fallback.
+    #[arg(long)]
+    pub config: Option<PathBuf>,
     /// Pre-release filter: `exclude` (default), `include-always`, or
     /// `include-if-current`. Overrides `[global] unstable`.
     #[arg(long, value_enum)]
@@ -149,9 +150,10 @@ pub struct ListArgs {
     pub ecosystem: Vec<EcosystemArg>,
     /// Config file path. `list` reads only the per-ecosystem `enabled` flags from
     /// it, so that an ecosystem you have switched off is not warned about; it does
-    /// not read registry or network settings.
-    #[arg(long, default_value = ".dependable.toml")]
-    pub config: PathBuf,
+    /// not read registry or network settings. Defaults to `.dependable.toml`,
+    /// skipped when absent; a file named here must exist.
+    #[arg(long)]
+    pub config: Option<PathBuf>,
     /// Output format: `table` for reading, `json` for the full inventory, `text` for
     /// one tab-separated line per dependency.
     #[arg(long, value_enum, default_value_t = Format::Table)]
@@ -221,8 +223,10 @@ pub struct FixArgs {
     /// registers no fetcher that was not already there.
     #[arg(long, value_enum, conflicts_with = "manifest")]
     pub ecosystem: Vec<EcosystemArg>,
-    #[arg(long, default_value = ".dependable.toml")]
-    pub config: PathBuf,
+    /// Config file path (default: `.dependable.toml`, skipped when absent). A file
+    /// named here must exist: a missing one is an error, not a silent fallback.
+    #[arg(long)]
+    pub config: Option<PathBuf>,
     /// Update all, including beyond the declared constraint.
     #[arg(long)]
     pub all: bool,
@@ -252,9 +256,10 @@ pub struct FixArgs {
 pub struct TuiArgs {
     /// Project directory to explore (default: current directory).
     pub path: Option<PathBuf>,
-    /// Config file path.
-    #[arg(long, default_value = ".dependable.toml")]
-    pub config: PathBuf,
+    /// Config file path (default: `.dependable.toml`, skipped when absent). A file
+    /// named here must exist: a missing one is an error, not a silent fallback.
+    #[arg(long)]
+    pub config: Option<PathBuf>,
     /// How many directories deep to search for manifests.
     #[arg(long, default_value_t = 3)]
     pub depth: usize,
@@ -268,7 +273,7 @@ impl Default for TuiArgs {
     fn default() -> Self {
         Self {
             path: None,
-            config: PathBuf::from(".dependable.toml"),
+            config: None,
             depth: 3,
             verbose: false,
         }
@@ -288,9 +293,10 @@ pub struct ReportArgs {
     /// Report on a single manifest file instead of discovering them.
     #[arg(long)]
     pub manifest: Option<PathBuf>,
-    /// Config file path.
-    #[arg(long, default_value = ".dependable.toml")]
-    pub config: PathBuf,
+    /// Config file path (default: `.dependable.toml`, skipped when absent). A file
+    /// named here must exist: a missing one is an error, not a silent fallback.
+    #[arg(long)]
+    pub config: Option<PathBuf>,
     /// How many directories deep to search.
     #[arg(long, default_value_t = 3)]
     pub depth: usize,

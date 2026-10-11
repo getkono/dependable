@@ -18,9 +18,11 @@ inputs:
     required: false
     default: ''
   config:
-    description: 'Config file path.'
+    description: >-
+      Config file path, which must exist. Empty means the CLI default:
+      .dependable.toml when present, built-in defaults otherwise.
     required: false
-    default: '.dependable.toml'
+    default: ''
   fail-on:
     description: >-
       Result level that fails the step: none, outdated, vulnerable, or any.

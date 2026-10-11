@@ -307,7 +307,9 @@ impl Default for VulnConfig {
 
 /// Load configuration: defaults overlaid with `path` (if present).
 ///
-/// A missing file is not an error — defaults are used.
+/// A missing file is not an error — defaults are used. That leniency is for the
+/// unnamed default only: the CLI refuses a `--config` file that does not exist
+/// before it gets here.
 ///
 /// # Errors
 /// A file that is present but cannot be read into the schema is an error. It used to

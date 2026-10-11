@@ -158,6 +158,36 @@ fn a_typo_outside_the_policy_block_is_also_an_error() {
     assert!(stderr.contains("concurrency"), "stderr: {stderr}");
 }
 
+/// A `--config` that names a missing file used to be indistinguishable from the
+/// unnamed default, so a moved CI config ran on defaults and every `[policy]` gate
+/// in it vanished with nothing on stderr.
+#[test]
+fn a_named_config_that_does_not_exist_refuses_the_run() {
+    let (tmp, _config) = config("policy_missing_config", DENY_LEFT_PAD);
+    let missing = tmp.path().join("moved.toml");
+
+    let output = check(&missing, &["--no-vuln"], &[]);
+    let stderr = stderr(&output);
+
+    assert_eq!(code(&output), 2, "stderr: {stderr}");
+    // The same `reading PATH: why` shape as a config that does not parse.
+    assert!(
+        stderr.contains(&format!("reading {}", missing.display())),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn a_named_config_that_is_a_directory_refuses_the_run() {
+    let (tmp, _config) = config("policy_dir_config", DENY_LEFT_PAD);
+
+    let output = check(tmp.path(), &["--no-vuln"], &[]);
+    let stderr = stderr(&output);
+
+    assert_eq!(code(&output), 2, "stderr: {stderr}");
+    assert!(stderr.contains("not a file"), "stderr: {stderr}");
+}
+
 #[test]
 fn the_kill_switch_disables_the_gate_without_a_flag() {
     let (_tmp, config) = config("policy_kill_switch", DENY_LEFT_PAD);

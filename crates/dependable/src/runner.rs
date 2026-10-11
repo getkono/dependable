@@ -420,24 +420,49 @@ fn progress_sink() -> Arc<dyn Fn(ProgressEvent) + Send + Sync> {
     })
 }
 
+/// The config file read when `--config` is not given.
+const DEFAULT_CONFIG: &str = ".dependable.toml";
+
+/// Read the config every subcommand starts from, returning the path it came from
+/// alongside it.
+///
+/// Only the default may be missing. `--config` used to carry `.dependable.toml` as
+/// a clap default, which left no way to tell a named file from an unnamed one, so a
+/// workflow whose `--config ci/dependable.toml` had been moved ran on defaults —
+/// every `[policy]` gate gone, nothing on stderr. A named file is now an error
+/// unless it exists, in the same `reading PATH: why` shape as a file that does not
+/// parse; the default stays a silent fallback.
+fn read_config(named: Option<&Path>) -> anyhow::Result<(PathBuf, Config)> {
+    let path = match named {
+        Some(path) => {
+            let meta =
+                std::fs::metadata(path).with_context(|| format!("reading {}", path.display()))?;
+            anyhow::ensure!(meta.is_file(), "reading {}: not a file", path.display());
+            path.to_path_buf()
+        }
+        None => PathBuf::from(DEFAULT_CONFIG),
+    };
+    let cfg = load_config(&path).with_context(|| format!("reading {}", path.display()))?;
+    Ok((path, cfg))
+}
+
 /// `dependable check`
 pub async fn run_check(args: CheckArgs) -> anyhow::Result<ExitCode> {
-    let cfg =
-        load_config(&args.config).with_context(|| format!("reading {}", args.config.display()))?;
+    let (config, cfg) = read_config(args.config.as_deref())?;
     let settings = resolve_check_settings(&args, &cfg)?;
     check_fail_on_is_enforceable(settings.fail_on, settings.check_vuln)?;
     // Both policy steps run before discovery, so a misconfigured gate costs a
     // parse rather than a full network check.
     #[cfg(feature = "report")]
     let policy = {
-        let policy = resolve_policy(&args.config)?;
+        let policy = resolve_policy(&config)?;
         if let Some(policy) = &policy {
             check_policy_is_enforceable(policy, settings.check_vuln)?;
         }
         policy
     };
     #[cfg(not(feature = "report"))]
-    warn_policy_ignored(&args.config);
+    warn_policy_ignored(&config);
 
     let ecosystems = requested_ecosystems(&args.ecosystem);
     let manifests = collect_manifests(
@@ -748,8 +773,7 @@ pub async fn run_list(args: ListArgs) -> anyhow::Result<ExitCode> {
     // Fallible for the same reason as every other command: the file decides which
     // ecosystems are on, so a config that cannot be read must not be silently
     // replaced by defaults that enable all of them.
-    let cfg =
-        load_config(&args.config).with_context(|| format!("reading {}", args.config.display()))?;
+    let (_, cfg) = read_config(args.config.as_deref())?;
     let ecosystems = requested_ecosystems(&args.ecosystem);
     let manifests = collect_manifests(
         args.manifest.as_deref(),
@@ -986,8 +1010,7 @@ fn relative_to(root: &Path, manifest: &Path) -> PathBuf {
 /// Returns an error if the checker cannot be built or the terminal cannot be
 /// configured.
 pub async fn run_tui(args: TuiArgs) -> anyhow::Result<ExitCode> {
-    let cfg =
-        load_config(&args.config).with_context(|| format!("reading {}", args.config.display()))?;
+    let (_, cfg) = read_config(args.config.as_deref())?;
     let settings = tui_settings(&cfg);
     // No progress bar: the UI draws its own screen.
     let engine = Engine::new(&settings, &cfg, false)?;
@@ -1055,8 +1078,7 @@ pub fn run_tree(args: TreeArgs) -> anyhow::Result<ExitCode> {
 
 /// `dependable fix`
 pub async fn run_fix(args: FixArgs) -> anyhow::Result<ExitCode> {
-    let cfg =
-        load_config(&args.config).with_context(|| format!("reading {}", args.config.display()))?;
+    let (_, cfg) = read_config(args.config.as_deref())?;
     let settings = Settings {
         concurrency: args.concurrency.unwrap_or(cfg.global.concurrency).max(1),
         depth: args.depth,
@@ -1403,8 +1425,7 @@ fn load_template_overrides(root: &Path) -> anyhow::Result<BTreeMap<String, Strin
 pub async fn run_report(args: crate::cli::ReportArgs) -> anyhow::Result<ExitCode> {
     use std::io::Write;
 
-    let cfg =
-        load_config(&args.config).with_context(|| format!("reading {}", args.config.display()))?;
+    let (_, cfg) = read_config(args.config.as_deref())?;
     let settings = resolve_report_settings(&args, &cfg)?;
     let root = args.path.clone().unwrap_or_else(|| PathBuf::from("."));
 
