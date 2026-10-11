@@ -842,7 +842,9 @@ fn json_distinguishes_an_unread_dependency_list_from_an_empty_one() {
 
 /// The same distinction in SARIF, which has no summary object to carry a counter:
 /// the unread manifest gets a `DEP003` result naming it, and the empty one gets the
-/// empty `results` array it has earned.
+/// empty `results` array it has earned. SARIF exists only in a build carrying the
+/// `report` feature.
+#[cfg(feature = "report")]
 #[test]
 fn sarif_reports_an_unread_dependency_list_as_a_finding() {
     let unread_dir = scratch("swift_sarif_unread");
@@ -951,6 +953,8 @@ fn sarif_reports_an_unread_dependency_list_as_a_finding() {
 /// so the quiet artifact for a Swift project with no `Package.resolved` was
 /// byte-for-byte the shape of a resolved, clean one, right down to §3 asserting
 /// "This manifest declares no dependencies", which nothing had established.
+/// The `report` subcommand exists only in a build carrying the `report` feature.
+#[cfg(feature = "report")]
 #[test]
 fn a_quiet_html_report_still_says_the_dependency_list_went_unread() {
     let unread_dir = scratch("swift_html_unread");

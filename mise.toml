@@ -46,6 +46,21 @@ depends = ["test"]
 run = "cargo test --workspace"
 env = { FORCE_COLOR = "3" }
 
+# `dependable`'s default features (`report`) are on in every other task, so this
+# is the only thing that builds and tests the feature-off configuration. The
+# `check` names the binary's own build as a failure separate from its tests.
+#
+# `wait_for` rather than `depends`: it must not run beside `test` or `test:color`
+# (the CLI integration tests share fixed-name scratch fixtures under
+# `CARGO_TARGET_TMPDIR`), but running it alone should not drag them in.
+[tasks."test:no-default-features"]
+description = "Build and test the workspace with default features off"
+wait_for = ["test", "test:color"]
+run = [
+  "cargo check --no-default-features -p dependable",
+  "cargo test --workspace --no-default-features",
+]
+
 [tasks."test:live"]
 description = "Run the live network smoke tests (hits crates.io + OSV)"
 run = "cargo test --workspace -- --ignored"
@@ -75,5 +90,5 @@ description = "Check that commits on this branch follow Conventional Commits"
 run = "convco check master..HEAD"
 
 [tasks.ci]
-description = "Run the full local CI gate: format check, lint, and tests (both color modes)"
-depends = ["fmt:check", "lint", "test", "test:color"]
+description = "Run the full local CI gate: format check, lint, tests (both color modes), and the default-features-off build"
+depends = ["fmt:check", "lint", "test", "test:color", "test:no-default-features"]
