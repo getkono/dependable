@@ -394,7 +394,7 @@ fn a_bare_nuget_version_is_exact_and_so_resolves() {
 /// looks. npm itself reads a bare `1.3.0` as exact, but this tree's translator
 /// reads it as a caret range, as Cargo does, so `left-pad` is not reported. This
 /// records the current reading, not an endorsement of it: #155 tracks the npm
-/// defect (and #149 the same one for Dart), and fixing it flips this assertion.
+/// defect, and fixing it flips this assertion.
 #[test]
 fn a_bare_npm_version_is_read_as_a_range_by_this_tree() {
     let dir = TempDir::new().expect("tempdir");
@@ -415,6 +415,30 @@ fn a_bare_npm_version_is_read_as_a_range_by_this_tree() {
     assert_eq!(version_of(&built.graph, "left-pad"), None);
     // npm's explicit `=` is the one form that does name a single release.
     assert_eq!(version_of(&built.graph, "pinned"), Some("4.17.21"));
+}
+
+/// pub reads a bare `6.0.5` as exactly that release and spells the caret range
+/// `^6.0.5` (#149), so a pubspec's bare version is one the manifest settled and
+/// `tree` reports it, while a `^` constraint, a range, and `any` stay unknown.
+#[test]
+fn a_bare_pubspec_version_is_exact_and_so_resolves() {
+    let dir = TempDir::new().expect("tempdir");
+    write(
+        &dir.path().join("pubspec.yaml"),
+        "name: app\nversion: 1.0.0\ndependencies:\n  provider: \"6.0.5\"\n  http: ^1.1.0\n  \
+         meta: any\n  collection: \">=1.0.0 <2.0.0\"\n",
+    );
+
+    let built = build_project_graph(
+        &dir.path().join("pubspec.yaml"),
+        &WorkspaceGraphOptions::default(),
+    )
+    .expect("graph");
+
+    assert_eq!(version_of(&built.graph, "provider"), Some("6.0.5"));
+    assert_eq!(version_of(&built.graph, "http"), None);
+    assert_eq!(version_of(&built.graph, "meta"), None);
+    assert_eq!(version_of(&built.graph, "collection"), None);
 }
 
 /// Candidacy is `Item::is_checkable()`, the existing predicate for "there is a
