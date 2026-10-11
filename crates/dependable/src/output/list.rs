@@ -25,7 +25,8 @@ use crate::output::posix;
 /// those fields are likewise open and always have been: `source` already falls back
 /// to `"unknown"` for a variant this function does not name, so a consumer that
 /// matched exhaustively on them was never safe. Adding a token (`"locked"`) or a
-/// field (`dependencies_unread`) therefore stays within `v1`.
+/// field (`dependencies_unread`, `summary.manifests_unread`) therefore stays within
+/// `v1`.
 /// The README states the same policy for readers who never open this file.
 const SCHEMA: &str = "dependable.list/v1";
 
@@ -152,6 +153,13 @@ fn table(reports: &[ProjectReport]) {
 }
 
 /// Machine-readable line output: one tab-separated record per dependency.
+///
+/// A project whose dependency list went unread therefore writes nothing here, and
+/// deliberately: every line of this format is a dependency, with a fixed arity, and
+/// a manifest-level record or a sentinel name would break that for every consumer
+/// (a sentinel is also a string a real package could hold). The fact is carried by
+/// the warning on stderr, which every `--format` prints, and by `--format json`'s
+/// `dependencies_unread` and `summary.manifests_unread`. The README says the same.
 fn text(reports: &[ProjectReport]) {
     for report in reports {
         let label = report.label();
@@ -177,11 +185,13 @@ fn text(reports: &[ProjectReport]) {
 fn json(reports: &[ProjectReport], root: &Path) -> anyhow::Result<()> {
     let mut by_ecosystem: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut dependencies = 0;
+    let mut manifests_unread = 0;
     for report in reports {
         *by_ecosystem
             .entry(report.ecosystem.display_name())
             .or_default() += 1;
         dependencies += report.items.len();
+        manifests_unread += usize::from(report.dependencies_unread);
     }
 
     let projects = reports
@@ -222,6 +232,7 @@ fn json(reports: &[ProjectReport], root: &Path) -> anyhow::Result<()> {
         summary: SummaryDto {
             projects: reports.len(),
             dependencies,
+            manifests_unread,
             by_ecosystem,
         },
         projects,
@@ -242,6 +253,15 @@ struct Output<'a> {
 struct SummaryDto {
     projects: usize,
     dependencies: usize,
+    /// How many of the [`projects`](Self::projects) had their dependency list go
+    /// unread — the count of `dependencies_unread: true` across `projects`, so a
+    /// consumer can ask "was anything here unread?" without iterating.
+    ///
+    /// Named as `check --format json` names the same count, so a consumer reading
+    /// both documents meets one name for one fact, even though this summary counts
+    /// `projects` where `check`'s counts `manifests`: every project here *is* one
+    /// discovered manifest. Additive, so the schema is unchanged.
+    manifests_unread: usize,
     by_ecosystem: BTreeMap<&'static str, usize>,
 }
 

@@ -487,7 +487,12 @@ dependable list --licenses         # add each dependency's declared license
 {
   "schema": "dependable.list/v1",
   "root": ".",
-  "summary": { "projects": 4, "dependencies": 53, "by_ecosystem": { "Rust": 4 } },
+  "summary": {
+    "projects": 4,
+    "dependencies": 53,
+    "manifests_unread": 0,
+    "by_ecosystem": { "Rust": 4 }
+  },
   "projects": [
     {
       "name": "dependable-core",
@@ -530,8 +535,18 @@ went unread, so an empty `dependencies` array says nothing about it — today on
 `Package.swift` with no readable `Package.resolved` beside it. `lockfile: null` is not
 the same question, since `--no-lock-file` produces that too, and a `Package.resolved`
 that records no pins leaves `dependencies_unread` false because the project really
-does declare nothing. The table output heads such a project `(dependency list unread)`
-in place of a count, in the same words `check` uses.
+does declare nothing. `summary.manifests_unread` counts the projects with
+`dependencies_unread` true — the same name `check --format json` gives the same count —
+so "was anything here unread?" needs no pass over `projects`. The table output heads
+such a project `(dependency list unread)` in place of a count, in the same words
+`check` uses.
+
+`--format text` writes one record per dependency and nothing else, so a project whose
+dependency list went unread writes no line at all — the same as one that declares
+nothing. That is deliberate: a manifest-level record or a placeholder name would break
+the rule that every line is a dependency. The warning on stderr, printed under every
+`--format`, is where `text` reports an unread list; a script that has to tell the two
+apart reads `--format json`.
 
 Values a single manifest cannot supply are resolved from the repository and marked as
 such: `version_inherited` for a Cargo `version.workspace = true`, `inherited` for a

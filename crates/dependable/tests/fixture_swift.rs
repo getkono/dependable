@@ -1214,7 +1214,41 @@ fn list_json_distinguishes_an_unread_dependency_list_from_an_empty_one() {
     assert_eq!(unread["summary"]["dependencies"], 0);
     assert_eq!(empty["summary"]["dependencies"], 0);
 
+    // The summary answers "was anything unread?" without iterating `projects`, under
+    // the name `check --format json` gives the same count.
+    assert_eq!(unread["summary"]["manifests_unread"], 1);
+    assert_eq!(empty["summary"]["manifests_unread"], 0);
+
     // An added field stays within v1; a consumer pinning the version keeps working.
     assert_eq!(unread["schema"], "dependable.list/v1");
     assert_eq!(empty["schema"], "dependable.list/v1");
+}
+
+/// `list --format text` is one record per dependency and nothing else, so an
+/// unread dependency list writes no record — by design, since a manifest-level line
+/// or a sentinel name would break that contract. What carries the fact for this
+/// format is the warning on stderr, and this pins that it is still there: without
+/// it a `text` consumer would have no channel at all.
+#[test]
+fn list_text_writes_no_record_for_an_unread_list_and_warns_on_stderr() {
+    let unread_dir = scratch("swift_list_text_unread");
+    std::fs::copy(
+        fixture("sample-swift/Package.swift"),
+        unread_dir.join("Package.swift"),
+    )
+    .unwrap();
+
+    let output = run(&["list", unread_dir.to_str().unwrap(), "--format", "text"]);
+    assert!(output.status.success(), "an unread list is not a failure");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.is_empty(),
+        "every line of `text` is a dependency, and there are none: {stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("warning:") && stderr.contains("Package.swift"),
+        "stderr is the channel `text` reports an unread list on: {stderr}"
+    );
 }

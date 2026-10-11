@@ -67,6 +67,9 @@ fn reports_every_project_in_a_workspace_with_its_identity() {
     assert_eq!(doc["schema"], "dependable.list/v1");
     assert_eq!(doc["summary"]["projects"], 3);
     assert_eq!(doc["summary"]["by_ecosystem"]["Rust"], 3);
+    // Always emitted, and zero where every list was read: a consumer can read the
+    // key unconditionally rather than treating its absence as "none".
+    assert_eq!(doc["summary"]["manifests_unread"], 0);
 
     let app = project(&doc, "app");
     assert_eq!(app["version"], "0.1.0");
