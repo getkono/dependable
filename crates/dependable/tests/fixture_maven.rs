@@ -15,6 +15,7 @@ use std::process::{Command, Output};
 use dependable_fetch::core::{DependencyKind, Item, PackageSource, parse, parse_project};
 use dependable_fetch::{Ecosystem, ManifestKind};
 use serde_json::Value;
+use tempfile::TempDir;
 
 fn fixture(rel: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -207,11 +208,17 @@ fn the_cli_lists_an_unresolvable_dependency_instead_of_omitting_it() {
 /// A registry nothing is listening on: `connect` fails at once.
 const OFFLINE: &str = "[jvm]\nregistry = \"http://127.0.0.1:1\"\n";
 
-/// A temp directory holding one `pom.xml`, walled off from this repository.
-fn pom_dir(name: &str, body: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
+/// A temp directory holding one `pom.xml`, walled off from this repository, that
+/// no other test process can pick, named after `name`.
+///
+/// The directory is removed when the returned guard drops, so bind it to a named
+/// variable (`_tmp`, not `_`) for the length of the test.
+fn pom_dir(name: &str, body: &str) -> (TempDir, PathBuf) {
+    let tmp = tempfile::Builder::new()
+        .prefix(name)
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
+    let dir = tmp.path().to_path_buf();
     // A repository boundary, so the discovery walk stays inside the temp dir.
     fs::create_dir_all(dir.join(".git")).unwrap();
     fs::write(dir.join("dependable.toml"), OFFLINE).unwrap();
@@ -225,7 +232,7 @@ fn pom_dir(name: &str, body: &str) -> PathBuf {
         ),
     )
     .unwrap();
-    dir
+    (tmp, dir)
 }
 
 /// Run the CLI in `dir`. `--config` and the hermetic flags belong to the
@@ -299,7 +306,7 @@ const PARENT_ONLY: &str = "  <parent>\n    \
 /// read. It also contradicted `list`, which calls the same entry `(unresolved)`.
 #[test]
 fn a_version_supplied_by_a_parent_is_undetermined_and_never_called_local() {
-    let dir = pom_dir("maven_parent_only", PARENT_ONLY);
+    let (_tmp, dir) = pom_dir("maven_parent_only", PARENT_ONLY);
     let doc = check_json(&dir, &[]);
 
     for artifact in ["spring-boot-starter-web", "spring-boot-starter-test"] {
@@ -322,7 +329,7 @@ fn a_version_supplied_by_a_parent_is_undetermined_and_never_called_local() {
 /// person and a shell pipeline actually read.
 #[test]
 fn the_table_and_the_text_format_both_say_undetermined() {
-    let dir = pom_dir("maven_parent_only_surfaces", PARENT_ONLY);
+    let (_tmp, dir) = pom_dir("maven_parent_only_surfaces", PARENT_ONLY);
 
     let table = run(&dir, &["check", "."]);
     let stdout = String::from_utf8_lossy(&table.stdout);
@@ -352,7 +359,7 @@ fn the_table_and_the_text_format_both_say_undetermined() {
 /// hermetic helper disables.)
 #[test]
 fn fail_on_any_does_not_pass_a_pom_whose_versions_were_never_read() {
-    let dir = pom_dir("maven_parent_only_gate", PARENT_ONLY);
+    let (_tmp, dir) = pom_dir("maven_parent_only_gate", PARENT_ONLY);
     for (gate, expected) in [("any", false), ("outdated", true)] {
         let output = run(&dir, &["check", ".", "--fail-on", gate]);
         assert_eq!(
@@ -368,7 +375,7 @@ fn fail_on_any_does_not_pass_a_pom_whose_versions_were_never_read() {
 /// was empty, and a reader looking at a table of dashes had to infer it.
 #[test]
 fn a_pom_whose_versions_were_not_read_says_so_on_stderr() {
-    let dir = pom_dir("maven_parent_only_warning", PARENT_ONLY);
+    let (_tmp, dir) = pom_dir("maven_parent_only_warning", PARENT_ONLY);
     let output = run(&dir, &["check", ".", "--format", "json"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -385,7 +392,7 @@ fn a_pom_whose_versions_were_not_read_says_so_on_stderr() {
 /// and is just as common.
 #[test]
 fn a_version_supplied_by_the_files_own_dependency_management_is_undetermined() {
-    let dir = pom_dir(
+    let (_tmp, dir) = pom_dir(
         "maven_managed_only",
         "  <dependencyManagement>\n    \
          <dependencies>\n      \
@@ -413,7 +420,7 @@ fn a_version_supplied_by_the_files_own_dependency_management_is_undetermined() {
 /// still `LOCAL`, and must stay that way, or the new status means nothing.
 #[test]
 fn a_system_scoped_jar_is_still_local() {
-    let dir = pom_dir(
+    let (_tmp, dir) = pom_dir(
         "maven_system_scope",
         "  <dependencies>\n    \
          <dependency>\n      \
@@ -443,7 +450,7 @@ fn a_system_scoped_jar_is_still_local() {
 /// conditional dependencies stays the decision; being silent about it does not.
 #[test]
 fn a_pom_whose_dependencies_are_all_in_profiles_says_so() {
-    let dir = pom_dir(
+    let (_tmp, dir) = pom_dir(
         "maven_profiles_only",
         "  <profiles>\n    \
          <profile>\n      \
@@ -488,7 +495,7 @@ fn a_pom_whose_dependencies_are_all_in_profiles_says_so() {
 /// coordinate instead of the version.
 #[test]
 fn a_group_this_file_cannot_resolve_is_still_listed() {
-    let dir = pom_dir(
+    let (_tmp, dir) = pom_dir(
         "maven_unresolvable_group",
         "  <dependencies>\n    \
          <dependency>\n      \
@@ -535,7 +542,7 @@ fn a_group_this_file_cannot_resolve_is_still_listed() {
 /// that pointed the reader at a parent POM that does not exist.
 #[test]
 fn a_version_beside_an_unnameable_coordinate_is_read_and_reported() {
-    let dir = pom_dir(
+    let (_tmp, dir) = pom_dir(
         "maven_unnameable_with_version",
         "  <dependencies>\n    \
          <dependency>\n      \
@@ -600,7 +607,7 @@ fn parent_story(stderr: &str) -> String {
 /// composed spelling among its reasons.
 #[test]
 fn a_composed_version_is_not_blamed_on_a_parent() {
-    let dir = pom_dir(
+    let (_tmp, dir) = pom_dir(
         "maven_composed_version",
         "  <properties>\n    \
          <minor>2</minor>\n  \
@@ -636,7 +643,7 @@ fn a_composed_version_is_not_blamed_on_a_parent() {
 /// `ERROR`, failing `--fail-on any`. Same POM, same scope, two answers.
 #[test]
 fn a_system_scoped_jar_stays_local_when_its_version_is_reconstructed() {
-    let dir = pom_dir(
+    let (_tmp, dir) = pom_dir(
         "maven_system_scope_reconstructed",
         "  <dependencies>\n    \
          <dependency>\n      \
