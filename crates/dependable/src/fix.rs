@@ -97,9 +97,12 @@ pub enum DeclineReason {
     /// [`Item::is_pinned`](dependable_fetch::core::Item::is_pinned). Not a
     /// refusal by the constraint's *shape* — the rewrite would succeed — but the
     /// author holds the version deliberately, and the action that changes it is a
-    /// flag rather than a rewrite of the constraint. A lone `=` in front of a
-    /// partial (`=1.2`) is counted as a pin but reports [`Self::EqualsPartial`],
-    /// because `--all` would not move it either.
+    /// flag rather than a rewrite of the constraint. A constraint counted as a
+    /// pin whose shape the rewrite refuses reports that shape refusal instead,
+    /// because `--all` would not move it either: a lone `=` in front of a partial
+    /// (`=1.2`) reports [`Self::EqualsPartial`], `=1.*` reports
+    /// [`Self::WildcardOperator`], `=1.2.3, <2` reports [`Self::CommaRange`], and
+    /// `=1.0.0 || =2.0.0` reports [`Self::MultiClause`].
     Pinned,
     /// No version resolved to write: the row has an update and neither
     /// `latest_compatible` (the default target) nor `latest_available` (under
@@ -1254,6 +1257,48 @@ mod tests {
                     "{kind:?} all={all}: {declined:?}"
                 );
             }
+        }
+    }
+
+    /// The pin guard reports any shape refusal, not only
+    /// [`DeclineReason::EqualsPartial`]: a constraint `is_pinned` counts by its
+    /// leading `=` but whose shape `rewrite_constraint` refuses gets that
+    /// refusal's reason without `--all`, never [`DeclineReason::Pinned`].
+    #[test]
+    fn a_pinned_constraint_with_a_refused_shape_reports_the_shape() {
+        for (constraint, reason) in [
+            ("=1.*", DeclineReason::WildcardOperator),
+            ("=1.2.3, <2", DeclineReason::CommaRange),
+            ("=1.0.0 || =2.0.0", DeclineReason::MultiClause),
+        ] {
+            let content = format!("[dependencies]\nserde = \"{constraint}\"\n");
+            let kind = ManifestKind::CargoToml;
+            let results = results_for(kind, &content, &[("serde", "2.5.0")]);
+            assert_eq!(
+                results.len(),
+                1,
+                "{constraint}: the fixture must produce one item"
+            );
+            assert!(
+                results[0].item.is_pinned(Some(kind.ecosystem())),
+                "{constraint}: the fixture must be one `is_pinned` counts"
+            );
+            let (updated, records, declined) =
+                plan_fixes(&content, &results, false, false, Some(kind.ecosystem()))
+                    .expect("the plan applies");
+            assert_eq!(
+                updated, content,
+                "{constraint}: the constraint was rewritten"
+            );
+            assert!(records.is_empty(), "{constraint}: {records:?}");
+            assert_eq!(
+                declined
+                    .iter()
+                    .map(|item| (item.reason, item.target.as_deref()))
+                    .collect::<Vec<_>>(),
+                [(reason, Some("2.5.0"))],
+                "{constraint}: {declined:?}"
+            );
         }
     }
 
