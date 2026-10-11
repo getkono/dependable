@@ -75,15 +75,26 @@ fn a_pep440_current_version_is_compared_as_pypi_reads_it() {
     let published = list(&["2.1", "2.1rc1", "2.0"]);
 
     let rc = freshness(Ecosystem::Python, &published, "2.1rc1");
-    assert!(
-        rc.status.has_update(),
-        "`2.1rc1` is behind `2.1`, got {:?}",
-        rc.status
+    assert_eq!(
+        rc.status,
+        DependencyStatus::PatchAvailable,
+        "`2.1rc1` is behind `2.1` within `2.1`, not outside the any-version constraint"
     );
     assert_eq!(rc.latest_available.as_deref(), Some("2.1"));
 
     let newest = freshness(Ecosystem::Python, &published, "2.1");
     assert_eq!(newest.status, DependencyStatus::UpToDate);
+}
+
+/// A package at its newest release, which is a pre-release, is current. Translated
+/// to `3.0.0-b.1`, semver's opt-in rule kept it out of the any-version constraint,
+/// and the pane reported it `Outdated`.
+#[test]
+fn a_pep440_newest_pre_release_in_use_is_up_to_date() {
+    let published = list(&["3.0b1", "2.9"]);
+    let evaluation = freshness(Ecosystem::Python, &published, "3.0b1");
+    assert_eq!(evaluation.status, DependencyStatus::UpToDate);
+    assert_eq!(evaluation.latest_available.as_deref(), Some("3.0b1"));
 }
 
 /// An ecosystem that publishes semver is untouched by the translation.

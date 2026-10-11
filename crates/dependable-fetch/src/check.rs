@@ -1522,8 +1522,10 @@ fn evaluate_item(
 /// 3. The reported `latest_compatible` / `latest_available` are mapped back to the
 ///    spelling the registry actually publishes (see `in_native_versions`).
 ///
-/// `constraint` is in the manifest's own dialect; `"*"` asks only whether `locked`
-/// is behind the newest release. `locked` is the version in use — a lockfile's
+/// `constraint` is in the manifest's own dialect; `""` (no constraint declared)
+/// asks only whether `locked` is behind the newest release. Not `"*"`: that is a
+/// spelling some dialects do not have — Maven's is untranslatable and evaluates as
+/// [`DependencyStatus::Undetermined`]. `locked` is the version in use — a lockfile's
 /// resolved version, or a graph node's — in the registry's dialect. A `locked`
 /// string the translation cannot read is passed through as written.
 #[must_use]
@@ -2902,6 +2904,46 @@ mod tests {
         );
         assert_eq!(result.status, DependencyStatus::UpdateAvailable);
         assert_eq!(result.latest_available.as_deref(), Some("2.2"));
+    }
+
+    /// A pre-release in use translates to a semver pre-release, which semver's
+    /// opt-in rule keeps out of `>=2.0.0`. PEP 440 admits a pre-release already in
+    /// use, so a project locked at the newest release, `2.1rc1`, is up to date, not
+    /// outside its constraint.
+    #[test]
+    fn a_locked_pre_release_inside_the_range_is_not_outdated() {
+        let mut declared = item_of(ManifestKind::RequirementsTxt, "requests>=2.0\n");
+        declared.locked_version = Some("2.1rc1".to_string());
+        let newest = evaluated(
+            &declared,
+            &["2.1rc1", "2.0"],
+            Ecosystem::Python,
+            UnstableFilter::IncludeIfCurrent,
+        );
+        assert_eq!(newest.status, DependencyStatus::UpToDate);
+        assert_eq!(newest.latest_available.as_deref(), Some("2.1rc1"));
+
+        // Behind its own final release, it is a patch behind — still not outside
+        // the range.
+        let behind = evaluated(
+            &declared,
+            &["2.1", "2.1rc1", "2.0"],
+            Ecosystem::Python,
+            UnstableFilter::IncludeIfCurrent,
+        );
+        assert_eq!(behind.status, DependencyStatus::PatchAvailable);
+        assert_eq!(behind.latest_available.as_deref(), Some("2.1"));
+
+        // A range the pre-release is ordered outside of still reads as outside it.
+        let mut capped = item_of(ManifestKind::RequirementsTxt, "requests<2.0\n");
+        capped.locked_version = Some("2.1rc1".to_string());
+        let outside = evaluated(
+            &capped,
+            &["2.1rc1", "2.0", "1.9"],
+            Ecosystem::Python,
+            UnstableFilter::IncludeIfCurrent,
+        );
+        assert_eq!(outside.status, DependencyStatus::Outdated);
     }
 
     /// Every version this tool reports has to be one the registry publishes. The

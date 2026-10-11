@@ -55,7 +55,12 @@ pub fn check_version_for(
     locked_at: Option<&str>,
 ) -> Evaluation {
     match try_to_semver_constraint(constraint, ecosystem) {
-        Some(translated) => check_version(&translated, versions, locked_at),
+        Some(translated) => evaluate(
+            &translated,
+            versions,
+            locked_at,
+            locked_pre_release_rule(ecosystem),
+        ),
         None => Evaluation {
             status: DependencyStatus::Undetermined,
             latest_compatible: None,
@@ -63,6 +68,48 @@ pub fn check_version_for(
             patch_available: false,
         },
     }
+}
+
+/// How a pre-release *in use* is judged against the declared range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockedPreRelease {
+    /// semver's opt-in rule: a pre-release satisfies a range only where a comparator
+    /// names a pre-release on the same `major.minor.patch`. npm and Cargo resolve
+    /// this way, so a locked pre-release outside it is outside the constraint.
+    OptIn,
+    /// By ordering alone. PEP 440 excludes pre-releases only from *selection* and
+    /// admits one already in use, and NuGet and Maven have no opt-in rule at all,
+    /// so a translated `2.1rc1` (`2.1.0-rc.1`) is inside `>=2.0` as it is ordered.
+    ByOrdering,
+}
+
+/// The rule for a locked pre-release in `ecosystem`'s dialect: by ordering where the
+/// version was translated from a dialect without semver's opt-in rule.
+fn locked_pre_release_rule(ecosystem: Ecosystem) -> LockedPreRelease {
+    match ecosystem {
+        Ecosystem::Python | Ecosystem::CSharp | Ecosystem::Jvm => LockedPreRelease::ByOrdering,
+        _ => LockedPreRelease::OptIn,
+    }
+}
+
+/// Whether `req` admits the version in use, `locked`, under `rule`.
+fn admits_locked(req: &VersionReq, locked: &Version, rule: LockedPreRelease) -> bool {
+    if locked.pre.is_empty() || rule == LockedPreRelease::OptIn {
+        return req.matches(locked);
+    }
+    // Add a comparator that `locked` satisfies and that opts its own
+    // `major.minor.patch` in to pre-releases: `>=X.Y.Z-0`, where `-0` is the lowest
+    // pre-release there is. Every other comparator is still checked by ordering, so
+    // this only lifts the opt-in rule, never the range.
+    let mut by_ordering = req.clone();
+    by_ordering.comparators.push(::semver::Comparator {
+        op: ::semver::Op::GreaterEq,
+        major: locked.major,
+        minor: Some(locked.minor),
+        patch: Some(locked.patch),
+        pre: ::semver::Prerelease::new("0").expect("`0` is a valid pre-release"),
+    });
+    by_ordering.matches(locked)
 }
 
 /// The newest parseable version in `versions`, if any.
@@ -78,6 +125,16 @@ fn newest(versions: &[String]) -> Option<Version> {
 /// by the caller after querying OSV.
 #[must_use]
 pub fn check_version(constraint: &str, versions: &[String], locked_at: Option<&str>) -> Evaluation {
+    evaluate(constraint, versions, locked_at, LockedPreRelease::OptIn)
+}
+
+/// [`check_version`], with the rule a locked pre-release is judged by.
+fn evaluate(
+    constraint: &str,
+    versions: &[String],
+    locked_at: Option<&str>,
+    locked_pre: LockedPreRelease,
+) -> Evaluation {
     let mut parsed: Vec<Version> = versions
         .iter()
         .filter_map(|v| Version::parse(v).ok())
@@ -142,7 +199,7 @@ pub fn check_version(constraint: &str, versions: &[String], locked_at: Option<&s
 
     // A locked version that no longer satisfies the declared constraint.
     if let Some(locked) = locked.as_ref()
-        && !req.matches(locked)
+        && !admits_locked(&req, locked, locked_pre)
     {
         return Evaluation {
             status: DependencyStatus::Outdated,
