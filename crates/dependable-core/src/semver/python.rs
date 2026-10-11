@@ -99,8 +99,8 @@ fn convert_suffix(suffix: &str) -> (String, String) {
 /// Convert a PEP 440 (or Poetry) constraint into a `semver::VersionReq` string.
 ///
 /// Splits on commas, strips `;` environment markers, and converts each clause.
-/// Poetry's `^`/`~`/`*` and the comparison operators pass through; `~=` and `==…*`
-/// expand to ranges; `!=` is dropped (semver can't express exclusion).
+/// Poetry's `^`/`~`/`*` and the comparison operators pass through; `~=`, `==…*`, and
+/// a bare `….*` expand to ranges; `!=` is dropped (semver can't express exclusion).
 #[must_use]
 pub fn pep440_constraint_to_semver(constraint: &str) -> String {
     let clauses: Vec<String> = constraint
@@ -129,6 +129,13 @@ fn convert_clause(clause: &str) -> Option<String> {
         if let Some(rest) = clause.strip_prefix(op) {
             return convert_op(op, rest.trim());
         }
+    }
+    // A bare prefix wildcard (`1.2.*`, the pixi/conda matchspec norm) is the same
+    // prefix match `==1.2.*` spells. Handed to `pep440_to_semver` it lost its `*` and
+    // came back as the bare `1.2.0`, which `VersionReq` reads as the caret `^1.2.0` —
+    // admitting `1.26.0` under a declaration of `1.20.*`.
+    if let Some(prefix) = clause.strip_suffix(".*") {
+        return wildcard_range(prefix);
     }
     // A bare version (`1.2.3`) — treat like Poetry/Cargo caret semantics.
     pep440_to_semver(clause)
@@ -171,7 +178,8 @@ fn is_plain_release(version: &str) -> bool {
             .all(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// `==1.0.*` → `>=1.0.0, <1.1.0` (the next release of the last specified segment).
+/// `==1.0.*` (or a bare `1.0.*`) → `>=1.0.0, <1.1.0` (the next release of the last
+/// specified segment).
 fn wildcard_range(prefix: &str) -> Option<String> {
     let nums: Vec<u64> = prefix
         .split('.')
@@ -406,6 +414,39 @@ mod tests {
                 "{constraint} -> {converted} admitted {rejects}"
             );
         }
+    }
+
+    /// A bare prefix wildcard is the prefix match `==` spells, not a caret: `1.20.*`
+    /// used to translate to `1.20.0`, which `VersionReq` reads as `^1.20.0` and so
+    /// admitted `1.26.0`.
+    #[test]
+    fn a_bare_prefix_wildcard_is_a_prefix_match_not_a_caret() {
+        let v = |s: &str| ::semver::Version::parse(s).unwrap();
+        // (constraint, admitted, rejected)
+        for (constraint, admits, rejects) in [
+            ("1.2.*", "1.2.9", "1.3.0"),
+            ("1.*", "1.9.0", "2.0.0"),
+            ("1.20.*", "1.20.5", "1.26.0"),
+            ("1.20.*", "1.20.0", "1.19.9"),
+        ] {
+            let converted = pep440_constraint_to_semver(constraint);
+            let req = ::semver::VersionReq::parse(&converted)
+                .unwrap_or_else(|e| panic!("{constraint} -> {converted} does not parse: {e}"));
+            assert!(
+                req.matches(&v(admits)),
+                "{constraint} -> {converted} rejected {admits}"
+            );
+            assert!(
+                !req.matches(&v(rejects)),
+                "{constraint} -> {converted} admitted {rejects}"
+            );
+            assert_eq!(
+                converted,
+                pep440_constraint_to_semver(&format!("=={constraint}")),
+                "{constraint} differs from its `==` spelling"
+            );
+        }
+        assert_eq!(pep440_constraint_to_semver("1.20.*"), ">=1.20.0, <1.21.0");
     }
 
     /// Reachable straight from a requirements file; `+ 1` on a parsed segment panicked
