@@ -41,6 +41,12 @@ Or download a prebuilt binary for your platform from the
 | Kotlin / Java | `gradle/libs.versions.toml`, `pom.xml` | Maven Central | — | 🧪 Experimental |
 | Swift | `Package.swift` (never read) | — none exists | `Package.resolved` | 🧪 Experimental |
 
+For pixi (`pixi.toml`, or `[tool.pixi]` in a `pyproject.toml`), only
+`[pypi-dependencies]` are read. pixi's `[dependencies]` are **conda** packages, resolved
+from a conda channel with conda matchspecs rather than PEP 440 specifiers; PyPI does
+not host them, or hosts an unrelated project under the same name, so they are not
+checked at all rather than checked against the wrong registry.
+
 Kotlin / Java coverage is the **declarative** half of a JVM build. For Gradle that is
 the version catalog: a build script (`build.gradle`, `build.gradle.kts`) is a program,
 and reading one means running your build — so a build script found without a catalog

@@ -149,7 +149,7 @@ conversion, all against **V1.1**.
 | Deno / JSR | `serde_json` + scanner | `deno.json(c)` | — | `jsr.io/<pkg>/meta.json` | native semver | `npm` | §5.1, 5.2, 5.4 |
 | pnpm | `serde_yaml` + scanner | `pnpm-workspace.yaml` | — | `registry.npmjs.org` | native semver | `npm` | §5.1, 5.2 |
 | PHP | `serde_json` + scanner | `composer.json` | `composer.lock` | `repo.packagist.org/p2/<name>.json` | native semver | `Packagist` | §5.1–5.4 |
-| Python | custom + `toml_edit` | `requirements*.txt`, `pyproject.toml`, `pixi.toml` | — | `pypi.org/pypi/<name>/json` | **PEP 440** | `PyPI` | §5.1, 5.2, 5.4, 5.5 |
+| Python | custom + `toml_edit` | `requirements*.txt`, `pyproject.toml`, `pixi.toml` (`[pypi-dependencies]` only; pixi's conda `[dependencies]` are not read) | — | `pypi.org/pypi/<name>/json` | **PEP 440** | `PyPI` | §5.1, 5.2, 5.4, 5.5 |
 | Dart | `serde_yaml` + scanner | `pubspec.yaml` | `pubspec.lock` | `pub.dev/api/packages/<name>` | native semver | `Pub` | §5.1–5.4 |
 | C# / NuGet | `roxmltree` | `*.csproj`, `Directory.*.props` | — | `api.nuget.org/v3/registration5-gz-semver2/…` | **NuGet bracket ranges** | `NuGet` | §5.1, 5.2, 5.4 |
 | Elixir | `regex` | `mix.exs` | `mix.lock` | `hex.pm/api/packages/<name>` | **Hex `~>`** | `Hex` | §5.1–5.5 |
