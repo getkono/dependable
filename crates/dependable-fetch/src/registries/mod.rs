@@ -270,6 +270,10 @@ pub trait RegistryFetcher: Send + Sync {
     /// `@scope` package to the registry `.npmrc` configures for that scope — overrides
     /// this, so a version list fetched from one host is never cached under, and read
     /// back as the answer of, another.
+    ///
+    /// It is also the root a failed lookup of `name` is reported under, in
+    /// `ManifestCheck::unreachable_registries`: a refusal names the host that was
+    /// actually asked, not the fetcher's default.
     fn registry_root_for(&self, name: &str) -> Option<&str> {
         let _ = name;
         self.registry_root()
