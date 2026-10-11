@@ -329,19 +329,18 @@ pub fn load_config(path: &Path) -> Result<Config, Box<figment::Error>> {
 
 /// Where a `[policy]` block came from — or why there is none.
 ///
-/// [`load_config`] is deliberately lenient: a malformed file falls back to
-/// defaults so a typo in an unrelated key never breaks a check. A security gate
-/// cannot afford that, so policy is loaded separately and the three cases are
-/// kept apart. `#[non_exhaustive]`: match with a wildcard arm.
+/// Policy is loaded apart from [`load_config`] so that "no gate was declared" and
+/// "a gate was declared" stay distinguishable: the merged [`Config`] fills an absent
+/// `[policy]` with defaults, which reads the same as an empty one. A file that
+/// cannot be read at all is not a third case here but an error from
+/// [`load_policy`], as it is from [`load_config`]. `#[non_exhaustive]`: match with
+/// a wildcard arm.
 #[cfg(feature = "report")]
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum PolicySource {
     /// No `[policy]` table — the file is absent, or declares none. No gate.
     Absent,
-    /// The config file exists but cannot be parsed at all, so nothing in it
-    /// (policy included) can be read. Carries the parser's complaint.
-    Unreadable(String),
     /// A `[policy]` table was found and is valid.
     Configured(Policy),
 }
@@ -354,17 +353,17 @@ pub enum PolicySource {
 ///
 /// - No `[policy]` table at all → [`PolicySource::Absent`]: no gate, exit code
 ///   unchanged. This is every existing user.
-/// - The file itself is unparseable → [`PolicySource::Unreadable`]: the caller
-///   warns and runs ungated, matching [`load_config`]'s leniency, because no
-///   policy could be read either.
 /// - A `[policy]` table that is present but invalid → `Err`: the caller must
 ///   fail the run rather than pretend a gate is in force.
+/// - The file itself is unparseable → `Err`: a file that cannot be read may hold
+///   a policy, so it cannot be reported as declaring none. The CLI never gets
+///   here with such a file, because [`load_config`] has already rejected it.
 ///
 /// # Errors
 ///
-/// Returns the figment error, naming the offending key, when a `[policy]` table
-/// exists but does not deserialize. Boxed because a `figment::Error` dwarfs the
-/// success value.
+/// Returns the figment error when the file does not parse, or, naming the
+/// offending key, when a `[policy]` table exists but does not deserialize. Boxed
+/// because a `figment::Error` dwarfs the success value.
 #[cfg(feature = "report")]
 pub fn load_policy(path: &Path) -> Result<PolicySource, Box<figment::Error>> {
     match Figment::from(Toml::file(path)).find_value("policy") {
@@ -372,7 +371,7 @@ pub fn load_policy(path: &Path) -> Result<PolicySource, Box<figment::Error>> {
         // "no config" and "config without a [policy] block".
         Err(e) if e.missing() => Ok(PolicySource::Absent),
         // Anything else from `find_value` is the file failing to parse at all.
-        Err(e) => Ok(PolicySource::Unreadable(e.to_string())),
+        Err(e) => Err(Box::new(e)),
         Ok(_) => Figment::from(Serialized::defaults(Config::default()))
             .merge(Toml::file(path))
             .extract_inner::<Policy>("policy")
@@ -470,11 +469,11 @@ mod tests {
     }
 
     #[test]
-    fn an_unparseable_file_is_reported_as_unreadable_not_as_a_policy() {
+    fn an_unparseable_file_is_an_error_not_an_absent_policy() {
         let path = write("broken", "this is not = = toml\n");
         assert!(
-            matches!(load_policy(&path), Ok(PolicySource::Unreadable(_))),
-            "expected Unreadable, got {:?}",
+            load_policy(&path).is_err(),
+            "expected an error, got {:?}",
             load_policy(&path)
         );
     }
