@@ -121,16 +121,14 @@ pub fn visible(
                 expanded.contains(path) || found.as_ref().is_some_and(|f| f.open.contains(path))
             };
             let is_kept = |path: &[usize]| found.as_ref().is_none_or(|f| f.keep.contains(path));
-            let opts = WalkOptions {
+            let opts = WalkOptions::default()
                 // A package opened under `tokio` is not the one under `clap`, so
                 // a second appearance is expanded on its own terms.
-                dedupe: false,
-                collapse_roots: true,
-                prefix: &path,
-                expand: Some(&is_expanded),
-                include: Some(&is_kept),
-                ..WalkOptions::default()
-            };
+                .dedupe(false)
+                .collapse_roots(true)
+                .prefix(&path)
+                .expand(Some(&is_expanded))
+                .include(Some(&is_kept));
             let mut builder = RowBuilder {
                 project,
                 project_index: index,
