@@ -349,7 +349,14 @@ fn source_token(source: PackageSource) -> &'static str {
         // published package whose version this manifest does not state, and a consumer
         // that cannot tell it from any other unknown source cannot report it.
         PackageSource::Unresolved => "unresolved",
-        _ => "unknown",
+        // Reachable only by a variant added to `PackageSource` without an arm here,
+        // which `every_source_has_its_own_token` fails on. A release build keeps the
+        // documented `"unknown"` fallback rather than aborting a listing a consumer
+        // can still mostly use.
+        _ => {
+            debug_assert!(false, "no token for {source:?}");
+            "unknown"
+        }
     }
 }
 
@@ -376,7 +383,8 @@ fn annotation(item: &Item) -> &'static str {
         // would otherwise render as a bare `—` that reads like a parse failure. A
         // resolved one falls through to its section, so a `dev` dep still says so.
         PackageSource::Inherited if item.version_constraint.is_empty() => " (unresolved)",
-        // `Locked` deliberately has no arm. A lockfile pin states a version, so it is
+        // `Locked` deliberately has no annotation of its own: it falls through to its
+        // kind with `Registry` below. A lockfile pin states a version, so it is
         // not unresolved, and it is not a source a reader of a table needs told about
         // — what a reader wants to know is that it is not a declared direct
         // dependency, which is exactly what its `kind` says below.
@@ -387,8 +395,18 @@ fn annotation(item: &Item) -> &'static str {
         // here is keyed by — so nothing was fetched under that name.
         PackageSource::Unidentified => " (unidentified)",
         // The kind's label is shared with `check`'s table, so the two commands spell
-        // each kind the same way.
-        _ => kind_annotation(item.kind),
+        // each kind the same way. Every source that falls through to it is named, so
+        // a new variant has to be placed deliberately rather than inheriting this.
+        PackageSource::Registry
+        | PackageSource::Inherited
+        | PackageSource::Locked
+        | PackageSource::Unresolved => kind_annotation(item.kind),
+        // Reachable only by a variant added without being considered above, which
+        // `every_source_has_a_considered_annotation` fails on.
+        _ => {
+            debug_assert!(false, "no annotation decision for {:?}", item.source);
+            kind_annotation(item.kind)
+        }
     }
 }
 
@@ -408,5 +426,46 @@ mod tests {
         assert_eq!(source_token(PackageSource::Git), "git");
         assert_eq!(source_token(PackageSource::Inherited), "inherited");
         assert_eq!(source_token(PackageSource::Unresolved), "unresolved");
+    }
+
+    /// No source reaches the `"unknown"` fallback. `PackageSource::ALL` is generated
+    /// from the enum itself, so a variant added without an arm in `source_token`
+    /// fails here instead of shipping `"source": "unknown"` in `list --format json`.
+    /// The tokens are also distinct, so two sources never read as one.
+    #[test]
+    fn every_source_has_its_own_token() {
+        let mut seen = std::collections::BTreeSet::new();
+        for &source in PackageSource::ALL {
+            let token = source_token(source);
+            assert_ne!(token, "unknown", "{source:?}");
+            assert!(seen.insert(token), "{source:?} shares the token {token:?}");
+        }
+    }
+
+    /// Every source has a deliberate annotation decision, even where that decision is
+    /// to fall through to the kind's label. Each is rendered with and without a stated
+    /// version, since `Inherited` answers differently for the two; an unconsidered
+    /// variant trips the `debug_assert` in the wildcard arm.
+    #[test]
+    fn every_source_has_a_considered_annotation() {
+        let declared = dependable_fetch::core::parse(
+            dependable_fetch::ManifestKind::CargoToml,
+            "[dependencies]\nserde = \"1.0\"\n",
+        )
+        .expect("parse the fixture manifest")
+        .items
+        .into_iter()
+        .next()
+        .expect("one dependency");
+        let mut versionless = declared.clone();
+        versionless.version_constraint.clear();
+
+        for &source in PackageSource::ALL {
+            for base in [&declared, &versionless] {
+                let mut item = base.clone();
+                item.source = source;
+                let _ = annotation(&item);
+            }
+        }
     }
 }

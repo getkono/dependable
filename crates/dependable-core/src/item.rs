@@ -211,6 +211,37 @@ impl DependencyKind {
     }
 }
 
+/// Declares [`PackageSource`] and its [`ALL`](PackageSource::ALL) list from one
+/// variant list, so a variant cannot exist without being in the list.
+///
+/// A hand-written list beside the enum is the defect this replaces: an omission
+/// from it compiles, and every guard that iterates it inherits the omission. Here
+/// the list is the enum's own token stream, so there is nothing to keep in step.
+macro_rules! package_source_enum {
+    (
+        $(#[$enum_meta:meta])*
+        $vis:vis enum $name:ident {
+            $( $(#[$variant_meta:meta])* $variant:ident, )+
+        }
+    ) => {
+        $(#[$enum_meta])*
+        $vis enum $name {
+            $( $(#[$variant_meta])* $variant, )+
+        }
+
+        impl $name {
+            /// Every variant, in declaration order.
+            ///
+            /// Generated from the enum's own definition, so it cannot fall behind
+            /// it. A consumer outside this crate cannot match exhaustively (the
+            /// enum is `#[non_exhaustive]`); iterating this is how it checks that
+            /// each variant has an answer rather than a wildcard's fallback.
+            pub const ALL: &'static [Self] = &[$( Self::$variant ),+];
+        }
+    };
+}
+
+package_source_enum! {
 /// Where a dependency comes from. Determines whether it is version-checked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
@@ -325,6 +356,7 @@ pub enum PackageSource {
     /// [`DependencyStatus::Undetermined`](crate::result::DependencyStatus::Undetermined).
     Unresolved,
 }
+}
 
 #[cfg(test)]
 mod tests {
@@ -345,6 +377,17 @@ mod tests {
             .find(|item| item.name == name)
             .unwrap_or_else(|| panic!("no item {name}"))
             .clone()
+    }
+
+    /// `ALL` holds each variant exactly once, in declaration order: position `i`
+    /// carries discriminant `i`, so no variant is repeated or skipped between the
+    /// first and the last.
+    #[test]
+    fn all_package_sources_lists_each_variant_once_in_order() {
+        for (position, source) in PackageSource::ALL.iter().enumerate() {
+            assert_eq!(*source as usize, position, "{source:?}");
+        }
+        assert_eq!(PackageSource::ALL.first(), Some(&PackageSource::default()));
     }
 
     #[test]
