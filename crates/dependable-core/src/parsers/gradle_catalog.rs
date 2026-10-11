@@ -24,8 +24,9 @@
 //! The exception is a `strictly` rich version, which is reported as
 //! [`DependencyKind::Override`]: Gradle forces it onto the whole resolved graph, so
 //! it is a forced version in the same sense as an npm `overrides` entry, and `fix`
-//! leaves it alone unless `--overrides` asks for it. `require` and `prefer` are not
-//! forced and stay `Normal`.
+//! leaves it alone unless `--overrides` asks for it. So is a version string carrying
+//! Gradle's `!!` strict shorthand (`"5.10.0!!"`), which means the same thing.
+//! `require` and `prefer` are not forced and stay `Normal`.
 //!
 //! # `version.ref`
 //!
@@ -73,8 +74,9 @@ pub struct GradleCatalogParser;
 struct Located {
     value: String,
     span: Range<usize>,
-    /// What the key the literal was read from makes it: [`DependencyKind::Override`]
-    /// for a `strictly` version, [`DependencyKind::Normal`] for everything else.
+    /// What the literal's key or spelling makes it: [`DependencyKind::Override`]
+    /// for a `strictly` version or its `!!` shorthand, [`DependencyKind::Normal`]
+    /// for everything else.
     kind: DependencyKind,
 }
 
@@ -242,11 +244,7 @@ fn version_literal(item: &TomlItem) -> Option<Located> {
     if let Some(value) = item.as_value()
         && let Some(text) = value.as_str()
     {
-        return Some(Located {
-            value: text.to_owned(),
-            span: unquoted(value.span()?),
-            kind: DependencyKind::Normal,
-        });
+        return Some(plain(text, unquoted(value.span()?)));
     }
     let table = item.as_table_like()?;
     for (key, kind) in [
@@ -286,13 +284,36 @@ fn shorthand(text: &str, span: Option<Range<usize>>) -> Option<Declared> {
     let start = span.start + 1 + coordinate.len() + 1;
     Some(Declared {
         name: coordinate.to_owned(),
-        version: Some(Located {
-            value: version.to_owned(),
-            span: start..start + version.len(),
-            kind: DependencyKind::Normal,
-        }),
+        version: Some(plain(version, start..start + version.len())),
         reference: None,
     })
+}
+
+/// A version written as a plain string, whose `span` covers exactly `text`.
+///
+/// Gradle reads a `!!` in a version string as its strict shorthand: `"5.10.0!!"` is
+/// `{ strictly = "5.10.0" }`, and `"[5.9,6.0)!!5.10.0"` is a `strictly` range with a
+/// `prefer`. Either is forced, so it is tagged [`DependencyKind::Override`] like the
+/// table form. A bare `!!` suffix is left out of the value and the span, so the
+/// version reads as the version it pins and a `fix --overrides` rewrite keeps the
+/// suffix — and with it the pin's strictness. Any other `!!` form is kept whole.
+fn plain(text: &str, span: Range<usize>) -> Located {
+    match text.strip_suffix("!!") {
+        Some(version) if !version.is_empty() && !version.contains("!!") => Located {
+            value: version.to_owned(),
+            span: span.start..span.start + version.len(),
+            kind: DependencyKind::Override,
+        },
+        _ => Located {
+            value: text.to_owned(),
+            span,
+            kind: if text.contains("!!") {
+                DependencyKind::Override
+            } else {
+                DependencyKind::Normal
+            },
+        },
+    }
 }
 
 /// An item pointing at the version literal that governs it, wherever in this file
@@ -562,6 +583,46 @@ testing = ["junit-jupiter"]
         let junit = find(&parsed, "org.junit.jupiter:junit-jupiter");
         assert_eq!(junit.version_constraint, "[5.9,6.0)");
         assert_eq!(junit.kind, DependencyKind::Override);
+    }
+
+    /// Gradle's `!!` shorthand is `strictly` spelled in the string, so it is forced
+    /// too — in `[versions]`, in an inline `version`, and in the `g:a:v` shorthand.
+    /// A bare suffix stays outside the span, so a rewrite keeps the pin strict.
+    #[test]
+    fn the_strict_shorthand_is_an_override_and_its_suffix_survives_a_rewrite() {
+        let content = "[versions]\n\
+                       junit = \"5.10.0!!\"\n\
+                       \n\
+                       [libraries]\n\
+                       junit = { module = \"org.junit.jupiter:junit-jupiter\", version.ref = \"junit\" }\n\
+                       slf4j = { module = \"org.slf4j:slf4j-api\", version = \"2.0.13!!\" }\n\
+                       commons = \"org.apache.commons:commons-lang3:3.14.0!!\"\n\
+                       guava = { module = \"com.google.guava:guava\", version = \"[32.0,34.0)!!33.0.0-jre\" }\n\
+                       okhttp = { module = \"com.squareup.okhttp3:okhttp\", version = \"4.12.0\" }\n";
+        let parsed = items(content);
+        for (name, literal) in [
+            ("org.junit.jupiter:junit-jupiter", "5.10.0"),
+            ("org.slf4j:slf4j-api", "2.0.13"),
+            ("org.apache.commons:commons-lang3", "3.14.0"),
+            ("com.google.guava:guava", "[32.0,34.0)!!33.0.0-jre"),
+        ] {
+            let item = find(&parsed, name);
+            assert_eq!(item.kind, DependencyKind::Override, "{name}");
+            assert_eq!(item.version_constraint, literal, "{name}");
+            assert_eq!(slice(content, item), literal, "{name}");
+            assert!(item.is_rewritable(), "{name}");
+        }
+        let junit = find(&parsed, "org.junit.jupiter:junit-jupiter");
+        let line = content.lines().nth(junit.version_line).unwrap();
+        assert_eq!(
+            &line[junit.version_col_end..],
+            "!!\"",
+            "the suffix is not rewritten"
+        );
+        assert_eq!(
+            find(&parsed, "com.squareup.okhttp3:okhttp").kind,
+            DependencyKind::Normal
+        );
     }
 
     /// A shared `strictly` alias rewrites nothing, but it still forces every library

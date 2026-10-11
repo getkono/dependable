@@ -147,7 +147,8 @@ pub enum DependencyKind {
     /// file does not support.
     Indirect,
     /// A version this manifest forces onto the tree regardless of what asked for it —
-    /// npm `overrides`, Yarn `resolutions`, `pnpm.overrides`.
+    /// npm `overrides`, Yarn `resolutions`, `pnpm.overrides`, and a Gradle version
+    /// catalog's `strictly` versions (including the `!!` shorthand).
     ///
     /// Worth reporting precisely because it is how a vulnerable transitive dependency is
     /// remediated: the pin is the fix, and a stale pin is the fix having quietly expired.

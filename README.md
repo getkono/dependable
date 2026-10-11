@@ -390,7 +390,9 @@ and `pnpm.overrides` — including npm's nested form (`"overrides": { "parent":
 { "child": "…" } }`) and pnpm's scoped keys (`"foo@2>bar"`, which forces a version
 onto **bar**). A Gradle version catalog (`gradle/libs.versions.toml`) can too:
 a `strictly` rich version (`junit = { strictly = "5.10.0" }`) is Gradle's forced
-version, and the usual shape of a JVM security pin. Its `require` and `prefer`
+version, and the usual shape of a JVM security pin, as is the `!!` shorthand
+for it in a version string (`junit = "5.10.0!!"`); a rewrite under `--overrides`
+keeps the `!!`. Its `require` and `prefer`
 forms are not forced — a floor and a soft preference — and are treated as
 ordinary constraints. Those are the only entries any parser tags as a forced
 version, so **`package.json` and a Gradle catalog's `strictly` versions are
