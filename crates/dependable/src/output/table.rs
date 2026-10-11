@@ -1,6 +1,6 @@
 //! Colored, TTY-aware table output (the default).
 
-use dependable_fetch::{CheckResult, DependencyKind, DependencyStatus, Item};
+use dependable_fetch::{CheckResult, DependencyStatus, Item};
 use owo_colors::{OwoColorize, Stream, Style};
 
 use super::{ManifestReport, Summary, current_display, kind_annotation, latest_display};
@@ -91,22 +91,16 @@ fn render_one(report: &ManifestReport) {
     print_totals(&Summary::of(std::slice::from_ref(report)));
 }
 
-/// The Package cell: the name, followed by its kind's label where `check` calls
-/// that kind out.
+/// The Package cell: the name, followed by its kind's label.
 ///
-/// Only a forced version is called out. An override is the one kind whose row
-/// changes what the reader should do next — it is usually a security pin, so "bump
-/// it" becomes "find out why this is here first", and `fix` declines to rewrite one
-/// unless asked. The other kinds (`dev`, `build`, `peer`, …) change nothing about
-/// what a `check` row asks of its reader, and labelling them would add noise to
-/// most rows of the most-run command. `list` shows every kind; the label itself
-/// comes from the same [`kind_annotation`] either way, so the two commands never
-/// spell one kind two ways.
+/// Every kind is labelled the way `list` labels it, from the same
+/// [`kind_annotation`], so the two commands never spell one kind two ways and no
+/// kind is special-cased: a forced version reads ` (override)` just as a dev
+/// dependency reads ` (dev)`, and a normal dependency stays bare. Only the kind is
+/// shown here, not `list`'s source labels: the Status column already names a
+/// `local` or `git` source.
 fn package_cell(item: &Item) -> String {
-    match item.kind {
-        DependencyKind::Override => format!("{}{}", item.name, kind_annotation(item.kind)),
-        _ => item.name.clone(),
-    }
+    format!("{}{}", item.name, kind_annotation(item.kind))
 }
 
 fn width(lengths: impl Iterator<Item = usize>, header: &str) -> usize {

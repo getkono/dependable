@@ -10,10 +10,10 @@ use std::process::Command;
 /// both said so while `check`'s table rendered it exactly like an ordinary
 /// dependency. The row now carries the same ` (override)` label `list` prints.
 ///
-/// The `dev` row is the other half: `check` calls out only the override kind, so a
-/// dev dependency stays unlabelled rather than every row growing a suffix.
+/// The `dev` row is the other half: no kind is special-cased, so a dev dependency
+/// carries ` (dev)` exactly as `list` prints it.
 #[test]
-fn the_table_labels_an_override_and_only_an_override() {
+fn the_table_labels_every_kind_as_list_does() {
     let tmp = tempfile::Builder::new()
         .prefix("check_override_label")
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
@@ -57,8 +57,5 @@ fn the_table_labels_an_override_and_only_an_override() {
     // Both override rows, whatever their source: the label is about the kind.
     assert!(row("lodash").starts_with("lodash (override) "), "{stdout}");
     assert!(row("pinned").starts_with("pinned (override) "), "{stdout}");
-    assert!(
-        !row("helper").contains('('),
-        "a dev dependency was labelled:\n{stdout}"
-    );
+    assert!(row("helper").starts_with("helper (dev) "), "{stdout}");
 }

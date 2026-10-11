@@ -216,9 +216,8 @@ pub fn current_display(result: &CheckResult) -> String {
 /// The parenthesized label a human-readable table gives a dependency kind —
 /// ` (dev)`, ` (override)`, … — or nothing for an ordinary runtime dependency.
 ///
-/// The one spelling of each kind for every table in the binary: `list` prints it
-/// for every kind, `check` for the kinds it chooses to call out (see
-/// [`table`]). Two renderers deriving their own words for the same fact is how a
+/// The one spelling of each kind for every table in the binary: `list` and
+/// `check`'s table (see [`table`]) both print it for every kind. Two renderers deriving their own words for the same fact is how a
 /// binary ends up saying `override` in one place and `forced` in another.
 #[must_use]
 pub fn kind_annotation(kind: DependencyKind) -> &'static str {

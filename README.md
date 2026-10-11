@@ -433,9 +433,10 @@ express            ^4.21.2  4.21.2   up to date
 lodash (override)  1.0.0    4.17.21  outdated
 ```
 
-That is the only kind the `check` table calls out. A `dev`, `build`, or `peer`
-dependency is checked the same way as any other, so labelling it would only add
-noise to the command run most; `dependable list` shows every kind.
+The label is not special to overrides: the `check` table labels every dependency
+kind the way `dependable list` does (` (dev)`, ` (build)`, ` (optional)`,
+` (peer)`, ` (declared)`, ` (indirect)`, ` (override)`), and leaves a normal
+dependency bare.
 
 `--overrides` is how you say yes:
 
