@@ -390,9 +390,9 @@ fn is_plain_version(c: &str) -> bool {
 /// Convert a constraint into a `semver::VersionReq`-compatible string for the
 /// given ecosystem. Python, NuGet, Hex, Maven and Dart translate in dedicated
 /// modules; every other ecosystem writes a dialect close enough to Cargo's that
-/// [`normalize_range_constraint`] covers it. Dart's module reads only the bare
-/// version itself (exact to pub, a caret range to Cargo) and hands every other
-/// spelling to [`normalize_range_constraint`].
+/// [`normalize_range_constraint`] covers it. Dart's module and npm's arm read only
+/// the bare version themselves (exact to pub and to npm, a caret range to Cargo)
+/// and hand every other spelling to [`normalize_range_constraint`].
 #[must_use]
 pub fn to_semver_constraint(constraint: &str, ecosystem: Ecosystem) -> String {
     match ecosystem {
@@ -401,7 +401,35 @@ pub fn to_semver_constraint(constraint: &str, ecosystem: Ecosystem) -> String {
         Ecosystem::Elixir => crate::semver::elixir::hex_constraint_to_semver(constraint),
         Ecosystem::Jvm => crate::semver::maven::maven_constraint_to_semver(constraint),
         Ecosystem::Dart => crate::semver::dart::dart_constraint_to_semver(constraint),
+        Ecosystem::Npm => npm_constraint_to_semver(constraint),
         _ => normalize_range_constraint(constraint),
+    }
+}
+
+/// Convert an npm (`package.json`) constraint into a `semver::VersionReq`-compatible
+/// string.
+///
+/// node-semver reads a bare full version — `"left-pad": "1.3.0"`, or `v1.3.0`, whose
+/// leading `v` it ignores — as exactly that release, and spells the caret range
+/// `^1.3.0`. Cargo, and so the shared front-end, read the bare form as the caret
+/// range, which reported an npm pin satisfied by every later 1.x release and never
+/// as resolved. So a bare version that parses as a complete `semver::Version`
+/// becomes the exact comparator `=x.y.z`; build metadata is dropped from it, because
+/// `semver::VersionReq` does not accept it there and an exact comparator ignores it
+/// when matching.
+///
+/// Every other spelling — an operator, a range, a union, a wildcard, a partial
+/// version (`1.2`, which npm reads as `1.2.x`), a dist-tag — goes to
+/// [`normalize_range_constraint`] unchanged.
+fn npm_constraint_to_semver(constraint: &str) -> String {
+    let trimmed = constraint.trim();
+    let bare = trimmed.strip_prefix(['v', 'V']).unwrap_or(trimmed);
+    match ::semver::Version::parse(bare) {
+        Ok(mut version) => {
+            version.build = ::semver::BuildMetadata::EMPTY;
+            format!("={version}")
+        }
+        Err(_) => normalize_range_constraint(constraint),
     }
 }
 
@@ -427,8 +455,8 @@ pub fn to_semver_constraint(constraint: &str, ecosystem: Ecosystem) -> String {
 /// their input verbatim instead, which is a failure this guard cannot see and which
 /// produces exactly the confident `up to date` it exists to prevent.
 ///
-/// The remaining ecosystems have no dedicated translator, and Dart's reads only a bare
-/// version itself; none of them signals failure here:
+/// The remaining ecosystems have no dedicated translator, and Dart's and npm's read
+/// only a bare version themselves; none of them signals failure here:
 /// [`normalize_range_constraint`] hands an untranslatable range back unchanged, and
 /// [`check_version`](crate::semver::check_version) classifies it.
 #[must_use]
@@ -484,6 +512,55 @@ mod tests {
         // A `v` not before a digit (or part of an operator constraint) is kept.
         assert_eq!(normalize_constraint("^1.0"), "^1.0");
         assert_eq!(normalize_constraint(">=1, <2"), ">=1, <2");
+    }
+
+    /// node-semver reads a bare full version as exactly that release (#155): `1.3.0`
+    /// is `=1.3.0`, and the caret range is spelled `^1.3.0`.
+    #[test]
+    fn a_bare_npm_version_is_exact() {
+        let v = |s: &str| ::semver::Version::parse(s).expect(s);
+        for (constraint, want) in [
+            ("1.3.0", "=1.3.0"),
+            ("  1.3.0 ", "=1.3.0"),
+            // node-semver ignores a leading `v`.
+            ("v1.3.0", "=1.3.0"),
+            ("2.0.0-beta.1", "=2.0.0-beta.1"),
+            // An exact comparator cannot carry build metadata, and ignores it.
+            ("1.2.3+build.5", "=1.2.3"),
+        ] {
+            assert_eq!(to_semver_constraint(constraint, Ecosystem::Npm), want);
+        }
+        let req = assert_translates("1.3.0", Ecosystem::Npm);
+        assert!(req.matches(&v("1.3.0")));
+        assert!(!req.matches(&v("1.3.1")));
+        assert!(!req.matches(&v("1.4.0")));
+        // The same spelling is still a caret range to Cargo.
+        assert_eq!(to_semver_constraint("1.3.0", Ecosystem::Rust), "1.3.0");
+    }
+
+    /// Only the bare full version is npm's to read; every other spelling goes to the
+    /// shared front-end exactly as before.
+    #[test]
+    fn every_other_npm_spelling_is_left_to_the_shared_front_end() {
+        for constraint in [
+            "^1.3.0",
+            "~1.3.0",
+            "=1.3.0",
+            ">=1.0.0 <2.0.0",
+            "1.x",
+            "*",
+            "",
+            "latest",
+            // A partial version is an X-range to npm, not a pin; out of scope here.
+            "1.2",
+            "1.2.3 || 2.0.0",
+        ] {
+            assert_eq!(
+                to_semver_constraint(constraint, Ecosystem::Npm),
+                normalize_range_constraint(constraint),
+                "{constraint:?}"
+            );
+        }
     }
 
     fn vers(list: &[&str]) -> Vec<String> {

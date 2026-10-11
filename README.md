@@ -462,10 +462,9 @@ ecosystem, and a full bare `"1.0.0"` wherever the ecosystem reads a bare version
 as exact, as npm does (`Ecosystem::bare_version` records it). So
 `"overrides": { "lodash": "1.0.0" }` gets the pin note under plain
 `--overrides`. Only `--overrides --all` moves it, and then to the newest
-release (`2.0.0`), because `--all` is what lifts a pin. The checker still reads a
-bare npm version as `^1.0.0` when it reports the compatible release
-([issue #155](https://github.com/getkono/dependable/issues/155)). `fix` no longer
-acts on that reading for a pin.
+release (`2.0.0`), because `--all` is what lifts a pin. The checker reads a bare
+npm version as exact too, so it reports no compatible release beyond the pin
+([issue #155](https://github.com/getkono/dependable/issues/155)).
 
 Before you reach for it, check *why* each pin is there. `--overrides` is the
 destructive flag in this command, and here is what it cannot work out for you:
@@ -638,13 +637,11 @@ not resolved against anything and what its manifest declares is what the crate
 is. A **dependency** is `null` there, because a manifest usually declares a
 constraint rather than a resolution — with one exception: a constraint that
 admits exactly one release (`serde = "=1.0.200"`, a PEP 440 `==2.28.1`, a NuGet
-`[1.2.3]`, a bare Gradle, Hex, or pubspec version) has already resolved it, and
-the version reported is the one the manifest spells, not a normalized form of it.
-Whether a bare version is a pin is decided by the ecosystem's constraint
+`[1.2.3]`, a bare Gradle, Hex, pubspec, or npm version) has already resolved it,
+and the version reported is the one the manifest spells, not a normalized form of
+it. Whether a bare version is a pin is decided by the ecosystem's constraint
 translator, not the string's shape: Cargo and Python read `1.2.3` as a range, and
-NuGet reads it as a lower bound. npm reads a bare version as exact, but this
-tree's translator currently reads it as a caret range, so a bare npm pin is
-`null` too (#155). It
+NuGet reads it as a lower bound. It
 is also `null` where the spelling itself is not a version the comparison engine
 can read as written — a two-segment `4.12`, a four-segment `1.2.3.4`, a Maven
 `6.4.4.Final` — because reporting one of those would put a string downstream that

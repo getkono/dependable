@@ -2507,8 +2507,9 @@ okhttp = { module = "com.squareup.okhttp3:okhttp", version.ref = "okhttp" }
 
     /// A full bare version is a pin wherever the ecosystem reads one as a single
     /// release, so the pin guard holds it exactly as it holds `=1.2.3` — even
-    /// when the check, reading the bare version as a caret, reports a newer
-    /// "compatible" release (#118). `--all` still overrides it. Where a bare
+    /// when a result reports a newer "compatible" release, as the check did while
+    /// it read npm's bare version as a caret (#118, #155). `--all` still overrides
+    /// it. Where a bare
     /// version is a caret (Cargo), the same spelling is a range and moves.
     #[test]
     fn a_bare_version_that_names_one_release_is_held_as_a_pin() {

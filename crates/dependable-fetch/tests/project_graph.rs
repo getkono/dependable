@@ -390,13 +390,12 @@ fn a_bare_nuget_version_is_exact_and_so_resolves() {
     }
 }
 
-/// The pin rule follows the constraint translator, not how concrete a constraint
-/// looks. npm itself reads a bare `1.3.0` as exact, but this tree's translator
-/// reads it as a caret range, as Cargo does, so `left-pad` is not reported. This
-/// records the current reading, not an endorsement of it: #155 tracks the npm
-/// defect, and fixing it flips this assertion.
+/// npm reads a bare `1.3.0` as exactly that release and spells the caret range
+/// `^1.3.0` (#155), so a `package.json`'s bare version is one the manifest settled
+/// and `tree` reports it, as it does an explicit `=`, while a `^` range stays
+/// unknown.
 #[test]
-fn a_bare_npm_version_is_read_as_a_range_by_this_tree() {
+fn a_bare_npm_version_is_exact_and_so_resolves() {
     let dir = TempDir::new().expect("tempdir");
     write(
         &dir.path().join("package.json"),
@@ -412,8 +411,7 @@ fn a_bare_npm_version_is_read_as_a_range_by_this_tree() {
 
     assert_eq!(built.source, GraphSource::Manifests);
     assert_eq!(version_of(&built.graph, "react"), None);
-    assert_eq!(version_of(&built.graph, "left-pad"), None);
-    // npm's explicit `=` is the one form that does name a single release.
+    assert_eq!(version_of(&built.graph, "left-pad"), Some("1.3.0"));
     assert_eq!(version_of(&built.graph, "pinned"), Some("4.17.21"));
 }
 

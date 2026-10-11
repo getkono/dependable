@@ -78,11 +78,9 @@ const NOT_IN_A_VERSION: &[char] = &[
 /// is whether *that* string parses.
 ///
 /// Note that "exact" is the translator's reading, not the string's shape. A bare
-/// `1.2.3` translates to an exact version for Maven, Hex, NuGet, and Dart, and a
-/// caret range for Cargo, Python, and npm — this reports a pin only where that
-/// ecosystem's translator already says so. For npm the caret reading is this
-/// tree's, not the ecosystem's: npm reads a bare version as exact, so its pins go
-/// unreported until the translator agrees (#155).
+/// `1.2.3` translates to an exact version for Maven, Hex, NuGet, Dart, and npm, and
+/// a caret range for Cargo and Python — this reports a pin only where that
+/// ecosystem's translator already says so.
 ///
 /// Pure: consults no registry, filesystem, or network.
 ///
@@ -210,9 +208,16 @@ mod tests {
             // -- npm --------------------------------------------------------
             ("^18.0.0", Ecosystem::Npm, None),
             ("latest", Ecosystem::Npm, None),
-            // Exact to npm, but a caret range to this tree's translator (#155).
-            ("1.2.3", Ecosystem::Npm, None),
+            // node-semver reads a bare version as exact and spells the caret range
+            // `^` (#155).
+            ("1.2.3", Ecosystem::Npm, Some("1.2.3")),
+            ("2.0.0-beta.1", Ecosystem::Npm, Some("2.0.0-beta.1")),
             ("=1.3.0", Ecosystem::Npm, Some("1.3.0")),
+            // Exact to npm, but `v1.2.3` is not a `semver::Version` as written.
+            ("v1.2.3", Ecosystem::Npm, None),
+            // A partial version is an X-range to npm, not a pin.
+            ("1.2", Ecosystem::Npm, None),
+            ("~1.2.3", Ecosystem::Npm, None),
             // -- Python -----------------------------------------------------
             ("==2.28.1", Ecosystem::Python, Some("2.28.1")),
             // Exact under PEP 440, but `0.20` is not a `semver::Version`.
