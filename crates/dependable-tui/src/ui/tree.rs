@@ -199,8 +199,14 @@ fn name_style(row: &Row) -> Style {
 }
 
 /// The `(workspace)` / `(git)` / `(path)` annotation, where it says something.
+///
+/// A crate a nested workspace governs reads `nested` rather than `workspace`: it
+/// is not a member of this project's workspace, and its version was resolved
+/// against another root. The column is too narrow to name that root; the detail
+/// pane names it.
 fn kind_tag(row: &Row) -> Option<&'static str> {
     match row.node_kind? {
+        NodeKind::Workspace if row.nested_root.is_some() => Some("nested"),
         NodeKind::Workspace => Some("workspace"),
         NodeKind::Git => Some("git"),
         NodeKind::Path => Some("path"),

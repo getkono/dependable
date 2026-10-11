@@ -4,6 +4,8 @@
 //! "not published", never as a blank line that looks like missing data, and a
 //! lookup that failed says so rather than looking like an empty package.
 
+use std::borrow::Cow;
+
 use dependable_fetch::{DependencyStatus, Ecosystem, NodeKind, Owner, OwnerKind, PackageMetadata};
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -141,7 +143,7 @@ fn package_lines(app: &App, row: &crate::rows::Row, width: u16) -> Content {
     // A package that did not come from the registry is not the registry's package
     // of the same name, so nothing is fetched and nothing is claimed.
     if !published {
-        content.push(dim(local_origin(row)));
+        content.push(dim(&local_origin(row)));
         return content;
     }
 
@@ -406,12 +408,23 @@ fn owner_span(owner: &Owner) -> Span<'static> {
 /// `NodeKind` is `#[non_exhaustive]`, so a kind this build has never heard of
 /// still has to say something. Saying only that it was not fetched is honest
 /// about both facts: nothing was looked up, and we cannot explain why.
-fn local_origin(row: &crate::rows::Row) -> &'static str {
-    match row.node_kind {
-        Some(NodeKind::Workspace) => "a member of this workspace — not fetched from a registry",
-        Some(NodeKind::Path) => "a local path dependency — not fetched from a registry",
-        Some(NodeKind::Git) => "a git dependency — not fetched from a registry",
-        _ => "not fetched from a registry",
+///
+/// A crate a nested workspace governs is not "a member of this workspace", and
+/// says which root it does belong to, since its version was resolved there.
+fn local_origin(row: &crate::rows::Row) -> Cow<'static, str> {
+    match (row.node_kind, row.nested_root.as_deref()) {
+        (Some(NodeKind::Workspace), Some(root)) => Cow::Owned(format!(
+            "a member of the nested workspace at {} — not fetched from a registry",
+            root.display()
+        )),
+        (Some(NodeKind::Workspace), None) => {
+            Cow::Borrowed("a member of this workspace — not fetched from a registry")
+        }
+        (Some(NodeKind::Path), _) => {
+            Cow::Borrowed("a local path dependency — not fetched from a registry")
+        }
+        (Some(NodeKind::Git), _) => Cow::Borrowed("a git dependency — not fetched from a registry"),
+        _ => Cow::Borrowed("not fetched from a registry"),
     }
 }
 

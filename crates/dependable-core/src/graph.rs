@@ -20,6 +20,14 @@ use crate::lockfiles::ResolvedLockfile;
 #[non_exhaustive]
 pub enum NodeKind {
     /// A crate that lives in this workspace (a member).
+    ///
+    /// A scan can reach a crate in a *nested*, independent workspace — a `fuzz/`
+    /// tree with a `[workspace]` of its own — and that crate is a workspace crate
+    /// too, so it is classified here as well. Which root governs it is not this
+    /// kind's to say: the kind classifies what a package *is*, and the graph model
+    /// has no notion of a workspace root's directory. A caller that ran the scan
+    /// holds that fact beside the graph instead (`dependable-fetch`'s
+    /// `WorkspaceGraph::nested_roots`), as it holds how the graph was built.
     Workspace,
     /// A package resolved from a registry (crates.io / a sparse index).
     Registry,

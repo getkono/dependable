@@ -1,6 +1,6 @@
 //! The data the TUI renders: discovered projects and per-package lookups.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use dependable_fetch::{
@@ -20,6 +20,11 @@ pub struct Project {
     pub graph: DependencyGraph,
     /// Where the graph's edges came from, so the UI can say why a tree stops.
     pub source: GraphSource,
+    /// The workspace nodes a nested workspace root governs rather than this
+    /// project's own, each mapped to that root's directory: the scan's
+    /// [`dependable_fetch::WorkspaceGraph::nested_roots`], carried so a nested
+    /// crate is not presented as a member of this workspace.
+    pub nested_roots: BTreeMap<usize, PathBuf>,
 }
 
 impl Project {
@@ -196,6 +201,7 @@ mod tests {
             ecosystem: Ecosystem::Npm,
             graph: DependencyGraph::default(),
             source: GraphSource::UnreadableLockfile,
+            nested_roots: BTreeMap::new(),
         };
 
         let caveat = project.caveat().expect("a shallow graph carries a caveat");

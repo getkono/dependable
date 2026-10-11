@@ -266,6 +266,7 @@ mod tests {
                 name: format!("pkg-{i}"),
                 version: None,
                 node_kind: None,
+                nested_root: None,
                 has_children: true,
                 redirect: None,
                 expanded: false,

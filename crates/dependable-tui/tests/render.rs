@@ -3,6 +3,7 @@
 //! No real terminal is involved, so these run identically on Linux, macOS, and
 //! Windows in CI. They assert on what the user can actually read.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use dependable_fetch::core::{LockedPackage, ResolvedLockfile};
@@ -71,6 +72,7 @@ fn project(source: GraphSource) -> Project {
         ecosystem: Ecosystem::Rust,
         graph: DependencyGraph::from_resolved(&resolved, &names, &["app".to_owned()]),
         source,
+        nested_roots: BTreeMap::new(),
     }
 }
 
@@ -977,6 +979,7 @@ fn two_members() -> App {
         ecosystem: Ecosystem::Rust,
         graph: DependencyGraph::from_resolved(&resolved, &names, &["a".to_owned(), "b".to_owned()]),
         source: GraphSource::Lockfile,
+        nested_roots: BTreeMap::new(),
     }])
 }
 
@@ -1049,6 +1052,7 @@ fn version_less_project() -> Project {
         ecosystem: Ecosystem::Rust,
         graph: DependencyGraph::from_resolved(&resolved, &names, &["app".to_owned()]),
         source: GraphSource::Unsupported,
+        nested_roots: BTreeMap::new(),
     }
 }
 
@@ -1178,6 +1182,7 @@ fn empty_version_project() -> Project {
         ecosystem: Ecosystem::Rust,
         graph: DependencyGraph::from_resolved(&resolved, &names, &["app".to_owned()]),
         source: GraphSource::Lockfile,
+        nested_roots: BTreeMap::new(),
     }
 }
 
@@ -1211,5 +1216,59 @@ fn an_empty_version_string_is_treated_as_no_version_at_all_not_as_up_to_date() {
         status_cell_of(&screen, "serde"),
         "unknown",
         "an empty version must never read as a freshness verdict: {screen}"
+    );
+}
+
+/// `app` is a member; `app-fuzz` is a workspace crate too, but a nested root at
+/// `fuzz` governs it.
+fn nested_project() -> Project {
+    let packages = vec![
+        LockedPackage::new("app".into(), Some("1.0.0".into()), None, Vec::new()),
+        LockedPackage::new("app-fuzz".into(), Some("0.0.0".into()), None, Vec::new()),
+    ];
+    let resolved = ResolvedLockfile::from_packages(packages);
+    let names = ["app".to_owned(), "app-fuzz".to_owned()]
+        .into_iter()
+        .collect();
+    let graph = DependencyGraph::from_resolved(
+        &resolved,
+        &names,
+        &["app".to_owned(), "app-fuzz".to_owned()],
+    );
+    let fuzz = graph
+        .nodes()
+        .iter()
+        .position(|n| n.name == "app-fuzz")
+        .expect("app-fuzz");
+    Project {
+        manifest: PathBuf::from("Cargo.toml"),
+        label: "Cargo.toml".to_owned(),
+        ecosystem: Ecosystem::Rust,
+        graph,
+        source: GraphSource::Manifests,
+        nested_roots: BTreeMap::from([(fuzz, PathBuf::from("fuzz"))]),
+    }
+}
+
+#[test]
+fn a_nested_workspaces_crate_is_not_presented_as_a_member() {
+    let mut app = App::new(vec![nested_project()]);
+    let screen = render(&mut app);
+    assert_eq!(status_cell_of(&screen, "app-fuzz"), "nested", "{screen}");
+    assert_eq!(
+        status_cell_of(&screen, "app "),
+        "workspace",
+        "a governed member keeps its tag: {screen}"
+    );
+
+    app.apply(Action::Move(2)); // `app-fuzz`
+    let screen = render(&mut app);
+    assert!(
+        screen.contains("nested workspace at fuzz"),
+        "the detail pane names the root that governs it: {screen}"
+    );
+    assert!(
+        !screen.contains("member of this workspace"),
+        "and does not call it a member of this one: {screen}"
     );
 }

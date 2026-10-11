@@ -60,6 +60,7 @@ pub fn discover_projects(root: &Path, depth: usize) -> (Vec<Project>, Vec<String
                 ecosystem: kind.ecosystem(),
                 graph: built.graph,
                 source: built.source,
+                nested_roots: built.nested_roots,
             }),
             Err(error) => {
                 notices.push(format!("skipped {}: {error}", manifest.display()));
