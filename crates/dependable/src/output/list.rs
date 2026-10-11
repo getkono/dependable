@@ -8,11 +8,11 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use dependable_fetch::core::ProjectRole;
-use dependable_fetch::{DependencyKind, Ecosystem, Item, PackageSource};
+use dependable_fetch::{Ecosystem, Item, PackageSource};
 use serde::Serialize;
 
 use crate::cli::Format;
-use crate::output::posix;
+use crate::output::{kind_annotation, posix};
 
 /// The identifier of the JSON document's shape. Consumers can pin on it; any
 /// incompatible change to the shape takes a new version.
@@ -386,16 +386,9 @@ fn annotation(item: &Item) -> &'static str {
         // one, or stated an identity (a Swift registry pin's `scope.name`) no query
         // here is keyed by — so nothing was fetched under that name.
         PackageSource::Unidentified => " (unidentified)",
-        _ => match item.kind {
-            DependencyKind::Dev => " (dev)",
-            DependencyKind::Build => " (build)",
-            DependencyKind::Optional => " (optional)",
-            DependencyKind::Peer => " (peer)",
-            DependencyKind::Workspace => " (declared)",
-            DependencyKind::Indirect => " (indirect)",
-            DependencyKind::Override => " (override)",
-            _ => "",
-        },
+        // The kind's label is shared with `check`'s table, so the two commands spell
+        // each kind the same way.
+        _ => kind_annotation(item.kind),
     }
 }
 

@@ -1,9 +1,9 @@
 //! Colored, TTY-aware table output (the default).
 
-use dependable_fetch::{CheckResult, DependencyStatus};
+use dependable_fetch::{CheckResult, DependencyKind, DependencyStatus, Item};
 use owo_colors::{OwoColorize, Stream, Style};
 
-use super::{ManifestReport, Summary, current_display, latest_display};
+use super::{ManifestReport, Summary, current_display, kind_annotation, latest_display};
 
 /// Render all reports as tables, with a combined totals line for multi-manifest runs.
 ///
@@ -62,7 +62,7 @@ fn render_one(report: &ManifestReport) {
         .iter()
         .map(|r| {
             (
-                r.item.name.clone(),
+                package_cell(&r.item),
                 current_display(r),
                 latest_display(r),
                 r,
@@ -89,6 +89,24 @@ fn render_one(report: &ManifestReport) {
     }
     println!();
     print_totals(&Summary::of(std::slice::from_ref(report)));
+}
+
+/// The Package cell: the name, followed by its kind's label where `check` calls
+/// that kind out.
+///
+/// Only a forced version is called out. An override is the one kind whose row
+/// changes what the reader should do next — it is usually a security pin, so "bump
+/// it" becomes "find out why this is here first", and `fix` declines to rewrite one
+/// unless asked. The other kinds (`dev`, `build`, `peer`, …) change nothing about
+/// what a `check` row asks of its reader, and labelling them would add noise to
+/// most rows of the most-run command. `list` shows every kind; the label itself
+/// comes from the same [`kind_annotation`] either way, so the two commands never
+/// spell one kind two ways.
+fn package_cell(item: &Item) -> String {
+    match item.kind {
+        DependencyKind::Override => format!("{}{}", item.name, kind_annotation(item.kind)),
+        _ => item.name.clone(),
+    }
 }
 
 fn width(lengths: impl Iterator<Item = usize>, header: &str) -> usize {

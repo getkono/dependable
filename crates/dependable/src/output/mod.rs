@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use dependable_fetch::{CheckResult, DependencyStatus, Ecosystem};
+use dependable_fetch::{CheckResult, DependencyKind, DependencyStatus, Ecosystem};
 
 use crate::cli::CheckFormat;
 
@@ -211,6 +211,27 @@ pub fn current_display(result: &CheckResult) -> String {
                 .then(|| result.item.version_constraint.clone())
         })
         .unwrap_or_else(|| "—".to_string())
+}
+
+/// The parenthesized label a human-readable table gives a dependency kind —
+/// ` (dev)`, ` (override)`, … — or nothing for an ordinary runtime dependency.
+///
+/// The one spelling of each kind for every table in the binary: `list` prints it
+/// for every kind, `check` for the kinds it chooses to call out (see
+/// [`table`]). Two renderers deriving their own words for the same fact is how a
+/// binary ends up saying `override` in one place and `forced` in another.
+#[must_use]
+pub fn kind_annotation(kind: DependencyKind) -> &'static str {
+    match kind {
+        DependencyKind::Dev => " (dev)",
+        DependencyKind::Build => " (build)",
+        DependencyKind::Optional => " (optional)",
+        DependencyKind::Peer => " (peer)",
+        DependencyKind::Workspace => " (declared)",
+        DependencyKind::Indirect => " (indirect)",
+        DependencyKind::Override => " (override)",
+        _ => "",
+    }
 }
 
 /// The version to display as "latest": the absolute latest, else the latest
