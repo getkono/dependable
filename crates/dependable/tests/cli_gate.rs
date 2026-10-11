@@ -16,11 +16,19 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-fn workdir(name: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).expect("create the scratch directory");
-    dir
+use tempfile::TempDir;
+
+/// A fresh scratch directory no other test process can pick, named after `name`.
+///
+/// The directory is removed when the returned guard drops, so bind it to a named
+/// variable (`_tmp`, not `_`) for the length of the test.
+fn workdir(name: &str) -> (TempDir, PathBuf) {
+    let tmp = tempfile::Builder::new()
+        .prefix(name)
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("create the scratch directory");
+    let dir = tmp.path().to_path_buf();
+    (tmp, dir)
 }
 
 /// One canned response: status code, `Content-Type`, body.
@@ -207,7 +215,7 @@ fn outcome(output: &Output) -> (String, String, i32) {
 /// exit 2.
 #[test]
 fn a_go_module_the_proxy_answers_410_for_does_not_break_the_gate() {
-    let dir = workdir("gate_go_gone");
+    let (_tmp, dir) = workdir("gate_go_gone");
     let base = registry(vec![
         ("/github.com/acme/private/@v/list".to_string(), status(410)),
         ("/github.com/acme/private/@latest".to_string(), status(410)),
@@ -255,7 +263,7 @@ fn a_go_module_the_proxy_answers_410_for_does_not_break_the_gate() {
 /// `--fail-on vulnerable` certified the build.
 #[test]
 fn an_unreadable_constraint_still_refuses_to_certify_the_build() {
-    let dir = workdir("gate_unreadable_constraint");
+    let (_tmp, dir) = workdir("gate_unreadable_constraint");
     let base = registry(vec![
         (
             "/lodash".to_string(),
@@ -293,7 +301,7 @@ fn an_unreadable_constraint_still_refuses_to_certify_the_build() {
 /// dependencies that did resolve.
 #[test]
 fn a_package_the_registry_answers_404_for_does_not_break_the_gate() {
-    let dir = workdir("gate_404_carve_out");
+    let (_tmp, dir) = workdir("gate_404_carve_out");
     let base = registry(vec![(
         "/express".to_string(),
         packument("express", &["4.19.2"], "4.19.2"),
@@ -334,7 +342,7 @@ fn a_package_the_registry_answers_404_for_does_not_break_the_gate() {
 /// gate, said nothing about it.
 #[test]
 fn an_override_key_carrying_a_range_is_checked_as_its_own_package() {
-    let dir = workdir("gate_override_range");
+    let (_tmp, dir) = workdir("gate_override_range");
     let base = registry(vec![
         (
             "/lodash".to_string(),
@@ -380,7 +388,7 @@ fn an_override_key_carrying_a_range_is_checked_as_its_own_package() {
 /// failed `--fail-on any`.
 #[test]
 fn a_poetry_wildcard_resolves_instead_of_going_undetermined() {
-    let dir = workdir("gate_poetry_wildcard");
+    let (_tmp, dir) = workdir("gate_poetry_wildcard");
     let base = registry(vec![(
         "/pypi/requests/json".to_string(),
         json("{\"releases\":{\"2.31.0\":[],\"2.32.3\":[]}}"),
@@ -412,7 +420,7 @@ fn a_poetry_wildcard_resolves_instead_of_going_undetermined() {
 /// but the run now says what it could not evaluate.
 #[test]
 fn a_dependency_whose_version_could_not_be_read_is_noted() {
-    let dir = workdir("gate_undetermined_note");
+    let (_tmp, dir) = workdir("gate_undetermined_note");
     let base = registry(vec![(
         "/express".to_string(),
         packument("express", &["4.19.2"], "4.19.2"),
@@ -459,7 +467,7 @@ fn a_dependency_whose_version_could_not_be_read_is_noted() {
 /// passing `--fail-on outdated` that versions it had read "could not" be read.
 #[test]
 fn a_registryless_pin_is_not_noted_as_an_unread_version() {
-    let dir = workdir("gate_swift_undetermined_note");
+    let (_tmp, dir) = workdir("gate_swift_undetermined_note");
     let base = registry(Vec::new());
     let config = write_config(&dir, &base);
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample-swift");
@@ -494,7 +502,7 @@ fn a_registryless_pin_is_not_noted_as_an_unread_version() {
 /// known about.
 #[test]
 fn a_metadata_document_listing_no_versions_is_not_exempt_from_the_gate() {
-    let dir = workdir("gate_empty_metadata");
+    let (_tmp, dir) = workdir("gate_empty_metadata");
     let base = registry(vec![(
         "/com/acme/thing/maven-metadata.xml".to_string(),
         xml(
@@ -540,7 +548,7 @@ fn a_metadata_document_listing_no_versions_is_not_exempt_from_the_gate() {
 /// manifest exited 0.
 #[test]
 fn the_ordinary_npm_ranges_no_longer_make_a_repository_unanswerable() {
-    let dir = workdir("gate_npm_range_dialects");
+    let (_tmp, dir) = workdir("gate_npm_range_dialects");
     let base = registry(vec![
         (
             "/react".to_string(),
@@ -594,7 +602,7 @@ fn the_ordinary_npm_ranges_no_longer_make_a_repository_unanswerable() {
 /// in another.
 #[test]
 fn a_dart_any_constraint_is_read_as_no_constraint() {
-    let dir = workdir("gate_dart_any");
+    let (_tmp, dir) = workdir("gate_dart_any");
     let base = registry(vec![(
         "/api/packages/meta".to_string(),
         json("{\"versions\":[{\"version\":\"1.15.0\"},{\"version\":\"1.16.0\"}]}"),
@@ -622,7 +630,7 @@ fn a_dart_any_constraint_is_read_as_no_constraint() {
 /// the newer release is outside the constraint and is an available update.
 #[test]
 fn a_bare_dart_version_is_exact_and_a_newer_release_is_an_update() {
-    let dir = workdir("gate_dart_bare_version");
+    let (_tmp, dir) = workdir("gate_dart_bare_version");
     let base = registry(vec![(
         "/api/packages/provider".to_string(),
         json("{\"versions\":[{\"version\":\"6.0.5\"},{\"version\":\"6.1.0\"}]}"),
@@ -647,7 +655,7 @@ fn a_bare_dart_version_is_exact_and_a_newer_release_is_an_update() {
 /// setting that promises every constraint was established.
 #[test]
 fn a_dist_tag_is_undetermined_rather_than_unevaluated() {
-    let dir = workdir("gate_dist_tag");
+    let (_tmp, dir) = workdir("gate_dist_tag");
     let base = registry(vec![(
         "/express".to_string(),
         packument("express", &["4.19.2"], "4.19.2"),
@@ -685,7 +693,7 @@ fn a_dist_tag_is_undetermined_rather_than_unevaluated() {
 /// configuration one function away; the `--fail-on` gate did not.
 #[test]
 fn a_vulnerability_gate_with_no_scan_is_refused_rather_than_passed() {
-    let dir = workdir("gate_vacuous_vulnerable");
+    let (_tmp, dir) = workdir("gate_vacuous_vulnerable");
     let base = registry(vec![(
         "/express".to_string(),
         packument("express", &["4.19.2"], "4.19.2"),
@@ -723,7 +731,7 @@ fn a_vulnerability_gate_with_no_scan_is_refused_rather_than_passed() {
 /// exit 2.
 #[test]
 fn an_override_referencing_a_workspace_dependency_is_not_sent_to_a_registry() {
-    let dir = workdir("gate_override_workspace_referent");
+    let (_tmp, dir) = workdir("gate_override_workspace_referent");
     let base = registry(vec![(
         "/express".to_string(),
         packument("express", &["4.19.2"], "4.19.2"),
@@ -762,7 +770,7 @@ fn an_override_referencing_a_workspace_dependency_is_not_sent_to_a_registry() {
 /// implicate it.
 #[test]
 fn the_refusal_names_the_registry_that_declined_and_not_the_one_that_answered() {
-    let dir = workdir("gate_split_registries");
+    let (_tmp, dir) = workdir("gate_split_registries");
     let npm_base = registry(vec![(
         "/express".to_string(),
         packument("express", &["4.19.2"], "4.19.2"),
@@ -824,7 +832,7 @@ fn the_refusal_names_the_registry_that_declined_and_not_the_one_that_answered() 
 #[cfg(feature = "report")]
 #[test]
 fn a_severity_policy_refuses_a_run_whose_registry_never_answered() {
-    let dir = workdir("gate_policy_registry_unanswered");
+    let (_tmp, dir) = workdir("gate_policy_registry_unanswered");
     let base = registry(vec![(
         "/lodash".to_string(),
         (503, "text/plain", String::new()),
