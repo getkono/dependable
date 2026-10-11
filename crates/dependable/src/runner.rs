@@ -11,8 +11,9 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use dependable_fetch::core::{
-    AlternateRegistryDecl, NpmrcConfig, PackageField, ProjectMeta, apply_lockfile, parse,
-    parse_cargo_config, parse_npmrc, parse_project, parse_workspace, resolve_workspace_inheritance,
+    AlternateRegistryDecl, NpmrcConfig, PackageField, ProjectMeta, apply_lockfile, lockfile_items,
+    parse, parse_cargo_config, parse_npmrc, parse_project, parse_workspace,
+    resolve_workspace_inheritance,
 };
 use dependable_fetch::{
     CheckError, Checker, DependencyStatus, Ecosystem, ErrorOrigin, GoProxyFetcher, GraphSource,
@@ -268,6 +269,12 @@ impl Engine {
                 )),
             );
         }
+        // Swift has no fetcher to register — it has no registry — so enabling it is
+        // an assertion rather than a registration. Same switch, same config key,
+        // and without it `[swift] enabled = false` would do nothing at all.
+        if cfg.swift.enabled {
+            builder = builder.registryless(Ecosystem::Swift);
+        }
         if show_progress {
             builder = builder.on_progress(progress_sink());
         }
@@ -279,8 +286,17 @@ impl Engine {
     /// has no registered checker or no parser yet — so a polyglot repo with a
     /// not-yet-supported manifest does not abort the whole run.
     async fn check_manifest(&self, path: &Path) -> anyhow::Result<Option<ManifestReport>> {
-        report_lockfile_notices(path);
-        match self.checker.check_path(path).await {
+        // The lockfile notices wait for the outcome: a manifest whose ecosystem is
+        // switched off is skipped, and a warning about its lockfile — or about a
+        // `Package.resolved` it lacks — is advice about a project nobody asked to
+        // check. Every other outcome prints them exactly as before, ahead of
+        // anything else said about the manifest.
+        let outcome = self.checker.check_path(path).await;
+        let dependencies_unread = match outcome {
+            Err(CheckError::UnsupportedEcosystem(_)) => false,
+            _ => report_lockfile_notices(path),
+        };
+        match outcome {
             Ok(check) => {
                 for warning in &check.warnings {
                     eprintln!("warning: {} — {warning}", path.display());
@@ -306,6 +322,7 @@ impl Engine {
                     ecosystem: check.ecosystem,
                     results: check.results,
                     workspace_root: check.workspace_root,
+                    dependencies_unread,
                     integrity,
                 }))
             }
@@ -330,18 +347,26 @@ impl Engine {
     }
 }
 
-/// Warn about lockfiles that are present beside `manifest` but cannot be used.
+/// Warn about lockfiles that are present beside `manifest` but cannot be used —
+/// or, for the one format that *is* the dependency list, absent altogether.
 ///
 /// Without this a `bun.lockb` is silently skipped and every dependency is
 /// reported unlocked, with nothing to tell the user that a lockfile they can
 /// migrate is the reason.
-fn report_lockfile_notices(manifest: &Path) {
+///
+/// Returns whether any notice means the project's dependency list itself went
+/// unread, which the caller has to carry into the exit code: a run that knows
+/// nothing about a project must not report it clean.
+fn report_lockfile_notices(manifest: &Path) -> bool {
     let Some(kind) = ManifestKind::detect(manifest) else {
-        return;
+        return false;
     };
+    let mut unread = false;
     for notice in dependable_fetch::lockfile_notices(manifest, kind) {
         eprintln!("warning: {notice}");
+        unread |= notice.dependency_list_unread;
     }
+    unread
 }
 
 /// A progress sink that drives a per-manifest indicatif bar. Each manifest's
@@ -477,11 +502,17 @@ pub async fn run_check(args: CheckArgs) -> anyhow::Result<ExitCode> {
 fn build_report(root: PathBuf, reports: &[ManifestReport]) -> dependable_report::Report {
     let mut report = dependable_report::Report::new(root);
     for manifest in reports {
-        report.push(dependable_report::ManifestResults::new(
-            manifest.path.clone(),
-            manifest.ecosystem,
-            manifest.results.clone(),
-        ));
+        report.push(
+            dependable_report::ManifestResults::new(
+                manifest.path.clone(),
+                manifest.ecosystem,
+                manifest.results.clone(),
+            )
+            // A policy rule counts rows. A manifest whose dependency list went
+            // unread contributes none, and a rule that passes over no rows has
+            // established nothing — so the model has to carry the difference.
+            .with_dependencies_unread(manifest.dependencies_unread),
+        );
     }
     report
 }
@@ -727,7 +758,7 @@ pub async fn run_list(args: ListArgs) -> anyhow::Result<ExitCode> {
         let Some(kind) = ManifestKind::detect(manifest) else {
             continue;
         };
-        report_lockfile_notices(manifest);
+        let _ = report_lockfile_notices(manifest);
         let content = std::fs::read_to_string(manifest)
             .with_context(|| format!("reading {}", manifest.display()))?;
         let mut parsed = match parse(kind, &content) {
@@ -768,9 +799,8 @@ pub async fn run_list(args: ListArgs) -> anyhow::Result<ExitCode> {
                 resolve_workspace_inheritance(&mut parsed.items, &declarations)
             })
             .unwrap_or_default();
-        let lockfile = (!args.no_lock_file)
-            .then(|| apply_nearest_lockfile(manifest, kind, &root, &mut parsed.items))
-            .flatten();
+        let lockfile =
+            apply_nearest_lockfile(manifest, kind, &root, !args.no_lock_file, &mut parsed.items);
         let meta = parse_project(kind, &content);
         let (version, version_inherited) = resolve_version(manifest, kind, &content, &meta);
 
@@ -811,12 +841,38 @@ pub async fn run_list(args: ListArgs) -> anyhow::Result<ExitCode> {
 /// found by walking up. The walk stops at the repository root (the first ancestor
 /// holding a `.git`) so a stray lockfile outside the project is never read, and the
 /// path that was used is reported rather than assumed.
+///
+/// # `annotations`
+/// `--no-lock-file` clears this, and it governs **only** the annotating half. The flag
+/// is documented as "ignore sibling lockfiles (do not report locked versions)": it
+/// suppresses the `locked_at` column, which is an annotation on a list the manifest
+/// already produced. A `Package.resolved` is not that — it *is* the list, because a
+/// `Package.swift` is a program this tool declines to read. Honouring the flag there
+/// would not withhold a version column, it would report a Swift project as depending
+/// on nothing at all, which is the inversion this ecosystem's support exists to
+/// prevent. So a dependency-source lockfile is read regardless, and the flag keeps
+/// exactly the meaning its help text claims.
 fn apply_nearest_lockfile(
     manifest: &Path,
     kind: ManifestKind,
     root: &Path,
-    items: &mut [Item],
+    annotations: bool,
+    items: &mut Vec<Item>,
 ) -> Option<PathBuf> {
+    // One lockfile *is* the dependency list rather than an annotation on one: a
+    // `Package.swift` is a program this tool declines to read, so its
+    // `Package.resolved` is where the dependencies come from. Without this branch
+    // `list` reports a Swift project as depending on nothing.
+    if let Some((path, lock_kind)) = dependable_fetch::locate_lockfile(manifest, kind)
+        && lock_kind.is_dependency_source()
+    {
+        let content = std::fs::read_to_string(&path).ok()?;
+        items.extend(lockfile_items(lock_kind, &content)?);
+        return Some(relative_to(root, &path));
+    }
+    if !annotations {
+        return None;
+    }
     let (path, resolved) = dependable_fetch::find_lockfile(manifest, kind)?;
     apply_lockfile(items, &resolved);
     Some(relative_to(root, &path))
@@ -1012,6 +1068,13 @@ pub async fn run_fix(args: FixArgs) -> anyhow::Result<ExitCode> {
 
     let engine = Engine::new(&settings, &cfg, true)?;
 
+    let mut unchecked = 0;
+    // Counted beside `unchecked`, not folded into it. `unchecked` is a tally of
+    // rows, and a manifest whose dependency list went unread produces none — so a
+    // Swift project with no `Package.resolved`, the state Apple advises library
+    // packages to be in, left both this loop's counters at zero and reached the
+    // clean closing line below with nothing having been read at all.
+    let mut unread = 0;
     // Plan every manifest before writing any of them. Writing as it went left the tree
     // half-rewritten when a later manifest failed — and because the report was printed
     // *after* each write, the failing iteration also destroyed the record of what had
@@ -1023,6 +1086,14 @@ pub async fn run_fix(args: FixArgs) -> anyhow::Result<ExitCode> {
             continue;
         };
         inherited += report_inherited_skips(manifest, &report);
+        if report.dependencies_unread {
+            unread += 1;
+        }
+        unchecked += report
+            .results
+            .iter()
+            .filter(|result| result.status == DependencyStatus::Undetermined)
+            .count();
         let plan = fix::plan(manifest, &report.results, args.all, args.overrides)?;
         report_declined_fixes(manifest, &plan.declined);
         planned.push(plan);
@@ -1052,26 +1123,56 @@ pub async fn run_fix(args: FixArgs) -> anyhow::Result<ExitCode> {
     // line below means, and counting only one of the two categories printed the
     // clean line on stdout directly over an inherited-skip note on stderr.
     let left_alone = declined + inherited;
-    if total == 0 {
+    if total == 0 && left_alone == 0 && unchecked == 0 && unread == 0 {
+        println!("Everything is already up to date.");
+    } else if total == 0 {
         // "Everything is already up to date" is only true when nothing was left
-        // behind. Saying it over an update this run declined to write is the
-        // contradiction with `check` that this whole path exists to remove, so the
-        // count of what was left alone takes over the line and points at the notes
-        // that explain it.
+        // behind and everything was looked at. Saying it over an update this run
+        // declined to write is the contradiction with `check` that this path
+        // exists to remove; saying it where no version could be compared against
+        // a registry — an ecosystem that publishes no registry at all, or an
+        // entry whose version this manifest never states — turns "we did not
+        // look" into "we looked and found nothing", which is the one thing a fix
+        // run must never say.
         //
-        // The notes are on stderr and this line is on stdout, so it says *where*:
-        // `dependable fix > fix.log` puts the summary in the log and the notes on
-        // the terminal, and "see the notes above" would name nothing the reader of
-        // either stream can find.
-        if left_alone == 0 {
-            println!("Everything is already up to date.");
-        } else {
-            println!(
-                "Nothing to rewrite. {left_alone} available update{} left alone; \
-                 see the notes on stderr.",
+        // The reasons are worded apart because they are different facts: an
+        // update left alone was found and declined, an undetermined dependency
+        // *was* read and could not be checked, and an unread dependency list was
+        // never read, so there is not even a list of dependencies to have failed
+        // to check.
+        //
+        // The notes and warnings are on stderr and this line is on stdout, so it
+        // says *where*: `dependable fix > fix.log` puts the summary in the log and
+        // the notes on the terminal, and "see the notes above" would name nothing
+        // the reader of either stream can find.
+        let mut reasons: Vec<String> = Vec::new();
+        if left_alone > 0 {
+            reasons.push(format!(
+                "{left_alone} available update{} left alone",
                 if left_alone == 1 { "" } else { "s" }
-            );
+            ));
         }
+        if unchecked > 0 {
+            reasons.push(format!(
+                "{unchecked} dependenc{} could not be checked for a newer version",
+                if unchecked == 1 { "y" } else { "ies" }
+            ));
+        }
+        if unread > 0 {
+            reasons.push(format!(
+                "{} dependency list for {unread} manifest{} could not be read, so nothing \
+                 in {} was checked",
+                if reasons.is_empty() { "The" } else { "the" },
+                if unread == 1 { "" } else { "s" },
+                if unread == 1 { "it" } else { "them" }
+            ));
+        }
+        let why = match reasons.split_last() {
+            Some((last, [])) => last.clone(),
+            Some((last, rest)) => format!("{}, and {last}", rest.join(", ")),
+            None => unreachable!("a run that rewrote nothing names at least one reason"),
+        };
+        println!("Nothing to rewrite. {why}; see the notes on stderr.");
     } else if !args.dry_run {
         println!(
             "\nUpdated {total} dependenc{}.",
@@ -1309,15 +1410,21 @@ pub async fn run_report(args: crate::cli::ReportArgs) -> anyhow::Result<ExitCode
     let engine = Engine::new(&settings, &cfg, !args.quiet)?;
     let mut report = dependable_report::Report::new(root.clone());
     for manifest in &manifests {
-        for notice in lockfile_notes(manifest) {
-            notes.push(notice);
-        }
         match engine.check_manifest(manifest).await? {
-            Some(checked) => report.push(dependable_report::ManifestResults::new(
-                relative_to(&root, &checked.path),
-                checked.ecosystem,
-                checked.results,
-            )),
+            Some(checked) => report.push({
+                // After the check, not before it: a skipped manifest's lockfile is
+                // not this report's business, exactly as on the console.
+                notes.extend(lockfile_notes(manifest));
+                dependable_report::ManifestResults::new(
+                    relative_to(&root, &checked.path),
+                    checked.ecosystem,
+                    checked.results,
+                )
+                // Structural, not a note: `--quiet` suppresses the notes below, and
+                // a caveat about what the report does not cover is not chatter. A
+                // report that omits it is indistinguishable from a clean one.
+                .with_dependencies_unread(checked.dependencies_unread)
+            }),
             None => notes.push(format!(
                 "Skipped {}: its ecosystem is not enabled or not yet supported.",
                 relative_to(&root, manifest).display()
@@ -1919,7 +2026,13 @@ fn exit_code(reports: &[ManifestReport], fail_on: FailOn, quiet: bool) -> ExitCo
                 DependencyStatus::UpToDate | DependencyStatus::Local | DependencyStatus::Git
             ),
         });
-    if triggered {
+    // A manifest whose dependency list was never read has no results to inspect,
+    // so the loop above sees an empty list and finds nothing wrong with it. That
+    // is the inversion in its purest form: zero rows read as a clean project. Only
+    // `--fail-on any` asks the question this answers — `vulnerable` and `outdated`
+    // ask about findings, and there are none to have.
+    let unread = fail_on == FailOn::Any && reports.iter().any(|r| r.dependencies_unread);
+    if triggered || unread {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
@@ -2182,6 +2295,7 @@ mod tests {
             ecosystem: dependable_fetch::Ecosystem::Rust,
             results,
             workspace_root: None,
+            dependencies_unread: false,
             integrity,
         }
     }

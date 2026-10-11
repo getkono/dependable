@@ -19,6 +19,7 @@ pub mod gradle_catalog;
 pub mod json_scan;
 pub mod mix_exs;
 pub mod package_json;
+pub mod package_swift;
 pub mod pnpm_workspace;
 pub mod pom_xml;
 pub mod position;
@@ -42,6 +43,7 @@ pub use go_mod::GoModParser;
 pub use gradle_catalog::GradleCatalogParser;
 pub use mix_exs::MixExsParser;
 pub use package_json::PackageJsonParser;
+pub use package_swift::PackageSwiftParser;
 pub use pnpm_workspace::PnpmWorkspaceParser;
 pub use pom_xml::PomXmlParser;
 pub use project::{ProjectMeta, ProjectRole, parse_project};
@@ -71,5 +73,6 @@ pub fn parse(kind: ManifestKind, content: &str) -> Result<ParsedManifest, ParseE
         ManifestKind::MixExs => MixExsParser.parse(content),
         ManifestKind::GradleVersionCatalog => GradleCatalogParser.parse(content),
         ManifestKind::PomXml => PomXmlParser.parse(content),
+        ManifestKind::PackageSwift => PackageSwiftParser.parse(content),
     }
 }

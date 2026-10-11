@@ -83,7 +83,10 @@ pub struct CheckArgs {
     /// `include-if-current`. Overrides `[global] unstable`.
     #[arg(long, value_enum)]
     pub unstable: Option<UnstableFilter>,
-    /// Ignore the lockfile, checking declared constraints only..
+    /// Ignore the lockfile, checking declared constraints only. A lockfile that
+    /// *is* the dependency list rather than an annotation on one — SwiftPM's
+    /// `Package.resolved` — is still read, or the project would be checked as
+    /// though it had no dependencies at all.
     #[arg(long)]
     pub no_lock_file: bool,
     /// Skip vulnerability scanning.
@@ -156,7 +159,9 @@ pub struct ListArgs {
     /// How many directories deep to search.
     #[arg(long, default_value_t = 3)]
     pub depth: usize,
-    /// Ignore sibling lockfiles (do not report locked versions).
+    /// Ignore sibling lockfiles (do not report locked versions). A lockfile that
+    /// *is* the dependency list rather than an annotation on one — SwiftPM's
+    /// `Package.resolved` — is still read, or the project would list nothing.
     #[arg(long)]
     pub no_lock_file: bool,
     /// Show each crate's available feature flags (Rust only; fetches the
@@ -440,6 +445,7 @@ pub enum EcosystemArg {
     CSharp,
     Elixir,
     Jvm,
+    Swift,
 }
 
 impl From<EcosystemArg> for dependable_fetch::Ecosystem {
@@ -454,6 +460,7 @@ impl From<EcosystemArg> for dependable_fetch::Ecosystem {
             EcosystemArg::CSharp => dependable_fetch::Ecosystem::CSharp,
             EcosystemArg::Elixir => dependable_fetch::Ecosystem::Elixir,
             EcosystemArg::Jvm => dependable_fetch::Ecosystem::Jvm,
+            EcosystemArg::Swift => dependable_fetch::Ecosystem::Swift,
         }
     }
 }
@@ -499,7 +506,7 @@ mod tests {
         assert_eq!(
             names,
             [
-                "rust", "go", "npm", "python", "php", "dart", "csharp", "elixir", "jvm"
+                "rust", "go", "npm", "python", "php", "dart", "csharp", "elixir", "jvm", "swift"
             ]
         );
     }

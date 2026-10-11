@@ -64,6 +64,13 @@ pub enum ManifestKind {
     Csproj,
     GradleVersionCatalog,
     PomXml,
+    /// SwiftPM's `Package.swift`.
+    ///
+    /// Its parser reads no dependencies at all, deliberately — the file is a Swift
+    /// program, not data. The dependency list comes from its `Package.resolved`,
+    /// which [`LockfileKind::is_dependency_source`] marks as a source of items
+    /// rather than an annotation on them.
+    PackageSwift,
 }
 
 impl ManifestKind {
@@ -82,6 +89,7 @@ impl ManifestKind {
             ManifestKind::MixExs => Ecosystem::Elixir,
             ManifestKind::Csproj => Ecosystem::CSharp,
             ManifestKind::GradleVersionCatalog | ManifestKind::PomXml => Ecosystem::Jvm,
+            ManifestKind::PackageSwift => Ecosystem::Swift,
         }
     }
 
@@ -102,6 +110,9 @@ impl ManifestKind {
             ManifestKind::ComposerJson => &[LockfileKind::ComposerLock],
             ManifestKind::PubspecYaml => &[LockfileKind::PubspecLock],
             ManifestKind::MixExs => &[LockfileKind::MixLock],
+            // The only entry here that is not merely a source of resolved versions:
+            // without it a Swift project has no dependency list at all.
+            ManifestKind::PackageSwift => &[LockfileKind::PackageResolved],
             _ => &[],
         }
     }
@@ -195,6 +206,7 @@ impl ManifestKind {
             "mix.exs" => ManifestKind::MixExs,
             "Directory.Packages.props" => ManifestKind::Csproj,
             "pom.xml" => ManifestKind::PomXml,
+            "Package.swift" => ManifestKind::PackageSwift,
             // Gradle reads every `*.versions.toml` under `gradle/` as a catalog;
             // `libs` is only the conventional name of the default one.
             _ if name.ends_with(".versions.toml") => ManifestKind::GradleVersionCatalog,
@@ -399,6 +411,11 @@ pub enum LockfileKind {
     PubspecLock,
     /// Mix's `mix.lock`.
     MixLock,
+    /// SwiftPM's `Package.resolved`.
+    ///
+    /// The only kind here that is a *source* of dependencies rather than an
+    /// annotation on them — see [`LockfileKind::is_dependency_source`].
+    PackageResolved,
 }
 
 impl LockfileKind {
@@ -412,7 +429,23 @@ impl LockfileKind {
             LockfileKind::ComposerLock => "composer.lock",
             LockfileKind::PubspecLock => "pubspec.lock",
             LockfileKind::MixLock => "mix.lock",
+            LockfileKind::PackageResolved => "Package.resolved",
         }
+    }
+
+    /// Whether this lockfile *is* the dependency list rather than an annotation on
+    /// one the manifest beside it already produced.
+    ///
+    /// False for every format whose manifest is readable data: there the lockfile
+    /// only supplies resolved versions, and
+    /// [`apply_lockfile`](crate::lockfiles::apply_lockfile) annotates existing items
+    /// and never inserts. Swift is the exception — `Package.swift` is executable
+    /// Swift and is deliberately not read — so `Package.resolved` is the only honest
+    /// record of what the project depends on, and a caller has to take items *from*
+    /// it. [`lockfile_items`](crate::lockfiles::lockfile_items) is that path.
+    #[must_use]
+    pub fn is_dependency_source(self) -> bool {
+        matches!(self, LockfileKind::PackageResolved)
     }
 
     /// Recognise a lockfile by its file name.
@@ -426,6 +459,7 @@ impl LockfileKind {
             LockfileKind::ComposerLock,
             LockfileKind::PubspecLock,
             LockfileKind::MixLock,
+            LockfileKind::PackageResolved,
         ]
         .into_iter()
         .find(|kind| kind.file_name() == name)
@@ -470,6 +504,7 @@ mod tests {
                 ManifestKind::GradleVersionCatalog,
             ),
             ("services/api/pom.xml", ManifestKind::PomXml),
+            ("app/Package.swift", ManifestKind::PackageSwift),
         ];
         for (path, expected) in cases {
             assert_eq!(
@@ -505,13 +540,14 @@ mod tests {
         assert_eq!(names(ManifestKind::ComposerJson), ["composer.lock"]);
         assert_eq!(names(ManifestKind::PubspecYaml), ["pubspec.lock"]);
         assert_eq!(names(ManifestKind::MixExs), ["mix.lock"]);
+        assert_eq!(names(ManifestKind::PackageSwift), ["Package.resolved"]);
         assert!(names(ManifestKind::GoMod).is_empty());
         assert!(!ManifestKind::GoMod.has_lockfile_support());
     }
 
     /// Every manifest kind, so an invariant that has to hold for *all* of them can be
     /// asserted over the whole set rather than over whichever ones a test remembered.
-    const ALL_KINDS: [ManifestKind; 13] = [
+    const ALL_KINDS: [ManifestKind; 14] = [
         ManifestKind::CargoToml,
         ManifestKind::GoMod,
         ManifestKind::PackageJson,
@@ -525,6 +561,7 @@ mod tests {
         ManifestKind::Csproj,
         ManifestKind::GradleVersionCatalog,
         ManifestKind::PomXml,
+        ManifestKind::PackageSwift,
     ];
 
     /// The match is what makes the compiler care that [`ALL_KINDS`] is complete: adding a
@@ -557,6 +594,7 @@ mod tests {
                 ManifestKind::Csproj => 10,
                 ManifestKind::GradleVersionCatalog => 11,
                 ManifestKind::PomXml => 12,
+                ManifestKind::PackageSwift => 13,
             };
             assert_eq!(
                 ALL_KINDS.get(position),
@@ -661,6 +699,29 @@ mod tests {
         // A `pom.xml` is data and reads fine; what it cannot resolve is reported
         // entry by entry, so there is nothing here to declare unreadable.
         assert!(ManifestKind::PomXml.unreadable_manifests().is_empty());
+        // A `Package.swift` is a program too, and is not listed here on purpose: an
+        // unreadable manifest is one whose dependencies went unread, and Swift's are
+        // read in full from `Package.resolved` beside it. What a Swift run cannot
+        // establish is currency, which is a different statement and is made per check.
+        assert!(ManifestKind::PackageSwift.unreadable_manifests().is_empty());
+    }
+
+    /// Exactly one lockfile supplies the dependency list; the rest annotate one the
+    /// manifest already produced, and a drift here would silently insert transitive
+    /// packages into five other ecosystems' results.
+    #[test]
+    fn only_package_resolved_is_a_source_of_dependencies() {
+        assert!(LockfileKind::PackageResolved.is_dependency_source());
+        for kind in [
+            LockfileKind::CargoLock,
+            LockfileKind::PackageLockJson,
+            LockfileKind::BunLock,
+            LockfileKind::ComposerLock,
+            LockfileKind::PubspecLock,
+            LockfileKind::MixLock,
+        ] {
+            assert!(!kind.is_dependency_source(), "{kind:?}");
+        }
     }
 
     #[test]
@@ -672,6 +733,10 @@ mod tests {
         assert_eq!(
             LockfileKind::detect(Path::new("package-lock.json")),
             Some(LockfileKind::PackageLockJson)
+        );
+        assert_eq!(
+            LockfileKind::detect(Path::new("app/Package.resolved")),
+            Some(LockfileKind::PackageResolved)
         );
         assert_eq!(LockfileKind::detect(Path::new("Cargo.toml")), None);
         assert_eq!(LockfileKind::detect(Path::new("")), None);
@@ -687,6 +752,7 @@ mod tests {
             ManifestKind::ComposerJson,
             ManifestKind::PubspecYaml,
             ManifestKind::MixExs,
+            ManifestKind::PackageSwift,
         ] {
             for lockfile in kind.lockfiles() {
                 assert_eq!(

@@ -181,6 +181,10 @@ pub(crate) struct View {
 #[derive(Debug, Serialize)]
 pub(crate) struct SummaryView {
     pub manifests: usize,
+    /// How many manifests contributed no rows because their dependency list could
+    /// not be read. The template states it whenever it is nonzero, because a
+    /// reader who is not told cannot tell this report from a clean one.
+    pub manifests_unread: usize,
     pub total: usize,
     pub checkable: usize,
     pub up_to_date: usize,
@@ -258,6 +262,12 @@ pub(crate) struct ManifestView {
     pub path: String,
     pub ecosystem: String,
     pub total: usize,
+    /// Whether the file that *is* this project's dependency list went unread, so
+    /// zero rows means nothing was read rather than nothing was declared. Without
+    /// it the section prints "This manifest declares no dependencies" and heads
+    /// itself "(0 dependencies)", both of which are claims the run never
+    /// established — and the heading is the half a reader skimming §3 sees.
+    pub dependencies_unread: bool,
     pub rows: Vec<DepRow>,
 }
 
@@ -372,6 +382,7 @@ impl View {
 fn summary_view(summary: &Summary) -> SummaryView {
     SummaryView {
         manifests: summary.manifests,
+        manifests_unread: summary.manifests_unread,
         total: summary.total,
         checkable: summary.checkable,
         up_to_date: summary.up_to_date,
@@ -491,6 +502,7 @@ fn manifest_view(manifest: &ManifestResults) -> ManifestView {
         path: manifest.path.display().to_string(),
         ecosystem: manifest.ecosystem.display_name().to_owned(),
         total: manifest.results.len(),
+        dependencies_unread: manifest.dependencies_unread,
         rows: manifest.results.iter().map(dep_row).collect(),
     }
 }
