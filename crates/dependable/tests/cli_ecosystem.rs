@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use serde_json::Value;
+use tempfile::TempDir;
 
 const CARGO_TOML: &str =
     "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1.0.100\"\n";
@@ -22,14 +23,18 @@ const MIX_EXS: &str = "defmodule Sample.MixProject do\n  use Mix.Project\n  defp
 const DENO_JSON: &str = "{\n  \"imports\": { \"chalk\": \"npm:chalk@^5.3.0\" }\n}\n";
 const PNPM_WORKSPACE: &str = "packages:\n  - 'packages/*'\n\ncatalog:\n  lodash: \"4.17.21\"\n";
 
-/// A scratch directory of its own per test, under Cargo's per-target temp dir.
-fn workdir(name: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("ecosystem")
-        .join(name);
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).expect("create the scratch directory");
-    dir
+/// A scratch directory of its own per test, under Cargo's per-target temp dir,
+/// that no other test process can pick, named after `name`.
+///
+/// The directory is removed when the returned guard drops, so bind it to a named
+/// variable (`_tmp`, not `_`) for the length of the test.
+fn workdir(name: &str) -> (TempDir, PathBuf) {
+    let tmp = tempfile::Builder::new()
+        .prefix(&format!("ecosystem_{name}"))
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("create the scratch directory");
+    let dir = tmp.path().to_path_buf();
+    (tmp, dir)
 }
 
 fn write(dir: &Path, rel: &str, content: &str) {
@@ -42,12 +47,12 @@ fn write(dir: &Path, rel: &str, content: &str) {
 
 /// A polyglot repository: one project per ecosystem, each in its own directory so
 /// that nothing about the layout depends on two manifests sharing a path.
-fn polyglot(name: &str) -> PathBuf {
-    let dir = workdir(name);
+fn polyglot(name: &str) -> (TempDir, PathBuf) {
+    let (tmp, dir) = workdir(name);
     write(&dir, "rust/Cargo.toml", CARGO_TOML);
     write(&dir, "web/package.json", PACKAGE_JSON);
     write(&dir, "svc/go.mod", GO_MOD);
-    dir
+    (tmp, dir)
 }
 
 /// Colour is pinned off rather than inherited: this repository has had tests go
@@ -100,7 +105,7 @@ fn manifests(doc: &Value) -> Vec<String> {
 /// asserting is that the *inventory* is different, not that the flag is accepted.
 #[test]
 fn ecosystem_narrows_the_inventory_to_what_was_asked_for() {
-    let dir = polyglot("narrows");
+    let (_tmp, dir) = polyglot("narrows");
 
     let all = list_json(&dir, &[]);
     assert_eq!(
@@ -123,7 +128,7 @@ fn ecosystem_narrows_the_inventory_to_what_was_asked_for() {
 /// filtering by ecosystem has to cover all of them without the user naming any.
 #[test]
 fn an_ecosystem_covers_every_manifest_spelling_it_owns() {
-    let dir = workdir("spellings");
+    let (_tmp, dir) = workdir("spellings");
     write(&dir, "rust/Cargo.toml", CARGO_TOML);
     write(&dir, "web/package.json", PACKAGE_JSON);
     write(&dir, "edge/deno.json", DENO_JSON);
@@ -145,7 +150,7 @@ fn an_ecosystem_covers_every_manifest_spelling_it_owns() {
 /// `--manifest-glob` gives a repeated pattern.
 #[test]
 fn two_ecosystems_are_a_union_not_a_contradiction() {
-    let dir = polyglot("union");
+    let (_tmp, dir) = polyglot("union");
     let doc = list_json(&dir, &["--ecosystem", "rust", "--ecosystem", "npm"]);
     assert_eq!(manifests(&doc), ["rust/Cargo.toml", "web/package.json"]);
 }
@@ -159,7 +164,7 @@ fn two_ecosystems_are_a_union_not_a_contradiction() {
 /// is constructed, which is also what makes this assertable offline.
 #[test]
 fn check_narrows_discovery_without_touching_the_network() {
-    let dir = workdir("empty_selection");
+    let (_tmp, dir) = workdir("empty_selection");
     write(&dir, "mix.exs", MIX_EXS);
 
     let output = run(&[
@@ -196,7 +201,7 @@ fn check_narrows_discovery_without_touching_the_network() {
 /// nothing on stdout — the stderr line is for a human.
 #[test]
 fn an_empty_check_selection_is_an_empty_document_not_empty_stdout() {
-    let dir = workdir("empty_check_document");
+    let (_tmp, dir) = workdir("empty_check_document");
     write(&dir, "mix.exs", MIX_EXS);
     let path = dir.to_str().expect("utf-8 path");
     let check = |format: &str| {
@@ -285,7 +290,7 @@ fn the_flag_is_advertised_with_the_values_it_accepts() {
 /// well as into the manifest set.
 #[test]
 fn an_ecosystem_filter_silences_advice_about_ecosystems_it_excluded() {
-    let dir = workdir("notices");
+    let (_tmp, dir) = workdir("notices");
     write(&dir, "rust/Cargo.toml", CARGO_TOML);
     write(&dir, "legacy/build.gradle", "dependencies { }\n");
 
@@ -317,7 +322,7 @@ fn an_ecosystem_filter_silences_advice_about_ecosystems_it_excluded() {
 /// that reached the network.
 #[test]
 fn fix_rewrites_only_the_ecosystem_it_was_pointed_at() {
-    let dir = workdir("fix_scope");
+    let (_tmp, dir) = workdir("fix_scope");
     write(&dir, "rust/Cargo.toml", CARGO_TOML_NO_DEPS);
     write(&dir, "web/package.json", PACKAGE_JSON);
     write(&dir, "svc/go.mod", GO_MOD);
@@ -369,7 +374,7 @@ fn fix_rewrites_only_the_ecosystem_it_was_pointed_at() {
 /// of this test fail.
 #[test]
 fn the_ecosystem_filter_runs_before_the_glob_filter() {
-    let dir = polyglot("order");
+    let (_tmp, dir) = polyglot("order");
     let path = dir.to_str().expect("utf-8 path");
 
     // A glob naming a manifest the ecosystem filter has already removed. Filtered

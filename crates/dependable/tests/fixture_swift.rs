@@ -13,6 +13,7 @@ use std::process::Command;
 use dependable_fetch::ManifestKind;
 use dependable_fetch::core::{Item, PackageSource, lockfile_items, parse, swift_package_name};
 use dependable_fetch::{Ecosystem, LockfileKind};
+use tempfile::TempDir;
 
 fn fixture(rel: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -435,9 +436,8 @@ fn no_lock_file_still_suppresses_an_annotating_lockfile() {
 /// key would parse, validate, and do nothing.
 #[test]
 fn a_disabled_swift_ecosystem_is_skipped() {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("swift_disabled");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = temp_dir("swift_disabled");
+    let dir = tmp.path();
     let config = dir.join("dependable.toml");
     std::fs::write(&config, "[swift]\nenabled = false\n").unwrap();
 
@@ -468,7 +468,7 @@ fn a_disabled_swift_ecosystem_is_skipped() {
 /// to resolve a dependency list nobody had asked to read — and then skipped.
 #[test]
 fn a_disabled_swift_project_with_no_package_resolved_is_not_warned_about() {
-    let dir = scratch("swift_disabled_no_resolved");
+    let (_tmp, dir) = scratch("swift_disabled_no_resolved");
     std::fs::copy(
         fixture("sample-swift/Package.swift"),
         dir.join("Package.swift"),
@@ -540,7 +540,7 @@ fn fix_never_claims_a_swift_project_is_up_to_date() {
 /// straight through to "Everything is already up to date."
 #[test]
 fn fix_never_claims_an_unread_swift_project_is_up_to_date() {
-    let dir = scratch("swift_fix_unread");
+    let (_tmp, dir) = scratch("swift_fix_unread");
     std::fs::copy(
         fixture("sample-swift/Package.swift"),
         dir.join("Package.swift"),
@@ -580,9 +580,8 @@ fn fix_never_claims_an_unread_swift_project_is_up_to_date() {
 #[test]
 #[ignore = "queries api.osv.dev"]
 fn live_osv_reports_a_known_vulnerable_swift_package() {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("swift_live_osv");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = temp_dir("swift_live_osv");
+    let dir = tmp.path();
     std::fs::write(dir.join("Package.swift"), "// swift-tools-version:5.9\n").unwrap();
     // Vapor 4.83.0 is affected by GHSA-r6r4-5pr8-gjcp (integer overflow in URI).
     std::fs::write(
@@ -622,11 +621,24 @@ fn live_osv_reports_a_known_vulnerable_swift_package() {
 
 /// A scratch directory with a `.git`, so the lockfile walk sees a repository
 /// boundary exactly where a real checkout would put one.
-fn scratch(name: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
-    let _ = std::fs::remove_dir_all(&dir);
+///
+/// The directory is fresh, no other test process can pick it, and it is named
+/// after `name`. It is removed when the returned guard drops, so bind the guard
+/// to a named variable (`_tmp`, not `_`) for the length of the test.
+fn scratch(name: &str) -> (TempDir, PathBuf) {
+    let tmp = temp_dir(name);
+    let dir = tmp.path().to_path_buf();
     std::fs::create_dir_all(dir.join(".git")).expect("create the scratch repository");
-    dir
+    (tmp, dir)
+}
+
+/// A fresh directory under Cargo's per-target temp dir that no other test
+/// process can pick, named after `name`; removed when the guard drops.
+fn temp_dir(name: &str) -> TempDir {
+    tempfile::Builder::new()
+        .prefix(name)
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("create the scratch directory")
 }
 
 /// A nested SwiftPM package must never adopt an ancestor's `Package.resolved`.
@@ -640,7 +652,7 @@ fn scratch(name: &str) -> PathBuf {
 /// in a SwiftPM monorepo it happens to every package not yet resolved.
 #[test]
 fn a_nested_package_does_not_adopt_an_ancestors_package_resolved() {
-    let root = scratch("swift_monorepo");
+    let (_tmp, root) = scratch("swift_monorepo");
     let nested = root.join("Examples/Demo");
     std::fs::create_dir_all(&nested).unwrap();
     let manifest = std::fs::read_to_string(fixture("sample-swift/Package.swift")).unwrap();
@@ -690,7 +702,7 @@ fn a_nested_package_does_not_adopt_an_ancestors_package_resolved() {
 /// asks whether everything here is checked and current — must not answer yes.
 #[test]
 fn a_swift_project_with_no_package_resolved_says_so_and_fails_a_strict_gate() {
-    let dir = scratch("swift_no_resolved");
+    let (_tmp, dir) = scratch("swift_no_resolved");
     std::fs::copy(
         fixture("sample-swift/Package.swift"),
         dir.join("Package.swift"),
@@ -740,7 +752,7 @@ fn a_swift_project_with_no_package_resolved_says_so_and_fails_a_strict_gate() {
 /// scanned and nothing said about it.
 #[test]
 fn a_truncated_package_resolved_is_reported_unread_rather_than_read_short() {
-    let dir = scratch("swift_truncated");
+    let (_tmp, dir) = scratch("swift_truncated");
     std::fs::copy(
         fixture("sample-swift/Package.swift"),
         dir.join("Package.swift"),
@@ -788,14 +800,14 @@ fn a_truncated_package_resolved_is_reported_unread_rather_than_read_short() {
 /// only field that separates "we looked and there is nothing" from "we never looked".
 #[test]
 fn json_distinguishes_an_unread_dependency_list_from_an_empty_one() {
-    let unread = scratch("swift_json_unread");
+    let (_unread_tmp, unread) = scratch("swift_json_unread");
     std::fs::copy(
         fixture("sample-swift/Package.swift"),
         unread.join("Package.swift"),
     )
     .unwrap();
 
-    let empty = scratch("swift_json_empty");
+    let (_empty_tmp, empty) = scratch("swift_json_empty");
     std::fs::copy(
         fixture("sample-swift/Package.swift"),
         empty.join("Package.swift"),
@@ -847,14 +859,14 @@ fn json_distinguishes_an_unread_dependency_list_from_an_empty_one() {
 #[cfg(feature = "report")]
 #[test]
 fn sarif_reports_an_unread_dependency_list_as_a_finding() {
-    let unread_dir = scratch("swift_sarif_unread");
+    let (_unread_tmp, unread_dir) = scratch("swift_sarif_unread");
     std::fs::copy(
         fixture("sample-swift/Package.swift"),
         unread_dir.join("Package.swift"),
     )
     .unwrap();
 
-    let empty = scratch("swift_sarif_empty");
+    let (_empty_tmp, empty) = scratch("swift_sarif_empty");
     std::fs::copy(
         fixture("sample-swift/Package.swift"),
         empty.join("Package.swift"),
@@ -957,14 +969,14 @@ fn sarif_reports_an_unread_dependency_list_as_a_finding() {
 #[cfg(feature = "report")]
 #[test]
 fn a_quiet_html_report_still_says_the_dependency_list_went_unread() {
-    let unread_dir = scratch("swift_html_unread");
+    let (_unread_tmp, unread_dir) = scratch("swift_html_unread");
     std::fs::copy(
         fixture("sample-swift/Package.swift"),
         unread_dir.join("Package.swift"),
     )
     .unwrap();
 
-    let empty_dir = scratch("swift_html_empty");
+    let (_empty_tmp, empty_dir) = scratch("swift_html_empty");
     std::fs::copy(
         fixture("sample-swift/Package.swift"),
         empty_dir.join("Package.swift"),
@@ -1048,14 +1060,14 @@ fn a_quiet_html_report_still_says_the_dependency_list_went_unread() {
 /// about the project, made by a run that read nothing about it.
 #[test]
 fn the_check_heading_says_the_list_went_unread_rather_than_counting_zero() {
-    let unread_dir = scratch("swift_check_heading_unread");
+    let (_unread_tmp, unread_dir) = scratch("swift_check_heading_unread");
     std::fs::copy(
         fixture("sample-swift/Package.swift"),
         unread_dir.join("Package.swift"),
     )
     .unwrap();
 
-    let empty_dir = scratch("swift_check_heading_empty");
+    let (_empty_tmp, empty_dir) = scratch("swift_check_heading_empty");
     std::fs::copy(
         fixture("sample-swift/Package.swift"),
         empty_dir.join("Package.swift"),
@@ -1101,14 +1113,14 @@ fn the_check_heading_says_the_list_went_unread_rather_than_counting_zero() {
 /// reporting an empty inventory for a list it never opened.
 #[test]
 fn the_list_heading_says_the_list_went_unread_rather_than_counting_zero() {
-    let unread_dir = scratch("swift_list_heading_unread");
+    let (_unread_tmp, unread_dir) = scratch("swift_list_heading_unread");
     std::fs::copy(
         fixture("sample-swift/Package.swift"),
         unread_dir.join("Package.swift"),
     )
     .unwrap();
 
-    let empty_dir = scratch("swift_list_heading_empty");
+    let (_empty_tmp, empty_dir) = scratch("swift_list_heading_empty");
     std::fs::copy(
         fixture("sample-swift/Package.swift"),
         empty_dir.join("Package.swift"),
@@ -1158,14 +1170,14 @@ fn the_list_heading_says_the_list_went_unread_rather_than_counting_zero() {
 /// project that declares nothing from one whose dependency list was never opened.
 #[test]
 fn list_json_distinguishes_an_unread_dependency_list_from_an_empty_one() {
-    let unread_dir = scratch("swift_list_json_unread");
+    let (_unread_tmp, unread_dir) = scratch("swift_list_json_unread");
     std::fs::copy(
         fixture("sample-swift/Package.swift"),
         unread_dir.join("Package.swift"),
     )
     .unwrap();
 
-    let empty_dir = scratch("swift_list_json_empty");
+    let (_empty_tmp, empty_dir) = scratch("swift_list_json_empty");
     std::fs::copy(
         fixture("sample-swift/Package.swift"),
         empty_dir.join("Package.swift"),
@@ -1235,7 +1247,7 @@ fn list_json_distinguishes_an_unread_dependency_list_from_an_empty_one() {
 /// it a `text` consumer would have no channel at all.
 #[test]
 fn list_text_writes_no_record_for_an_unread_list_and_warns_on_stderr() {
-    let unread_dir = scratch("swift_list_text_unread");
+    let (_unread_tmp, unread_dir) = scratch("swift_list_text_unread");
     std::fs::copy(
         fixture("sample-swift/Package.swift"),
         unread_dir.join("Package.swift"),

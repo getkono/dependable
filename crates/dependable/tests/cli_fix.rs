@@ -12,11 +12,19 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-fn workdir(name: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).expect("create the scratch directory");
-    dir
+use tempfile::TempDir;
+
+/// A fresh scratch directory no other test process can pick, named after `name`.
+///
+/// The directory is removed when the returned guard drops, so bind it to a named
+/// variable (`_tmp`, not `_`) for the length of the test.
+fn workdir(name: &str) -> (TempDir, PathBuf) {
+    let tmp = tempfile::Builder::new()
+        .prefix(name)
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("create the scratch directory");
+    let dir = tmp.path().to_path_buf();
+    (tmp, dir)
 }
 
 fn run(dir: &Path, args: &[&str]) -> Output {
@@ -32,7 +40,7 @@ const LOCAL_ONLY: &str = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dep
 
 #[test]
 fn a_run_with_nothing_to_change_leaves_the_manifest_byte_identical() {
-    let dir = workdir("fix_no_change");
+    let (_tmp, dir) = workdir("fix_no_change");
     let manifest = dir.join("Cargo.toml");
     fs::write(&manifest, LOCAL_ONLY).unwrap();
 
@@ -52,7 +60,7 @@ fn a_run_with_nothing_to_change_leaves_the_manifest_byte_identical() {
 /// Comments, ordering, and formatting are not `fix`'s to touch; it replaces one span.
 #[test]
 fn formatting_and_comments_survive_a_run() {
-    let dir = workdir("fix_formatting");
+    let (_tmp, dir) = workdir("fix_formatting");
     let manifest = dir.join("Cargo.toml");
     let original = "# a leading comment\n[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\n# why this dep exists\nhelper = { path = \"../helper\" }   # trailing\n";
     fs::write(&manifest, original).unwrap();
@@ -70,7 +78,7 @@ fn formatting_and_comments_survive_a_run() {
 /// command, so it is the one that must never be wrong.
 #[test]
 fn a_dry_run_writes_nothing() {
-    let dir = workdir("fix_dry_run");
+    let (_tmp, dir) = workdir("fix_dry_run");
     let manifest = dir.join("Cargo.toml");
     fs::write(&manifest, LOCAL_ONLY).unwrap();
     let before = fs::metadata(&manifest).unwrap().modified().unwrap();
@@ -90,7 +98,7 @@ fn a_dry_run_writes_nothing() {
 /// with a half-written tree behind it.
 #[test]
 fn an_unparseable_manifest_is_left_alone() {
-    let dir = workdir("fix_unparseable");
+    let (_tmp, dir) = workdir("fix_unparseable");
     let manifest = dir.join("Cargo.toml");
     let broken = "[package\nname = \"app\"\n";
     fs::write(&manifest, broken).unwrap();
@@ -107,7 +115,7 @@ fn an_unparseable_manifest_is_left_alone() {
 /// renamed into place. Nothing may be left behind on success.
 #[test]
 fn no_temporary_files_are_left_beside_the_manifest() {
-    let dir = workdir("fix_no_temp_files");
+    let (_tmp, dir) = workdir("fix_no_temp_files");
     fs::write(dir.join("Cargo.toml"), LOCAL_ONLY).unwrap();
 
     let output = run(&dir, &[]);
@@ -136,7 +144,7 @@ fn no_temporary_files_are_left_beside_the_manifest() {
 fn a_read_only_manifest_is_not_destroyed() {
     use std::os::unix::fs::PermissionsExt as _;
 
-    let dir = workdir("fix_read_only");
+    let (_tmp, dir) = workdir("fix_read_only");
     let manifest = dir.join("Cargo.toml");
     fs::write(&manifest, LOCAL_ONLY).unwrap();
     let mut permissions = fs::metadata(&manifest).unwrap().permissions();
@@ -290,7 +298,7 @@ fn run_in(home: &Path, scan: &Path, config: &Path, args: &[&str]) -> Output {
 /// of it and `--dry-run` printed nothing at all.
 #[test]
 fn a_declined_wildcard_is_reported_instead_of_claimed_up_to_date() {
-    let dir = workdir("fix_declined_wildcard");
+    let (_tmp, dir) = workdir("fix_declined_wildcard");
     let base = registry(vec![(
         "/lodash".to_string(),
         packument(&["1.0.0", "1.9.0", "2.0.0"], "2.0.0"),
@@ -331,7 +339,7 @@ fn a_declined_wildcard_is_reported_instead_of_claimed_up_to_date() {
 /// anything to do.
 #[test]
 fn a_dry_run_reports_a_declined_wildcard_too() {
-    let dir = workdir("fix_declined_wildcard_dry");
+    let (_tmp, dir) = workdir("fix_declined_wildcard_dry");
     let base = registry(vec![(
         "/lodash".to_string(),
         packument(&["1.0.0", "1.9.0", "2.0.0"], "2.0.0"),
@@ -363,7 +371,7 @@ fn a_dry_run_reports_a_declined_wildcard_too() {
 /// an older one — and then `fix` must say why it will not pin the channel.
 #[test]
 fn a_declined_dist_tag_is_reported() {
-    let dir = workdir("fix_declined_dist_tag");
+    let (_tmp, dir) = workdir("fix_declined_dist_tag");
     let base = registry(vec![(
         "/lodash".to_string(),
         packument(&["1.0.0", "2.0.0"], "2.0.0"),
@@ -404,7 +412,7 @@ fn a_declined_dist_tag_is_reported() {
 /// `||`-separated one `a_declined_multi_clause_range_is_reported` covers.
 #[test]
 fn a_declined_comma_range_is_reported() {
-    let dir = workdir("fix_declined_comma_range");
+    let (_tmp, dir) = workdir("fix_declined_comma_range");
     let base = registry(vec![(
         "/pypi/requests/json".to_string(),
         "{\"releases\":{\"1.0.0\":[],\"1.9.0\":[],\"2.0.0\":[]}}".to_string(),
@@ -438,7 +446,7 @@ fn a_declined_comma_range_is_reported() {
 /// wrong message for another.
 #[test]
 fn a_run_with_no_declines_still_says_everything_is_up_to_date() {
-    let dir = workdir("fix_no_declines");
+    let (_tmp, dir) = workdir("fix_no_declines");
     let base = registry(vec![(
         "/lodash".to_string(),
         packument(&["1.0.0"], "1.0.0"),
@@ -478,7 +486,7 @@ fn a_run_with_no_declines_still_says_everything_is_up_to_date() {
 /// "Everything is already up to date." on stdout directly over it.
 #[test]
 fn an_inherited_skip_is_not_contradicted_by_the_summary() {
-    let dir = workdir("fix_inherited_skip");
+    let (_tmp, dir) = workdir("fix_inherited_skip");
     let member = dir.join("crates/app");
     fs::create_dir_all(&member).unwrap();
     // A repository boundary: without it the lockfile and workspace walks climb
@@ -536,7 +544,7 @@ fn an_inherited_skip_is_not_contradicted_by_the_summary() {
 /// dependency is deliberately held back.
 #[test]
 fn a_pin_held_back_for_want_of_all_is_reported() {
-    let dir = workdir("fix_declined_pin");
+    let (_tmp, dir) = workdir("fix_declined_pin");
     let base = registry(vec![(
         "/lodash".to_string(),
         packument(&["1.0.0", "1.9.0"], "1.9.0"),
@@ -588,7 +596,7 @@ fn a_pin_held_back_for_want_of_all_is_reported() {
 /// `--all`, which would leave it exactly where it is.
 #[test]
 fn an_equals_partial_is_not_reported_as_a_pin() {
-    let dir = workdir("fix_declined_equals_partial");
+    let (_tmp, dir) = workdir("fix_declined_equals_partial");
     let base = registry(vec![(
         "/lodash".to_string(),
         packument(&["1.2.0", "1.2.9", "2.0.0"], "2.0.0"),
@@ -627,7 +635,7 @@ fn an_equals_partial_is_not_reported_as_a_pin() {
 /// would write and `--all` itself, not the installed one.
 #[test]
 fn a_constraint_already_at_its_target_is_reported() {
-    let dir = workdir("fix_already_at_target");
+    let (_tmp, dir) = workdir("fix_already_at_target");
     let base = registry(vec![(
         "/lodash".to_string(),
         packument(&["1.0.0", "2.0.0"], "2.0.0"),
@@ -677,7 +685,7 @@ fn a_constraint_already_at_its_target_is_reported() {
 /// still moves it.
 #[test]
 fn a_bare_npm_version_is_held_as_a_pin() {
-    let dir = workdir("fix_bare_npm_pin");
+    let (_tmp, dir) = workdir("fix_bare_npm_pin");
     let base = registry(vec![(
         "/lodash".to_string(),
         packument(&["1.2.3", "1.9.0", "2.0.0"], "2.0.0"),
@@ -722,7 +730,7 @@ fn a_bare_npm_version_is_held_as_a_pin() {
 /// the log and the notes on the terminal.
 #[test]
 fn the_summary_names_the_stream_the_notes_went_to() {
-    let dir = workdir("fix_summary_names_stderr");
+    let (_tmp, dir) = workdir("fix_summary_names_stderr");
     let base = registry(vec![(
         "/lodash".to_string(),
         packument(&["1.0.0", "1.9.0", "2.0.0"], "2.0.0"),
@@ -765,7 +773,7 @@ fn packagist(name: &str, versions: &[&str]) -> String {
 /// constraint became `DependencyStatus::Error` long before `fix` saw it.
 #[test]
 fn a_declined_multi_clause_range_is_reported() {
-    let dir = workdir("fix_declined_multi_clause");
+    let (_tmp, dir) = workdir("fix_declined_multi_clause");
     let base = registry(vec![
         (
             "/lodash".to_string(),
@@ -813,7 +821,7 @@ fn a_declined_multi_clause_range_is_reported() {
 /// concrete release would drop it. Issue #87's harm, refused.
 #[test]
 fn a_declined_composer_stability_flag_is_reported() {
-    let dir = workdir("fix_declined_stability_flag");
+    let (_tmp, dir) = workdir("fix_declined_stability_flag");
     let base = registry(vec![(
         "/p2/acme/lib.json".to_string(),
         packagist("acme/lib", &["1.0.0", "2.8.5", "3.0.0"]),
@@ -883,7 +891,7 @@ fn forced_version_routes() -> Vec<(String, String)> {
 /// output of any kind, and the run claimed to be up to date over the top of it.
 #[test]
 fn a_forced_version_is_reported_instead_of_silently_skipped() {
-    let dir = workdir("fix_forced_version_reported");
+    let (_tmp, dir) = workdir("fix_forced_version_reported");
     let base = registry(forced_version_routes());
     let config = write_config(&dir, &base);
     let manifest = dir.join("package.json");
@@ -925,7 +933,7 @@ fn a_forced_version_is_reported_instead_of_silently_skipped() {
 /// version: it is the flag most likely to be aimed at a tree full of security pins.
 #[test]
 fn fix_all_still_leaves_a_forced_version_alone() {
-    let dir = workdir("fix_forced_version_all");
+    let (_tmp, dir) = workdir("fix_forced_version_all");
     let base = registry(forced_version_routes());
     let config = write_config(&dir, &base);
     let manifest = dir.join("package.json");
@@ -951,7 +959,7 @@ fn fix_all_still_leaves_a_forced_version_alone() {
 /// Asked for by name, the forced version moves — and only then.
 #[test]
 fn overrides_are_rewritten_when_asked_for() {
-    let dir = workdir("fix_forced_version_requested");
+    let (_tmp, dir) = workdir("fix_forced_version_requested");
     let base = registry(forced_version_routes());
     let config = write_config(&dir, &base);
     let manifest = dir.join("package.json");
@@ -985,7 +993,7 @@ fn overrides_are_rewritten_when_asked_for() {
 /// to find out what it would do must still write nothing.
 #[test]
 fn a_requested_override_rewrite_honours_dry_run() {
-    let dir = workdir("fix_forced_version_dry_run");
+    let (_tmp, dir) = workdir("fix_forced_version_dry_run");
     let base = registry(forced_version_routes());
     let config = write_config(&dir, &base);
     let manifest = dir.join("package.json");
