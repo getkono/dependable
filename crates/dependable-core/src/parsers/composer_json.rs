@@ -29,14 +29,21 @@ impl Parser for ComposerJsonParser {
                 && is_packagist_package(name)
             {
                 let (line, col_start) = offset_to_line_col(&starts, entry.content_start);
+                // The span covers the raw, still-escaped text, which is not the
+                // constraint recorded beside it. Withhold it, as the other JSON parsers
+                // do, so `--fix` never splices a decoded version over escaped source.
+                let col_end = if entry.escaped {
+                    col_start
+                } else {
+                    col_start + entry.content_end.saturating_sub(entry.content_start)
+                };
                 items.push(Item {
                     name: name.clone(),
                     version_constraint: entry.value.clone(),
                     source: PackageSource::Registry,
                     version_line: line,
                     version_col_start: col_start,
-                    version_col_end: col_start
-                        + entry.content_end.saturating_sub(entry.content_start),
+                    version_col_end: col_end,
                     registry: None,
                     locked_version: None,
                     kind: *kind,
@@ -108,5 +115,21 @@ mod tests {
         assert_eq!(monolog.version_constraint, "^2.0");
         assert_eq!(sliced(content, monolog), "^2.0");
         assert_eq!(find(&m, "phpunit/phpunit").version_constraint, "^9.5");
+    }
+
+    /// An escaped constraint's span covers the raw escapes, which are not the
+    /// constraint recorded beside it, so the span is withheld rather than offered to
+    /// `--fix` as though slicing it gave the constraint back.
+    #[test]
+    fn an_escaped_constraint_withholds_its_span() {
+        let bar = format!("{}u007c", char::from(92u8));
+        let content = format!(r#"{{"require": {{"vendor/pkg": "^1.0 {bar}{bar} ^2.0"}}}}"#);
+        let m = parse(&content);
+        let item = find(&m, "vendor/pkg");
+        assert_eq!(item.version_constraint, "^1.0 || ^2.0");
+        assert_eq!(item.version_col_start, item.version_col_end);
+        assert!(!item.is_rewritable());
+        let line = content.lines().nth(item.version_line).unwrap();
+        assert!(line[item.version_col_start..].starts_with("^1.0 "));
     }
 }
