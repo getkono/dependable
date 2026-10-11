@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/getkono/dependable/compare/dependable-tui-v0.1.3...dependable-tui-v0.2.0) - 2026-10-11
+
+### Added
+
+- *(jvm)* pom.xml parser — literal versions and same-file properties only ([#95](https://github.com/getkono/dependable/pull/95))
+- *(fetch)* [**breaking**] report a dependency pinned to an exact version rather than leaving it unknown ([#120](https://github.com/getkono/dependable/pull/120))
+- *(core)* report a manifest we recognise but cannot read
+
+### Fixed
+
+- *(tui)* [**breaking**] report a dependency with no known version as unknown ([#104](https://github.com/getkono/dependable/pull/104))
+- *(fetch)* resolve an unread build script against its build root
+
 ## [0.1.3](https://github.com/getkono/dependable/compare/dependable-tui-v0.1.2...dependable-tui-v0.1.3) - 2026-08-29
 
 ### Added
