@@ -414,7 +414,7 @@ included. It says so instead:
 
 ```
 $ dependable fix .
-note: left lodash = 1.0.0 alone in package.json: 1.9.0 is available, but an override
+note: left lodash = ^1.0.0 alone in package.json: 1.9.0 is available, but an override
       forces this version onto the resolved tree; pass --overrides to advance it
 Nothing to rewrite. 1 available update left alone; see the notes on stderr.
 ```
@@ -431,17 +431,18 @@ dependable fix . --overrides --all       # …and beyond it, like --all everywhe
 dependable fix . --overrides --dry-run   # see it first; nothing is written
 ```
 
-"Within the range the tool reads" is the honest boundary, and for npm it is not
-always the range npm reads. The requirement is built with Cargo's `VersionReq`,
-which takes a bare `1.0.0` as `^1.0.0` — so `"overrides": { "lodash": "1.0.0" }`
-is advanced to `1.9.0` by `--overrides` alone, while npm reads that same string as
-exactly `1.0.0`, which is what `Ecosystem::bare_version` records for it. The two
-readings disagree, and closing that gap is
-[issue #118](https://github.com/getkono/dependable/issues/118) — it changes how
-every bare version is read, not just a forced one, so it is not settled here. A
-forced version spelled as a range (`"^1.0.0"`) or as an explicit pin (`"=1.0.0"`)
-carries no such ambiguity: the first advances within the range, the second needs
-`--all` like any other pin.
+"Within the range the tool reads" is the boundary for a forced version spelled as
+a range: `"overrides": { "lodash": "^1.0.0" }` is advanced to `1.9.0` by
+`--overrides` alone. A forced version that names one release is a pin first, and
+`fix` treats it like any other pin. That covers an explicit `"=1.0.0"` in every
+ecosystem, and a full bare `"1.0.0"` wherever the ecosystem reads a bare version
+as exact, as npm does (`Ecosystem::bare_version` records it). So
+`"overrides": { "lodash": "1.0.0" }` gets the pin note under plain
+`--overrides`. Only `--overrides --all` moves it, and then to the newest
+release (`2.0.0`), because `--all` is what lifts a pin. The checker still reads a
+bare npm version as `^1.0.0` when it reports the compatible release
+([issue #155](https://github.com/getkono/dependable/issues/155)). `fix` no longer
+acts on that reading for a pin.
 
 Before you reach for it, check *why* each pin is there. `--overrides` is the
 destructive flag in this command, and here is what it cannot work out for you:
