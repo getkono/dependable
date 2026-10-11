@@ -1988,13 +1988,27 @@ fn note_unresolved(reports: &[ManifestReport], fail_on: FailOn, quiet: bool) {
 /// Mirrors [`note_unresolved`] exactly — same silences, same shape. Deliberately *not* a
 /// gate: adding `Undetermined` to `--fail-on outdated` would change what that setting
 /// promises, and `--fail-on any` already fails on it.
+///
+/// A checkable pin in an ecosystem with no registry (Swift) is not counted. It is
+/// `Undetermined` because there is nothing to compare its version against, not because
+/// the version went unread: `Package.resolved` states it, the vulnerability scan is
+/// keyed by it, and the check already says once per manifest that such an ecosystem
+/// cannot be checked for a newer version. Counting it here told a passing run that
+/// versions it had read could not be read. A pin there that states no version is still
+/// counted, because that one really was not read.
 fn note_undetermined(reports: &[ManifestReport], fail_on: FailOn, quiet: bool) {
     if quiet || matches!(fail_on, FailOn::None | FailOn::Any) {
         return;
     }
     let undetermined = reports
         .iter()
-        .flat_map(|report| &report.results)
+        .flat_map(|report| {
+            let registryless = !report.ecosystem.has_registry();
+            report
+                .results
+                .iter()
+                .filter(move |result| !(registryless && result.item.is_checkable()))
+        })
         .filter(|result| matches!(result.status, DependencyStatus::Undetermined))
         .count();
     if undetermined == 0 {

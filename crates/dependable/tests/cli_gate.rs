@@ -453,6 +453,36 @@ fn a_dependency_whose_version_could_not_be_read_is_noted() {
     );
 }
 
+/// A Swift pin is `Undetermined` because SwiftPM has no registry to compare it against,
+/// not because its version went unread: `Package.resolved` states the version, and the
+/// vulnerability scan is keyed by it. Counting those pins in the undetermined note told a
+/// passing `--fail-on outdated` that versions it had read "could not" be read.
+#[test]
+fn a_registryless_pin_is_not_noted_as_an_unread_version() {
+    let dir = workdir("gate_swift_undetermined_note");
+    let base = registry(Vec::new());
+    let config = write_config(&dir, &base);
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample-swift");
+    for file in ["Package.swift", "Package.resolved"] {
+        fs::copy(fixture.join(file), dir.join(file)).expect("copy the Swift fixture");
+    }
+
+    let output = check(&dir, &config, &["--fail-on", "outdated"]);
+    let (stdout, stderr, code) = outcome(&output);
+
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("undetermined"), "stdout: {stdout}");
+    assert!(
+        !stderr.contains("could not read"),
+        "Swift pins whose versions were read were noted as unread:\n{stderr}"
+    );
+    // What the note was standing in for is still said, by the manifest-level warning.
+    assert!(
+        stderr.contains("Swift publishes no package registry"),
+        "stderr: {stderr}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // A 200 that lists no versions
 // ---------------------------------------------------------------------------
