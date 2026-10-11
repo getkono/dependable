@@ -15,6 +15,8 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
+use tempfile::TempDir;
+
 /// An Elixir manifest plus a config disabling Elixir: discovery finds it, the
 /// checker declines it, and nothing touches the network.
 const MIX_EXS: &str = "defmodule Sample.MixProject do\n  use Mix.Project\n  defp deps do\n    [{:phoenix, \"~> 1.7\"}]\n  end\nend\n";
@@ -27,25 +29,31 @@ fn run(args: &[&str]) -> Output {
         .expect("run dependable")
 }
 
-fn workdir(name: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).expect("create the work directory");
-    dir
+/// A fresh scratch directory no other test process can pick, named after `name`.
+///
+/// The directory is removed when the returned guard drops, so bind it to a named
+/// variable (`_tmp`, not `_`) for the length of the test.
+fn workdir(name: &str) -> (TempDir, PathBuf) {
+    let tmp = tempfile::Builder::new()
+        .prefix(name)
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("create the work directory");
+    let dir = tmp.path().to_path_buf();
+    (tmp, dir)
 }
 
 /// A tree with one manifest whose ecosystem the config turns off.
-fn hermetic_tree(name: &str) -> (PathBuf, PathBuf) {
-    let dir = workdir(name);
+fn hermetic_tree(name: &str) -> (TempDir, PathBuf, PathBuf) {
+    let (tmp, dir) = workdir(name);
     fs::write(dir.join("mix.exs"), MIX_EXS).expect("write mix.exs");
     let config = dir.join("dependable.toml");
     fs::write(&config, DISABLE_ELIXIR).expect("write the config");
-    (dir, config)
+    (tmp, dir, config)
 }
 
 #[test]
 fn report_writes_a_document_to_stdout() {
-    let (dir, config) = hermetic_tree("report_stdout");
+    let (_tmp, dir, config) = hermetic_tree("report_stdout");
 
     let out = run(&[
         "report",
@@ -74,7 +82,7 @@ fn report_writes_a_document_to_stdout() {
 /// advice on resolving a dependency list nobody asked to read into the document.
 #[test]
 fn report_carries_no_lockfile_note_for_a_skipped_manifest() {
-    let dir = workdir("report_swift_disabled_no_resolved");
+    let (_tmp, dir) = workdir("report_swift_disabled_no_resolved");
     fs::copy(
         concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -110,7 +118,7 @@ fn report_carries_no_lockfile_note_for_a_skipped_manifest() {
 
 #[test]
 fn report_output_flag_writes_a_file_and_leaves_stdout_empty() {
-    let (dir, config) = hermetic_tree("report_output_file");
+    let (_tmp, dir, config) = hermetic_tree("report_output_file");
     let target = dir.join("report.html");
 
     let out = run(&[
@@ -136,7 +144,7 @@ fn report_output_flag_writes_a_file_and_leaves_stdout_empty() {
 
 #[test]
 fn report_on_a_tree_with_no_manifests_says_so_and_exits_zero() {
-    let dir = workdir("report_no_manifests");
+    let (_tmp, dir) = workdir("report_no_manifests");
 
     let out = run(&["report", dir.to_str().expect("a UTF-8 path")]);
 
@@ -151,7 +159,7 @@ fn report_on_a_tree_with_no_manifests_says_so_and_exits_zero() {
 
 #[test]
 fn report_rejects_an_unknown_template_override_name() {
-    let (dir, config) = hermetic_tree("report_unknown_override");
+    let (_tmp, dir, config) = hermetic_tree("report_unknown_override");
     let templates = dir.join("dependable-templates");
     fs::create_dir_all(&templates).expect("create the override directory");
     fs::write(templates.join("sections.html"), "<p>mine</p>").expect("write the override");
@@ -177,7 +185,7 @@ fn report_rejects_an_unknown_template_override_name() {
 
 #[test]
 fn report_ignores_unrelated_files_in_the_override_directory() {
-    let (dir, config) = hermetic_tree("report_override_readme");
+    let (_tmp, dir, config) = hermetic_tree("report_override_readme");
     let templates = dir.join("dependable-templates");
     fs::create_dir_all(&templates).expect("create the override directory");
     fs::write(templates.join("README.md"), "how to theme this report").expect("write the README");
@@ -200,7 +208,7 @@ fn report_ignores_unrelated_files_in_the_override_directory() {
 
 #[test]
 fn report_rejects_a_malformed_template_override() {
-    let (dir, config) = hermetic_tree("report_malformed_override");
+    let (_tmp, dir, config) = hermetic_tree("report_malformed_override");
     let templates = dir.join("dependable-templates");
     fs::create_dir_all(&templates).expect("create the override directory");
     fs::write(templates.join("summary.html"), "{% for x in %}").expect("write the override");
@@ -225,7 +233,7 @@ fn report_rejects_a_malformed_template_override() {
 
 #[test]
 fn report_uses_a_supplied_styles_override() {
-    let (dir, config) = hermetic_tree("report_styles_override");
+    let (_tmp, dir, config) = hermetic_tree("report_styles_override");
     let templates = dir.join("dependable-templates");
     fs::create_dir_all(&templates).expect("create the override directory");
     fs::write(

@@ -14,16 +14,23 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use serde_json::Value;
+use tempfile::TempDir;
 
 /// A manifest whose sole dependency is local, so the check resolves entirely
 /// offline and the SARIF log is a valid, empty-result document.
 const CARGO_TOML: &str = "[package]\nname = \"sample\"\nversion = \"0.1.0\"\n\n[dependencies]\nhelper = { path = \"helper\" }\n";
 
-fn workdir(name: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir
+/// A fresh scratch directory no other test process can pick, named after `name`.
+///
+/// The directory is removed when the returned guard drops, so bind it to a named
+/// variable (`_tmp`, not `_`) for the length of the test.
+fn workdir(name: &str) -> (TempDir, PathBuf) {
+    let tmp = tempfile::Builder::new()
+        .prefix(name)
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
+    let dir = tmp.path().to_path_buf();
+    (tmp, dir)
 }
 
 fn run(args: &[&str]) -> std::process::Output {
@@ -45,7 +52,7 @@ fn check_sarif(dir: &std::path::Path) -> std::process::Output {
 
 #[test]
 fn check_format_sarif_emits_a_valid_log() {
-    let dir = workdir("sarif_check");
+    let (_tmp, dir) = workdir("sarif_check");
     fs::write(dir.join("Cargo.toml"), CARGO_TOML).unwrap();
 
     let output = check_sarif(&dir);
@@ -92,7 +99,7 @@ fn check_format_sarif_emits_a_valid_log() {
 
 #[test]
 fn sarif_output_is_byte_deterministic() {
-    let dir = workdir("sarif_deterministic");
+    let (_tmp, dir) = workdir("sarif_deterministic");
     fs::write(dir.join("Cargo.toml"), CARGO_TOML).unwrap();
 
     let first = check_sarif(&dir);
