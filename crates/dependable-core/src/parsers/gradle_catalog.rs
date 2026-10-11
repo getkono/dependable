@@ -21,6 +21,12 @@
 //! entry as a declaration nothing has been shown to depend on would report every
 //! Gradle project as depending on nothing at all.
 //!
+//! The exception is a `strictly` rich version, which is reported as
+//! [`DependencyKind::Override`]: Gradle forces it onto the whole resolved graph, so
+//! it is a forced version in the same sense as an npm `overrides` entry, and `fix`
+//! leaves it alone unless `--overrides` asks for it. `require` and `prefer` are not
+//! forced and stay `Normal`.
+//!
 //! # `version.ref`
 //!
 //! A library may name a version instead of stating one:
@@ -67,6 +73,9 @@ pub struct GradleCatalogParser;
 struct Located {
     value: String,
     span: Range<usize>,
+    /// What the key the literal was read from makes it: [`DependencyKind::Override`]
+    /// for a `strictly` version, [`DependencyKind::Normal`] for everything else.
+    kind: DependencyKind,
 }
 
 /// One library entry, read but not yet resolved.
@@ -108,7 +117,7 @@ impl Parser for GradleCatalogParser {
                     if uses.get(alias.as_str()).copied() == Some(1) {
                         positioned(&entry.name, target, &starts)
                     } else {
-                        inherited(&entry.name, &target.value)
+                        inherited(&entry.name, target)
                     }
                 }
                 // A version supplied by a platform/BOM rather than by the catalog.
@@ -222,6 +231,13 @@ fn coordinate(entry: &dyn TableLike) -> Option<String> {
 ///
 /// `prefer` is read last: where a rich version carries both, `strictly`/`require`
 /// is the bound that actually holds and `prefer` only picks within it.
+///
+/// The key is kept, not just its value. `strictly` is Gradle's forced version — it
+/// holds the whole resolved graph to that version, which is how a JVM security pin
+/// on a transitive dependency is written — so it is tagged
+/// [`DependencyKind::Override`], the tag `fix` refuses to rewrite without
+/// `--overrides`. `require` is a floor conflict resolution may raise, and `prefer`
+/// a soft preference, so both stay [`DependencyKind::Normal`] with the plain form.
 fn version_literal(item: &TomlItem) -> Option<Located> {
     if let Some(value) = item.as_value()
         && let Some(text) = value.as_str()
@@ -229,10 +245,15 @@ fn version_literal(item: &TomlItem) -> Option<Located> {
         return Some(Located {
             value: text.to_owned(),
             span: unquoted(value.span()?),
+            kind: DependencyKind::Normal,
         });
     }
     let table = item.as_table_like()?;
-    for key in ["strictly", "require", "prefer"] {
+    for (key, kind) in [
+        ("strictly", DependencyKind::Override),
+        ("require", DependencyKind::Normal),
+        ("prefer", DependencyKind::Normal),
+    ] {
         if let Some(inner) = table.get(key)
             && let Some(value) = inner.as_value()
             && let Some(text) = value.as_str()
@@ -240,6 +261,7 @@ fn version_literal(item: &TomlItem) -> Option<Located> {
             return Some(Located {
                 value: text.to_owned(),
                 span: unquoted(value.span()?),
+                kind,
             });
         }
     }
@@ -267,6 +289,7 @@ fn shorthand(text: &str, span: Option<Range<usize>>) -> Option<Declared> {
         version: Some(Located {
             value: version.to_owned(),
             span: start..start + version.len(),
+            kind: DependencyKind::Normal,
         }),
         reference: None,
     })
@@ -285,22 +308,25 @@ fn positioned(name: &str, version: &Located, starts: &[usize]) -> Item {
         version_col_end: col_start + version.span.len(),
         registry: None,
         locked_version: None,
-        kind: DependencyKind::Normal,
+        kind: version.kind,
     }
 }
 
 /// An item whose version is resolved but whose line belongs to other libraries too.
-fn inherited(name: &str, version: &str) -> Item {
+///
+/// It keeps the kind its literal was read as: a shared `strictly` alias forces every
+/// library that names it, whether or not any one of them may rewrite it.
+fn inherited(name: &str, version: &Located) -> Item {
     Item {
         name: name.to_owned(),
-        version_constraint: version.to_owned(),
+        version_constraint: version.value.clone(),
         source: PackageSource::Inherited,
         version_line: 0,
         version_col_start: 0,
         version_col_end: 0,
         registry: None,
         locked_version: None,
-        kind: DependencyKind::Normal,
+        kind: version.kind,
     }
 }
 
@@ -477,6 +503,87 @@ testing = ["junit-jupiter"]
         let okhttp = find(&parsed, "com.squareup.okhttp3:okhttp");
         assert!(okhttp.is_rewritable());
         assert_eq!(slice(content, okhttp), "4.12.0");
+    }
+
+    /// `strictly` is Gradle's forced version and is tagged as one, so `fix` leaves it
+    /// alone by default; `require` (a floor) and `prefer` (a soft preference) are
+    /// not forced and stay `Normal`. All three keep their rewritable span.
+    #[test]
+    fn a_strictly_version_is_an_override_and_require_and_prefer_are_not() {
+        let content = "[versions]\n\
+                       junit = { strictly = \"5.10.0\" }\n\
+                       okhttp = { require = \"4.12.0\" }\n\
+                       guava = { prefer = \"33.0.0-jre\" }\n\
+                       \n\
+                       [libraries]\n\
+                       junit = { module = \"org.junit.jupiter:junit-jupiter\", version.ref = \"junit\" }\n\
+                       okhttp = { module = \"com.squareup.okhttp3:okhttp\", version.ref = \"okhttp\" }\n\
+                       guava = { module = \"com.google.guava:guava\", version.ref = \"guava\" }\n\
+                       slf4j = { module = \"org.slf4j:slf4j-api\", version = { strictly = \"2.0.13\" } }\n\
+                       commons = { module = \"org.apache.commons:commons-lang3\", version = { prefer = \"3.14.0\" } }\n";
+        let parsed = items(content);
+        for (name, kind, literal) in [
+            (
+                "org.junit.jupiter:junit-jupiter",
+                DependencyKind::Override,
+                "5.10.0",
+            ),
+            ("org.slf4j:slf4j-api", DependencyKind::Override, "2.0.13"),
+            (
+                "com.squareup.okhttp3:okhttp",
+                DependencyKind::Normal,
+                "4.12.0",
+            ),
+            (
+                "com.google.guava:guava",
+                DependencyKind::Normal,
+                "33.0.0-jre",
+            ),
+            (
+                "org.apache.commons:commons-lang3",
+                DependencyKind::Normal,
+                "3.14.0",
+            ),
+        ] {
+            let item = find(&parsed, name);
+            assert_eq!(item.kind, kind, "{name}");
+            assert_eq!(slice(content, item), literal, "{name}");
+            assert!(item.is_rewritable(), "{name}");
+        }
+    }
+
+    /// Where a rich version carries both, `strictly` is the bound that holds, so it
+    /// is the literal read and the entry is forced.
+    #[test]
+    fn strictly_wins_over_prefer_and_makes_the_entry_forced() {
+        let content = "[libraries]\n\
+                       junit = { module = \"org.junit.jupiter:junit-jupiter\", version = { strictly = \"[5.9,6.0)\", prefer = \"5.10.0\" } }\n";
+        let parsed = items(content);
+        let junit = find(&parsed, "org.junit.jupiter:junit-jupiter");
+        assert_eq!(junit.version_constraint, "[5.9,6.0)");
+        assert_eq!(junit.kind, DependencyKind::Override);
+    }
+
+    /// A shared `strictly` alias rewrites nothing, but it still forces every library
+    /// that names it, and says so.
+    #[test]
+    fn a_shared_strictly_alias_is_still_forced() {
+        let parsed = items(
+            "[versions]\n\
+             jackson = { strictly = \"2.17.1\" }\n\
+             \n\
+             [libraries]\n\
+             core = { module = \"com.fasterxml.jackson.core:jackson-core\", version.ref = \"jackson\" }\n\
+             databind = { module = \"com.fasterxml.jackson.core:jackson-databind\", version.ref = \"jackson\" }\n",
+        );
+        for name in [
+            "com.fasterxml.jackson.core:jackson-core",
+            "com.fasterxml.jackson.core:jackson-databind",
+        ] {
+            let item = find(&parsed, name);
+            assert_eq!(item.source, PackageSource::Inherited, "{name}");
+            assert_eq!(item.kind, DependencyKind::Override, "{name}");
+        }
     }
 
     #[test]
