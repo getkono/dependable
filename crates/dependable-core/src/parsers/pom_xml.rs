@@ -181,6 +181,8 @@ impl Parser for PomXmlParser {
             alternate_registries: Vec::new(),
             notices: profile_notice(project)
                 .into_iter()
+                .chain(managed_notice(project))
+                .chain(plugin_notice(project))
                 .chain(unnameable_notice(&declared))
                 .collect(),
         })
@@ -256,7 +258,9 @@ pub(super) fn own_field(project: roxmltree::Node<'_, '_>, tag: &str) -> Option<L
 /// Only that one: `<dependencyManagement>` states versions for dependencies
 /// declared elsewhere, `<build><plugins>` describes the build rather than the
 /// artifact, and `<profiles>` applies conditionally. None of the three is a
-/// dependency of this project as written.
+/// dependency of this project as written, and each one this file holds is
+/// announced by a notice of its own ([`profile_notice`], [`managed_notice`],
+/// [`plugin_notice`]) rather than skipped in silence.
 fn read_dependencies<'a>(
     project: roxmltree::Node<'a, 'a>,
     properties: &HashMap<String, Located>,
@@ -515,6 +519,55 @@ fn profile_notice(project: roxmltree::Node<'_, '_>) -> Option<String> {
         },
         if count == 1 { "is" } else { "are" },
     ))
+}
+
+/// Say that a `<dependencyManagement>` block was seen and its entries were not
+/// listed.
+///
+/// The `<profiles>` notice's reasoning holds here unchanged, for a different
+/// reason to have looked away: `<dependencyManagement>` states versions for
+/// dependencies declared elsewhere — in this file's own `<dependencies>`, or in
+/// a child module — and declares none itself. An aggregator or BOM-style POM
+/// keeps all of its versions there and nothing under `<project><dependencies>`,
+/// so it would otherwise list as `(0 dependencies)` with nothing said.
+fn managed_notice(project: roxmltree::Node<'_, '_>) -> Option<String> {
+    let entries = child(project, "dependencyManagement")
+        .and_then(|managed| child(managed, "dependencies"))?;
+    let count = element_children(entries, "dependency");
+    if count == 0 {
+        return None;
+    }
+    Some(format!(
+        "{count} {} stated in <dependencyManagement> {} not listed: it states versions for dependencies declared elsewhere, and declares none of its own",
+        if count == 1 { "version" } else { "versions" },
+        if count == 1 { "is" } else { "are" },
+    ))
+}
+
+/// Say that a `<build><plugins>` block was seen and its plugins were not listed.
+///
+/// A plugin describes the build rather than the artifact, so it is not a
+/// dependency of this project — but it carries its own `<version>` and can carry
+/// its own advisories, and a reader is owed the fact that the run declined to
+/// look at it.
+fn plugin_notice(project: roxmltree::Node<'_, '_>) -> Option<String> {
+    let plugins = child(project, "build").and_then(|build| child(build, "plugins"))?;
+    let count = element_children(plugins, "plugin");
+    if count == 0 {
+        return None;
+    }
+    Some(format!(
+        "{count} build {} under <build><plugins> {} not listed: a plugin describes the build, not the artifact, so it is not one of this project's dependencies",
+        if count == 1 { "plugin" } else { "plugins" },
+        if count == 1 { "is" } else { "are" },
+    ))
+}
+
+/// How many direct child elements of `node` are named `tag`.
+fn element_children(node: roxmltree::Node<'_, '_>, tag: &str) -> usize {
+    node.children()
+        .filter(|child| child.is_element() && child.tag_name().name() == tag)
+        .count()
 }
 
 /// Say that some entries name a coordinate this file cannot state, so nothing was
@@ -850,6 +903,12 @@ mod tests {
         let m = parse(&content);
         let names: Vec<&str> = m.items.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(names, vec!["real:real"]);
+        assert_eq!(
+            m.notices.len(),
+            2,
+            "each skipped element is announced: {:?}",
+            m.notices
+        );
     }
 
     /// `<scope>` and `<optional>` are stated in the manifest, so they are read
@@ -1495,6 +1554,120 @@ mod tests {
              \x20     </properties>\n\
              \x20   </profile>\n\
              \x20 </profiles>\n");
+        assert!(parse(&content).notices.is_empty());
+    }
+
+    /// A BOM-style POM keeps every version in `<dependencyManagement>` and
+    /// declares nothing, so without a notice it would list as empty and read as
+    /// complete.
+    #[test]
+    fn a_dependency_management_block_is_announced_in_its_own_words() {
+        let content = pom("  <dependencyManagement>\n\
+             \x20   <dependencies>\n\
+             \x20     <dependency>\n\
+             \x20       <groupId>g</groupId>\n\
+             \x20       <artifactId>one</artifactId>\n\
+             \x20       <version>1.0.0</version>\n\
+             \x20     </dependency>\n\
+             \x20     <dependency>\n\
+             \x20       <groupId>g</groupId>\n\
+             \x20       <artifactId>two</artifactId>\n\
+             \x20       <version>2.0.0</version>\n\
+             \x20     </dependency>\n\
+             \x20   </dependencies>\n\
+             \x20 </dependencyManagement>\n");
+        let m = parse(&content);
+        assert!(m.items.is_empty(), "a managed version is not a dependency");
+        assert_eq!(m.notices.len(), 1, "{:?}", m.notices);
+        assert!(
+            m.notices[0].contains("2 versions stated in <dependencyManagement> are not listed")
+                && m.notices[0].contains("declared elsewhere"),
+            "{:?}",
+            m.notices
+        );
+        assert!(!m.notices[0].contains("conditional"), "{:?}", m.notices);
+    }
+
+    /// A build plugin carries its own version, so the run says it did not look.
+    #[test]
+    fn build_plugins_are_announced_in_their_own_words() {
+        let content = pom("  <build>\n\
+             \x20   <plugins>\n\
+             \x20     <plugin>\n\
+             \x20       <groupId>org.apache.maven.plugins</groupId>\n\
+             \x20       <artifactId>maven-surefire-plugin</artifactId>\n\
+             \x20       <version>3.2.5</version>\n\
+             \x20     </plugin>\n\
+             \x20   </plugins>\n\
+             \x20 </build>\n");
+        let m = parse(&content);
+        assert!(m.items.is_empty(), "a plugin is not a dependency");
+        assert_eq!(m.notices.len(), 1, "{:?}", m.notices);
+        assert!(
+            m.notices[0].contains("1 build plugin under <build><plugins> is not listed")
+                && m.notices[0].contains("describes the build"),
+            "{:?}",
+            m.notices
+        );
+    }
+
+    /// Each exclusion gets its own line, so the three reasons stay apart.
+    #[test]
+    fn every_excluded_element_is_announced_once() {
+        let content = pom("  <dependencyManagement>\n\
+             \x20   <dependencies>\n\
+             \x20     <dependency>\n\
+             \x20       <groupId>g</groupId>\n\
+             \x20       <artifactId>managed</artifactId>\n\
+             \x20       <version>1.0.0</version>\n\
+             \x20     </dependency>\n\
+             \x20   </dependencies>\n\
+             \x20 </dependencyManagement>\n\
+             \x20 <build>\n\
+             \x20   <plugins>\n\
+             \x20     <plugin>\n\
+             \x20       <artifactId>plug</artifactId>\n\
+             \x20     </plugin>\n\
+             \x20     <plugin>\n\
+             \x20       <artifactId>other</artifactId>\n\
+             \x20     </plugin>\n\
+             \x20   </plugins>\n\
+             \x20 </build>\n\
+             \x20 <profiles>\n\
+             \x20   <profile>\n\
+             \x20     <dependencies>\n\
+             \x20       <dependency>\n\
+             \x20         <groupId>g</groupId>\n\
+             \x20         <artifactId>conditional</artifactId>\n\
+             \x20         <version>1.0.0</version>\n\
+             \x20       </dependency>\n\
+             \x20     </dependencies>\n\
+             \x20   </profile>\n\
+             \x20 </profiles>\n");
+        let m = parse(&content);
+        assert_eq!(m.notices.len(), 3, "{:?}", m.notices);
+        assert!(m.notices[0].contains("1 dependency declared inside <profiles> is not listed"));
+        assert!(m.notices[1].contains("1 version stated in <dependencyManagement> is not listed"));
+        assert!(m.notices[2].contains("2 build plugins under <build><plugins> are not listed"));
+    }
+
+    /// An excluded element with nothing in it has nothing to announce, and a
+    /// `<build>` that only manages plugins declares none.
+    #[test]
+    fn empty_excluded_elements_say_nothing() {
+        let content = pom("  <dependencyManagement>\n\
+             \x20   <dependencies/>\n\
+             \x20 </dependencyManagement>\n\
+             \x20 <build>\n\
+             \x20   <plugins/>\n\
+             \x20   <pluginManagement>\n\
+             \x20     <plugins>\n\
+             \x20       <plugin>\n\
+             \x20         <artifactId>managed-plugin</artifactId>\n\
+             \x20       </plugin>\n\
+             \x20     </plugins>\n\
+             \x20   </pluginManagement>\n\
+             \x20 </build>\n");
         assert!(parse(&content).notices.is_empty());
     }
 }

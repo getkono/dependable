@@ -59,7 +59,11 @@ to its `<parent>`, to `<dependencyManagement>`, or to an imported BOM is **not**
 resolved — doing so correctly can mean fetching the parent POM from a registry, which
 is a resolution engine rather than a parser. Those dependencies are still listed, with
 no version and nothing claimed about them, so a POM that inherits some of its versions
-is never presented as depending on only the rest.
+is never presented as depending on only the rest. The elements a POM holds that are not
+its own dependencies — `<profiles>` (conditional), `<dependencyManagement>` (versions for
+dependencies declared elsewhere), and `<build><plugins>` (the build, not the artifact) —
+are not listed, and each one present is announced on stderr with its own reason, so a
+POM that keeps everything there never lists as an empty, complete-looking project.
 
 **Swift is vulnerability-only, and says so.** SwiftPM identifies a package by its git
 URL and discovers versions by enumerating git tags. SE-0292 defines a registry API, but
