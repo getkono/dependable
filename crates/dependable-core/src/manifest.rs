@@ -16,6 +16,18 @@ pub struct ParsedManifest {
     pub items: Vec<Item>,
     /// Alternate registry declarations (Rust `[registries.*]`).
     pub alternate_registries: Vec<AlternateRegistryDecl>,
+    /// What the parser saw and deliberately did not read, in the parser's own
+    /// words, ready to print.
+    ///
+    /// Not errors and not warnings *about* the dependencies in
+    /// [`items`](Self::items): each one names a construct this parser declines to
+    /// interpret, so that a list which reads as complete and is not says so.
+    /// A Maven `<profiles>` block holding dependencies is the motivating case —
+    /// excluding conditional dependencies is defensible, printing
+    /// `(0 dependencies)` for a POM that declares twelve of them is not.
+    ///
+    /// Empty for every parser that has nothing to declare, which is most of them.
+    pub notices: Vec<String>,
 }
 
 /// A declared alternate registry (Rust only).
@@ -51,6 +63,7 @@ pub enum ManifestKind {
     MixExs,
     Csproj,
     GradleVersionCatalog,
+    PomXml,
 }
 
 impl ManifestKind {
@@ -68,7 +81,7 @@ impl ManifestKind {
             ManifestKind::PubspecYaml => Ecosystem::Dart,
             ManifestKind::MixExs => Ecosystem::Elixir,
             ManifestKind::Csproj => Ecosystem::CSharp,
-            ManifestKind::GradleVersionCatalog => Ecosystem::Jvm,
+            ManifestKind::GradleVersionCatalog | ManifestKind::PomXml => Ecosystem::Jvm,
         }
     }
 
@@ -181,6 +194,7 @@ impl ManifestKind {
             "pubspec.yaml" => ManifestKind::PubspecYaml,
             "mix.exs" => ManifestKind::MixExs,
             "Directory.Packages.props" => ManifestKind::Csproj,
+            "pom.xml" => ManifestKind::PomXml,
             // Gradle reads every `*.versions.toml` under `gradle/` as a catalog;
             // `libs` is only the conventional name of the default one.
             _ if name.ends_with(".versions.toml") => ManifestKind::GradleVersionCatalog,
@@ -455,6 +469,7 @@ mod tests {
                 "gradle/deps.versions.toml",
                 ManifestKind::GradleVersionCatalog,
             ),
+            ("services/api/pom.xml", ManifestKind::PomXml),
         ];
         for (path, expected) in cases {
             assert_eq!(
@@ -496,7 +511,7 @@ mod tests {
 
     /// Every manifest kind, so an invariant that has to hold for *all* of them can be
     /// asserted over the whole set rather than over whichever ones a test remembered.
-    const ALL_KINDS: [ManifestKind; 12] = [
+    const ALL_KINDS: [ManifestKind; 13] = [
         ManifestKind::CargoToml,
         ManifestKind::GoMod,
         ManifestKind::PackageJson,
@@ -509,6 +524,7 @@ mod tests {
         ManifestKind::MixExs,
         ManifestKind::Csproj,
         ManifestKind::GradleVersionCatalog,
+        ManifestKind::PomXml,
     ];
 
     /// The match is what makes the compiler care that [`ALL_KINDS`] is complete: adding a
@@ -540,6 +556,7 @@ mod tests {
                 ManifestKind::MixExs => 9,
                 ManifestKind::Csproj => 10,
                 ManifestKind::GradleVersionCatalog => 11,
+                ManifestKind::PomXml => 12,
             };
             assert_eq!(
                 ALL_KINDS.get(position),
@@ -641,6 +658,9 @@ mod tests {
             );
         }
         assert!(ManifestKind::CargoToml.unreadable_manifests().is_empty());
+        // A `pom.xml` is data and reads fine; what it cannot resolve is reported
+        // entry by entry, so there is nothing here to declare unreadable.
+        assert!(ManifestKind::PomXml.unreadable_manifests().is_empty());
     }
 
     #[test]

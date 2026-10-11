@@ -61,6 +61,9 @@ pub enum DeclineReason {
     Qualifier,
     /// A dist-tag or channel name: `latest`, `next`.
     DistTag,
+    /// A Maven interval with no comma: `[1.0]`, Maven's hard requirement, which a
+    /// bare version would soften into one any transitive declaration may outvote.
+    Interval,
     /// A wildcard behind an operator (`^1.x`, `=1.*`), whose rewrite would not be
     /// a bare version at all.
     WildcardOperator,
@@ -147,6 +150,10 @@ impl DeclineReason {
                  version"
             }
             Self::DistTag => "a dist-tag names a release channel, not a version",
+            Self::Interval => {
+                "a bracketed interval is a hard requirement, and a bare version here would \
+                 soften it into one any transitive declaration may outvote"
+            }
             Self::WildcardOperator => {
                 "an operator in front of a wildcard is a range the new version would not reproduce"
             }
@@ -558,10 +565,11 @@ fn plan_fixes(
 /// (Cargo `>=1.0, <2.0`), a space-separated range (npm/pubspec `>=1.0.0 <2.0.0`),
 /// a `||` alternation (`^1 || ^2`), a dist-tag (`latest`), anything carrying an
 /// `@` (a Composer stability flag such as `@dev` or `^1.0@beta`, an npm alias
-/// such as `npm:pkg@1.0.0`), a partial version behind a tilde operator (`~1`,
-/// `~> 1.0`, `~=1.4`) or a lone `=` (`=1.2`), an all-zero partial behind a caret
-/// (`^0`, `^0.0`), and — depending on `ecosystem` — a wildcard (`*`, `1.x`,
-/// `1.*`) or a partial version (npm `"16"` or `"v16"`, Cargo `"0"`).
+/// such as `npm:pkg@1.0.0`), a Maven interval (`[1.0]`, `(,2.0)`), a partial
+/// version behind a tilde operator (`~1`, `~> 1.0`, `~=1.4`) or a lone `=`
+/// (`=1.2`), an all-zero partial behind a caret (`^0`, `^0.0`), and — depending
+/// on `ecosystem` — a wildcard (`*`, `1.x`, `1.*`) or a partial version (npm
+/// `"16"` or `"v16"`, Cargo `"0"`).
 ///
 /// The error is a [`DeclineReason`] and not a bare `None`, because *which* guard
 /// fired is the only thing that makes the resulting note actionable, and this is
@@ -613,6 +621,16 @@ fn rewrite_constraint(
     // range, so it must never be pinned to a concrete version (npm D8).
     if rest.starts_with(|c: char| c.is_ascii_alphabetic()) {
         return Err(DeclineReason::DistTag);
+    }
+    // A Maven interval — `[1.0]`, `[1.0,2.0)`, `(,1.0]` — states its bounds in
+    // brackets rather than with an operator, and `[1.0]` in particular is Maven's
+    // one way to say "exactly this, and defeat nearest-wins mediation". Rewriting it
+    // to a bare `1.0` reverts it to a *soft* requirement any transitive declaration
+    // may outvote, and the fix record reads "from [1.0] to 1.0", which does not read
+    // as the semantics change it is. A range with a comma is already declined above;
+    // the single-version form has no comma to catch it.
+    if rest.starts_with(['[', '(']) {
+        return Err(DeclineReason::Interval);
     }
 
     let bare = ecosystem.map_or(BareVersion::Exact, Ecosystem::bare_version);
@@ -1842,6 +1860,38 @@ mod tests {
                 rewrite_constraint("==1.4", "1.4.2", it).as_deref(),
                 Ok("==1.4.2"),
                 "{ecosystem:?}"
+            );
+        }
+    }
+
+    /// A Maven interval states its bounds in brackets, and `[1.0]` is Maven's only
+    /// way to say "exactly 1.0, and do not let nearest-wins mediation substitute
+    /// anything else". Rewriting it to a bare `1.0` turns a hard requirement into a
+    /// soft one that any transitive declaration may outvote, and the fix record reads
+    /// "from [1.0] to 1.0" — a semantics change that does not look like one. Every
+    /// other guard misses it: no comma, no space or `|` after the empty operator
+    /// prefix, no `@`, it starts with `[` rather than a letter, and `is_wildcard`
+    /// splits it into `["[1", "0]"]`, neither of which is `x`/`X` nor starts with
+    /// `*`/`+`. The guard runs before the ecosystem is consulted, so the verdict
+    /// is the same under every reading, and for an unrecognized manifest.
+    #[test]
+    fn rewrite_never_softens_a_maven_interval() {
+        for it in EVERY_ECOSYSTEM.map(Some).into_iter().chain([None]) {
+            let interval = Err(DeclineReason::Interval);
+            let comma = Err(DeclineReason::CommaRange);
+            assert_eq!(rewrite_constraint("[1.0]", "2.0.0", it), interval, "{it:?}");
+            assert_eq!(
+                rewrite_constraint("[1.0,2.0)", "2.0.0", it),
+                comma,
+                "{it:?}"
+            );
+            assert_eq!(rewrite_constraint("(,1.0]", "2.0.0", it), comma, "{it:?}");
+            assert_eq!(rewrite_constraint("[1.0,)", "2.0.0", it), comma, "{it:?}");
+            // Whitespace before the bracket is still a bracket.
+            assert_eq!(
+                rewrite_constraint(" [1.0] ", "2.0.0", it),
+                interval,
+                "{it:?}"
             );
         }
     }

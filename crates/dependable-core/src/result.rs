@@ -183,32 +183,60 @@ pub enum ErrorOrigin {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DependencyStatus {
+    /// The best available version is already the one in use.
     UpToDate,
+    /// A newer patch release exists within the declared constraint.
     PatchAvailable,
+    /// A newer release exists within the declared constraint.
     UpdateAvailable,
+    /// A newer release exists outside the declared constraint.
     Outdated,
+    /// A known advisory affects the version in use.
     Vulnerable,
+    /// The registry was asked and the request failed; the text is what it said.
     Error(String),
-    /// A real package whose declared version this run could not read: the constraint is
-    /// written in a dialect that did not translate, it names a channel or a branch
-    /// instead of a range, or it refers to something the manifest never declares.
-    ///
-    /// Deliberately distinct from [`Self::UpToDate`]: an unreadable constraint is not
-    /// evidence that a dependency is current, and reporting it as current is what
-    /// disarms `--fail-on outdated`.
-    ///
-    /// Deliberately distinct from [`Self::Error`] too, and the distinction is a policy,
-    /// not a shade of meaning. `Error` is the registry failing, the fetch failing, or
-    /// input nobody could read as a requirement — a run that could not do its job.
-    /// `Undetermined` is a constraint the *manifest* got right and this crate has no
-    /// front-end for, which is a gap here rather than a defect there. So it does not
-    /// count toward the run's unevaluated tally, does not trip `--fail-on vulnerable`
-    /// (which promises something about vulnerabilities) or `--fail-on outdated` (which
-    /// promises something about staleness), and does trip `--fail-on any`, which is the
-    /// setting that promises everything was established.
-    Undetermined,
+    /// There is no registry behind this dependency: a `path` entry, a Maven
+    /// `<scope>system</scope>` jar. Nothing was looked up because there is
+    /// nowhere to look.
     Local,
+    /// A git dependency, tracked by revision rather than by version.
     Git,
+    /// Whether this dependency is current **could not be determined**, and no
+    /// claim is made either way.
+    ///
+    /// Distinct from all three of its neighbours, and the distinction is the
+    /// point:
+    ///
+    /// - [`Local`](Self::Local) says *there is no registry for this*. Applied to
+    ///   a package that is on one, it is a false statement.
+    /// - [`Error`](Self::Error) says *the registry was asked and it failed*.
+    ///   Nothing was asked here.
+    /// - [`UpToDate`](Self::UpToDate) says *this is current*, which is precisely
+    ///   what was not established.
+    ///
+    /// Two situations produce it. The manifest names a real package but states no
+    /// version this tool can resolve — a Maven POM deferring to `<parent>`,
+    /// `<dependencyManagement>`, or a property it does not declare, or a Cargo
+    /// member inheriting a name its workspace root never declares. Or the
+    /// ecosystem publishes no registry to compare a version against at all, so
+    /// currency is not merely unread but unknowable.
+    ///
+    /// It also covers a constraint this run could not read: one written in a dialect
+    /// that did not translate, one naming a channel or a branch instead of a range,
+    /// or one referring to something the manifest never declares.
+    ///
+    /// The distinction from `Error` is a policy, not a shade of meaning. `Error` is
+    /// the registry failing, the fetch failing, or input nobody could read as a
+    /// requirement — a run that could not do its job. `Undetermined` is a gap here
+    /// rather than a defect in the manifest. So it does not count toward the run's
+    /// unevaluated tally, does not trip `--fail-on vulnerable` or `--fail-on
+    /// outdated`, and does trip `--fail-on any`, which is the setting that promises
+    /// everything was established.
+    ///
+    /// A run is expected to say *why* alongside it: the check that produces one
+    /// emits a manifest-level warning naming the dependencies involved, because a
+    /// status word on its own does not tell a reader what to fix.
+    Undetermined,
 }
 
 impl DependencyStatus {
@@ -903,6 +931,29 @@ mod tests {
         assert_eq!(Advisory::max_cvss(&[]), None);
         assert_eq!(Advisory::max_severity(&[]), None);
         assert_eq!(Advisory::unrated_count(&[]), 0);
+    }
+
+    /// The tokens are what a CI consumer matches on, so they are pinned here.
+    /// `UNDETERMINED` in particular must never collapse into `LOCAL`: one says
+    /// there is no registry for this package, the other says nothing was read
+    /// about a package that has one.
+    #[test]
+    fn status_labels_and_tokens_are_stable_and_distinct() {
+        let cases = [
+            (DependencyStatus::UpToDate, "up to date", "OK"),
+            (DependencyStatus::Local, "local", "LOCAL"),
+            (DependencyStatus::Git, "git", "GIT"),
+            (
+                DependencyStatus::Undetermined,
+                "undetermined",
+                "UNDETERMINED",
+            ),
+        ];
+        for (status, label, token) in &cases {
+            assert_eq!(status.label(), *label);
+            assert_eq!(status.token(), *token);
+        }
+        assert_ne!(DependencyStatus::Undetermined, DependencyStatus::Local);
     }
 
     #[test]

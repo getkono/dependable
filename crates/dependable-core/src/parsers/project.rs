@@ -74,6 +74,7 @@ pub fn parse_project(kind: ManifestKind, content: &str) -> ProjectMeta {
         ManifestKind::GoMod => go_module(content),
         ManifestKind::PubspecYaml => pubspec(content),
         ManifestKind::MixExs => mix(content),
+        ManifestKind::PomXml => pom(content),
         // A `pnpm-workspace.yaml` exists to hold catalogs; `Directory.Packages.props`
         // exists to hold central versions. A Gradle version catalog is the same shape
         // again — the project it serves is described by a build script. None names a
@@ -212,6 +213,46 @@ fn mix(content: &str) -> ProjectMeta {
         role: role_for(name.as_deref()),
         name,
         version: version.map(PackageField::Literal),
+    }
+}
+
+/// `pom.xml`: the `<artifactId>`, `<groupId>`, and `<version>` directly under
+/// `<project>`.
+///
+/// The coordinate is the identity, and it is spelled `groupId:artifactId` — the same
+/// way the POM parser names the dependencies it reads, so a project and a dependency
+/// on it are the same string. A POM that states no `<groupId>` of its own inherits it
+/// from its `<parent>`, which is out of reach here (see
+/// [`pom_xml`](super::pom_xml)); the bare `artifactId` is reported rather than a
+/// coordinate that would be half guessed. A `<version>` that is a property
+/// (`${revision}`) is likewise not a literal this file states.
+///
+/// The element's text is read by [`pom_xml::text_of`](super::pom_xml::text_of) and
+/// not by `Node::text`, so this reader and the dependency reader agree on what an
+/// element says: `Node::text` returns the *first* text node only, which makes
+/// `<version>1.0<!-- patched -->.0</version>` read `1.0` here and `1.0.0` there —
+/// one file, one element, two answers, and one of them a version nobody wrote.
+fn pom(content: &str) -> ProjectMeta {
+    let Ok(doc) = roxmltree::Document::parse(content) else {
+        return unnamed();
+    };
+    let project = doc.root_element();
+    let field = |tag: &str| {
+        project
+            .children()
+            .find(|child| child.is_element() && child.tag_name().name() == tag)
+            .and_then(super::pom_xml::text_of)
+            .map(|located| located.value)
+            .filter(|text| !text.contains('$'))
+    };
+    let name = field("artifactId").map(|artifact| match field("groupId") {
+        Some(group) => format!("{group}:{artifact}"),
+        None => artifact,
+    });
+    ProjectMeta {
+        role: role_for(name.as_deref()),
+        name,
+        version: field("version").map(PackageField::Literal),
     }
 }
 
@@ -390,6 +431,84 @@ mod tests {
             .role,
             ProjectRole::Workspace
         );
+    }
+
+    /// A POM names itself by coordinate — the same string a dependency on it would
+    /// use. Anything it leaves to its `<parent>` is left unstated rather than guessed.
+    #[test]
+    fn a_pom_is_named_by_its_coordinate() {
+        let meta = parse_project(
+            ManifestKind::PomXml,
+            "<project>\n  <groupId>org.example</groupId>\n  \
+             <artifactId>demo</artifactId>\n  <version>1.4.0</version>\n</project>\n",
+        );
+        assert_eq!(meta.name.as_deref(), Some("org.example:demo"));
+        assert_eq!(meta.literal_version(), Some("1.4.0"));
+        assert_eq!(meta.role, ProjectRole::Package);
+
+        // Group and version both inherited from a parent, and a `<parent>` of its own
+        // whose fields must not be mistaken for the project's.
+        let inheriting = parse_project(
+            ManifestKind::PomXml,
+            "<project>\n  <parent>\n    <groupId>org.parent</groupId>\n    \
+             <artifactId>parent</artifactId>\n    <version>9.9.9</version>\n  \
+             </parent>\n  <artifactId>child</artifactId>\n</project>\n",
+        );
+        assert_eq!(inheriting.name.as_deref(), Some("child"));
+        assert_eq!(inheriting.literal_version(), None);
+
+        // `${revision}` is CI-friendly versioning, not a version.
+        let templated = parse_project(
+            ManifestKind::PomXml,
+            "<project>\n  <artifactId>demo</artifactId>\n  \
+             <version>${revision}</version>\n</project>\n",
+        );
+        assert_eq!(templated.literal_version(), None);
+
+        assert_eq!(
+            parse_project(ManifestKind::PomXml, "<not xml").role,
+            ProjectRole::Unnamed
+        );
+    }
+
+    /// One element, one rule. `Node::text` stops at the first text node, so a
+    /// `<version>` a comment or a character reference splits in two used to read as
+    /// its first half here while the dependency reader read it whole — the project
+    /// then claimed version `1.0` of itself while a sibling POM depending on it read
+    /// `1.0.0`, and a monorepo could not match the two.
+    #[test]
+    fn a_split_element_reads_the_same_here_as_in_the_dependency_reader() {
+        let split = parse_project(
+            ManifestKind::PomXml,
+            "<project>\n  <groupId>org.exa<!--split-->mple</groupId>\n  \
+             <artifactId>demo</artifactId>\n  \
+             <version>1.0<!--patched-->.0</version>\n</project>\n",
+        );
+        assert_eq!(split.name.as_deref(), Some("org.example:demo"));
+        assert_eq!(split.literal_version(), Some("1.0.0"));
+
+        // And the dependency reader, over the same shape, agrees.
+        let items = crate::parsers::parse(
+            ManifestKind::PomXml,
+            "<project>\n  <dependencies>\n    <dependency>\n      \
+             <groupId>org.exa<!--split-->mple</groupId>\n      \
+             <artifactId>demo</artifactId>\n      \
+             <version>1.0<!--patched-->.0</version>\n    \
+             </dependency>\n  </dependencies>\n</project>\n",
+        )
+        .expect("the POM parses")
+        .items;
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name, "org.example:demo");
+        assert_eq!(items[0].version_constraint, "1.0.0");
+
+        // A character reference is read whole by both too.
+        let entity = parse_project(
+            ManifestKind::PomXml,
+            "<project>\n  <artifactId>demo</artifactId>\n  \
+             <version>1.0&#46;0</version>\n</project>\n",
+        );
+        assert_eq!(entity.literal_version(), Some("1.0.0"));
     }
 
     #[test]

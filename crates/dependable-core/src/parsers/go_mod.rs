@@ -52,6 +52,7 @@ impl Parser for GoModParser {
             kind: ManifestKind::GoMod,
             items,
             alternate_registries: Vec::new(),
+            notices: Vec::new(),
         })
     }
 }

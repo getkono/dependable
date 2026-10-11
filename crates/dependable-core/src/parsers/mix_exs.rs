@@ -56,6 +56,7 @@ impl Parser for MixExsParser {
             kind: ManifestKind::MixExs,
             items,
             alternate_registries: Vec::new(),
+            notices: Vec::new(),
         })
     }
 }

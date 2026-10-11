@@ -27,7 +27,10 @@ struct SummaryDto {
     outdated: usize,
     vulnerable: usize,
     error: usize,
-    /// Additive: real packages whose declared version this run could not read.
+    /// Declarations whose currency could not be established — a POM deferring to
+    /// its `<parent>`, an unresolved workspace inheritance, a declared version this
+    /// run could not read. Additive, and deliberately not folded into `error`:
+    /// nothing failed, nothing was asked.
     undetermined: usize,
 }
 

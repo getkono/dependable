@@ -40,6 +40,7 @@ impl Parser for PackageJsonParser {
             kind: ManifestKind::PackageJson,
             items,
             alternate_registries: Vec::new(),
+            notices: Vec::new(),
         })
     }
 }

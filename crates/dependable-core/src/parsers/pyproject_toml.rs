@@ -121,6 +121,7 @@ impl Parser for PyprojectTomlParser {
             kind: ManifestKind::PyprojectToml,
             items,
             alternate_registries: Vec::new(),
+            notices: Vec::new(),
         })
     }
 }

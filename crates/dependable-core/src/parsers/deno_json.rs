@@ -29,6 +29,7 @@ impl Parser for DenoJsonParser {
             kind: ManifestKind::DenoJson,
             items,
             alternate_registries: Vec::new(),
+            notices: Vec::new(),
         })
     }
 }
