@@ -1,5 +1,7 @@
 //! The fundamental dependency unit as it appears in a manifest.
 
+use crate::ecosystem::Ecosystem;
+
 /// A single dependency as declared in a manifest.
 ///
 /// Carries the byte position of the version *value* so the CLI can rewrite it in
@@ -28,12 +30,29 @@ pub struct Item {
 }
 
 impl Item {
-    /// Whether the constraint pins an exact version (`=1.2.3`, not `==`), which
-    /// excludes it from a blanket `--update-all`.
+    /// Whether the author pinned this dependency to one release, which is what
+    /// keeps a plain `fix` from moving it (only `--all` does).
+    ///
+    /// Two spellings count, because a pin is a question about what the constraint
+    /// admits rather than about which characters wrote it:
+    ///
+    /// - an explicit `=` (`=1.2.3`, but not PEP 440's `==`), in any ecosystem;
+    /// - a full concrete version written with no operator (`1.2.3`, `v1.2.3`,
+    ///   `1.2.3-beta.1`) where `ecosystem` reads a bare version as one release —
+    ///   [`Ecosystem::bare_version_is_exact`]. npm's `"lodash": "1.2.3"` is a pin;
+    ///   Cargo's `serde = "1.2.3"` is `^1.2.3` and is not.
+    ///
+    /// A *partial* bare version is never a pin here: npm reads `"16"` as the
+    /// X-range `16.x`. `None` is a manifest kind nobody recognized, and answers
+    /// the protective way — a full bare version counts as pinned — because a
+    /// wrong `false` lets `fix` collapse or move a version the author held.
     #[must_use]
-    pub fn is_pinned(&self) -> bool {
-        let c = self.version_constraint.trim_start();
-        c.starts_with('=') && !c.starts_with("==")
+    pub fn is_pinned(&self, ecosystem: Option<Ecosystem>) -> bool {
+        let c = self.version_constraint.trim();
+        if c.starts_with('=') && !c.starts_with("==") {
+            return true;
+        }
+        ecosystem.is_none_or(Ecosystem::bare_version_is_exact) && is_full_bare_version(c)
     }
 
     /// Whether this item should be fetched + version-checked. Local and git
@@ -107,6 +126,15 @@ impl Item {
             && !self.version_constraint.is_empty()
             && self.version_col_end > self.version_col_start
     }
+}
+
+/// Whether `constraint` is one concrete release written with no operator: all
+/// three numeric components, optionally a prerelease or build suffix, and
+/// optionally node-semver's and Composer's leading `v`. A partial (`1.2`), a
+/// wildcard (`1.x`), a range, or anything with an operator in front is not.
+fn is_full_bare_version(constraint: &str) -> bool {
+    let version = constraint.strip_prefix(['v', 'V']).unwrap_or(constraint);
+    semver::Version::parse(version).is_ok()
 }
 
 /// Which manifest section a dependency was declared in.
@@ -340,6 +368,74 @@ mod tests {
         assert!(numpy.has_position(), "line 2 of this very file");
         assert_eq!(numpy.version_line, 1);
         assert!(!numpy.is_rewritable(), "the span is zero-width");
+    }
+
+    /// A pin is what the constraint admits, not how it is spelled: npm's bare
+    /// `1.2.3` names exactly the one release Cargo's `=1.2.3` does, while Cargo's
+    /// bare `1.2.3` is `^1.2.3` and NuGet's is `>= 1.2.3`.
+    #[test]
+    fn a_full_bare_version_is_pinned_where_a_bare_version_is_exact() {
+        let mut item = find(&items("[dependencies]\nserde = \"1.0\"\n"), "serde");
+        let pinned = |item: &Item, constraint: &str, ecosystem| {
+            let mut item = item.clone();
+            item.version_constraint = constraint.to_owned();
+            item.is_pinned(ecosystem)
+        };
+
+        for ecosystem in [
+            Ecosystem::Npm,
+            Ecosystem::Python,
+            Ecosystem::Php,
+            Ecosystem::Dart,
+            Ecosystem::Elixir,
+            Ecosystem::Swift,
+        ] {
+            assert!(ecosystem.bare_version_is_exact(), "{ecosystem:?}");
+            for constraint in [
+                "1.2.3",
+                "v1.2.3",
+                "1.2.3-beta.1",
+                "1.2.3+build.5",
+                " 1.2.3 ",
+            ] {
+                assert!(
+                    pinned(&item, constraint, Some(ecosystem)),
+                    "{ecosystem:?} {constraint:?}"
+                );
+            }
+            // A partial is an X-range under node-semver; a wildcard, a range, or
+            // an operator other than a lone `=` floats.
+            for constraint in [
+                "1.2", "1", "1.x", "1.2.*", "*", "^1.2.3", "~1.2.3", ">=1.2.3",
+            ] {
+                assert!(
+                    !pinned(&item, constraint, Some(ecosystem)),
+                    "{ecosystem:?} {constraint:?}"
+                );
+            }
+        }
+
+        for ecosystem in [
+            Ecosystem::Rust,
+            Ecosystem::Go,
+            Ecosystem::CSharp,
+            Ecosystem::Jvm,
+        ] {
+            assert!(!ecosystem.bare_version_is_exact(), "{ecosystem:?}");
+            assert!(!pinned(&item, "1.2.3", Some(ecosystem)), "{ecosystem:?}");
+        }
+
+        // An unrecognized manifest answers the protective way.
+        assert!(pinned(&item, "1.2.3", None));
+        assert!(!pinned(&item, "1.2", None));
+
+        // The explicit `=` pins in every ecosystem; PEP 440's `==` is not it.
+        item.version_constraint = "=1.2.3".to_owned();
+        for ecosystem in [Some(Ecosystem::Rust), Some(Ecosystem::Npm), None] {
+            assert!(item.is_pinned(ecosystem), "{ecosystem:?}");
+        }
+        item.version_constraint = "==1.2.3".to_owned();
+        assert!(!item.is_pinned(Some(Ecosystem::Python)));
     }
 
     #[test]
