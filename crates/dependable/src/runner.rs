@@ -656,7 +656,9 @@ fn check_fail_on_is_enforceable(fail_on: FailOn, check_vuln: bool) -> anyhow::Re
 ///
 /// # Errors
 ///
-/// When a `[policy]` table exists but is invalid, or an override is unusable.
+/// When a `[policy]` table exists but is invalid, or an override is unusable. A
+/// config file that does not parse at all is also an error, but `run_check` never
+/// reaches this with one: [`read_config`] has already refused it.
 #[cfg(feature = "report")]
 fn resolve_policy(config: &Path) -> anyhow::Result<Option<dependable_report::policy::Policy>> {
     use dependable_fetch::core::result::Severity;
@@ -671,13 +673,6 @@ fn resolve_policy(config: &Path) -> anyhow::Result<Option<dependable_report::pol
     let mut policy = match load_policy(config) {
         Ok(PolicySource::Configured(policy)) => policy,
         Ok(PolicySource::Absent) => Policy::default(),
-        Ok(PolicySource::Unreadable(why)) => {
-            eprintln!(
-                "warning: {} could not be parsed; configuration ignored ({why})",
-                config.display()
-            );
-            Policy::default()
-        }
         Err(e) => {
             return Err(anyhow::Error::new(*e).context(format!(
                 "invalid `[policy]` in {} — a policy that is configured is enforced or it is an error",
