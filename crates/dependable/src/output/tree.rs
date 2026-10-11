@@ -3,8 +3,9 @@
 //! The pure [`DependencyGraph`] does the traversal; this module only turns the
 //! resulting [`Tree`]/graph into text. Color is TTY-aware via `owo-colors`.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
+use std::path::{Component, Path, PathBuf};
 
 use dependable_fetch::{DependencyGraph, NodeKind, Placement, TreeNode, TreeOptions};
 use owo_colors::{OwoColorize, Stream, Style};
@@ -14,31 +15,55 @@ use crate::cli::TreeFormat;
 
 /// Render `graph` in the requested `format` using `opts` for the tree shape.
 ///
+/// `nested` is [`dependable_fetch::WorkspaceGraph::nested_roots`]: the workspace
+/// nodes a nested root governs rather than the scanned one, which every format
+/// marks so they do not read as members of the workspace being shown.
+///
 /// # Errors
 /// Propagates serialization errors from the JSON renderer.
 pub fn render(
     graph: &DependencyGraph,
+    nested: &BTreeMap<usize, PathBuf>,
     format: TreeFormat,
     opts: &TreeOptions,
 ) -> anyhow::Result<()> {
     match format {
         TreeFormat::Tree => {
-            print!("{}", ascii(graph, opts));
+            print!("{}", ascii(graph, nested, opts));
             Ok(())
         }
         TreeFormat::Json => {
-            println!("{}", json(graph, opts)?);
+            println!("{}", json(graph, nested, opts)?);
             Ok(())
         }
         TreeFormat::Dot => {
-            print!("{}", dot(graph, opts));
+            print!("{}", dot(graph, nested, opts));
             Ok(())
         }
     }
 }
 
+/// A nested root's directory as every format spells it: its components joined by
+/// `/`, so the same tree prints the same text — and the same JSON — on Windows.
+fn root_text(dir: &Path) -> String {
+    let parts: Vec<String> = dir
+        .components()
+        .filter_map(|part| match part {
+            Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    if parts.is_empty() {
+        // Only reachable for a root the scan could not express relative to itself;
+        // `.` is still truthful where an empty string would read as no root at all.
+        ".".to_owned()
+    } else {
+        parts.join("/")
+    }
+}
+
 /// cargo-tree-style ASCII, a forest with one tree per root.
-fn ascii(graph: &DependencyGraph, opts: &TreeOptions) -> String {
+fn ascii(graph: &DependencyGraph, nested: &BTreeMap<usize, PathBuf>, opts: &TreeOptions) -> String {
     let tree = graph.tree(opts);
     if tree.roots.is_empty() {
         return "(no crates to show)\n".to_owned();
@@ -48,7 +73,7 @@ fn ascii(graph: &DependencyGraph, opts: &TreeOptions) -> String {
         if i > 0 {
             out.push('\n');
         }
-        write_node(&mut out, graph, root, "", true, true);
+        write_node(&mut out, graph, nested, root, "", true, true);
     }
     // A tree that ran out of budget is a prefix, and a prefix that does not say so reads
     // as the whole graph. `--no-dedupe` on a large lockfile is how a reader gets here.
@@ -63,6 +88,7 @@ fn ascii(graph: &DependencyGraph, opts: &TreeOptions) -> String {
 fn write_node(
     out: &mut String,
     graph: &DependencyGraph,
+    nested: &BTreeMap<usize, PathBuf>,
     node: &TreeNode,
     prefix: &str,
     is_last: bool,
@@ -75,7 +101,7 @@ fn write_node(
     } else {
         "├── "
     };
-    let _ = writeln!(out, "{prefix}{connector}{}", label(graph, node));
+    let _ = writeln!(out, "{prefix}{connector}{}", label(graph, nested, node));
 
     let child_prefix = if is_root {
         String::new()
@@ -86,7 +112,15 @@ fn write_node(
     };
     let count = node.children.len();
     for (i, child) in node.children.iter().enumerate() {
-        write_node(out, graph, child, &child_prefix, i + 1 == count, false);
+        write_node(
+            out,
+            graph,
+            nested,
+            child,
+            &child_prefix,
+            i + 1 == count,
+            false,
+        );
     }
 }
 
@@ -94,14 +128,24 @@ fn write_node(
 /// `(*)` for a repeat, `(see root)` for a crate with a tree of its own further
 /// down the forest. Colored by kind (workspace bold cyan, git magenta, path
 /// yellow, registry plain) and dimmed wherever it is collapsed.
-fn label(graph: &DependencyGraph, node: &TreeNode) -> String {
+///
+/// A crate a nested workspace governs is tagged `(workspace: DIR)` rather than
+/// `(workspace)`, naming the root its version was resolved against. Only those
+/// crates carry the longer tag, so a tree with no nested root reads exactly as it
+/// always has.
+fn label(graph: &DependencyGraph, nested: &BTreeMap<usize, PathBuf>, node: &TreeNode) -> String {
     let n = &graph.nodes()[node.node];
     let mut text = match n.version.as_deref() {
         Some(version) => format!("{} v{}", n.name, version),
         None => n.name.clone(),
     };
     match n.kind {
-        NodeKind::Workspace => text.push_str(" (workspace)"),
+        NodeKind::Workspace => match nested.get(&node.node) {
+            Some(dir) => {
+                let _ = write!(text, " (workspace: {})", root_text(dir));
+            }
+            None => text.push_str(" (workspace)"),
+        },
         NodeKind::Git => text.push_str(" (git)"),
         NodeKind::Path => text.push_str(" (path)"),
         _ => {}
@@ -221,6 +265,13 @@ struct NodeDto<'a> {
     /// absent version.
     version: Option<&'a str>,
     kind: &'static str,
+    /// Additive: the directory, relative to the scanned root and `/`-separated, of
+    /// the nested workspace root that governs this node — a `fuzz/` tree with a
+    /// `[workspace]` of its own — or `null` for every node that root does not
+    /// govern. Only a `"workspace"` node can carry one, and its version, where it
+    /// has one, was resolved against that root rather than the scanned one.
+    /// Emitted as `null` rather than omitted, for the same reason as `version`.
+    nested_root: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -229,7 +280,11 @@ struct EdgeDto {
     to: usize,
 }
 
-fn json(graph: &DependencyGraph, opts: &TreeOptions) -> anyhow::Result<String> {
+fn json(
+    graph: &DependencyGraph,
+    nested: &BTreeMap<usize, PathBuf>,
+    opts: &TreeOptions,
+) -> anyhow::Result<String> {
     let flat = flatten(graph, opts);
     let nodes = flat
         .order
@@ -242,6 +297,7 @@ fn json(graph: &DependencyGraph, opts: &TreeOptions) -> anyhow::Result<String> {
                 name: &n.name,
                 version: n.version.as_deref(),
                 kind: kind_str(n.kind),
+                nested_root: nested.get(&orig).map(|dir| root_text(dir)),
             }
         })
         .collect();
@@ -259,8 +315,10 @@ fn json(graph: &DependencyGraph, opts: &TreeOptions) -> anyhow::Result<String> {
     Ok(serde_json::to_string_pretty(&dto)?)
 }
 
-/// Graphviz DOT: workspace nodes filled, git/path tinted, registry plain.
-fn dot(graph: &DependencyGraph, opts: &TreeOptions) -> String {
+/// Graphviz DOT: workspace nodes filled, git/path tinted, registry plain. A crate
+/// a nested workspace governs carries `(workspace: DIR)` in its label, as it does
+/// in the ASCII tree, since the fill alone cannot tell it from a member.
+fn dot(graph: &DependencyGraph, nested: &BTreeMap<usize, PathBuf>, opts: &TreeOptions) -> String {
     let flat = flatten(graph, opts);
     let mut out = String::from(
         "digraph dependencies {\n  rankdir=LR;\n  node [shape=box, fontname=\"monospace\"];\n",
@@ -274,10 +332,13 @@ fn dot(graph: &DependencyGraph, opts: &TreeOptions) -> String {
     }
     for (id, &orig) in flat.order.iter().enumerate() {
         let n = &graph.nodes()[orig];
-        let label = match n.version.as_deref() {
+        let mut label = match n.version.as_deref() {
             Some(version) => format!("{} v{}", n.name, version),
             None => n.name.clone(),
         };
+        if let Some(dir) = nested.get(&orig) {
+            let _ = write!(label, " (workspace: {})", root_text(dir));
+        }
         let escaped = label.replace('"', "\\\"");
         let attrs = match n.kind {
             NodeKind::Workspace => ", style=filled, fillcolor=\"#a6d8ff\"",
@@ -299,6 +360,10 @@ mod tests {
     use super::*;
     use dependable_fetch::DependencyGraph;
     use dependable_fetch::core::{LockedPackage, ResolvedLockfile, parse_cargo_lock_graph};
+
+    /// A scan with no nested workspace root, which is every graph but the one
+    /// [`nested_crates_are_marked_in_every_format`] builds.
+    const NO_NESTING: &BTreeMap<usize, PathBuf> = &BTreeMap::new();
 
     /// app (workspace) -> serde (registry) -> serde_derive; and app -> serde too,
     /// so serde is deduped on its second appearance.
@@ -403,7 +468,7 @@ source = "registry+https://x"
 
     #[test]
     fn ascii_marks_workspace_and_dedupe() {
-        let out = strip_ansi(&ascii(&sample(), &TreeOptions::default()));
+        let out = strip_ansi(&ascii(&sample(), NO_NESTING, &TreeOptions::default()));
         assert!(out.contains("app v0.1.0 (workspace)"));
         assert!(out.contains("├── serde v1.0.0"));
         assert!(out.contains("└── ")); // last-child connector
@@ -435,7 +500,7 @@ source = "registry+https://x"
 
     #[test]
     fn ascii_points_a_member_at_its_own_tree() {
-        let out = strip_ansi(&ascii(&workspace(), &TreeOptions::default()));
+        let out = strip_ansi(&ascii(&workspace(), NO_NESTING, &TreeOptions::default()));
         assert!(
             out.contains("└── lib v0.1.0 (workspace) (see root)"),
             "under `app`, `lib` is a pointer rather than a copy; {out}"
@@ -458,7 +523,7 @@ source = "registry+https://x"
             collapse_roots: false,
             ..TreeOptions::default()
         };
-        let out = strip_ansi(&ascii(&workspace(), &opts));
+        let out = strip_ansi(&ascii(&workspace(), NO_NESTING, &opts));
         assert!(!out.contains("(see root)"), "{out}");
         assert_eq!(out.matches("serde v1.0.0").count(), 2, "{out}");
     }
@@ -470,7 +535,7 @@ source = "registry+https://x"
             dedupe: true,
             ..TreeOptions::default()
         };
-        let out = strip_ansi(&ascii(&sample(), &opts));
+        let out = strip_ansi(&ascii(&sample(), NO_NESTING, &opts));
         assert!(out.contains("app v0.1.0 (workspace)"));
         assert!(!out.contains("serde"));
     }
@@ -509,13 +574,13 @@ source = "registry+https://x"
             "the fixture must actually truncate, or the assertions below prove nothing"
         );
 
-        let ascii = ascii(&graph, &opts);
+        let ascii = ascii(&graph, NO_NESTING, &opts);
         assert!(ascii.contains("(tree truncated"), "{ascii}");
 
-        let json = json(&graph, &opts).unwrap();
+        let json = json(&graph, NO_NESTING, &opts).unwrap();
         assert!(json.contains("\"truncated\": true"), "{json}");
 
-        let dot = dot(&graph, &opts);
+        let dot = dot(&graph, NO_NESTING, &opts);
         assert!(dot.contains("dependable_truncated=true;"), "{dot}");
         assert!(dot.contains("// tree truncated"), "{dot}");
     }
@@ -524,16 +589,16 @@ source = "registry+https://x"
     /// must be able to require the flag, not infer completeness from its absence.
     #[test]
     fn a_complete_walk_reports_itself_complete() {
-        let json = json(&sample(), &TreeOptions::default()).unwrap();
+        let json = json(&sample(), NO_NESTING, &TreeOptions::default()).unwrap();
         assert!(json.contains("\"truncated\": false"), "{json}");
 
-        let dot = dot(&sample(), &TreeOptions::default());
+        let dot = dot(&sample(), NO_NESTING, &TreeOptions::default());
         assert!(!dot.contains("dependable_truncated"), "{dot}");
     }
 
     #[test]
     fn json_has_nodes_edges_and_roots() {
-        let out = json(&sample(), &TreeOptions::default()).unwrap();
+        let out = json(&sample(), NO_NESTING, &TreeOptions::default()).unwrap();
         assert!(out.contains("\"roots\""));
         assert!(out.contains("\"kind\": \"workspace\""));
         assert!(out.contains("\"kind\": \"registry\""));
@@ -559,7 +624,7 @@ source = "registry+https://x"
         let names = ["app".to_owned()].into_iter().collect();
         let graph = DependencyGraph::from_resolved(&resolved, &names, &["app".to_owned()]);
 
-        let out = json(&graph, &TreeOptions::default()).unwrap();
+        let out = json(&graph, NO_NESTING, &TreeOptions::default()).unwrap();
         assert!(out.contains("\"version\": null"), "{out}");
         assert!(!out.contains("\"version\": \"\""), "{out}");
     }
@@ -591,24 +656,76 @@ source = "registry+https://example.com"
         };
         let opts = TreeOptions::default();
 
-        let text = ascii(&graph, &opts);
+        let text = ascii(&graph, NO_NESTING, &opts);
         assert!(text.contains("\u{2514}\u{2500}\u{2500} serde\n"), "{text}");
         assert!(!text.contains("serde v"), "no trailing `v`: {text}");
 
-        let out = dot(&graph, &opts);
+        let out = dot(&graph, NO_NESTING, &opts);
         assert!(out.contains("[label=\"serde\"]"), "{out}");
 
-        let out = json(&graph, &opts).unwrap();
+        let out = json(&graph, NO_NESTING, &opts).unwrap();
         assert!(out.contains("\"version\": null"), "{out}");
         assert!(!out.contains("\"version\": \"\""), "{out}");
     }
 
     #[test]
     fn dot_is_a_digraph_with_styled_workspace() {
-        let out = dot(&sample(), &TreeOptions::default());
+        let out = dot(&sample(), NO_NESTING, &TreeOptions::default());
         assert!(out.starts_with("digraph dependencies {"));
         assert!(out.contains("label=\"app v0.1.0\", style=filled"));
         assert!(out.contains(" -> "));
         assert!(out.trim_end().ends_with('}'));
+    }
+
+    /// `app` and `lib` are both workspace nodes, but a nested root at `fuzz/deep`
+    /// governs `lib`. Every format must tell them apart, and must say which root.
+    #[test]
+    fn nested_crates_are_marked_in_every_format() {
+        let graph = workspace();
+        let lib = graph.nodes().iter().position(|n| n.name == "lib").unwrap();
+        let nested: BTreeMap<usize, PathBuf> =
+            std::iter::once((lib, Path::new("fuzz").join("deep"))).collect();
+        let opts = TreeOptions::default();
+
+        let text = strip_ansi(&ascii(&graph, &nested, &opts));
+        assert!(text.contains("app v0.1.0 (workspace)\n"), "{text}");
+        assert!(
+            text.contains("lib v0.1.0 (workspace: fuzz/deep)\n"),
+            "the nested crate names its root, `/`-separated on every platform; {text}"
+        );
+        assert!(
+            text.contains("└── lib v0.1.0 (workspace: fuzz/deep) (see root)"),
+            "the marker survives on a pointer row too; {text}"
+        );
+
+        let out = json(&graph, &nested, &opts).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let root_of = |name: &str| {
+            value["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|n| n["name"] == name)
+                .unwrap()["nested_root"]
+                .clone()
+        };
+        assert_eq!(root_of("lib"), serde_json::json!("fuzz/deep"), "{out}");
+        assert_eq!(root_of("app"), serde_json::Value::Null, "{out}");
+        assert_eq!(root_of("serde"), serde_json::Value::Null, "{out}");
+
+        let out = dot(&graph, &nested, &opts);
+        assert!(
+            out.contains("label=\"lib v0.1.0 (workspace: fuzz/deep)\""),
+            "{out}"
+        );
+        assert!(out.contains("label=\"app v0.1.0\""), "{out}");
+    }
+
+    /// With no nested root, every node still carries the key, as `null`, so a
+    /// consumer can require it rather than read its absence.
+    #[test]
+    fn json_emits_nested_root_as_null_without_a_nested_workspace() {
+        let out = json(&sample(), NO_NESTING, &TreeOptions::default()).unwrap();
+        assert_eq!(out.matches("\"nested_root\": null").count(), 3, "{out}");
     }
 }

@@ -1048,7 +1048,8 @@ pub fn run_tree(args: TreeArgs) -> anyhow::Result<ExitCode> {
         dedupe: !args.no_dedupe,
         collapse_roots: !args.no_dedupe,
     };
-    output::tree::render(&graph, args.format, &tree_opts)?;
+    // `inverted` keeps every node index, so the nested roots hold for either graph.
+    output::tree::render(&graph, &built.nested_roots, args.format, &tree_opts)?;
     Ok(ExitCode::SUCCESS)
 }
 
