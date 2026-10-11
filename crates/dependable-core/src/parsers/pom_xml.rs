@@ -39,13 +39,22 @@
 //! `<parent>` inheritance, `<dependencyManagement>`, and BOM imports are out of
 //! scope: resolving any of them correctly can require fetching the parent POM from
 //! a registry, which makes this a resolution engine rather than a parser. Maven's
-//! built-in properties (`${project.version}`, `${revision}`, …) are not
+//! other built-in properties (`${revision}`, `${project.artifactId}`, …) are not
 //! `<properties>` entries and are likewise not resolved.
 //!
-//! The same holds for a coordinate: `<groupId>${project.groupId}</groupId>` — the
-//! standard idiom for a sibling module in a multi-module build — names a built-in
-//! this file does not state, and the dependency is reported under that literal
-//! rather than dropped. Such an entry is
+//! The exceptions are `${project.groupId}` and `${project.version}`, the
+//! project's own coordinate and version. Both are written in this file — under
+//! `<project>`, or else under the `<parent>` element Maven inherits them from — so
+//! they resolve with no IO, and the sibling-module idiom
+//! `<groupId>${project.groupId}</groupId>` names the same coordinate the sibling's
+//! own POM is named by (see [`own_field`]). A version read that way is checked but
+//! never rewritten: its line is the project's own `<version>`, not the
+//! dependency's.
+//!
+//! A coordinate this file does not state — `${project.groupId}` in a POM that
+//! names a group in neither `<project>` nor `<parent>`, or a property declared in
+//! a parent POM — is reported under that literal rather than dropped. Such an
+//! entry is
 //! [`PackageSource::Unidentified`]: nothing is fetched under a name this file never
 //! spelled. Its `<version>` is read and reported all the same, because the two are
 //! independent — a POM stating `<version>2.0.13</version>` beside
@@ -178,21 +187,68 @@ impl Parser for PomXmlParser {
     }
 }
 
-/// Read `<properties>` into property name → stated value.
+/// The Maven built-ins this file can answer from its own text, by the `<project>`
+/// element each one reads.
+///
+/// `${project.groupId}` and `${project.version}` are the project's own coordinate
+/// and version, which [`own_field`] reads the way Maven does: from `<project>`, or
+/// else from the `<parent>` it inherits them from. Both are written in this file,
+/// so resolving them needs no IO.
+const BUILT_INS: [(&str, &str); 2] = [
+    ("project.groupId", "groupId"),
+    ("project.version", "version"),
+];
+
+/// Read `<properties>` into property name → stated value, together with the
+/// [`BUILT_INS`] this file states.
 ///
 /// The value is kept exactly as written, `${…}` and all: whether it is a literal or
 /// another reference is [`terminal`]'s question, not this one's.
+///
+/// A built-in carries **no span**. Its value is written on the project's own
+/// `<version>` (or `<groupId>`) line, which is the project's identity and not any
+/// dependency's line to rewrite: `--fix` bumping a sibling module declared as
+/// `${project.version}` must not renumber the module doing the depending. A
+/// `<properties>` entry spelled like a built-in is overridden by it, as Maven's own
+/// `project.*` prefix reads the model rather than the property table.
 fn read_properties<'a>(project: roxmltree::Node<'a, 'a>) -> HashMap<String, Located> {
     let mut out = HashMap::new();
-    let Some(table) = child(project, "properties") else {
-        return out;
-    };
-    for entry in table.children().filter(roxmltree::Node::is_element) {
-        if let Some(located) = text_of(entry) {
-            out.insert(entry.tag_name().name().to_owned(), located);
+    if let Some(table) = child(project, "properties") {
+        for entry in table.children().filter(roxmltree::Node::is_element) {
+            if let Some(located) = text_of(entry) {
+                out.insert(entry.tag_name().name().to_owned(), located);
+            }
+        }
+    }
+    for (name, tag) in BUILT_INS {
+        if let Some(located) = own_field(project, tag) {
+            out.insert(
+                name.to_owned(),
+                Located {
+                    value: located.value,
+                    span: None,
+                },
+            );
         }
     }
     out
+}
+
+/// The project's own `<tag>` — `groupId` or `version` — as written, `${…}` and all:
+/// stated under `<project>`, or else inherited from its `<parent>`.
+///
+/// Maven's inheritance rule for exactly these two fields: a module that omits them
+/// takes its parent's, and the parent element states them right here in this file.
+/// It is the one source for both readers of a POM's identity — this parser, when it
+/// resolves `${project.groupId}` for a sibling module, and
+/// [`project`](super::project), when it names the module itself — so a module and a
+/// dependency on it spell the same coordinate.
+pub(super) fn own_field(project: roxmltree::Node<'_, '_>, tag: &str) -> Option<Located> {
+    child(project, tag).and_then(text_of).or_else(|| {
+        child(project, "parent")
+            .and_then(|parent| child(parent, tag))
+            .and_then(text_of)
+    })
 }
 
 /// Read the `<dependencies>` directly under `<project>`, in source order.
@@ -331,8 +387,8 @@ fn interpolation(value: &str) -> Option<&str> {
 /// be — and reported as written where it cannot.
 ///
 /// `None` only when the element is absent or states nothing. An *unresolvable* half
-/// (`${project.groupId}`, the standard idiom for a sibling module, or a property
-/// declared in a `<parent>`) still yields the literal text, because dropping the
+/// (`${project.groupId}` in a POM that states a group nowhere, or a property
+/// declared in a parent POM) still yields the literal text, because dropping the
 /// dependency would report a POM as depending on fewer things than it declares —
 /// the silent omission this parser exists to avoid, and an asymmetry with
 /// `<version>`, which is reported unresolved rather than deleted.
@@ -732,7 +788,8 @@ mod tests {
              \x20   </dependency>\n\
              \x20 </dependencies>\n");
         let m = parse(&content);
-        // The `<parent>` is not a dependency, and its version is not read.
+        // The `<parent>` is not a dependency, and its version is not a managed
+        // version for anything it does not state one for.
         let names: Vec<&str> = m.items.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(
             names,
@@ -742,7 +799,14 @@ mod tests {
                 "org.example:composed",
             ]
         );
-        for item in &m.items {
+        // `${project.version}` is the project's own, which it inherits from the
+        // `<parent>` this file states — read, checkable, and never written to.
+        let sibling = find(&m, "org.example:sibling");
+        assert_eq!(sibling.version_constraint, "3.2.5");
+        assert_eq!(sibling.source, PackageSource::Inherited);
+        assert!(sibling.is_checkable());
+        assert!(!sibling.has_position());
+        for item in m.items.iter().filter(|item| item.name != sibling.name) {
             assert!(item.version_constraint.is_empty(), "{item:?}");
             assert_eq!(item.source, PackageSource::Inherited, "{item:?}");
             assert!(!item.is_checkable(), "{item:?}");
@@ -903,7 +967,8 @@ mod tests {
 
     /// `${project.groupId}` is *the* idiom for a sibling module in a multi-module
     /// build, and a POM using it for two of its three dependencies must not list as
-    /// depending on one. Reported under the literal it states, as
+    /// depending on one. Where the POM states a group in neither `<project>` nor
+    /// `<parent>`, it is reported under the literal it states, as
     /// [`PackageSource::Unidentified`] — never fetched, because no registry has heard
     /// of a package by that name — rather than dropped in silence.
     #[test]
@@ -944,6 +1009,89 @@ mod tests {
             "{:?}",
             m.notices
         );
+    }
+
+    /// `${project.groupId}` and `${project.version}` are the project's own, and a
+    /// POM states them — under `<project>`, or under the `<parent>` it inherits them
+    /// from. Resolved, the sibling idiom names a real coordinate; the version is
+    /// checked but never rewritten, because the line it is written on is the
+    /// project's own `<version>`, and `--fix` must not renumber the module.
+    #[test]
+    fn the_projects_own_group_and_version_resolve_from_this_file() {
+        let sibling_dep = "  <dependencies>\n\
+             \x20   <dependency>\n\
+             \x20     <groupId>${project.groupId}</groupId>\n\
+             \x20     <artifactId>app-core</artifactId>\n\
+             \x20     <version>${project.version}</version>\n\
+             \x20   </dependency>\n\
+             \x20 </dependencies>\n";
+        let stated = pom(&format!(
+            "  <groupId>org.own</groupId>\n  <artifactId>app-web</artifactId>\n  \
+             <version>2.1.0</version>\n{sibling_dep}"
+        ));
+        let inherited_from_parent = pom(&format!(
+            "  <parent>\n    <groupId>org.own</groupId>\n    \
+             <artifactId>app-parent</artifactId>\n    <version>2.1.0</version>\n  \
+             </parent>\n  <artifactId>app-web</artifactId>\n{sibling_dep}"
+        ));
+        // The project's own fields win over its parent's, as Maven's do.
+        let overriding = pom(&format!(
+            "  <parent>\n    <groupId>org.parent</groupId>\n    \
+             <artifactId>app-parent</artifactId>\n    <version>9.9.9</version>\n  \
+             </parent>\n  <groupId>org.own</groupId>\n  \
+             <artifactId>app-web</artifactId>\n  <version>2.1.0</version>\n{sibling_dep}"
+        ));
+        for content in [&stated, &inherited_from_parent, &overriding] {
+            let m = parse(content);
+            let core = find(&m, "org.own:app-core");
+            assert_eq!(core.version_constraint, "2.1.0", "{content}");
+            assert_eq!(core.source, PackageSource::Inherited, "{content}");
+            assert!(core.is_checkable(), "{content}");
+            assert!(!core.is_rewritable(), "{content}");
+            assert!(m.notices.is_empty(), "{:?}", m.notices);
+        }
+
+        // A CI-friendly `${revision}` version chains through to the property that
+        // states it, and is still never this dependency's line: the project's own
+        // `<version>` reads it too.
+        let revision = pom(&format!(
+            "  <properties>\n    <revision>3.0.0</revision>\n  </properties>\n  \
+             <groupId>org.own</groupId>\n  <artifactId>app-web</artifactId>\n  \
+             <version>${{revision}}</version>\n{sibling_dep}"
+        ));
+        let m = parse(&revision);
+        let core = find(&m, "org.own:app-core");
+        assert_eq!(core.version_constraint, "3.0.0");
+        assert!(!core.is_rewritable());
+    }
+
+    /// Maven's `project.*` prefix reads the model, not the property table, so a
+    /// `<properties>` entry spelled like a built-in never shadows the project's own
+    /// `<groupId>` or `<version>`.
+    #[test]
+    fn a_property_spelled_like_a_built_in_is_overridden_by_the_project() {
+        let content = pom(
+            "  <properties>\n    <project.groupId>org.shadow</project.groupId>\n    \
+             <project.version>0.0.1</project.version>\n  </properties>\n  \
+             <groupId>org.own</groupId>\n  <artifactId>app-web</artifactId>\n  \
+             <version>2.1.0</version>\n  <dependencies>\n    <dependency>\n      \
+             <groupId>${project.groupId}</groupId>\n      \
+             <artifactId>app-core</artifactId>\n      \
+             <version>${project.version}</version>\n    </dependency>\n  \
+             </dependencies>\n",
+        );
+        let m = parse(&content);
+        assert!(
+            m.items
+                .iter()
+                .all(|item| item.name != "org.shadow:app-core"),
+            "{:?}",
+            m.items
+        );
+        let core = find(&m, "org.own:app-core");
+        assert_eq!(core.version_constraint, "2.1.0");
+        assert_eq!(core.source, PackageSource::Inherited);
+        assert!(!core.is_rewritable());
     }
 
     /// A coordinate this file cannot state and a version it can are independent
