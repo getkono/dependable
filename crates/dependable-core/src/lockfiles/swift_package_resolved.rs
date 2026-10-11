@@ -314,8 +314,16 @@ fn pin_item(pin: &Pin) -> Option<Item> {
         Some("fileSystem" | "localSourceControl")
     ) || pin.location.as_deref().is_some_and(is_local_path);
 
+    // An SE-0292 package-registry pin is addressed by a scoped identity
+    // (`mona.linkedlist`), not a repository URL, and OSV keys `SwiftURL` by
+    // repository URL. Querying it there asks a question that can never match, and
+    // the row would then read as clean when nothing was established — so it is
+    // kept visible but made unfetchable, until something can actually check it.
+    let registry = pin.kind.as_deref() == Some("registry");
+
     // A local package's location is a path, which is not a name; its identity is.
-    let name = if local {
+    // A registry package's identity is the only name it has.
+    let name = if local || registry {
         pin.identity.clone()
     } else {
         pin.location
@@ -347,8 +355,19 @@ fn pin_item(pin: &Pin) -> Option<Item> {
     // declared it; a consumer told "inherited" would go looking for a central
     // declaration that does not exist. A branch pin has no version at all and is
     // the git dependency it looks like.
+    //
+    // A registry pin is `Unidentified`: its version is plain, but its identity is
+    // not a name the `SwiftURL` ecosystem could answer for, so nothing is fetched
+    // or scanned for it and a check reports it `Undetermined` rather than clean.
+    // Not `Local` — there *is* a registry behind it — and not `Locked`, which is
+    // the checkable claim that would send the identity to OSV. The version stays in
+    // the constraint, because the file states it. This holds even when a library
+    // consumer registers a Swift fetcher: this parser is IO-free and cannot know one
+    // exists, so such a fetcher never sees a registry pin.
     let (source, constraint, locked) = if local {
         (PackageSource::Local, state, None)
+    } else if registry {
+        (PackageSource::Unidentified, state, None)
     } else if let Some(version) = version {
         (PackageSource::Locked, version.clone(), Some(version))
     } else {
@@ -521,6 +540,58 @@ mod tests {
         assert_eq!(items[0].source, PackageSource::Git);
         assert_eq!(items[0].version_constraint, "main");
         assert_eq!(items[0].locked_version, None);
+        assert!(!items[0].is_checkable());
+    }
+
+    /// An SE-0292 registry pin carries a scoped identity and no repository URL, so
+    /// it has no `SwiftURL` key: a checkable item would send `mona.linkedlist` to
+    /// OSV, match nothing, and report clean. It stays in the list, with the version
+    /// the file states, but is never fetched or scanned.
+    #[test]
+    fn a_registry_pin_is_listed_but_never_queried() {
+        let lock = r#"{
+  "pins" : [
+    {
+      "identity" : "mona.linkedlist",
+      "kind" : "registry",
+      "state" : { "version" : "0.1.2" }
+    }
+  ],
+  "version" : 2
+}"#;
+        let items = items(lock);
+        assert_eq!(items.len(), 1, "the pin is still listed");
+        assert_eq!(items[0].name, "mona.linkedlist");
+        assert_eq!(items[0].source, PackageSource::Unidentified);
+        assert_eq!(items[0].version_constraint, "0.1.2");
+        assert_eq!(items[0].locked_version, None);
+        assert!(!items[0].is_checkable());
+
+        let data = parse_swift_package_resolved(lock).expect("reads");
+        assert!(
+            !data.versions.contains_key("mona.linkedlist"),
+            "no checkable version is recorded for a name OSV cannot key"
+        );
+    }
+
+    /// The `registry` kind decides, not the absence of a location: a registry pin
+    /// that happens to carry a URL is still named by its identity and not scanned.
+    #[test]
+    fn a_registry_pin_with_a_location_is_still_unidentified() {
+        let lock = r#"{
+  "pins" : [
+    {
+      "identity" : "mona.linkedlist",
+      "kind" : "registry",
+      "location" : "https://packages.example.com/mona/LinkedList",
+      "state" : { "version" : "0.1.2" }
+    }
+  ],
+  "version" : 2
+}"#;
+        let items = items(lock);
+        assert_eq!(items[0].name, "mona.linkedlist");
+        assert_eq!(items[0].source, PackageSource::Unidentified);
         assert!(!items[0].is_checkable());
     }
 
