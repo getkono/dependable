@@ -46,6 +46,7 @@ fn catalog_project() -> (TempDir, Project) {
         ecosystem: kind.ecosystem(),
         graph: built.graph,
         source: built.source,
+        nested_roots: built.nested_roots,
     };
     (dir, project)
 }

@@ -2,6 +2,7 @@
 //!
 //! No terminal and no network — the whole point of keeping `App` free of both.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use dependable_fetch::core::{LockedPackage, ResolvedLockfile};
@@ -34,6 +35,7 @@ fn project(label: &str, packages: &[(&str, &str, &[&str])]) -> Project {
         ecosystem: Ecosystem::Rust,
         graph: DependencyGraph::from_resolved(&resolved, &names, &[root]),
         source: GraphSource::Lockfile,
+        nested_roots: BTreeMap::new(),
     }
 }
 
@@ -66,6 +68,7 @@ fn workspace(label: &str, members: usize, packages: &[(&str, &str, &[&str])]) ->
         ecosystem: Ecosystem::Rust,
         graph: DependencyGraph::from_resolved(&resolved, &names, &roots),
         source: GraphSource::Lockfile,
+        nested_roots: BTreeMap::new(),
     }
 }
 

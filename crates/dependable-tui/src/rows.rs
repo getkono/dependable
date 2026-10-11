@@ -13,6 +13,7 @@
 //! and copying their subtrees under each other buries the tree in repeats.
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 
 use dependable_fetch::{NodeKind, Placement, Visit, Visitor, WalkOptions};
 
@@ -67,6 +68,10 @@ pub struct Row {
     pub version: Option<String>,
     /// How the node relates to the workspace; `None` for a project row.
     pub node_kind: Option<NodeKind>,
+    /// The nested workspace root that governs this crate, relative to the
+    /// project's root, where it is not the project's own — a `fuzz/` tree with a
+    /// `[workspace]` of its own. `None` for every other row.
+    pub nested_root: Option<PathBuf>,
     /// Whether the row has children to expand.
     pub has_children: bool,
     /// Whether it is currently expanded.
@@ -109,6 +114,7 @@ pub fn visible(
             name: project.label.clone(),
             version: None,
             node_kind: None,
+            nested_root: None,
             has_children: !project.graph.roots().is_empty(),
             expanded: is_open,
             cyclic: false,
@@ -164,6 +170,7 @@ impl Visitor for RowBuilder<'_> {
             name: info.name.clone(),
             version: info.version.clone(),
             node_kind: Some(info.kind),
+            nested_root: self.project.nested_roots.get(&visit.node).cloned(),
             has_children: expandable,
             expanded: visit.placement == Placement::Full && visit.degree > 0,
             cyclic: visit.placement == Placement::Cycle,

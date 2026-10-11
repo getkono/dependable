@@ -645,6 +645,21 @@ shown **once**, at its own tree. Reached under another member it is a pointer,
 buries itself in repeats. Crates repeated elsewhere collapse to `(*)`.
 `--no-dedupe` turns both off and expands every occurrence in place.
 
+A crate inside a **nested, independent workspace** — a `fuzz/` or `examples/`
+tree with a `[workspace]` of its own — is a workspace crate too, but not this
+workspace's: its `version.workspace = true` is resolved against that nested root.
+`tree` tags it `(workspace: fuzz)` instead of `(workspace)`, naming the root, and
+`--format json` gives every node a `nested_root` key holding that directory
+(relative to the scanned root, `/`-separated), or `null` for a node no nested
+root governs. The interactive UI tags such a crate `nested` and names its root in
+the detail pane.
+
+```
+a v1.0.0 (workspace)
+
+a-fuzz v0.0.0 (workspace: fuzz)
+```
+
 The tree is the **resolved union graph** from `Cargo.lock`: unlike
 `cargo tree --edges` it does not distinguish normal/dev/build edges or feature
 activation. When no `Cargo.lock` is present, `tree` prints a warning and falls
