@@ -582,6 +582,44 @@ fn a_pin_held_back_for_want_of_all_is_reported() {
     );
 }
 
+/// Issue #157: `=1.2` starts with a lone `=`, so it is counted as a pin, but it
+/// is node-semver's X-range `1.2.x`, and `--all` declines it for that shape.
+/// Without `--all` the note has to give the same reason rather than point at
+/// `--all`, which would leave it exactly where it is.
+#[test]
+fn an_equals_partial_is_not_reported_as_a_pin() {
+    let dir = workdir("fix_declined_equals_partial");
+    let base = registry(vec![(
+        "/lodash".to_string(),
+        packument(&["1.2.0", "1.2.9", "2.0.0"], "2.0.0"),
+    )]);
+    let config = write_config(&dir, &base);
+    let manifest = dir.join("package.json");
+    let original =
+        "{\n  \"name\": \"app\",\n  \"dependencies\": {\n    \"lodash\": \"=1.2\"\n  }\n}\n";
+    fs::write(&manifest, original).unwrap();
+
+    for args in [&[][..], &["--all"][..]] {
+        let output = run_with_config(&dir, &config, args);
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(output.status.success(), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains("note: left lodash = =1.2 alone in ")
+                && stderr.contains(
+                    "2.0.0 is available, but an `=` in front of a partial version is a range that already tracks new \
+                     releases"
+                ),
+            "{args:?}: no equals-partial note.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert!(
+            !stderr.contains("only `--all` moves a pin"),
+            "{args:?}: the note pointed at `--all`.\nstderr: {stderr}"
+        );
+        assert_eq!(fs::read_to_string(&manifest).unwrap(), original, "{args:?}");
+    }
+}
+
 /// The constraint already names the only version in range, and a newer release
 /// exists outside it. Nothing to write, and — until now — nothing said: the
 /// clean line went out over an update `check` had just reported. `~1.0.0`
