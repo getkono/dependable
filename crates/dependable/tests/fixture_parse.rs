@@ -4,7 +4,9 @@
 use std::path::Path;
 
 use dependable_fetch::PackageSource;
-use dependable_fetch::core::{CargoTomlParser, Parser, apply_lockfile, parse_cargo_lock};
+use dependable_fetch::core::{
+    CargoTomlParser, Ecosystem, Parser, apply_lockfile, parse_cargo_lock,
+};
 
 #[test]
 fn fixture_parses_and_applies_lock() {
@@ -25,5 +27,5 @@ fn fixture_parses_and_applies_lock() {
     // The path dependency is classified local and skipped.
     assert_eq!(find("local-thing").source, PackageSource::Local);
     // The exact pin is detected.
-    assert!(find("time").is_pinned());
+    assert!(find("time").is_pinned(Some(Ecosystem::Rust)));
 }

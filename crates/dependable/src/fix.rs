@@ -91,7 +91,10 @@ pub enum DeclineReason {
     /// A partial version behind a tilde operator, which reads its upper bound off
     /// the number of components it was given: `~1`, `~> 1.0`, `~=1.4`.
     TildeArity,
-    /// An exact pin (`=1.0.100`) with no `--all` to authorise moving it. Not a
+    /// An exact pin with no `--all` to authorise moving it: an explicit
+    /// `=1.0.100` anywhere, or a full bare version where the ecosystem reads one
+    /// as a single release (npm's `"1.0.0"`) — see
+    /// [`Item::is_pinned`](dependable_fetch::core::Item::is_pinned). Not a
     /// refusal by the constraint's *shape* — the rewrite would succeed — but the
     /// author holds the version deliberately, and the action that changes it is a
     /// flag rather than a rewrite of the constraint.
@@ -108,7 +111,7 @@ pub enum DeclineReason {
     /// The constraint already names the newest release it admits, a newer one
     /// exists beyond it, and `--all` would write that one. The exact pins
     /// [`Item::is_pinned`](dependable_fetch::core::Item::is_pinned)
-    /// does not recognise reach this — npm's bare `"1.0.0"`, PEP 440's `==1.0.0` —
+    /// does not recognise reach this — PEP 440's `==1.0.0` —
     /// so, like [`Self::Pinned`], the note names `--all` and the release it would
     /// write rather than the one already in force.
     NeedsAll,
@@ -428,7 +431,7 @@ fn plan_fixes(
         // `forced` guard below names `--overrides` in turn. Each note is true at
         // the moment it is printed, which is what
         // `an_override_that_is_also_a_pin_reports_the_pin` walks through.
-        if item.is_pinned() && !all {
+        if item.is_pinned(ecosystem) && !all {
             declined.push(Declined {
                 name: item.name.clone(),
                 constraint: item.version_constraint.clone(),
@@ -493,8 +496,8 @@ fn plan_fixes(
         // force reaches it with an advisory attached. `check` reports that row,
         // so `fix` cannot answer it with "everything is already up to date".
         if new_constraint == item.version_constraint {
-            // An exact pin `is_pinned` does not recognise — npm's bare `"1.0.0"`,
-            // PEP 440's `==1.0.0` — lands here rather than at the pin guard. Where
+            // An exact pin `is_pinned` does not recognise — PEP 440's `==1.0.0` —
+            // lands here rather than at the pin guard. Where
             // `--all` would write a newer release, that is the action to name and
             // the release to name with it; the one already in force is not
             // "available" in any sense the author can use.
@@ -1129,7 +1132,10 @@ mod tests {
         let results = results_for(ManifestKind::PackageJson, content, &[("lodash", "1.9.0")]);
         assert_eq!(results.len(), 1, "the fixture must produce one item");
         assert_eq!(results[0].item.kind, DependencyKind::Override);
-        assert!(results[0].item.is_pinned(), "the fixture must be a pin");
+        assert!(
+            results[0].item.is_pinned(Some(Ecosystem::Npm)),
+            "the fixture must be a pin"
+        );
 
         // Even with `--overrides` asked for by name: the next flag to lift for
         // this entry is `--all`, and that is what the note has to say.
@@ -1292,7 +1298,7 @@ mod tests {
         assert_eq!(results.len(), 1, "the fixture must produce one item");
         assert_eq!(results[0].item.kind, DependencyKind::Override);
         assert!(
-            !results[0].item.is_pinned(),
+            !results[0].item.is_pinned(Some(Ecosystem::Npm)),
             "a range-form override must not be a pin, or the pin guard answers first"
         );
         results[0].latest_available = Some("2.0.0".to_string());
@@ -2261,13 +2267,14 @@ mod tests {
     /// The constraint already names the version that would have been written.
     /// Reached most sharply by a `Vulnerable` row whose only fixed release is the
     /// one already in force: `check` reports it, so `fix` cannot answer with
-    /// "everything is already up to date".
+    /// "everything is already up to date". Written as a caret range, because
+    /// npm's bare `"1.0.0"` is a pin and the pin guard answers it first.
     #[test]
     fn a_constraint_already_at_its_target_is_recorded() {
         let content = r#"{
   "name": "demo",
   "dependencies": {
-    "lodash": "1.0.0"
+    "lodash": "^1.0.0"
   }
 }
 "#;
@@ -2288,35 +2295,75 @@ mod tests {
             declined,
             vec![Declined {
                 name: "lodash".to_string(),
-                constraint: "1.0.0".to_string(),
+                constraint: "^1.0.0".to_string(),
                 target: Some("1.0.0".to_string()),
                 reason: DeclineReason::AlreadyAtTarget,
             }]
         );
     }
 
-    /// An exact pin `is_pinned` does not recognise — npm's bare `"1.0.0"`, PEP
-    /// 440's `==1.0.0` — has its newest compatible release already in force, so
-    /// it reaches the already-at-target branch. `--all` rewrites it, so the note
-    /// names `--all` and the release it would write, not the installed one.
+    /// A full bare version is a pin wherever the ecosystem reads one as a single
+    /// release, so the pin guard holds it exactly as it holds `=1.2.3` — even
+    /// when the check, reading the bare version as a caret, reports a newer
+    /// "compatible" release (#118). `--all` still overrides it. Where a bare
+    /// version is a caret (Cargo), the same spelling is a range and moves.
+    #[test]
+    fn a_bare_version_that_names_one_release_is_held_as_a_pin() {
+        let content =
+            "{\n  \"name\": \"demo\",\n  \"dependencies\": {\n    \"lodash\": \"1.2.3\"\n  }\n}\n";
+        let mut results = results_for(ManifestKind::PackageJson, content, &[("lodash", "1.9.0")]);
+        results[0].item.locked_version = Some("1.2.3".to_string());
+        results[0].latest_available = Some("2.0.0".to_string());
+        let npm = Some(ManifestKind::PackageJson.ecosystem());
+
+        let (updated, records, declined) =
+            plan_fixes(content, &results, false, false, npm).expect("the plan applies");
+        assert_eq!(updated, content, "the pin moved without `--all`");
+        assert!(records.is_empty(), "{records:?}");
+        assert_eq!(
+            declined,
+            vec![Declined {
+                name: "lodash".to_string(),
+                constraint: "1.2.3".to_string(),
+                target: Some("2.0.0".to_string()),
+                reason: DeclineReason::Pinned,
+            }]
+        );
+
+        let (updated, records, declined) =
+            plan_fixes(content, &results, true, false, npm).expect("the plan applies");
+        assert!(updated.contains("\"lodash\": \"2.0.0\""), "{updated}");
+        assert_eq!(records.len(), 1);
+        assert!(declined.is_empty(), "{declined:?}");
+
+        let content = "[dependencies]\nserde = \"1.2.3\"\n";
+        let results = results_for(ManifestKind::CargoToml, content, &[("serde", "1.9.0")]);
+        let (updated, records, declined) = plan_fixes(
+            content,
+            &results,
+            false,
+            false,
+            Some(ManifestKind::CargoToml.ecosystem()),
+        )
+        .expect("the plan applies");
+        assert_eq!(updated, "[dependencies]\nserde = \"1.9.0\"\n");
+        assert_eq!(records.len(), 1);
+        assert!(declined.is_empty(), "{declined:?}");
+    }
+
+    /// An exact pin `is_pinned` does not recognise — PEP 440's `==1.0.0` — has
+    /// its newest compatible release already in force, so it reaches the
+    /// already-at-target branch. `--all` rewrites it, so the note names `--all`
+    /// and the release it would write, not the installed one.
     #[test]
     fn an_exact_pin_is_pinned_misses_names_all_and_the_newer_release() {
-        let cases = [
-            (
-                ManifestKind::PackageJson,
-                "{\n  \"name\": \"demo\",\n  \"dependencies\": {\n    \"lodash\": \"1.0.0\"\n  }\n}\n",
-                "lodash",
-                "1.0.0",
-                "\"lodash\": \"2.0.0\"",
-            ),
-            (
-                ManifestKind::RequirementsTxt,
-                "requests==1.0.0\n",
-                "requests",
-                "==1.0.0",
-                "requests==2.0.0",
-            ),
-        ];
+        let cases = [(
+            ManifestKind::RequirementsTxt,
+            "requests==1.0.0\n",
+            "requests",
+            "==1.0.0",
+            "requests==2.0.0",
+        )];
         for (kind, content, name, constraint, moved) in cases {
             let mut results = results_for(kind, content, &[(name, "1.0.0")]);
             results[0].latest_available = Some("2.0.0".to_string());

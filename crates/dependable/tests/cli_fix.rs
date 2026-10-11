@@ -584,9 +584,9 @@ fn a_pin_held_back_for_want_of_all_is_reported() {
 
 /// The constraint already names the only version in range, and a newer release
 /// exists outside it. Nothing to write, and — until now — nothing said: the
-/// clean line went out over an update `check` had just reported. npm's bare
-/// `"1.0.0"` is an exact pin `is_pinned` does not recognise, so the note names
-/// the release `--all` would write and `--all` itself, not the installed one.
+/// clean line went out over an update `check` had just reported. `~1.0.0`
+/// admits only `1.0.0` of these releases, so the note names the release `--all`
+/// would write and `--all` itself, not the installed one.
 #[test]
 fn a_constraint_already_at_its_target_is_reported() {
     let dir = workdir("fix_already_at_target");
@@ -597,7 +597,7 @@ fn a_constraint_already_at_its_target_is_reported() {
     let config = write_config(&dir, &base);
     let manifest = dir.join("package.json");
     let original =
-        "{\n  \"name\": \"app\",\n  \"dependencies\": {\n    \"lodash\": \"1.0.0\"\n  }\n}\n";
+        "{\n  \"name\": \"app\",\n  \"dependencies\": {\n    \"lodash\": \"~1.0.0\"\n  }\n}\n";
     fs::write(&manifest, original).unwrap();
 
     let output = run_with_config(&dir, &config, &[]);
@@ -606,7 +606,7 @@ fn a_constraint_already_at_its_target_is_reported() {
     assert!(output.status.success(), "{stderr}");
 
     assert!(
-        stderr.contains("note: left lodash = 1.0.0 alone in ")
+        stderr.contains("note: left lodash = ~1.0.0 alone in ")
             && stderr.contains(
                 "2.0.0 is available, but nothing newer satisfies the constraint, and only \
                  `--all` writes a release beyond it"
@@ -623,6 +623,52 @@ fn a_constraint_already_at_its_target_is_reported() {
     let output = run_with_config(&dir, &config, &["--all"]);
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(output.status.success(), "{stderr}");
+    assert!(!stderr.contains("note: left lodash"), "stderr: {stderr}");
+    assert!(
+        fs::read_to_string(&manifest)
+            .unwrap()
+            .contains("\"lodash\": \"~2.0.0\""),
+        "`--all` did not move the constraint"
+    );
+}
+
+/// Issue #118: npm's bare `"1.2.3"` names exactly one release, as Cargo's
+/// `=1.2.3` does, so a plain `fix` holds it as a pin even though `check` —
+/// reading the bare version as a caret — reports `1.9.0` as compatible and
+/// `2.0.0` beyond it. Before #118 a plain `fix` rewrote it to `1.9.0`. `--all`
+/// still moves it.
+#[test]
+fn a_bare_npm_version_is_held_as_a_pin() {
+    let dir = workdir("fix_bare_npm_pin");
+    let base = registry(vec![(
+        "/lodash".to_string(),
+        packument(&["1.2.3", "1.9.0", "2.0.0"], "2.0.0"),
+    )]);
+    let config = write_config(&dir, &base);
+    let manifest = dir.join("package.json");
+    let original =
+        "{\n  \"name\": \"app\",\n  \"dependencies\": {\n    \"lodash\": \"1.2.3\"\n  }\n}\n";
+    fs::write(&manifest, original).unwrap();
+
+    let output = run_with_config(&dir, &config, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("note: left lodash = 1.2.3 alone in ")
+            && stderr.contains(
+                "2.0.0 is available, but the constraint pins one release, and only `--all` \
+                 moves a pin"
+            ),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert_eq!(fs::read_to_string(&manifest).unwrap(), original);
+
+    let output = run_with_config(&dir, &config, &["--all"]);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(output.status.success(), "{stderr}");
+    assert!(stdout.contains("lodash 1.2.3 → 2.0.0"), "stdout: {stdout}");
     assert!(!stderr.contains("note: left lodash"), "stderr: {stderr}");
     assert!(
         fs::read_to_string(&manifest)
@@ -803,7 +849,12 @@ fn a_forced_version_is_reported_instead_of_silently_skipped() {
     let base = registry(forced_version_routes());
     let config = write_config(&dir, &base);
     let manifest = dir.join("package.json");
-    fs::write(&manifest, FORCED_VERSION_MANIFEST).unwrap();
+    // A caret range rather than the constant's bare `1.0.0`: without `--all`,
+    // npm's bare version is a pin, and the pin guard would answer before the
+    // forced-version one this test is about.
+    let original =
+        FORCED_VERSION_MANIFEST.replace("\"lodash\": \"1.0.0\"", "\"lodash\": \"^1.0.0\"");
+    fs::write(&manifest, &original).unwrap();
 
     let output = run_with_config(&dir, &config, &[]);
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -812,7 +863,7 @@ fn a_forced_version_is_reported_instead_of_silently_skipped() {
 
     assert!(
         stderr.contains(&format!(
-            "note: left lodash = 1.0.0 alone in {}",
+            "note: left lodash = ^1.0.0 alone in {}",
             manifest.display()
         )) && stderr.contains(
             "1.9.0 is available, but an override forces this version onto the resolved \
@@ -828,11 +879,8 @@ fn a_forced_version_is_reported_instead_of_silently_skipped() {
         stdout.contains("Nothing to rewrite. 1 available update left alone"),
         "stdout: {stdout}"
     );
-    // Reporting is not rewriting: the pin the author wrote is still exactly there.
-    assert_eq!(
-        fs::read_to_string(&manifest).unwrap(),
-        FORCED_VERSION_MANIFEST
-    );
+    // Reporting is not rewriting: the version the author wrote is still exactly there.
+    assert_eq!(fs::read_to_string(&manifest).unwrap(), original);
 }
 
 /// `--all` reaches beyond the declared constraint, and must still stop at a forced
