@@ -50,6 +50,7 @@ pub mod tree;
 // High-level entry point (recommended for embedding).
 pub use check::{
     CheckError, Checker, CheckerBuilder, ManifestCheck, ProgressEvent, UnreachableRegistry,
+    evaluate_versions,
 };
 
 // Manifest discovery (filesystem; shared by every frontend).
