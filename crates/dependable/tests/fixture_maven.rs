@@ -479,9 +479,10 @@ fn a_pom_whose_dependencies_are_all_in_profiles_says_so() {
     );
 }
 
-/// `${project.groupId}` is the standard way a multi-module build names a sibling
-/// module, and this file cannot resolve it — Maven's built-ins are not
-/// `<properties>` entries. Dropping the entry made `list` report a POM declaring
+/// A group named by a property a parent POM declares (`${platform.group}`) is
+/// one this file cannot resolve: the property is not among its `<properties>`.
+/// (`${project.groupId}` is different — the project states its own group, so the
+/// sibling-module idiom resolves.) Dropping the entry made `list` report a POM declaring
 /// three dependencies as having one, with nothing on stderr: the same silent
 /// omission a parent-supplied `<version>` used to cause, reached through the
 /// coordinate instead of the version.
@@ -491,12 +492,12 @@ fn a_group_this_file_cannot_resolve_is_still_listed() {
         "maven_unresolvable_group",
         "  <dependencies>\n    \
          <dependency>\n      \
-         <groupId>${project.groupId}</groupId>\n      \
+         <groupId>${platform.group}</groupId>\n      \
          <artifactId>app-core</artifactId>\n      \
          <version>${project.version}</version>\n    \
          </dependency>\n    \
          <dependency>\n      \
-         <groupId>${project.groupId}</groupId>\n      \
+         <groupId>${platform.group}</groupId>\n      \
          <artifactId>app-web</artifactId>\n      \
          <version>${project.version}</version>\n    \
          </dependency>\n    \
@@ -518,14 +519,14 @@ fn a_group_this_file_cannot_resolve_is_still_listed() {
     // And `check` classifies the two as undetermined rather than omitting them.
     let doc = check_json(&dir, &[]);
     assert_eq!(doc["summary"]["total"], 3, "{}", doc["summary"]);
-    for name in ["${project.groupId}:app-core", "${project.groupId}:app-web"] {
+    for name in ["${platform.group}:app-core", "${platform.group}:app-web"] {
         assert_eq!(status_of(&doc, name)["status"], "UNDETERMINED", "{name}");
     }
     assert_eq!(doc["summary"]["undetermined"], 2, "{}", doc["summary"]);
 }
 
-/// The multi-module idiom states a version *and* a coordinate this file cannot
-/// spell, and the two are read independently.
+/// A dependency may state a version *and* a coordinate this file cannot spell,
+/// and the two are read independently.
 ///
 /// Forcing the version to unknown because the coordinate did not resolve threw away
 /// a `2.0.13` written in plain sight: `list` showed the entry with no version at
@@ -538,7 +539,7 @@ fn a_version_beside_an_unnameable_coordinate_is_read_and_reported() {
         "maven_unnameable_with_version",
         "  <dependencies>\n    \
          <dependency>\n      \
-         <groupId>${project.groupId}</groupId>\n      \
+         <groupId>${platform.group}</groupId>\n      \
          <artifactId>app-core</artifactId>\n      \
          <version>2.0.13</version>\n    \
          </dependency>\n    \
@@ -558,14 +559,14 @@ fn a_version_beside_an_unnameable_coordinate_is_read_and_reported() {
 
     let stderr = String::from_utf8_lossy(&listed.stderr);
     assert!(
-        stderr.contains("coordinate") && stderr.contains("${project.groupId}:app-core"),
+        stderr.contains("coordinate") && stderr.contains("${platform.group}:app-core"),
         "the unread coordinate gets its own notice: {stderr}"
     );
 
     // `check` still declines to claim a status for it — nothing was fetched under a
     // name no registry has heard of — but reports the version it read.
     let doc = check_json(&dir, &[]);
-    let core = status_of(&doc, "${project.groupId}:app-core");
+    let core = status_of(&doc, "${platform.group}:app-core");
     assert_eq!(core["status"], "UNDETERMINED", "{core}");
     assert_eq!(core["current"], "2.0.13", "{core}");
     // The entry whose version really does come from the `<parent>` keeps that story,

@@ -225,11 +225,12 @@ fn mix(content: &str) -> ProjectMeta {
 ///
 /// The coordinate is the identity, and it is spelled `groupId:artifactId` — the same
 /// way the POM parser names the dependencies it reads, so a project and a dependency
-/// on it are the same string. A POM that states no `<groupId>` of its own inherits it
-/// from its `<parent>`, which is out of reach here (see
-/// [`pom_xml`](super::pom_xml)); the bare `artifactId` is reported rather than a
-/// coordinate that would be half guessed. A `<version>` that is a property
-/// (`${revision}`) is likewise not a literal this file states.
+/// on it are the same string. A POM that states no `<groupId>` or `<version>` of its
+/// own inherits it from its `<parent>`, which this file states, so it is read from
+/// there — [`pom_xml::own_field`](super::pom_xml::own_field), the same reader that
+/// resolves a sibling's `${project.groupId}`. Only a POM that states a group in
+/// neither place is named by its bare `artifactId`. A `<version>` that is a property
+/// (`${revision}`) is not a literal this file states.
 ///
 /// The element's text is read by [`pom_xml::text_of`](super::pom_xml::text_of) and
 /// not by `Node::text`, so this reader and the dependency reader agree on what an
@@ -241,22 +242,24 @@ fn pom(content: &str) -> ProjectMeta {
         return unnamed();
     };
     let project = doc.root_element();
-    let field = |tag: &str| {
-        project
-            .children()
-            .find(|child| child.is_element() && child.tag_name().name() == tag)
-            .and_then(super::pom_xml::text_of)
-            .map(|located| located.value)
-            .filter(|text| !text.contains('$'))
-    };
-    let name = field("artifactId").map(|artifact| match field("groupId") {
+    let literal =
+        |located: super::pom_xml::Located| Some(located.value).filter(|text| !text.contains('$'));
+    // `artifactId` is never inherited — a module is always its own artifact — while
+    // `groupId` and `version` fall back to the `<parent>`'s, as Maven's do.
+    let artifact = project
+        .children()
+        .find(|child| child.is_element() && child.tag_name().name() == "artifactId")
+        .and_then(super::pom_xml::text_of)
+        .and_then(literal);
+    let own = |tag: &str| super::pom_xml::own_field(project, tag).and_then(literal);
+    let name = artifact.map(|artifact| match own("groupId") {
         Some(group) => format!("{group}:{artifact}"),
         None => artifact,
     });
     ProjectMeta {
         role: role_for(name.as_deref()),
         name,
-        version: field("version").map(PackageField::Literal),
+        version: own("version").map(PackageField::Literal),
     }
 }
 
@@ -438,7 +441,8 @@ mod tests {
     }
 
     /// A POM names itself by coordinate — the same string a dependency on it would
-    /// use. Anything it leaves to its `<parent>` is left unstated rather than guessed.
+    /// use. What it leaves to its `<parent>` is read from the parent element, which
+    /// states it in this same file.
     #[test]
     fn a_pom_is_named_by_its_coordinate() {
         let meta = parse_project(
@@ -450,16 +454,35 @@ mod tests {
         assert_eq!(meta.literal_version(), Some("1.4.0"));
         assert_eq!(meta.role, ProjectRole::Package);
 
-        // Group and version both inherited from a parent, and a `<parent>` of its own
-        // whose fields must not be mistaken for the project's.
+        // Group and version both inherited from the parent; the parent's own
+        // `<artifactId>` is never the child's.
         let inheriting = parse_project(
             ManifestKind::PomXml,
             "<project>\n  <parent>\n    <groupId>org.parent</groupId>\n    \
              <artifactId>parent</artifactId>\n    <version>9.9.9</version>\n  \
              </parent>\n  <artifactId>child</artifactId>\n</project>\n",
         );
-        assert_eq!(inheriting.name.as_deref(), Some("child"));
-        assert_eq!(inheriting.literal_version(), None);
+        assert_eq!(inheriting.name.as_deref(), Some("org.parent:child"));
+        assert_eq!(inheriting.literal_version(), Some("9.9.9"));
+
+        // What the project states itself wins over what the parent would supply.
+        let overriding = parse_project(
+            ManifestKind::PomXml,
+            "<project>\n  <parent>\n    <groupId>org.parent</groupId>\n    \
+             <artifactId>parent</artifactId>\n    <version>9.9.9</version>\n  \
+             </parent>\n  <groupId>org.own</groupId>\n  \
+             <artifactId>child</artifactId>\n  <version>1.0.0</version>\n</project>\n",
+        );
+        assert_eq!(overriding.name.as_deref(), Some("org.own:child"));
+        assert_eq!(overriding.literal_version(), Some("1.0.0"));
+
+        // A group stated in neither place leaves the bare artifact.
+        let parentless = parse_project(
+            ManifestKind::PomXml,
+            "<project>\n  <artifactId>child</artifactId>\n</project>\n",
+        );
+        assert_eq!(parentless.name.as_deref(), Some("child"));
+        assert_eq!(parentless.literal_version(), None);
 
         // `${revision}` is CI-friendly versioning, not a version.
         let templated = parse_project(
@@ -473,6 +496,46 @@ mod tests {
             parse_project(ManifestKind::PomXml, "<not xml").role,
             ProjectRole::Unnamed
         );
+    }
+
+    /// The promise a POM's name exists to keep: in a multi-module build, a child
+    /// that inherits its group from `<parent>` and a sibling that depends on it —
+    /// by literal group or by the `${project.groupId}` idiom — spell the same
+    /// string, so `tree` can draw the edge between them.
+    #[test]
+    fn an_inheriting_module_and_a_dependency_on_it_are_the_same_string() {
+        let parent = "  <parent>\n    <groupId>org.x</groupId>\n    \
+                      <artifactId>app-parent</artifactId>\n    \
+                      <version>1.0.0</version>\n  </parent>\n";
+        let child = parse_project(
+            ManifestKind::PomXml,
+            &format!("<project>\n{parent}  <artifactId>child</artifactId>\n</project>\n"),
+        );
+        let sibling = crate::parsers::parse(
+            ManifestKind::PomXml,
+            &format!(
+                "<project>\n{parent}  <artifactId>sibling</artifactId>\n  \
+                 <dependencies>\n    <dependency>\n      \
+                 <groupId>org.x</groupId>\n      <artifactId>child</artifactId>\n      \
+                 <version>1.0.0</version>\n    </dependency>\n    <dependency>\n      \
+                 <groupId>${{project.groupId}}</groupId>\n      \
+                 <artifactId>child</artifactId>\n      \
+                 <version>${{project.version}}</version>\n    </dependency>\n  \
+                 </dependencies>\n</project>\n"
+            ),
+        )
+        .expect("the POM parses")
+        .items;
+        assert_eq!(child.name.as_deref(), Some("org.x:child"));
+        assert_eq!(sibling.len(), 2);
+        for item in &sibling {
+            assert_eq!(Some(item.name.as_str()), child.name.as_deref(), "{item:?}");
+            assert_eq!(
+                Some(item.version_constraint.as_str()),
+                child.literal_version(),
+                "{item:?}"
+            );
+        }
     }
 
     /// One element, one rule. `Node::text` stops at the first text node, so a
