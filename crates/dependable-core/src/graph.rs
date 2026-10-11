@@ -173,7 +173,11 @@ pub type PathPredicate<'a> = &'a dyn Fn(&[usize]) -> bool;
 /// How a walk decides what to expand.
 ///
 /// The defaults are what an offline `tree` render wants, so a caller states
-/// only its differences and leaves the rest to `..WalkOptions::default()`.
+/// only its differences and leaves the rest to [`WalkOptions::default`].
+///
+/// `#[non_exhaustive]`: build from [`WalkOptions::default`] and the builder
+/// methods ([`WalkOptions::dedupe`] and its siblings), so new options stay additive.
+#[non_exhaustive]
 pub struct WalkOptions<'a> {
     /// Maximum edge depth. `Some(0)` = roots only; `None` = unlimited.
     pub max_depth: Option<usize>,
@@ -262,8 +266,63 @@ impl Default for WalkOptions<'_> {
     }
 }
 
+impl<'a> WalkOptions<'a> {
+    /// Set [`Self::max_depth`](field@Self::max_depth).
+    #[must_use]
+    pub fn max_depth(mut self, max_depth: Option<usize>) -> Self {
+        self.max_depth = max_depth;
+        self
+    }
+
+    /// Set [`Self::dedupe`](field@Self::dedupe).
+    #[must_use]
+    pub fn dedupe(mut self, dedupe: bool) -> Self {
+        self.dedupe = dedupe;
+        self
+    }
+
+    /// Set [`Self::collapse_roots`](field@Self::collapse_roots).
+    #[must_use]
+    pub fn collapse_roots(mut self, collapse_roots: bool) -> Self {
+        self.collapse_roots = collapse_roots;
+        self
+    }
+
+    /// Set [`Self::prefix`](field@Self::prefix).
+    #[must_use]
+    pub fn prefix(mut self, prefix: &'a [usize]) -> Self {
+        self.prefix = prefix;
+        self
+    }
+
+    /// Set [`Self::expand`](field@Self::expand). `None` = always expand.
+    #[must_use]
+    pub fn expand(mut self, expand: Option<PathPredicate<'a>>) -> Self {
+        self.expand = expand;
+        self
+    }
+
+    /// Set [`Self::include`](field@Self::include). `None` = always emit.
+    #[must_use]
+    pub fn include(mut self, include: Option<PathPredicate<'a>>) -> Self {
+        self.include = include;
+        self
+    }
+
+    /// Set [`Self::max_visits`](field@Self::max_visits). `None` = unlimited.
+    #[must_use]
+    pub fn max_visits(mut self, max_visits: Option<usize>) -> Self {
+        self.max_visits = max_visits;
+        self
+    }
+}
+
 /// A rendered dependency tree (a forest, one entry per root).
+///
+/// `#[non_exhaustive]`: only [`DependencyGraph::tree`] builds one, so new fields
+/// stay additive for a consumer that reads it.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Tree {
     /// The root nodes, each with their expanded subtree.
     pub roots: Vec<TreeNode>,
@@ -665,6 +724,33 @@ mod tests {
             walk(g, r, &mut out);
         }
         out
+    }
+
+    #[test]
+    fn walk_options_builder_sets_every_field_it_names() {
+        let prefix = [3, 1];
+        let expand = |_: &[usize]| false;
+        let include = |p: &[usize]| p.len() < 2;
+        let opts = WalkOptions::default()
+            .max_depth(Some(4))
+            .dedupe(false)
+            .collapse_roots(false)
+            .prefix(&prefix)
+            .expand(Some(&expand))
+            .include(Some(&include))
+            .max_visits(None);
+        assert_eq!(opts.max_depth, Some(4));
+        assert!(!opts.dedupe);
+        assert!(!opts.collapse_roots);
+        assert_eq!(opts.prefix, &[3, 1]);
+        assert!(!(opts.expand.expect("expand set"))(&[]));
+        let include = opts.include.expect("include set");
+        assert!(include(&[0]) && !include(&[0, 0]));
+        assert_eq!(opts.max_visits, None);
+
+        let defaults = WalkOptions::default().expand(None).include(None);
+        assert!(defaults.expand.is_none() && defaults.include.is_none());
+        assert_eq!(defaults.max_visits, Some(DEFAULT_MAX_VISITS));
     }
 
     #[test]
