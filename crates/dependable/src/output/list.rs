@@ -17,11 +17,15 @@ use crate::output::posix;
 /// The identifier of the JSON document's shape. Consumers can pin on it; any
 /// incompatible change to the shape takes a new version.
 ///
-/// The *shape* — which fields exist and what type each holds. The token sets inside
-/// those fields are open and always have been: `source` already falls back to
-/// `"unknown"` for a variant this function does not name, so a consumer that matched
-/// exhaustively on them was never safe. Adding a token (`"locked"`) therefore stays
-/// within `v1`; removing a field, renaming one, or changing one's type would not.
+/// The *shape*, and specifically what a consumer may rely on remaining true:
+/// removing a field, renaming one, or changing one's type takes a new version.
+/// *Adding* a field does not — a consumer that reads the fields it knows is
+/// unaffected by a key it never looks at, and a version bump would break every
+/// consumer pinning `v1` in order to protect none of them. The token sets inside
+/// those fields are likewise open and always have been: `source` already falls back
+/// to `"unknown"` for a variant this function does not name, so a consumer that
+/// matched exhaustively on them was never safe. Adding a token (`"locked"`) or a
+/// field (`dependencies_unread`) therefore stays within `v1`.
 /// The README states the same policy for readers who never open this file.
 const SCHEMA: &str = "dependable.list/v1";
 
@@ -42,6 +46,16 @@ pub struct ProjectReport {
     pub role: ProjectRole,
     /// The lockfile that supplied locked versions, relative to the scanned root.
     pub lockfile: Option<PathBuf>,
+    /// Whether the file that *is* this project's dependency list went unread, so
+    /// [`Self::items`] being empty says nothing about the project.
+    ///
+    /// The same fact [`crate::output::ManifestReport::dependencies_unread`] carries
+    /// for `check`, and set from the same notices: only a SwiftPM project can set
+    /// it, because a `Package.swift` is a program this tool declines to read, so
+    /// with no readable `Package.resolved` beside it there is no dependency list at
+    /// all. A `Package.resolved` that parses to zero pins leaves this `false` — that
+    /// project really does declare nothing.
+    pub dependencies_unread: bool,
     /// Dependencies whose constraint was inherited from a workspace root.
     pub inherited: Vec<String>,
     /// The declared dependencies, in manifest order.
@@ -98,11 +112,21 @@ fn table(reports: &[ProjectReport]) {
             ProjectRole::Workspace => " [workspace]",
             _ => "",
         };
+        // A count is a claim about the project. Where the file that *is* the
+        // dependency list went unread there was nothing to count, so the heading
+        // says that instead — in the same words `check` and the HTML report use, so
+        // a reader comparing the three sees one phrase and not three. The
+        // `is_empty` conjunct is load-bearing: a partially-read list still gets
+        // counted rather than disclaimed.
+        let scope = if report.items.is_empty() && report.dependencies_unread {
+            "dependency list unread".to_owned()
+        } else {
+            format!("{} dependencies", report.items.len())
+        };
         println!(
-            "{} — {identity}{}{role} ({} dependencies)",
+            "{} — {identity}{}{role} ({scope})",
             report.relative.display(),
             report.ecosystem.display_name(),
-            report.items.len()
         );
         for item in &report.items {
             let constraint = if item.version_constraint.is_empty() {
@@ -170,6 +194,7 @@ fn json(reports: &[ProjectReport], root: &Path) -> anyhow::Result<()> {
             role: role_token(report.role),
             manifest: posix(&report.relative),
             lockfile: report.lockfile.as_deref().map(posix),
+            dependencies_unread: report.dependencies_unread,
             dependencies: report
                 .items
                 .iter()
@@ -229,6 +254,14 @@ struct ProjectDto<'a> {
     role: &'static str,
     manifest: String,
     lockfile: Option<String>,
+    /// Whether the file that *is* this project's dependency list went unread, so an
+    /// empty `dependencies` says nothing about the project. Always emitted — the
+    /// answer is always known — and `false` for every ecosystem but SwiftPM.
+    ///
+    /// `lockfile: null` is not a substitute: `--no-lock-file` produces that too, and
+    /// a `Package.resolved` that parses to zero pins leaves this `false` because the
+    /// project really does declare nothing. Additive, so the schema is unchanged.
+    dependencies_unread: bool,
     dependencies: Vec<DependencyDto<'a>>,
 }
 

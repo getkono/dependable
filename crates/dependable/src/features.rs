@@ -109,6 +109,7 @@ mod tests {
             version_inherited: false,
             role: ProjectRole::Package,
             lockfile: None,
+            dependencies_unread: false,
             inherited: Vec::new(),
             items: parse(ManifestKind::CargoToml, manifest)
                 .expect("fixture should parse")
