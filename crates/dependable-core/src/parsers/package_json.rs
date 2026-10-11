@@ -260,16 +260,22 @@ fn build_item(
             source,
             version_offset,
         } => {
-            let global_start = entry.content_start + version_offset;
-            let global_end = entry.content_end;
-            let (line, col_start) = offset_to_line_col(starts, global_start);
             // `version_offset` indexes the *decoded* value. That only lands on the right
-            // source byte while the two are identical, so an escaped string reports its
-            // line and declines the span rather than handing `--fix` a drifted offset.
-            let col_end = if entry.escaped {
-                col_start
+            // source byte while the two are identical. An escaped string is anchored at
+            // its own first content byte instead — a source offset, so always a
+            // character boundary a consumer can slice at — and declines the span rather
+            // than handing `--fix` a drifted offset, or a consumer one mid-UTF-8.
+            let (line, col_start, col_end) = if entry.escaped {
+                let (line, col) = offset_to_line_col(starts, entry.content_start);
+                (line, col, col)
             } else {
-                col_start + global_end.saturating_sub(global_start)
+                let global_start = entry.content_start + version_offset;
+                let (line, col) = offset_to_line_col(starts, global_start);
+                (
+                    line,
+                    col,
+                    col + entry.content_end.saturating_sub(global_start),
+                )
             };
             Item {
                 name,
@@ -811,5 +817,28 @@ mod tests {
             vec!["lodash", "bar", "foo", "a", "baz"],
             "got {names:?}"
         );
+    }
+
+    /// An escaped value's version offset indexes the decoded text, so it used to land
+    /// on a source byte that was not where the version is — here the second byte of
+    /// `é`, where slicing the line panics. It is anchored at the value's own first
+    /// source byte instead, with the span withheld.
+    #[test]
+    fn an_escaped_values_span_is_a_sliceable_source_position() {
+        // `A` arrives as a six-byte escape, built at run time so nothing decodes it
+        // ahead of the scanner. Decoded, `^1` sits at byte 11 of the value, and byte 11
+        // of the raw source is the middle of `é`.
+        let content = format!(
+            r#"{{"dependencies": {{"x": "npm:{}u0041ébcd@^1"}}}}"#,
+            char::from(92u8)
+        );
+        let m = parse(&content);
+        let item = find(&m, "Aébcd");
+        assert_eq!(item.version_constraint, "^1");
+        assert_eq!(item.version_col_start, item.version_col_end);
+        assert!(!item.is_rewritable());
+        assert_eq!(sliced(&content, item), "");
+        let line = content.lines().nth(item.version_line).unwrap();
+        assert!(line[item.version_col_start..].starts_with("npm:"));
     }
 }

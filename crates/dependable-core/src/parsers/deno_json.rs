@@ -56,14 +56,20 @@ fn build_item(entry: &JsonStringValue, starts: &[usize]) -> Option<Item> {
         (n, c, PackageSource::Registry, off)
     };
 
-    let global_start = entry.content_start + version_offset;
-    let (line, col_start) = offset_to_line_col(starts, global_start);
     // See `package_json::build_item`: an escaped value's decoded offsets do not map onto
-    // the source span, so the span is withheld and the import is reported but not fixed.
-    let col_end = if entry.escaped {
-        col_start
+    // the source span, so it is anchored at its first source content byte, the span is
+    // withheld, and the import is reported but not fixed.
+    let (line, col_start, col_end) = if entry.escaped {
+        let (line, col) = offset_to_line_col(starts, entry.content_start);
+        (line, col, col)
     } else {
-        col_start + entry.content_end.saturating_sub(global_start)
+        let global_start = entry.content_start + version_offset;
+        let (line, col) = offset_to_line_col(starts, global_start);
+        (
+            line,
+            col,
+            col + entry.content_end.saturating_sub(global_start),
+        )
     };
     Some(Item {
         name,
@@ -147,5 +153,23 @@ mod tests {
         let m = parse(content);
         assert_eq!(find(&m, "@std/assert").source, PackageSource::Jsr);
         assert_eq!(find(&m, "@std/assert").version_constraint, "^1.0.0");
+    }
+
+    /// See `package_json`'s test of the same name: the decoded version offset lands
+    /// mid-`é` in the source, so an escaped import is anchored at its first source
+    /// byte with the span withheld.
+    #[test]
+    fn an_escaped_values_span_is_a_sliceable_source_position() {
+        let content = format!(
+            r#"{{"imports": {{"x": "npm:{}u0041ébcd@^1"}}}}"#,
+            char::from(92u8)
+        );
+        let m = parse(&content);
+        let item = find(&m, "Aébcd");
+        assert_eq!(item.version_constraint, "^1");
+        assert_eq!(item.version_col_start, item.version_col_end);
+        assert_eq!(sliced(&content, item), "");
+        let line = content.lines().nth(item.version_line).unwrap();
+        assert!(line[item.version_col_start..].starts_with("npm:"));
     }
 }
