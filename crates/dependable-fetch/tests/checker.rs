@@ -7,9 +7,9 @@ use std::sync::Arc;
 use dependable_fetch::osv::Severity;
 use dependable_fetch::{
     Checker, DependencyStatus, Ecosystem, GoProxyFetcher, JsrFetcher, ManifestKind, NpmFetcher,
-    PackageSource, PackagistFetcher, PyPiFetcher, build_client,
+    PackageSource, PackagistFetcher, PyPiFetcher, ScopedRegistry, build_client,
 };
-use wiremock::matchers::{body_string_contains, method, path};
+use wiremock::matchers::{body_string_contains, method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const MANIFEST: &str = r#"
@@ -1442,6 +1442,149 @@ async fn a_private_registry_does_not_share_disk_cache_entries_with_the_public_on
         "the public run was served the private index's version list"
     );
     assert!(!public.received_requests().await.unwrap().is_empty());
+}
+
+/// #126: `NpmFetcher` sends an `@scope` package to the registry `.npmrc` names for that
+/// scope, so the cache key must name that registry, not the fetcher's default. With the
+/// key taken from the default root, two runs whose `.npmrc` route `@acme` to different
+/// hosts — or one run with the `.npmrc` and one without — read each other's answers.
+#[tokio::test]
+async fn npm_scoped_registries_do_not_share_disk_cache_entries() {
+    let respond = |latest: &str| {
+        ResponseTemplate::new(200).set_body_string(format!(
+            r#"{{"dist-tags":{{"latest":"{latest}"}},"versions":{{"{latest}":{{}}}}}}"#
+        ))
+    };
+    let public = MockServer::start().await;
+    let nexus = MockServer::start().await;
+    let artifactory = MockServer::start().await;
+    for (server, latest) in [
+        (&public, "1.0.0"),
+        (&nexus, "7.0.0"),
+        (&artifactory, "3.0.0"),
+    ] {
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/@acme"))
+            .respond_with(respond(latest))
+            .mount(server)
+            .await;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let client = build_client().unwrap();
+    let check = |scope_root: Option<String>| {
+        let mut fetcher = NpmFetcher::with_registry(client.clone(), public.uri());
+        if let Some(registry) = scope_root {
+            let scopes = std::collections::HashMap::from([(
+                "@acme".to_owned(),
+                ScopedRegistry {
+                    registry,
+                    token: None,
+                },
+            )]);
+            fetcher = fetcher.with_auth(None, scopes);
+        }
+        let checker = Checker::builder()
+            .http_client(client.clone())
+            .registry(Ecosystem::Npm, Arc::new(fetcher))
+            .vulnerabilities(false)
+            .disk_cache_dir(dir.path())
+            .build()
+            .unwrap();
+        async move {
+            let check = checker
+                .check_manifest(
+                    ManifestKind::PackageJson,
+                    r#"{ "dependencies": { "@acme/thing": "^1.0.0" } }"#,
+                    None,
+                )
+                .await
+                .unwrap();
+            check
+                .results
+                .into_iter()
+                .find(|r| r.item.name == "@acme/thing")
+                .expect("@acme/thing")
+                .latest_available
+        }
+    };
+
+    assert_eq!(check(Some(nexus.uri())).await.as_deref(), Some("7.0.0"));
+    assert_eq!(
+        check(Some(artifactory.uri())).await.as_deref(),
+        Some("3.0.0"),
+        "a second scoped registry was served the first one's cached version list"
+    );
+    assert_eq!(
+        check(None).await.as_deref(),
+        Some("1.0.0"),
+        "a run without the scope was served a scoped registry's cached version list"
+    );
+    for server in [&nexus, &artifactory, &public] {
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    // Each registry's own entry is still served from the cache.
+    assert_eq!(check(Some(nexus.uri())).await.as_deref(), Some("7.0.0"));
+    assert_eq!(nexus.received_requests().await.unwrap().len(), 1);
+}
+
+/// #126: a non-default JSR registry is keyed by its root, as every other ecosystem's
+/// mirror is, rather than by the constant the public registry uses.
+#[tokio::test]
+async fn a_jsr_mirror_does_not_share_disk_cache_entries_with_another() {
+    let first = MockServer::start().await;
+    let second = MockServer::start().await;
+    for (server, latest) in [(&first, "1.0.0"), (&second, "2.0.0")] {
+        Mock::given(method("GET"))
+            .and(path("/@std/path/meta.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"{{"latest":"{latest}","versions":{{"{latest}":{{}}}}}}"#
+            )))
+            .mount(server)
+            .await;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let client = build_client().unwrap();
+    let check = |root: String| {
+        let checker = Checker::builder()
+            .http_client(client.clone())
+            // A `deno.json` is an npm-ecosystem manifest, so it needs an npm fetcher
+            // even though this one declares only a JSR import.
+            .registry(
+                Ecosystem::Npm,
+                Arc::new(NpmFetcher::with_registry(client.clone(), root.clone())),
+            )
+            .jsr_registry(Arc::new(JsrFetcher::with_registry(client.clone(), root)))
+            .vulnerabilities(false)
+            .disk_cache_dir(dir.path())
+            .build()
+            .unwrap();
+        async move {
+            checker
+                .check_manifest(
+                    ManifestKind::DenoJson,
+                    r#"{ "imports": { "@std/path": "jsr:@std/path@^1.0.0" } }"#,
+                    None,
+                )
+                .await
+                .unwrap()
+                .results
+                .into_iter()
+                .find(|r| r.item.name == "@std/path")
+                .expect("@std/path")
+                .latest_available
+        }
+    };
+
+    assert_eq!(check(first.uri()).await.as_deref(), Some("1.0.0"));
+    assert_eq!(
+        check(second.uri()).await.as_deref(),
+        Some("2.0.0"),
+        "a second JSR registry was served the first one's cached version list"
+    );
+    assert_eq!(second.received_requests().await.unwrap().len(), 1);
 }
 
 /// The leak that started all of this: constructing a checker must not, on its own, give

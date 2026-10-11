@@ -255,8 +255,24 @@ pub trait RegistryFetcher: Send + Sync {
     /// mirror and the public registry publish different version lists for the same
     /// package name, and an entry that records only `(ecosystem, name)` lets one serve
     /// the other. Returning `None` opts out of scoping entirely.
+    ///
+    /// This is the fetcher's *default* root. A fetcher that sends some names elsewhere
+    /// must also override [`registry_root_for`](Self::registry_root_for), which is what
+    /// the cache key is actually derived from.
     fn registry_root(&self) -> Option<&str> {
         None
+    }
+
+    /// The registry root a lookup of `name` actually queries.
+    ///
+    /// Defaults to [`registry_root`](Self::registry_root), which is right for a fetcher
+    /// that sends every name to one host. A fetcher that routes per name — npm sends an
+    /// `@scope` package to the registry `.npmrc` configures for that scope — overrides
+    /// this, so a version list fetched from one host is never cached under, and read
+    /// back as the answer of, another.
+    fn registry_root_for(&self, name: &str) -> Option<&str> {
+        let _ = name;
+        self.registry_root()
     }
 }
 
