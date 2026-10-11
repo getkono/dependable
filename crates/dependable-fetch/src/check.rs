@@ -503,14 +503,6 @@ impl Checker {
             .await
     }
 
-    /// Check a manifest on disk: detect its kind, read it (and, when
-    /// [`CheckerBuilder::read_lockfiles`] is set, its sibling lockfile), then check.
-    /// This is the only place the library performs filesystem IO.
-    ///
-    /// # Errors
-    /// [`CheckError::UnknownManifest`] if the file name is unrecognized,
-    /// [`CheckError::Io`] if the manifest cannot be read, plus the errors of
-    /// [`Checker::check_manifest`].
     /// Fetch the available versions for one package, newest-first.
     ///
     /// Shares the checker's version cache with `check_*`, so a package already
@@ -766,6 +758,16 @@ impl Checker {
         Ok(metadata)
     }
 
+    /// Check a manifest on disk: detect its kind, read it (and, when
+    /// [`CheckerBuilder::read_lockfiles`] is set, its sibling lockfile), then check.
+    /// Unlike [`Checker::check_manifest`], it has a path to walk upwards from, so it
+    /// resolves inherited (`dep.workspace = true`) constraints against the
+    /// workspace root above the manifest.
+    ///
+    /// # Errors
+    /// [`CheckError::UnknownManifest`] if the file name is unrecognized,
+    /// [`CheckError::Io`] if the manifest cannot be read, plus the errors of
+    /// [`Checker::check_manifest`].
     pub async fn check_path(&self, path: impl AsRef<Path>) -> Result<ManifestCheck, CheckError> {
         let path = path.as_ref();
         let kind = ManifestKind::detect(path)
