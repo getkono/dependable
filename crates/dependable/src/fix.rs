@@ -1268,6 +1268,69 @@ mod tests {
         assert!(declined.is_empty(), "{declined:?}");
     }
 
+    /// A Gradle `strictly` version is a forced version (#147): a plain `fix` leaves
+    /// it alone and says so, while its `require` neighbour is still advanced, and
+    /// `--overrides` advances it.
+    #[test]
+    fn a_gradle_strictly_version_moves_only_with_overrides() {
+        let content = r#"[versions]
+junit = { strictly = "5.10.0" }
+okhttp = { require = "4.12.0" }
+
+[libraries]
+junit = { module = "org.junit.jupiter:junit-jupiter", version.ref = "junit" }
+okhttp = { module = "com.squareup.okhttp3:okhttp", version.ref = "okhttp" }
+"#;
+        let results = results_for(
+            ManifestKind::GradleVersionCatalog,
+            content,
+            &[
+                ("org.junit.jupiter:junit-jupiter", "5.11.0"),
+                ("com.squareup.okhttp3:okhttp", "4.12.1"),
+            ],
+        );
+        assert_eq!(results.len(), 2, "the fixture must produce two items");
+        let ecosystem = Some(ManifestKind::GradleVersionCatalog.ecosystem());
+
+        let (updated, records, declined) =
+            plan_fixes(content, &results, false, false, ecosystem).expect("the plan applies");
+        assert!(
+            updated.contains(r#"junit = { strictly = "5.10.0" }"#),
+            "a plain `fix` advanced a forced version: {updated}"
+        );
+        assert!(
+            updated.contains(r#"okhttp = { require = "4.12.1" }"#),
+            "a `require` version is not forced and should still advance: {updated}"
+        );
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.name.as_str())
+                .collect::<Vec<_>>(),
+            ["com.squareup.okhttp3:okhttp"],
+            "{records:?}"
+        );
+        assert_eq!(
+            declined,
+            [Declined {
+                name: "org.junit.jupiter:junit-jupiter".to_string(),
+                constraint: "5.10.0".to_string(),
+                target: Some("5.11.0".to_string()),
+                reason: DeclineReason::ForcedVersion,
+            }],
+            "the forced version was not reported"
+        );
+
+        let (updated, records, declined) =
+            plan_fixes(content, &results, false, true, ecosystem).expect("the plan applies");
+        assert!(
+            updated.contains(r#"junit = { strictly = "5.11.0" }"#),
+            "`--overrides` did not advance the forced version: {updated}"
+        );
+        assert_eq!(records.len(), 2, "{records:?}");
+        assert!(declined.is_empty(), "{declined:?}");
+    }
+
     /// `--overrides` *without* `--all`, which is the combination the README
     /// recommends first and the one every other test here reaches only to watch
     /// it decline. The write path for it was unpinned: each of the two cases
