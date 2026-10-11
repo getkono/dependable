@@ -265,7 +265,8 @@ pub enum PackageSource {
     /// database this build queries is keyed by.
     ///
     /// A Maven POM is the first case: `<groupId>${project.groupId}</groupId>`
-    /// names a built-in this file does not state, and a `<dependency>` may omit
+    /// names a built-in this file does not state when the POM gives a `<groupId>`
+    /// in neither `<project>` nor its `<parent>`, and a `<dependency>` may omit
     /// `<groupId>` altogether and inherit it from a `<parent>`. A Swift
     /// `Package.resolved` registry pin (SE-0292) is the second: its identity
     /// (`mona.linkedlist`) is stated plainly, but the `SwiftURL` ecosystem is keyed

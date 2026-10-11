@@ -1065,6 +1065,35 @@ mod tests {
         assert!(!core.is_rewritable());
     }
 
+    /// Maven's `project.*` prefix reads the model, not the property table, so a
+    /// `<properties>` entry spelled like a built-in never shadows the project's own
+    /// `<groupId>` or `<version>`.
+    #[test]
+    fn a_property_spelled_like_a_built_in_is_overridden_by_the_project() {
+        let content = pom(
+            "  <properties>\n    <project.groupId>org.shadow</project.groupId>\n    \
+             <project.version>0.0.1</project.version>\n  </properties>\n  \
+             <groupId>org.own</groupId>\n  <artifactId>app-web</artifactId>\n  \
+             <version>2.1.0</version>\n  <dependencies>\n    <dependency>\n      \
+             <groupId>${project.groupId}</groupId>\n      \
+             <artifactId>app-core</artifactId>\n      \
+             <version>${project.version}</version>\n    </dependency>\n  \
+             </dependencies>\n",
+        );
+        let m = parse(&content);
+        assert!(
+            m.items
+                .iter()
+                .all(|item| item.name != "org.shadow:app-core"),
+            "{:?}",
+            m.items
+        );
+        let core = find(&m, "org.own:app-core");
+        assert_eq!(core.version_constraint, "2.1.0");
+        assert_eq!(core.source, PackageSource::Inherited);
+        assert!(!core.is_rewritable());
+    }
+
     /// A coordinate this file cannot state and a version it can are independent
     /// facts, and the standard multi-module idiom states both at once. Blanking the
     /// version because the name did not resolve dropped a `2.0.13` written in plain
