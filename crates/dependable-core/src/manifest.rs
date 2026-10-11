@@ -42,6 +42,34 @@ pub struct AlternateRegistryDecl {
     pub auth_token: Option<String>,
 }
 
+/// Declares [`ManifestKind`] and, from the same variant list, the test-only
+/// `ALL_KINDS` every kind-wide invariant is asserted over.
+///
+/// One list is the point: a variant cannot exist without appearing in `ALL_KINDS`, so
+/// no invariant can be silently skipped for a kind someone forgot to add to a
+/// hand-written array. The enum it emits is an ordinary item, attributes and docs
+/// included, so rustdoc and callers see no difference.
+macro_rules! manifest_kinds {
+    (
+        $(#[$enum_meta:meta])*
+        $vis:vis enum $name:ident {
+            $( $(#[$variant_meta:meta])* $variant:ident ),* $(,)?
+        }
+    ) => {
+        $(#[$enum_meta])*
+        $vis enum $name {
+            $( $(#[$variant_meta])* $variant ),*
+        }
+
+        /// Every manifest kind, in declaration order, so an invariant that has to hold
+        /// for *all* of them can be asserted over the whole set rather than over
+        /// whichever ones a test remembered.
+        #[cfg(test)]
+        const ALL_KINDS: &[$name] = &[ $( $name::$variant ),* ];
+    };
+}
+
+manifest_kinds! {
 /// Distinguishes manifest files. Every variant has a parser; the mapping to
 /// [`Ecosystem`] is many-to-one, since several manifest formats can belong to one
 /// registry.
@@ -71,6 +99,7 @@ pub enum ManifestKind {
     /// which [`LockfileKind::is_dependency_source`] marks as a source of items
     /// rather than an annotation on them.
     PackageSwift,
+}
 }
 
 impl ManifestKind {
@@ -571,72 +600,6 @@ mod tests {
         assert!(!ManifestKind::GoMod.has_lockfile_support());
     }
 
-    /// Every manifest kind, so an invariant that has to hold for *all* of them can be
-    /// asserted over the whole set rather than over whichever ones a test remembered.
-    const ALL_KINDS: [ManifestKind; 14] = [
-        ManifestKind::CargoToml,
-        ManifestKind::GoMod,
-        ManifestKind::PackageJson,
-        ManifestKind::DenoJson,
-        ManifestKind::PnpmWorkspaceYaml,
-        ManifestKind::ComposerJson,
-        ManifestKind::RequirementsTxt,
-        ManifestKind::PyprojectToml,
-        ManifestKind::PubspecYaml,
-        ManifestKind::MixExs,
-        ManifestKind::Csproj,
-        ManifestKind::GradleVersionCatalog,
-        ManifestKind::PomXml,
-        ManifestKind::PackageSwift,
-    ];
-
-    /// The match is what makes the compiler care that [`ALL_KINDS`] is complete: adding a
-    /// [`ManifestKind`] variant makes it non-exhaustive. It maps each kind to its
-    /// *position* in the array and the round trip is asserted, so the arm a new variant
-    /// needs has no position it can honestly name — every index the array has is already
-    /// claimed by another kind — and `ALL_KINDS` and its length annotation have to grow
-    /// with the enum before one is free.
-    ///
-    /// This narrows the door rather than closing it: the loop visits what the array
-    /// holds, so an arm naming a position the array does not have is never evaluated.
-    /// Nothing in the language forces a variant into the array without either an
-    /// unstable `variant_count` or a derive dependency, which `dependable-core` does not
-    /// take.
-    #[test]
-    fn all_kinds_lists_every_variant_once() {
-        let mut seen = Vec::new();
-        for kind in ALL_KINDS {
-            let position = match kind {
-                ManifestKind::CargoToml => 0,
-                ManifestKind::GoMod => 1,
-                ManifestKind::PackageJson => 2,
-                ManifestKind::DenoJson => 3,
-                ManifestKind::PnpmWorkspaceYaml => 4,
-                ManifestKind::ComposerJson => 5,
-                ManifestKind::RequirementsTxt => 6,
-                ManifestKind::PyprojectToml => 7,
-                ManifestKind::PubspecYaml => 8,
-                ManifestKind::MixExs => 9,
-                ManifestKind::Csproj => 10,
-                ManifestKind::GradleVersionCatalog => 11,
-                ManifestKind::PomXml => 12,
-                ManifestKind::PackageSwift => 13,
-            };
-            assert_eq!(
-                ALL_KINDS.get(position),
-                Some(&kind),
-                "{kind:?} claims position {position} of ALL_KINDS"
-            );
-            assert!(!seen.contains(&kind), "{kind:?} listed twice");
-            seen.push(kind);
-        }
-        assert_eq!(
-            seen.len(),
-            ALL_KINDS.len(),
-            "every position is claimed once"
-        );
-    }
-
     /// Every kind but Cargo declares its versions in place, so the upward walk is
     /// skipped for all of them — the behaviour the boolean gate this replaced had.
     #[test]
@@ -647,7 +610,7 @@ mod tests {
         assert_eq!(cargo.root_names, [("Cargo.toml", ManifestKind::CargoToml)]);
         assert!(cargo.self_governing, "a Cargo root may be a package too");
 
-        for kind in ALL_KINDS {
+        for &kind in ALL_KINDS {
             if kind == ManifestKind::CargoToml {
                 continue;
             }
@@ -670,7 +633,7 @@ mod tests {
     /// unresolved rather than as wrong.
     #[test]
     fn a_self_governing_kind_is_one_of_its_own_root_kinds() {
-        for kind in ALL_KINDS {
+        for &kind in ALL_KINDS {
             let Some(roots) = kind.workspace_roots() else {
                 continue;
             };
