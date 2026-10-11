@@ -293,8 +293,8 @@ fn swift_workdir(name: &str, resolved: bool) -> (TempDir, PathBuf) {
 /// The undetermined case: the pins were read, and not one of them could be
 /// checked for a newer version.
 ///
-/// Every one is `Undetermined`, a status the renderer does not annotate, so no
-/// table is built — and an empty table set used to reach the all-clear line. That
+/// Every one is `Undetermined`, which once built no table — and an empty table set
+/// used to reach the all-clear line. That
 /// line is the same false claim of currency the table heading, the HTML report,
 /// `manifests_unread` in JSON and `DEP003` in SARIF were all changed to stop
 /// making; the job summary is the one a pull request actually renders.
@@ -323,6 +323,38 @@ fn the_summary_never_calls_an_undetermined_swift_project_clean() {
     assert!(
         markdown.contains("2 dependencies could not be checked for a newer version"),
         "{markdown}"
+    );
+}
+
+/// Each pin's notice says why it went unchecked: Swift has no registry. The
+/// version itself was read from `Package.resolved`, so a notice claiming "its
+/// declared version could not be read" would be false for every one of them.
+#[test]
+fn a_registryless_pin_is_annotated_as_unregistered_not_unread() {
+    let (_tmp, dir) = swift_workdir("github_swift_notice_text", true);
+    let output = check(
+        &dir,
+        &["--annotations", "always"],
+        &[("GITHUB_WORKSPACE", dir.to_str().unwrap())],
+    );
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    let stderr = stderr_of(&output);
+
+    for pin in [
+        "github.com/apple/swift-nio 2.65.0",
+        "github.com/apple/swift-log 1.5.4",
+    ] {
+        assert!(
+            stderr.contains(&format!(
+                "::{pin} could not be checked for a newer version: Swift publishes no \
+                 package registry"
+            )),
+            "{pin}: {stderr}"
+        );
+    }
+    assert!(
+        !stderr.contains("its declared version could not be read"),
+        "{stderr}"
     );
 }
 
