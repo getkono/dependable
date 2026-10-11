@@ -2707,6 +2707,26 @@ mod tests {
         assert_eq!(query.version, "0.2.9");
     }
 
+    /// A bare NuGet `Version` is exact, and there is no NuGet lockfile reader, so
+    /// the version OSV is asked about is the declared one — what restore installs —
+    /// not the registry's newest release. A `>=` reading asked about `13.0.3` here
+    /// and so could not see an advisory against the `13.0.1` actually in use.
+    #[test]
+    fn a_bare_nuget_version_is_audited_at_its_declared_version() {
+        let declared = csharp_item("Newtonsoft.Json", "13.0.1");
+        assert_eq!(declared.locked_version, None, "no NuGet lockfile is read");
+        let result = evaluated(
+            &declared,
+            &["13.0.3", "13.0.1"],
+            Ecosystem::CSharp,
+            UnstableFilter::Exclude,
+        );
+        let query = only_query(&result, Ecosystem::CSharp);
+        assert_eq!(query.ecosystem, "NuGet");
+        assert_eq!(query.name, "Newtonsoft.Json");
+        assert_eq!(query.version, "13.0.1");
+    }
+
     #[test]
     fn nothing_is_queried_without_a_version() {
         let result = CheckResult::new(registry_item(), DependencyStatus::UpToDate);
