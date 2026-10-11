@@ -180,12 +180,19 @@ fn is_plain_release(version: &str) -> bool {
 
 /// `==1.0.*` (or a bare `1.0.*`) → `>=1.0.0, <1.1.0` (the next release of the last
 /// specified segment).
+///
+/// A prefix of more than three segments (`2.7.6.1.*`) has no semver range: both
+/// bounds keep only three segments, so it came back as the unsatisfiable
+/// `>=2.7.6, <2.7.6`. It is dropped instead, like a non-numeric prefix.
 fn wildcard_range(prefix: &str) -> Option<String> {
     let nums: Vec<u64> = prefix
         .split('.')
         .filter(|s| !s.is_empty())
         .map(|s| s.parse().ok())
         .collect::<Option<_>>()?;
+    if nums.len() > 3 {
+        return None;
+    }
     let lower = pad_to_semver(&nums);
     let upper = bump_last(&nums)?;
     Some(format!(">={lower}, <{upper}"))
@@ -447,6 +454,27 @@ mod tests {
             );
         }
         assert_eq!(pep440_constraint_to_semver("1.20.*"), ">=1.20.0, <1.21.0");
+    }
+
+    /// A bare wildcard whose prefix is not a plain release is dropped, as its `==`
+    /// spelling is, rather than read as the caret it used to become: the translation
+    /// is empty, which the checker reports as undetermined.
+    #[test]
+    fn a_bare_wildcard_with_a_non_numeric_prefix_is_dropped() {
+        assert_eq!(pep440_constraint_to_semver("1.0rc1.*"), "");
+        assert_eq!(pep440_constraint_to_semver("==1.0rc1.*"), "");
+        // Another clause still stands on its own.
+        assert_eq!(pep440_constraint_to_semver(">=1.0, 1.0rc1.*"), ">=1.0.0");
+    }
+
+    /// A prefix of four or more segments has no semver range: both bounds kept three
+    /// segments, giving the unsatisfiable `>=2.7.6, <2.7.6`. The clause is dropped.
+    #[test]
+    fn a_wildcard_past_three_segments_is_dropped_not_unsatisfiable() {
+        for constraint in ["2.7.6.1.*", "==2.7.6.1.*", "1.2.3.4.5.*"] {
+            assert_eq!(pep440_constraint_to_semver(constraint), "", "{constraint}");
+        }
+        assert_eq!(pep440_constraint_to_semver("1.2.3.*"), ">=1.2.3, <1.2.4");
     }
 
     /// Reachable straight from a requirements file; `+ 1` on a parsed segment panicked
