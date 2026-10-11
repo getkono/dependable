@@ -29,9 +29,16 @@ pub struct JsonStringValue {
     pub path: Vec<String>,
     /// The (unescaped) string content.
     pub value: String,
-    /// Byte offset of the first content byte (just after the opening quote).
+    /// Byte offset *into the source document* of the first content byte (just after
+    /// the opening quote). Always a character boundary of the source.
+    ///
+    /// This and [`content_end`](Self::content_end) index the raw text, escapes and
+    /// all, never [`value`](Self::value). An offset found by searching `value` lands
+    /// on the same source byte only when [`escaped`](Self::escaped) is `false`.
     pub content_start: usize,
-    /// Byte offset just past the last content byte (the closing quote).
+    /// Byte offset *into the source document* just past the last content byte (the
+    /// closing quote). Always a character boundary of the source, so
+    /// `&src[content_start..content_end]` is the raw, still-escaped content.
     pub content_end: usize,
     /// Whether the raw text carried backslash escapes, so [`value`](Self::value) is
     /// shorter than — and not byte-aligned with — the `content_start..content_end`
@@ -383,18 +390,14 @@ fn unescape(raw: &str) -> String {
             Some('u') => match take_hex4(&mut chars) {
                 // A high surrogate is only meaningful paired with the low surrogate
                 // that follows it; either half alone is not a character.
-                Some(hi @ 0xD800..=0xDBFF) => {
-                    let low = take_surrogate_escape(&mut chars);
-                    match low {
-                        Some(lo @ 0xDC00..=0xDFFF) => {
-                            let combined = 0x1_0000
-                                + ((u32::from(hi) - 0xD800) << 10)
-                                + (u32::from(lo) - 0xDC00);
-                            out.push(char::from_u32(combined).unwrap_or('\u{FFFD}'));
-                        }
-                        _ => out.push('\u{FFFD}'),
+                Some(hi @ 0xD800..=0xDBFF) => match take_low_surrogate(&mut chars) {
+                    Some(lo) => {
+                        let combined =
+                            0x1_0000 + ((u32::from(hi) - 0xD800) << 10) + (u32::from(lo) - 0xDC00);
+                        out.push(char::from_u32(combined).unwrap_or('\u{FFFD}'));
                     }
-                }
+                    None => out.push('\u{FFFD}'),
+                },
                 Some(unit) => out.push(char::from_u32(u32::from(unit)).unwrap_or('\u{FFFD}')),
                 None => out.push('\u{FFFD}'),
             },
@@ -416,8 +419,13 @@ fn take_hex4(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<u16
     Some(unit)
 }
 
-/// Read a following `\uXXXX` escape, used to complete a surrogate pair.
-fn take_surrogate_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<u16> {
+/// Read a following `\uXXXX` escape that is a low surrogate, completing a pair.
+///
+/// Anything else — no escape, a malformed one, or a well-formed `\uXXXX` that is not
+/// a low surrogate — is left unconsumed, so the caller emits U+FFFD for the lone high
+/// surrogate and the next escape is decoded on its own. Consuming it here dropped a
+/// valid character from the decoded value.
+fn take_low_surrogate(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<u16> {
     if chars.peek() != Some(&'\\') {
         return None;
     }
@@ -428,6 +436,9 @@ fn take_surrogate_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -
     }
     lookahead.next();
     let unit = take_hex4(&mut lookahead)?;
+    if !(0xDC00..=0xDFFF).contains(&unit) {
+        return None;
+    }
     *chars = lookahead;
     Some(unit)
 }
@@ -572,6 +583,32 @@ mod tests {
         let src = r#"{"a":"\u00"}"#;
         let v = scan_strings(src);
         assert_eq!(v[0].value, "\u{FFFD}");
+    }
+
+    /// A lone high surrogate becomes U+FFFD, and the escape after it is decoded on its
+    /// own rather than swallowed as the pair's would-be low half.
+    #[test]
+    fn a_lone_high_surrogate_does_not_eat_the_next_escape() {
+        let esc = |hex: &str| format!("{}u{hex}", char::from(92u8));
+        // A BMP escape after the lone surrogate survives.
+        let src = format!(r#"{{"a":"{}{}b"}}"#, esc("D83D"), esc("0041"));
+        assert_eq!(scan_strings(&src)[0].value, "\u{FFFD}Ab");
+        // So does a whole surrogate pair: the second high surrogate starts the pair.
+        let src = format!(r#"{{"a":"{}{}{}"}}"#, esc("D83D"), esc("D83D"), esc("DE00"));
+        assert_eq!(scan_strings(&src)[0].value, "\u{FFFD}\u{1F600}");
+        // A lone low surrogate is no character either, and the pair after it holds.
+        let src = format!(r#"{{"a":"{}{}{}"}}"#, esc("DE00"), esc("D83D"), esc("DE00"));
+        assert_eq!(scan_strings(&src)[0].value, "\u{FFFD}\u{1F600}");
+    }
+
+    /// The span is a *source* span: for an escaped value it slices the raw escapes,
+    /// not the decoded text, and it stays on character boundaries either way.
+    #[test]
+    fn an_escaped_values_span_is_its_raw_source_text() {
+        let src = r#"{"a":"é\/x"}"#;
+        let v = &scan_strings(src)[0];
+        assert_eq!(v.value, "é/x");
+        assert_eq!(&src[v.content_start..v.content_end], r"é\/x");
     }
 
     /// An escaped value's decoded offsets do not line up with its source span, so the
