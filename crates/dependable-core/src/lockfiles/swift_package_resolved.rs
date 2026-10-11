@@ -361,7 +361,9 @@ fn pin_item(pin: &Pin) -> Option<Item> {
     // or scanned for it and a check reports it `Undetermined` rather than clean.
     // Not `Local` — there *is* a registry behind it — and not `Locked`, which is
     // the checkable claim that would send the identity to OSV. The version stays in
-    // the constraint, because the file states it.
+    // the constraint, because the file states it. This holds even when a library
+    // consumer registers a Swift fetcher: this parser is IO-free and cannot know one
+    // exists, so such a fetcher never sees a registry pin.
     let (source, constraint, locked) = if local {
         (PackageSource::Local, state, None)
     } else if registry {

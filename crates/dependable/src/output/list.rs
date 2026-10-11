@@ -361,8 +361,10 @@ fn annotation(item: &Item) -> &'static str {
         // — what a reader wants to know is that it is not a declared direct
         // dependency, which is exactly what its `kind` says below.
 
-        // The version beside it may be perfectly clear; what this file never stated is
-        // which package it belongs to, so nothing was fetched under that name.
+        // The version beside it may be perfectly clear; what is missing is a name for
+        // the package that its ecosystem's key can answer for — the file never stated
+        // one, or stated an identity (a Swift registry pin's `scope.name`) no query
+        // here is keyed by — so nothing was fetched under that name.
         PackageSource::Unidentified => " (unidentified)",
         _ => match item.kind {
             DependencyKind::Dev => " (dev)",

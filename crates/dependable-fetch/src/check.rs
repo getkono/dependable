@@ -1389,8 +1389,10 @@ fn unfetchable(item: &Item) -> CheckResult {
         // A coordinate this manifest could not state is the same shape of
         // ignorance reached through the name instead of the version: nothing was
         // asked, so nothing is known. `Local` would again say the wrong thing —
-        // that there is no registry behind the entry, rather than that this file
-        // never said which package it is.
+        // that there is no registry behind the entry, rather than that nothing in
+        // this file names the package by a key its ecosystem can answer for (the
+        // file never said which package it is, or stated an identity, like a Swift
+        // registry pin's `scope.name`, that no query here is keyed by).
         PackageSource::Unidentified => DependencyStatus::Undetermined,
         // A real package whose declared version could not be read from the
         // manifest. Nothing to fetch, and nothing that would justify calling it

@@ -259,16 +259,21 @@ pub enum PackageSource {
     /// declares stay with the source of that declaration and keep their span, and only
     /// the pins no manifest mentions are `Locked`.
     Locked,
-    /// The entry names a package this manifest cannot identify, whatever version it
-    /// states beside it.
+    /// The entry names a package by nothing its ecosystem's key can answer for,
+    /// whatever version it states beside it: either this file never states which
+    /// package it is, or it states an identity in a form no fetcher or advisory
+    /// database this build queries is keyed by.
     ///
-    /// A Maven POM is the case that needs it: `<groupId>${project.groupId}</groupId>`
+    /// A Maven POM is the first case: `<groupId>${project.groupId}</groupId>`
     /// names a built-in this file does not state, and a `<dependency>` may omit
-    /// `<groupId>` altogether and inherit it from a `<parent>`. Either way the
-    /// coordinate is not a name any registry could answer for, so the entry is never
-    /// fetched — and a check reports it
+    /// `<groupId>` altogether and inherit it from a `<parent>`. A Swift
+    /// `Package.resolved` registry pin (SE-0292) is the second: its identity
+    /// (`mona.linkedlist`) is stated plainly, but the `SwiftURL` ecosystem is keyed
+    /// by repository URL, and a scoped identity is not one. Either way the
+    /// coordinate is not a name any registry or advisory query here could answer
+    /// for, so the entry is never fetched or scanned — and a check reports it
     /// [`Undetermined`](crate::result::DependencyStatus::Undetermined), because what
-    /// went unread is which package this is.
+    /// went unresolved is which package this is.
     ///
     /// Distinct from [`Inherited`](Self::Inherited), whose name *is* known and whose
     /// missing half is the version: the two get different explanations, and an entry
