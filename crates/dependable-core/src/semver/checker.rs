@@ -270,6 +270,40 @@ mod tests {
         assert_eq!(e.latest_compatible.as_deref(), Some("1.9.0"));
     }
 
+    /// A bare NuGet `Version` is the ordinary shape of a `PackageReference`, and
+    /// with no NuGet lockfile reader there is never a locked version to compare.
+    /// Read as `>=13.0.1`, every later release satisfied it and the answer was
+    /// `UpToDate` whatever the registry published (#113).
+    #[test]
+    fn a_bare_nuget_version_behind_the_registry_is_not_up_to_date() {
+        let e = check_version_for(
+            "13.0.1",
+            Ecosystem::CSharp,
+            &vers(&["12.0.3", "13.0.1", "13.0.3"]),
+            None,
+        );
+        assert_ne!(e.status, DependencyStatus::UpToDate, "{e:?}");
+        assert_eq!(e.status, DependencyStatus::UpdateAvailable, "{e:?}");
+        assert_eq!(e.latest_compatible.as_deref(), Some("13.0.1"));
+        assert_eq!(e.latest_available.as_deref(), Some("13.0.3"));
+
+        // At the newest release it is current, and a partial version is read the
+        // same way once padded.
+        let current = check_version_for(
+            "13.0.3",
+            Ecosystem::CSharp,
+            &vers(&["13.0.1", "13.0.3"]),
+            None,
+        );
+        assert_eq!(current.status, DependencyStatus::UpToDate, "{current:?}");
+        let partial = check_version_for("1.0", Ecosystem::CSharp, &vers(&["1.0.0", "1.2.0"]), None);
+        assert_eq!(
+            partial.status,
+            DependencyStatus::UpdateAvailable,
+            "{partial:?}"
+        );
+    }
+
     #[test]
     fn up_to_date_when_constraint_allows_latest() {
         let e = check_version("1", &vers(&["1.0.0", "1.2.0", "1.5.0"]), None);

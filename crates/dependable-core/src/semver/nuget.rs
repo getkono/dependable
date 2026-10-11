@@ -45,8 +45,15 @@ pub fn nuget_to_semver(version: &str) -> Option<String> {
 /// Convert a NuGet version range into a `semver::VersionReq`-compatible string.
 ///
 /// Handles interval notation (`[1.0,2.0)`, `[1.0]`, `(1.0,)`, `(,2.0]`), floating
-/// wildcards (`*`, `1.*`, `1.0.*`), and a bare version (`1.0`), which NuGet reads
-/// as an inclusive minimum (`>=1.0`).
+/// wildcards (`*`, `1.*`, `1.0.*`), and a bare version (`13.0.1`, `1.0`).
+///
+/// A bare version is read as **exact** (`13.0.1` → `=13.0.1`, `1.0` → `=1.0.0`), as
+/// Maven's and Hex's are. NuGet *resolves* it as an inclusive minimum, but restore
+/// then picks the lowest release at or above it, so the version a project actually
+/// builds with is the one written. Reading it as an open `>=` bound instead would let
+/// every later release satisfy it and report every such reference as up to date
+/// whatever the registry publishes. A partial version is padded and read the same
+/// way, since `1.0` restores `1.0.0` exactly as `1.0.0` does.
 ///
 /// Anything else returns the **empty string**, the signal
 /// [`try_to_semver_constraint`](crate::semver::try_to_semver_constraint) reads as a
@@ -66,8 +73,8 @@ pub fn nuget_constraint_to_semver(constraint: &str) -> String {
     if c.starts_with('[') || c.starts_with('(') {
         return interval_range(c).unwrap_or_default();
     }
-    // A bare version is an inclusive minimum in NuGet.
-    nuget_to_semver(c).map_or_else(String::new, |v| format!(">={v}"))
+    // A bare version is read as exact: it is the release restore resolves to.
+    nuget_to_semver(c).map_or_else(String::new, |v| format!("={v}"))
 }
 
 /// Parse an interval such as `[1.0,2.0)` / `[1.0]` / `(1.0,)` / `(,2.0]`.
@@ -216,8 +223,11 @@ mod tests {
 
     #[test]
     fn converts_bare_and_floating() {
-        // Bare version → inclusive minimum.
-        assert_eq!(nuget_constraint_to_semver("1.0"), ">=1.0.0");
+        // Bare version → exact, partial forms padded (#113).
+        assert_eq!(nuget_constraint_to_semver("13.0.1"), "=13.0.1");
+        assert_eq!(nuget_constraint_to_semver("1.0"), "=1.0.0");
+        assert_eq!(nuget_constraint_to_semver("1"), "=1.0.0");
+        assert_eq!(nuget_constraint_to_semver("1.0.0.4"), "=1.0.0");
         assert_eq!(nuget_constraint_to_semver("*"), "*");
         assert_eq!(nuget_constraint_to_semver("1.*"), ">=1.0.0, <2.0.0");
         assert_eq!(nuget_constraint_to_semver("1.2.*"), ">=1.2.0, <1.3.0");

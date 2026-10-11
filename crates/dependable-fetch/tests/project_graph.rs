@@ -365,25 +365,18 @@ fn a_nuget_single_version_interval_resolves_and_a_two_segment_one_does_not() {
     assert_eq!(version_of(&built.graph, "Ranged"), None);
 }
 
-/// The case #107 opened with, and the one this change does **not** close. NuGet
-/// reads a bare `Version` as an inclusive *minimum* (`>=13.0.1`), not a pin — see
-/// `nuget_constraint_to_semver`, "A bare version is an inclusive minimum in NuGet"
-/// — so `Newtonsoft.Json` still reports no version.
-///
-/// Admitting it here would make `tree` claim a resolution for a line `check`
-/// reports as satisfied by every later release, which is a disagreement about one
-/// line of one file. The reading itself is the defect, and it is filed as #113;
-/// this test is the record of what today's translation says, and is expected to
-/// change with it.
+/// The case #107 opened with. `nuget_constraint_to_semver` reads a bare `Version`
+/// as exact (`=13.0.1`, #113) — the release restore resolves to — so `tree` and
+/// `check` agree that `Newtonsoft.Json` is at `13.0.1`.
 #[test]
-fn a_bare_nuget_version_is_a_minimum_and_so_resolves_nothing() {
+fn a_bare_nuget_version_is_exact_and_so_resolves() {
     let built = build_project_graph(
         &fixture("sample-csharp").join("App.csproj"),
         &WorkspaceGraphOptions::default(),
     )
     .expect("graph");
 
-    assert_eq!(version_of(&built.graph, "Newtonsoft.Json"), None);
+    assert_eq!(version_of(&built.graph, "Newtonsoft.Json"), Some("13.0.1"));
     // An interval spanning two majors names a set by anyone's reading.
     assert_eq!(version_of(&built.graph, "Serilog"), None);
     // A reference whose version is an unexpanded MSBuild property, and one with no

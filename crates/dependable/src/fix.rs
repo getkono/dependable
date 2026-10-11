@@ -659,8 +659,10 @@ fn rewrite_constraint(
         //   `"lodash": "1.x"` would become `"1.9.0"`, and Composer and Hex read a
         //   bare version the same way.
         // - [`BareVersion::Minimum`] loses the upper bound instead: NuGet's `1.*`
-        //   is any 1.x resolved to the newest, while a bare `1.9.0` is `>= 1.9.0`
-        //   resolved to the *oldest* — a different range and a different pick.
+        //   is any 1.x resolved to the newest, while restore reads a bare `1.9.0`
+        //   as `>= 1.9.0` resolved to the *oldest*, i.e. `1.9.0` itself, which is
+        //   why `check` reads it as exact (#113). Either way it is a different
+        //   range and a different pick from the floating `1.*`.
         //   Gradle's `1.+` against its `require` semantics is the same trade.
         // - A bare `*` is every version, and any concrete release confines it to
         //   one major — a narrowing even where the bare form is a caret.
@@ -746,8 +748,10 @@ fn rewrite_constraint(
             // shape.
             //
             // [`BareVersion::Minimum`] keeps the rewrite unconditionally. NuGet's
-            // `1.0` is `>=1.0` and its `0` is `>=0.0.0`; both are floors with no
-            // upper bound to lose, and raising a floor is exactly what `fix` is.
+            // `1.0` is `>=1.0` and its `0` is `>=0.0.0` to restore, which resolves
+            // each to that floor (so `check` reads them as `=1.0.0` and `=0.0.0`,
+            // #113); there is no upper bound to lose, and raising a floor is
+            // exactly what `fix` is.
             //
             // The exactness question is asked through the predicate the enum
             // exports for it rather than by comparing the enum here, so an

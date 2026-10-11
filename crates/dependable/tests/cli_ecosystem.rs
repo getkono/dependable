@@ -222,9 +222,13 @@ fn an_empty_check_selection_is_an_empty_document_not_empty_stdout() {
     assert_eq!(json["summary"]["total"], 0);
     assert_eq!(json["results"], serde_json::json!([]));
 
-    let sarif: Value = serde_json::from_slice(&check("sarif")).expect("a SARIF document");
-    assert_eq!(sarif["version"], "2.1.0");
-    assert_eq!(sarif["runs"][0]["results"], serde_json::json!([]));
+    // SARIF exists only in a build carrying the `report` feature.
+    #[cfg(feature = "report")]
+    {
+        let sarif: Value = serde_json::from_slice(&check("sarif")).expect("a SARIF document");
+        assert_eq!(sarif["version"], "2.1.0");
+        assert_eq!(sarif["runs"][0]["results"], serde_json::json!([]));
+    }
 
     for format in ["table", "text"] {
         assert!(
