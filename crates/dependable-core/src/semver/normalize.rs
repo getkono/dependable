@@ -388,9 +388,11 @@ fn is_plain_version(c: &str) -> bool {
 }
 
 /// Convert a constraint into a `semver::VersionReq`-compatible string for the
-/// given ecosystem. Python, NuGet, Hex and Maven translate in dedicated modules;
-/// every other ecosystem writes a dialect close enough to Cargo's that
-/// [`normalize_range_constraint`] covers it.
+/// given ecosystem. Python, NuGet, Hex, Maven and Dart translate in dedicated
+/// modules; every other ecosystem writes a dialect close enough to Cargo's that
+/// [`normalize_range_constraint`] covers it. Dart's module reads only the bare
+/// version itself (exact to pub, a caret range to Cargo) and hands every other
+/// spelling to [`normalize_range_constraint`].
 #[must_use]
 pub fn to_semver_constraint(constraint: &str, ecosystem: Ecosystem) -> String {
     match ecosystem {
@@ -398,6 +400,7 @@ pub fn to_semver_constraint(constraint: &str, ecosystem: Ecosystem) -> String {
         Ecosystem::CSharp => crate::semver::nuget::nuget_constraint_to_semver(constraint),
         Ecosystem::Elixir => crate::semver::elixir::hex_constraint_to_semver(constraint),
         Ecosystem::Jvm => crate::semver::maven::maven_constraint_to_semver(constraint),
+        Ecosystem::Dart => crate::semver::dart::dart_constraint_to_semver(constraint),
         _ => normalize_range_constraint(constraint),
     }
 }
@@ -424,7 +427,8 @@ pub fn to_semver_constraint(constraint: &str, ecosystem: Ecosystem) -> String {
 /// their input verbatim instead, which is a failure this guard cannot see and which
 /// produces exactly the confident `up to date` it exists to prevent.
 ///
-/// The remaining ecosystems have no dedicated translator and never signal failure here:
+/// The remaining ecosystems have no dedicated translator, and Dart's reads only a bare
+/// version itself; none of them signals failure here:
 /// [`normalize_range_constraint`] hands an untranslatable range back unchanged, and
 /// [`check_version`](crate::semver::check_version) classifies it.
 #[must_use]

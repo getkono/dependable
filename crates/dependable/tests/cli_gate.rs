@@ -587,6 +587,31 @@ fn a_dart_any_constraint_is_read_as_no_constraint() {
     assert!(stdout.contains("up to date"), "stdout: {stdout}");
 }
 
+/// pub reads a bare version as exact (#149). Read as a caret range, `provider: 6.0.5`
+/// admitted the published `6.1.0` and was reported up to date; read as pub reads it,
+/// the newer release is outside the constraint and is an available update.
+#[test]
+fn a_bare_dart_version_is_exact_and_a_newer_release_is_an_update() {
+    let dir = workdir("gate_dart_bare_version");
+    let base = registry(vec![(
+        "/api/packages/provider".to_string(),
+        json("{\"versions\":[{\"version\":\"6.0.5\"},{\"version\":\"6.1.0\"}]}"),
+    )]);
+    let config = write_config(&dir, &base);
+    fs::write(
+        dir.join("pubspec.yaml"),
+        "name: my_app\ndependencies:\n  provider: 6.0.5\n",
+    )
+    .unwrap();
+
+    let output = check(&dir, &config, &["--fail-on", "vulnerable"]);
+    let (stdout, stderr, code) = outcome(&output);
+
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("update available"), "stdout: {stdout}");
+    assert!(!stdout.contains("up to date"), "stdout: {stdout}");
+}
+
 /// A dist-tag names a channel, not a range. It is `undetermined` — noted, outside the
 /// vulnerability and staleness gates, and still failing `--fail-on any`, which is the
 /// setting that promises every constraint was established.

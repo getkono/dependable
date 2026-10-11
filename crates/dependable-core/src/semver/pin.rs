@@ -78,12 +78,11 @@ const NOT_IN_A_VERSION: &[char] = &[
 /// is whether *that* string parses.
 ///
 /// Note that "exact" is the translator's reading, not the string's shape. A bare
-/// `1.2.3` translates to an exact version for Maven, Hex, and NuGet, and a caret
-/// range for Cargo, Python, npm, and Dart — this reports
-/// a pin only where that ecosystem's translator already says so. For npm and Dart
-/// the caret reading is this tree's, not the ecosystem's: both read a bare version
-/// as exact, so their pins go unreported until the translator agrees (#155 for
-/// npm, #149 for Dart).
+/// `1.2.3` translates to an exact version for Maven, Hex, NuGet, and Dart, and a
+/// caret range for Cargo, Python, and npm — this reports a pin only where that
+/// ecosystem's translator already says so. For npm the caret reading is this
+/// tree's, not the ecosystem's: npm reads a bare version as exact, so its pins go
+/// unreported until the translator agrees (#155).
 ///
 /// Pure: consults no registry, filesystem, or network.
 ///
@@ -230,9 +229,18 @@ mod tests {
             ("== 3.10.3", Ecosystem::Elixir, Some("3.10.3")),
             ("~> 3.10", Ecosystem::Elixir, None),
             (">= 3.0.0", Ecosystem::Elixir, None),
-            // -- Dart, Go, PHP ----------------------------------------------
-            ("6.0.5", Ecosystem::Dart, None),
+            // -- Dart / pub --------------------------------------------------
+            // pub reads a bare version as exact and spells the caret range `^`
+            // (#149).
+            ("6.0.5", Ecosystem::Dart, Some("6.0.5")),
+            ("2.0.0-dev.1", Ecosystem::Dart, Some("2.0.0-dev.1")),
+            // Build metadata is part of the published version and is reported
+            // as declared, though the translation drops it.
+            ("1.2.3+4", Ecosystem::Dart, Some("1.2.3+4")),
             ("^1.1.0", Ecosystem::Dart, None),
+            (">=1.0.0 <2.0.0", Ecosystem::Dart, None),
+            ("any", Ecosystem::Dart, None),
+            // -- Go, PHP ----------------------------------------------------
             ("v1.6.0", Ecosystem::Go, None),
             ("^2.0", Ecosystem::Php, None),
             // -- Nothing at all ---------------------------------------------
@@ -272,6 +280,9 @@ mod tests {
             // The translation re-spells a pre-release into semver's dotted form;
             // `1.2.3-rc.1` is not what the index has.
             ("==1.2.3-rc1", Ecosystem::Python),
+            // pub's build metadata is part of the published version, and the
+            // translation drops it because a comparator cannot carry it.
+            ("1.2.3+4", Ecosystem::Dart),
         ] {
             let pin = exact_pin(constraint, ecosystem).expect("a pin");
             assert!(
