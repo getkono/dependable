@@ -33,7 +33,7 @@ single valid document while the annotations still reach the pull request.
 | --- | --- | --- |
 | `path` | `.` | Project directory to scan. |
 | `manifest` | `''` | Check one manifest instead of discovering them. |
-| `config` | `.dependable.toml` | Config file path. |
+| `config` | `''` | Config file path, which must exist. Empty uses `.dependable.toml` when present and built-in defaults otherwise. |
 | `fail-on` | `vulnerable` | `none`, `outdated`, `vulnerable`, or `any`. |
 | `format` | `table` | `table`, `json`, `text`, or `sarif` — what goes to stdout. |
 | `annotations` | `auto` | `auto`, `always`, or `never`. `never` also turns off the job summary. |
