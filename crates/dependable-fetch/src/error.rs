@@ -8,8 +8,17 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum FetchError {
+    /// A request that failed in transport: a timeout, a refused connection, a TLS or
+    /// redirect failure.
+    ///
+    /// Built through the `From<reqwest::Error>` impl, which drops the request URL.
+    /// reqwest's `Display` ends with ` for url (...)`, and a registry root can carry a
+    /// credential in its path or query, or in userinfo on any request not built
+    /// through a `RequestBuilder`; left in, it would reach the table output and the
+    /// GitHub annotations verbatim. The ecosystem and package name are reported beside
+    /// the error, so the URL adds nothing the reader lacks.
     #[error("http error: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(reqwest::Error),
 
     #[error("package `{0}` not found")]
     NotFound(String),
@@ -47,6 +56,14 @@ pub enum FetchError {
     OsvStatus { code: u16 },
 }
 
+impl From<reqwest::Error> for FetchError {
+    /// Wraps a transport error with its URL removed, so no credential embedded in a
+    /// registry root survives into the message. See [`FetchError::Http`].
+    fn from(error: reqwest::Error) -> Self {
+        Self::Http(error.without_url())
+    }
+}
+
 impl FetchError {
     /// Whether the registry answered, permanently, that this package has nothing to
     /// offer: it does not exist, or every release of it is yanked.
@@ -81,5 +98,71 @@ impl FetchError {
             | Self::Decode { .. }
             | Self::Osv(_) => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FetchError;
+
+    /// A loopback URL on a port nothing listens on, so a request to it fails with a
+    /// refused connection and no external network is involved.
+    fn closed_loopback_root() -> String {
+        // Bind then drop a listener so the port is free and closed.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|listener| listener.local_addr())
+            .expect("bind loopback")
+            .port();
+        format!("127.0.0.1:{port}")
+    }
+
+    /// Converts `raw`, after checking that reqwest's own message carries `secret` (so
+    /// the test proves the conversion is what removes it), and checks the result.
+    fn assert_redacted(raw: reqwest::Error, secret: &str) {
+        assert!(raw.to_string().contains(secret), "{raw}");
+
+        let error = FetchError::from(raw);
+        let display = error.to_string();
+        assert!(!display.contains(secret), "{display}");
+        assert!(!format!("{error:?}").contains(secret), "{error:?}");
+        assert!(display.starts_with("http error: "), "{display}");
+        // The URL goes; the kind of failure stays, so retry still applies.
+        assert!(error.is_transient());
+    }
+
+    /// A refused connection to a root carrying `user:secret@` does not print the
+    /// credential.
+    #[tokio::test]
+    async fn http_error_display_omits_url_userinfo() {
+        let url = format!(
+            "http://user:secret@{}/index/se/rd/serde",
+            closed_loopback_root()
+        );
+        // `Client::execute` keeps the userinfo in the URL it reports; the
+        // `RequestBuilder` path moves it into a basic-auth header first, so this is
+        // the route on which reqwest itself would print it.
+        let request = reqwest::Request::new(reqwest::Method::GET, url.parse().expect("valid url"));
+        let raw = reqwest::Client::new()
+            .execute(request)
+            .await
+            .expect_err("nothing listens on a closed port");
+
+        assert_redacted(raw, "secret");
+    }
+
+    /// A token carried in the path, which reqwest never strips, is not printed either.
+    #[tokio::test]
+    async fn http_error_display_omits_path_token() {
+        let url = format!(
+            "http://{}/tok-s3cr3t/npm/serde?auth=q-s3cr3t",
+            closed_loopback_root()
+        );
+        let raw = reqwest::Client::new()
+            .get(&url)
+            .send()
+            .await
+            .expect_err("nothing listens on a closed port");
+
+        assert_redacted(raw, "s3cr3t");
     }
 }
