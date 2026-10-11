@@ -169,6 +169,10 @@ impl RegistryFetcher for NpmFetcher {
         Some(&self.base_url)
     }
 
+    fn registry_root_for(&self, name: &str) -> Option<&str> {
+        Some(self.resolve(name).0)
+    }
+
     fn fetch_versions<'a>(
         &'a self,
         name: &'a str,

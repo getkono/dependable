@@ -10,7 +10,8 @@ use serde::Deserialize;
 use super::{FetchedVersions, RegistryFetcher};
 use crate::error::FetchError;
 
-const DEFAULT_REGISTRY: &str = "https://jsr.io";
+/// The public JSR registry: the root whose cache entries keep the bare `jsr` key.
+pub(crate) const DEFAULT_REGISTRY: &str = "https://jsr.io";
 
 /// Fetches package versions from JSR (`jsr.io/<@scope/name>/meta.json`).
 #[derive(Clone)]

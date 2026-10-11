@@ -101,13 +101,9 @@ pub enum CheckError {
 /// `#[non_exhaustive]`: build one with [`UnreachableRegistry::new`]; future fields are
 /// additive.
 ///
-/// # Limitation
-/// [`root`](Self::root) is the fetcher's *default* root. `NpmFetcher` resolves an
-/// `@scope` package to a per-scope registry read from `.npmrc`, which
-/// [`RegistryFetcher::registry_root`] does not name, so a scoped package that failed
-/// against a private host is reported under the fetcher's default root instead. Naming
-/// the host that was actually asked needs a per-package root on the trait, which every
-/// fetcher would have to implement.
+/// [`root`](Self::root) is the root the failed lookups actually queried
+/// ([`RegistryFetcher::registry_root_for`]), so an `@scope` package `NpmFetcher` sent
+/// to its `.npmrc` registry is reported under that registry, not the default one.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnreachableRegistry {
@@ -138,7 +134,7 @@ impl UnreachableRegistry {
     /// Whether [`root`](Self::root) is the ecosystem's own default registry — `true`
     /// also when no root is known, since nothing then distinguishes it.
     ///
-    /// The same discrimination `default_cache_key` makes when deciding whether a cache
+    /// The same discrimination `scoped_cache_key` makes when deciding whether a cache
     /// key needs scoping: only a non-default root says anything the ecosystem name does
     /// not already say.
     #[must_use]
@@ -373,7 +369,8 @@ pub struct Checker {
     progress: Option<ProgressSink>,
 }
 
-/// Cache key used for JSR lookups, kept distinct from the npm ecosystem key.
+/// Cache key base for JSR lookups, kept distinct from the npm ecosystem key. Used bare
+/// for the public JSR registry and scoped by root for any other (`scoped_cache_key`).
 const JSR_CACHE_KEY: &str = "jsr";
 
 /// One package to fetch: its name, the fetcher to use, and its versions-cache key.
@@ -1040,7 +1037,10 @@ impl Checker {
     /// to the JSR fetcher; an item naming an alternate Rust registry that resolved
     /// to a fetcher goes there, with a per-alias cache key so same-named crates in
     /// different registries never collide; everything else uses `default` (the
-    /// ecosystem's fetcher) under the ecosystem's cache key.
+    /// ecosystem's fetcher). The JSR and default keys are scoped by the root the
+    /// fetcher queries for *this name* ([`RegistryFetcher::registry_root_for`]), so an
+    /// npm `@scope` package routed to its `.npmrc` registry, or a non-default JSR
+    /// registry, never shares an entry with the public registry.
     fn route_item(
         &self,
         item: &Item,
@@ -1050,7 +1050,12 @@ impl Checker {
         if item.source == PackageSource::Jsr
             && let Some(jsr) = &self.jsr
         {
-            return (jsr.clone(), JSR_CACHE_KEY.to_string());
+            let key = scoped_cache_key(
+                JSR_CACHE_KEY,
+                jsr.registry_root_for(&item.name),
+                crate::registries::jsr::DEFAULT_REGISTRY,
+            );
+            return (jsr.clone(), key);
         }
         if let Some(alias) = &item.registry
             && let Some(fetcher) = self.rust_registries.get(alias)
@@ -1059,10 +1064,12 @@ impl Checker {
             // becomes a directory name under the disk-cache root.
             return (fetcher.clone(), format!("{}-{alias}", ecosystem.osv_name()));
         }
-        (
-            default.clone(),
-            default_cache_key(default.as_ref(), ecosystem),
-        )
+        let key = scoped_cache_key(
+            ecosystem.osv_name(),
+            default.registry_root_for(&item.name),
+            ecosystem.default_registry(),
+        );
+        (default.clone(), key)
     }
 
     /// Whether this checker reads and writes the on-disk registry cache.
@@ -1120,7 +1127,9 @@ impl Checker {
                     task.cache_key.clone(),
                     UnreachableRegistry::new(
                         ecosystem,
-                        task.fetcher.registry_root().map(str::to_owned),
+                        task.fetcher
+                            .registry_root_for(&task.name)
+                            .map(str::to_owned),
                     ),
                 )
             })
@@ -1435,19 +1444,23 @@ fn without_a_registry(item: &Item) -> CheckResult {
 
 /// Evaluate one parsed item against the fetched version lists, applying the
 /// configured pre-release filter before classification.
-/// The cache key for an ecosystem's default fetcher.
+/// The cache key for a lookup that queried `root`: `base` alone when `root` is
+/// `default_root` (or unknown), otherwise `base` scoped by a hash of `root`.
 ///
 /// A checker pointed at a private index or a mirror answers different questions than one
 /// pointed at the public registry, and the on-disk cache records only `(key, name)`. With
 /// the key naming the ecosystem alone, a run against a mirror wrote entries a later
 /// public run read back as its own — and the entry's name guard cannot catch it, because
 /// the name matches. Only a non-default root is scoped, so existing entries stay valid.
-fn default_cache_key(fetcher: &dyn RegistryFetcher, ecosystem: Ecosystem) -> String {
-    let base = ecosystem.osv_name();
-    match fetcher.registry_root() {
-        Some(root)
-            if root.trim_end_matches('/') != ecosystem.default_registry().trim_end_matches('/') =>
-        {
+///
+/// `root` is the root queried for *this name*
+/// ([`RegistryFetcher::registry_root_for`]), not the fetcher's default: an npm
+/// fetcher sends an `@scope` package to the scope's `.npmrc` registry, and keying that
+/// answer by the default root would let a later run without the `.npmrc` read a
+/// private registry's versions back as public npm's.
+fn scoped_cache_key(base: &str, root: Option<&str>, default_root: &str) -> String {
+    match root {
+        Some(root) if root.trim_end_matches('/') != default_root.trim_end_matches('/') => {
             let mut hasher = DefaultHasher::new();
             root.hash(&mut hasher);
             format!("{base}-{:016x}", hasher.finish())
@@ -2131,7 +2144,11 @@ mod tests {
         ];
         for (ecosystem, fetcher) in &mirrors {
             assert_ne!(
-                default_cache_key(fetcher.as_ref(), *ecosystem),
+                scoped_cache_key(
+                    ecosystem.osv_name(),
+                    fetcher.registry_root(),
+                    ecosystem.default_registry()
+                ),
                 ecosystem.osv_name(),
                 "{ecosystem:?} caches a mirror's answers under the public registry's key"
             );
@@ -2169,7 +2186,11 @@ mod tests {
         ];
         for (ecosystem, fetcher) in &defaults {
             assert_eq!(
-                default_cache_key(fetcher.as_ref(), *ecosystem),
+                scoped_cache_key(
+                    ecosystem.osv_name(),
+                    fetcher.registry_root(),
+                    ecosystem.default_registry()
+                ),
                 ecosystem.osv_name(),
                 "{ecosystem:?} rescoped its own default registry"
             );
@@ -3289,7 +3310,7 @@ mod tests {
     }
 
     /// Only a root that is not the ecosystem's own says anything the ecosystem name does
-    /// not already say — the same discrimination `default_cache_key` makes.
+    /// not already say — the same discrimination `scoped_cache_key` makes.
     #[test]
     fn only_a_non_default_root_is_named_beside_the_ecosystem() {
         let npm_default = Ecosystem::Npm.default_registry();
