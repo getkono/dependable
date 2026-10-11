@@ -490,6 +490,65 @@ fn a_missing_lockfile_falls_back_to_direct_dependencies() {
     assert_eq!(flatten(&built.graph), vec!["app", "react"]);
 }
 
+/// A lockfile v1 (npm 5/6) keeps its graph under a top-level `dependencies` tree and
+/// has no `packages` map. It must be rejected rather than misread, and the graph must
+/// fall back to the manifest's direct dependencies — not come back empty — with the
+/// caller told a lockfile is sitting there unread.
+#[test]
+fn a_v1_package_lock_is_rejected_and_falls_back_to_direct_dependencies() {
+    let dir = TempDir::new().expect("tempdir");
+    write(
+        &dir.path().join("package.json"),
+        r#"{ "name": "app", "version": "1.0.0", "dependencies": { "react": "^18.0.0" } }"#,
+    );
+    let v1 = r#"{
+  "name": "app",
+  "version": "1.0.0",
+  "lockfileVersion": 1,
+  "requires": true,
+  "dependencies": {
+    "loose-envify": { "version": "1.4.0", "requires": { "js-tokens": "^4.0.0" } },
+    "js-tokens": { "version": "4.0.0" },
+    "react": { "version": "18.2.0", "requires": { "loose-envify": "^1.1.0" } }
+  }
+}"#;
+    write(&dir.path().join("package-lock.json"), v1);
+
+    assert!(
+        dependable_fetch::core::parse_package_lock_graph(v1).is_err(),
+        "a v1 lockfile must be rejected, not read as a graph with no packages"
+    );
+
+    let built = build_project_graph(
+        &dir.path().join("package.json"),
+        &WorkspaceGraphOptions::default(),
+    )
+    .expect("an unreadable lockfile is not a reason to fail the command");
+
+    assert_eq!(
+        built.source,
+        GraphSource::UnreadableLockfile,
+        "a lockfile is present, so this is not `Manifests`"
+    );
+    let roots: Vec<&str> = built
+        .graph
+        .roots()
+        .iter()
+        .map(|&i| built.graph.nodes()[i].name.as_str())
+        .collect();
+    assert_eq!(roots, vec!["app"]);
+    assert_eq!(
+        flatten(&built.graph),
+        vec!["app", "react"],
+        "the direct-dependency fallback, with nothing transitive read from the v1 tree"
+    );
+    assert_eq!(
+        version_of(&built.graph, "react"),
+        None,
+        "the v1 lockfile's resolved version must not leak into the fallback"
+    );
+}
+
 /// An `overrides`/`resolutions`/`pnpm.overrides` entry forces a version somewhere in
 /// the tree; it is not a dependency of the root, so the fallback graph must not draw
 /// it as one.
