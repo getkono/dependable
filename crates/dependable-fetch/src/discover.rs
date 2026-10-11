@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 use dependable_core::{
     DependencyKind, Ecosystem, Item, LockfileData, LockfileKind, ManifestKind,
-    UNREADABLE_MANIFESTS, UnreadableManifest, parse, parse_lockfile_kind,
+    UNREADABLE_MANIFESTS, UnreadableManifest, WorkspaceRoots, parse, parse_lockfile_kind,
 };
 
 /// Directories never descended into during discovery: build output, vendored
@@ -345,7 +345,19 @@ pub fn nearest_workspace_root(
     manifest: &Path,
     kind: ManifestKind,
 ) -> Option<(PathBuf, ManifestKind, String)> {
-    let roots = kind.workspace_roots()?;
+    nearest_root_under(manifest, kind.workspace_roots()?)
+}
+
+/// [`nearest_workspace_root`] under an explicit descriptor rather than the one `kind`
+/// ships.
+///
+/// The whole walk lives here, so a test can drive it with a descriptor no kind ships yet
+/// — one whose candidates are read by a kind other than the member's — and reach exactly
+/// the code a second ecosystem's descriptor will.
+fn nearest_root_under(
+    manifest: &Path,
+    roots: WorkspaceRoots,
+) -> Option<(PathBuf, ManifestKind, String)> {
     let manifest = std::fs::canonicalize(manifest).ok()?;
     let mut dir = manifest.parent()?;
     loop {
@@ -417,7 +429,17 @@ pub fn workspace_root_of(
     kind: ManifestKind,
     content: &str,
 ) -> Option<(PathBuf, ManifestKind, String)> {
-    let roots = kind.workspace_roots()?;
+    root_of_under(manifest, kind, kind.workspace_roots()?, content)
+}
+
+/// [`workspace_root_of`] under an explicit descriptor rather than the one `kind` ships,
+/// for the reason [`nearest_root_under`] gives.
+pub(crate) fn root_of_under(
+    manifest: &Path,
+    kind: ManifestKind,
+    roots: WorkspaceRoots,
+    content: &str,
+) -> Option<(PathBuf, ManifestKind, String)> {
     debug_assert!(
         !roots.self_governing || roots.root_names.iter().any(|(_, root)| *root == kind),
         "{kind:?} governs itself but is not among its own root kinds: {:?}",
@@ -430,7 +452,7 @@ pub fn workspace_root_of(
             .unwrap_or_else(|_| manifest.to_path_buf());
         return Some((root, kind, content.to_owned()));
     }
-    nearest_workspace_root(manifest, kind)
+    nearest_root_under(manifest, roots)
 }
 
 /// The governing manifest and the declarations it offers — the input
@@ -1106,6 +1128,121 @@ mod tests {
         let (_, root_kind, _) =
             workspace_root_of(&manifest, ManifestKind::CargoToml, content).expect("itself");
         assert_eq!(root_kind, ManifestKind::CargoToml);
+    }
+
+    /// A Cargo workspace root, the only kind of root anything recognises today.
+    const CARGO_ROOT: &str =
+        "[workspace]\nmembers = []\n\n[workspace.dependencies]\nserde = \"1.0.200\"\n";
+
+    /// The shape a JavaScript descriptor will take: a member of one kind, whose roots
+    /// are named by more than one file and read by kinds other than its own. Cargo is
+    /// the only kind that recognises a root today, so it stands in for the root kind
+    /// that does; the `pnpm-workspace.yaml` ahead of it is recognised by nothing, which
+    /// is what a candidate that exists but declares nothing looks like.
+    const HETEROGENEOUS: WorkspaceRoots = WorkspaceRoots::new(
+        &[
+            ("pnpm-workspace.yaml", ManifestKind::PnpmWorkspaceYaml),
+            ("Cargo.toml", ManifestKind::CargoToml),
+        ],
+        false,
+    );
+
+    /// The public walk, driven by a member whose kind is not the kind of any root it
+    /// names: the root is found by the paired kind, reported with the paired kind, and
+    /// its declarations come out of that kind's parser. A walk that reported the
+    /// member's kind would hand `workspace_declarations` a `PackageJson` parser for a
+    /// TOML file, which declares nothing.
+    #[test]
+    fn the_walk_reports_the_root_kind_not_the_members() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().expect("canonical");
+        write(&root.join("pnpm-workspace.yaml"), "packages: []\n");
+        write(&root.join("Cargo.toml"), CARGO_ROOT);
+        // A nearer directory holding only an unrecognised candidate is walked past.
+        write(&root.join("apps/pnpm-workspace.yaml"), "packages: []\n");
+        let member = root.join("apps/web/package.json");
+        write(&member, "{\"name\": \"web\"}");
+
+        let (path, root_kind, content) =
+            nearest_root_under(&member, HETEROGENEOUS).expect("the Cargo root");
+
+        assert_eq!(path, simplified(root.join("Cargo.toml")));
+        assert_eq!(root_kind, ManifestKind::CargoToml);
+        assert_ne!(root_kind, ManifestKind::PackageJson);
+        let declarations = workspace_declarations(root_kind, &content);
+        assert_eq!(declarations.len(), 1, "{declarations:?}");
+        assert_eq!(declarations[0].name, "serde");
+        assert!(
+            workspace_declarations(ManifestKind::PackageJson, &content).is_empty(),
+            "the member's own kind reads nothing from the root"
+        );
+    }
+
+    /// A descriptor that does not govern itself sends even a manifest that declares a
+    /// root of its own up the tree, however heterogeneous the list.
+    #[test]
+    fn a_kind_that_does_not_govern_itself_walks_past_its_own_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().expect("canonical");
+        write(&root.join("Cargo.toml"), CARGO_ROOT);
+        let member = root.join("crates/app/Cargo.toml");
+        let own = "[workspace]\nmembers = []\n\n[workspace.dependencies]\ntokio = \"1\"\n";
+        write(&member, own);
+
+        let (path, root_kind, _) =
+            root_of_under(&member, ManifestKind::CargoToml, HETEROGENEOUS, own)
+                .expect("the root above");
+
+        assert_eq!(path, simplified(root.join("Cargo.toml")));
+        assert_eq!(root_kind, ManifestKind::CargoToml);
+    }
+
+    /// The self-governing branch under a heterogeneous list: the manifest is its own
+    /// root, reported as its own kind, even though the first candidate the list names
+    /// is read by a different kind and sits right beside it.
+    #[test]
+    fn a_self_governing_root_wins_over_a_heterogeneous_candidate_beside_it() {
+        const SELF_FIRST: WorkspaceRoots = WorkspaceRoots::new(
+            &[
+                ("package.json", ManifestKind::PackageJson),
+                ("Cargo.toml", ManifestKind::CargoToml),
+            ],
+            true,
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().expect("canonical");
+        write(&root.join("Cargo.toml"), CARGO_ROOT);
+        let manifest = root.join("app/Cargo.toml");
+        let own = "[package]\nname = \"app\"\n\n[workspace]\nmembers = []\n\n[workspace.dependencies]\ntokio = \"1\"\n";
+        write(&manifest, own);
+        write(&root.join("app/package.json"), "{\"name\": \"app\"}");
+
+        let (path, root_kind, content) =
+            root_of_under(&manifest, ManifestKind::CargoToml, SELF_FIRST, own).expect("itself");
+
+        assert_eq!(path, simplified(manifest.clone()));
+        assert_eq!(root_kind, ManifestKind::CargoToml);
+        let declarations = workspace_declarations(root_kind, &content);
+        assert_eq!(declarations.len(), 1, "{declarations:?}");
+        assert_eq!(declarations[0].name, "tokio");
+    }
+
+    /// The invariant `self_governing` states, tripped: a kind claiming to govern itself
+    /// while none of its candidates is read by its own kind. Debug builds refuse it
+    /// before the walk, rather than letting one parser accept the manifest and another
+    /// read it.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "governs itself but is not among its own root kinds")]
+    fn a_self_governing_kind_missing_from_its_root_kinds_is_refused() {
+        const BROKEN: WorkspaceRoots =
+            WorkspaceRoots::new(&[("Cargo.toml", ManifestKind::CargoToml)], true);
+        let _ = root_of_under(
+            Path::new("package.json"),
+            ManifestKind::PackageJson,
+            BROKEN,
+            "{}",
+        );
     }
 
     /// The same boundary the lockfile search respects: an unrelated checkout above the

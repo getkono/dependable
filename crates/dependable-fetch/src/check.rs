@@ -14,8 +14,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use dependable_core::{
     CheckResult, DependencyStatus, Ecosystem, ErrorOrigin, Evaluation, Item, LockfileKind,
-    ManifestKind, PackageSource, UnstableFilter, apply_lockfile, check_version_for, lockfile_items,
-    parse, parse_lockfile_kind, resolve_workspace_inheritance, swift_package_name_variants,
+    ManifestKind, PackageSource, UnstableFilter, WorkspaceRoots, apply_lockfile, check_version_for,
+    lockfile_items, parse, parse_lockfile_kind, resolve_workspace_inheritance,
+    swift_package_name_variants,
 };
 use futures::stream::{self, StreamExt};
 use semver::Version as SemverVersion;
@@ -802,8 +803,22 @@ impl Checker {
         kind: ManifestKind,
         manifest: &str,
     ) -> Option<(PathBuf, Arc<Vec<Item>>)> {
+        self.workspace_source_under(path, kind, kind.workspace_roots()?, manifest)
+            .await
+    }
+
+    /// [`Checker::workspace_source`] under an explicit descriptor rather than the one
+    /// `kind` ships, so a test can reach the cache with a root whose kind is not the
+    /// member's.
+    async fn workspace_source_under(
+        &self,
+        path: &Path,
+        kind: ManifestKind,
+        roots: WorkspaceRoots,
+        manifest: &str,
+    ) -> Option<(PathBuf, Arc<Vec<Item>>)> {
         let (root, root_kind, root_content) =
-            crate::discover::workspace_root_of(path, kind, manifest)?;
+            crate::discover::root_of_under(path, kind, roots, manifest)?;
         // Keyed on the kind as well as the path: the same file can be a candidate root
         // for two kinds, and the declarations are whatever that kind's parser saw.
         let key = (root.clone(), root_kind);
@@ -2240,6 +2255,105 @@ mod tests {
         // A local package reports what it always did — nothing was going to be
         // fetched for it in any ecosystem.
         assert_eq!(check.results[1].status, DependencyStatus::Local);
+    }
+
+    /// A member whose kind is not its root's, the way a JavaScript member's will be:
+    /// its candidates are read by kinds other than its own. Cargo is the only kind that
+    /// recognises a root today, so it stands in for the root kind that does.
+    const HETEROGENEOUS: WorkspaceRoots = WorkspaceRoots::new(
+        &[
+            ("pnpm-workspace.yaml", ManifestKind::PnpmWorkspaceYaml),
+            ("Cargo.toml", ManifestKind::CargoToml),
+        ],
+        false,
+    );
+
+    /// A workspace root with one member of each kind below it, and the paths of both.
+    fn mixed_workspace(dir: &Path) -> (PathBuf, PathBuf) {
+        let root = dir.canonicalize().expect("canonical");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"app\"]\n\n[workspace.dependencies]\nserde = \"1.0.200\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("app")).unwrap();
+        std::fs::create_dir_all(root.join("web")).unwrap();
+        let app = root.join("app/Cargo.toml");
+        let web = root.join("web/package.json");
+        std::fs::write(&app, "[package]\nname = \"app\"\n").unwrap();
+        std::fs::write(&web, "{\"name\": \"web\"}").unwrap();
+        (app, web)
+    }
+
+    /// The cache is keyed on the kind the root was *parsed as*, not the kind of the
+    /// member that went looking: two members of different kinds governed by one root
+    /// share one entry. Keying on the member's kind would parse that root once per
+    /// member kind, and file each parse under a kind that never read it.
+    #[tokio::test]
+    async fn members_of_two_kinds_share_the_entry_for_their_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (app, web) = mixed_workspace(dir.path());
+        let checker = offline_checker();
+
+        let (root, from_web) = checker
+            .workspace_source_under(&web, ManifestKind::PackageJson, HETEROGENEOUS, "{}")
+            .await
+            .expect("the web member's root");
+        let (same_root, from_app) = checker
+            .workspace_source(&app, ManifestKind::CargoToml, "[package]\nname = \"app\"\n")
+            .await
+            .expect("the app member's root");
+
+        assert_eq!(root, same_root);
+        assert_eq!(from_web.len(), 1, "{from_web:?}");
+        assert_eq!(from_web[0].name, "serde");
+        assert!(
+            Arc::ptr_eq(&from_web, &from_app),
+            "the second member was served the first's parse"
+        );
+        checker.workspace_cache.run_pending_tasks().await;
+        assert_eq!(checker.workspace_cache.entry_count(), 1);
+        assert!(
+            checker
+                .workspace_cache
+                .contains_key(&(root.clone(), ManifestKind::CargoToml))
+        );
+        assert!(
+            !checker
+                .workspace_cache
+                .contains_key(&(root, ManifestKind::PackageJson))
+        );
+    }
+
+    /// The other half of the key: one path read by two kinds is two entries. Another
+    /// kind's reading of the root — here one that declares nothing, which is what a
+    /// `PackageJson` parse of TOML answers — must not be served to a member whose root
+    /// is that path parsed as `CargoToml`. A key on the path alone would hand it back,
+    /// and which answer won would depend on which member was checked first.
+    #[tokio::test]
+    async fn one_path_read_by_two_kinds_is_two_entries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (app, web) = mixed_workspace(dir.path());
+        let checker = offline_checker();
+        // The walk's own spelling of the root, which is what the cache is keyed on.
+        let (root, _, _) = crate::discover::nearest_workspace_root(&app, ManifestKind::CargoToml)
+            .expect("the root");
+        checker
+            .workspace_cache
+            .insert(
+                (root.clone(), ManifestKind::PackageJson),
+                Arc::new(Vec::new()),
+            )
+            .await;
+
+        let (found, declarations) = checker
+            .workspace_source_under(&web, ManifestKind::PackageJson, HETEROGENEOUS, "{}")
+            .await
+            .expect("the root");
+
+        assert_eq!(found, root);
+        assert_eq!(declarations.len(), 1, "{declarations:?}");
+        assert_eq!(declarations[0].name, "serde");
     }
 
     /// `--no-lock-file` suppresses locked-version *annotations*. A
