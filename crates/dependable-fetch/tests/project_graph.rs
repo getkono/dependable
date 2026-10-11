@@ -419,14 +419,14 @@ fn a_bare_npm_version_is_read_as_a_range_by_this_tree() {
 
 /// pub reads a bare `6.0.5` as exactly that release and spells the caret range
 /// `^6.0.5` (#149), so a pubspec's bare version is one the manifest settled and
-/// `tree` reports it, while a `^` constraint, a range, and `any` stay unknown.
+/// `tree` reports it, while a `^` constraint, a `>=` bound, and `any` stay unknown.
 #[test]
 fn a_bare_pubspec_version_is_exact_and_so_resolves() {
     let dir = TempDir::new().expect("tempdir");
     write(
         &dir.path().join("pubspec.yaml"),
         "name: app\nversion: 1.0.0\ndependencies:\n  provider: \"6.0.5\"\n  http: ^1.1.0\n  \
-         meta: any\n  collection: \">=1.0.0 <2.0.0\"\n",
+         meta: any\n  collection: \">=1.0.0\"\n",
     );
 
     let built = build_project_graph(
