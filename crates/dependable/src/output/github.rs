@@ -35,7 +35,7 @@ use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
 
 use dependable_fetch::core::result::Advisory;
-use dependable_fetch::{CheckResult, DependencyStatus, Ecosystem};
+use dependable_fetch::{CheckResult, DependencyStatus, Ecosystem, PackageSource};
 
 use crate::cli::AnnotationMode;
 use crate::output::{ManifestReport, Summary, current_display, latest_display};
@@ -146,6 +146,16 @@ impl Finding<'_> {
     /// is missing, would have gone unchecked with a registry too.
     fn is_registryless(&self) -> bool {
         !self.ecosystem.has_registry() && self.result.item.is_checkable()
+    }
+
+    /// Whether this result went unchecked because its identity is not one any
+    /// query here is keyed by, although the entry states a version that was read.
+    ///
+    /// A Swift `Package.resolved` registry pin is the case: never checkable, so
+    /// [`Self::is_registryless`] does not claim it, yet its version is plain.
+    fn is_unidentified_with_version(&self) -> bool {
+        let item = &self.result.item;
+        item.source == PackageSource::Unidentified && !item.version_constraint.is_empty()
     }
 }
 
@@ -406,6 +416,15 @@ fn message(finding: &Finding<'_>, level: Level) -> String {
                  no package registry",
                 finding.ecosystem.display_name()
             ),
+            // An unidentified entry that states a version (a Swift registry pin's comes
+            // from `Package.resolved`) was read too: what went unresolved is which
+            // package it is, so neither the registry nor the version is to blame.
+            DependencyStatus::Undetermined if finding.is_unidentified_with_version() => {
+                format!(
+                    "{name} {current} could not be checked: its version was read, but its \
+                     identity is not one any registry or advisory query here can look up"
+                )
+            }
             DependencyStatus::Undetermined => {
                 format!("{name} could not be checked: its declared version could not be read")
             }
@@ -1454,6 +1473,38 @@ mod tests {
             lines[0].contains("its declared version could not be read"),
             "{lines:?}"
         );
+        assert!(
+            !lines[0].contains("publishes no package registry"),
+            "{lines:?}"
+        );
+    }
+
+    /// A Swift registry pin is `Unidentified` with its version read from
+    /// `Package.resolved`. It is not checkable, so the registry-less text does not
+    /// claim it, and "its declared version could not be read" would be false: what
+    /// went unresolved is its identity.
+    #[test]
+    fn an_unidentified_pin_with_a_version_is_annotated_as_unidentified_not_unread() {
+        // A dotted name is not a bare TOML key, so the fixture is parsed first.
+        let mut pin = item("linkedlist", 3);
+        pin.name = "mona.linkedlist".to_string();
+        pin.source = PackageSource::Unidentified;
+        pin.locked_version = None;
+        let mut swift = report(
+            "/w/Package.swift",
+            vec![CheckResult::new(pin, DependencyStatus::Undetermined)],
+        );
+        swift.ecosystem = Ecosystem::Swift;
+        let lines = lines_for(&[swift]);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains(
+                "mona.linkedlist 1.0 could not be checked: its version was read, but its \
+                 identity is not one any registry or advisory query here can look up"
+            ),
+            "{lines:?}"
+        );
+        assert!(!lines[0].contains("could not be read"), "{lines:?}");
         assert!(
             !lines[0].contains("publishes no package registry"),
             "{lines:?}"
