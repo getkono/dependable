@@ -1331,6 +1331,36 @@ okhttp = { module = "com.squareup.okhttp3:okhttp", version.ref = "okhttp" }
         assert!(declined.is_empty(), "{declined:?}");
     }
 
+    /// Gradle's `!!` shorthand is the same forced version as `strictly`: `--all`
+    /// alone leaves it, and `--overrides` advances it without dropping the `!!`,
+    /// which would turn the strict pin into a plain requirement.
+    #[test]
+    fn a_gradle_strict_shorthand_moves_only_with_overrides_and_stays_strict() {
+        let content = "[versions]\njunit = \"5.10.0!!\"\n\n[libraries]\njunit = { module = \"org.junit.jupiter:junit-jupiter\", version.ref = \"junit\" }\n";
+        let results = results_for(
+            ManifestKind::GradleVersionCatalog,
+            content,
+            &[("org.junit.jupiter:junit-jupiter", "5.11.0")],
+        );
+        assert_eq!(results.len(), 1, "the fixture must produce one item");
+        let ecosystem = Some(ManifestKind::GradleVersionCatalog.ecosystem());
+
+        let (updated, records, declined) =
+            plan_fixes(content, &results, true, false, ecosystem).expect("the plan applies");
+        assert_eq!(updated, content, "`--all` advanced a forced version");
+        assert!(records.is_empty(), "{records:?}");
+        assert_eq!(declined.len(), 1, "{declined:?}");
+        assert_eq!(declined[0].reason, DeclineReason::ForcedVersion);
+
+        let (updated, records, _) =
+            plan_fixes(content, &results, true, true, ecosystem).expect("the plan applies");
+        assert!(
+            updated.contains("junit = \"5.11.0!!\""),
+            "`--overrides` dropped the strict suffix: {updated}"
+        );
+        assert_eq!(records.len(), 1, "{records:?}");
+    }
+
     /// `--overrides` *without* `--all`, which is the combination the README
     /// recommends first and the one every other test here reaches only to watch
     /// it decline. The write path for it was unpinned: each of the two cases
