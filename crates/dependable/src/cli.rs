@@ -361,6 +361,10 @@ pub enum FailOn {
 
 impl FailOn {
     /// Parse from an environment-variable string (`DEPENDABLE_FAIL_ON`).
+    ///
+    /// `None` means the value is not a level, not that nothing was set: the caller
+    /// must treat it as an error, because falling back to a default would let a typo
+    /// disarm the gate.
     #[must_use]
     pub fn from_env(value: &str) -> Option<Self> {
         match value.trim().to_lowercase().as_str() {

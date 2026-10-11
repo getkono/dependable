@@ -61,6 +61,8 @@ fn check(config: &Path, extra: &[&str], env: &[(&str, &str)]) -> Output {
         "DEPENDABLE_MAX_CVSS",
         "DEPENDABLE_FAIL_ON_SEVERITY",
         "DEPENDABLE_MAX_MAJOR_BEHIND",
+        "DEPENDABLE_FAIL_ON",
+        "DEPENDABLE_CONCURRENCY",
     ] {
         command.env_remove(key);
     }
@@ -191,6 +193,72 @@ fn an_unusable_environment_override_is_an_error_not_a_silent_no_op() {
 
     assert_eq!(code(&output), 2, "stderr: {stderr}");
     assert!(stderr.contains("DEPENDABLE_MAX_CVSS"), "stderr: {stderr}");
+}
+
+/// A mistyped `DEPENDABLE_FAIL_ON` used to fall through to the config default
+/// (`none`), so a workflow typo turned the gate off and every build passed green.
+#[test]
+fn an_unrecognised_fail_on_level_is_an_error_not_a_disarmed_gate() {
+    let (_tmp, config) = config("fail_on_env_bad", "[global]\nconcurrency = 4\n");
+
+    let output = check(
+        &config,
+        &["--no-vuln"],
+        &[("DEPENDABLE_FAIL_ON", "vulnerabilities")],
+    );
+    let stderr = stderr(&output);
+
+    assert_eq!(code(&output), 2, "stderr: {stderr}");
+    assert!(stderr.contains("DEPENDABLE_FAIL_ON"), "stderr: {stderr}");
+    assert!(stderr.contains("vulnerabilities"), "stderr: {stderr}");
+    assert!(stderr.contains("outdated"), "stderr: {stderr}");
+}
+
+/// The recognised spellings still reach the gate, case- and whitespace-insensitively.
+#[test]
+fn a_recognised_fail_on_level_from_the_environment_still_gates() {
+    let (_tmp, config) = config("fail_on_env_good", "[global]\nconcurrency = 4\n");
+
+    // No `--fail-on vulnerable` on the command line: the precondition that rejects
+    // it without a scan can only fire if the environment value was read.
+    let output = check(
+        &config,
+        &["--no-vuln"],
+        &[("DEPENDABLE_FAIL_ON", " Vulnerable ")],
+    );
+    let stderr = stderr(&output);
+
+    assert_eq!(code(&output), 2, "stderr: {stderr}");
+    assert!(stderr.contains("--fail-on vulnerable"), "stderr: {stderr}");
+}
+
+/// An empty value is what an unset workflow expression expands to: it overrides
+/// nothing, so the config still governs.
+#[test]
+fn an_empty_fail_on_level_overrides_nothing() {
+    let (_tmp, config) = config("fail_on_env_empty", "[global]\nconcurrency = 4\n");
+
+    let output = check(&config, &["--no-vuln"], &[("DEPENDABLE_FAIL_ON", "")]);
+
+    assert_eq!(code(&output), 0, "stderr: {}", stderr(&output));
+}
+
+#[test]
+fn an_unparseable_concurrency_is_an_error_not_a_silent_default() {
+    let (_tmp, config) = config("concurrency_env_bad", "[global]\nconcurrency = 4\n");
+
+    let output = check(
+        &config,
+        &["--no-vuln"],
+        &[("DEPENDABLE_CONCURRENCY", "ten")],
+    );
+    let stderr = stderr(&output);
+
+    assert_eq!(code(&output), 2, "stderr: {stderr}");
+    assert!(
+        stderr.contains("DEPENDABLE_CONCURRENCY"),
+        "stderr: {stderr}"
+    );
 }
 
 #[test]

@@ -76,16 +76,33 @@ fn flag_is_on(raw: Option<&str>) -> bool {
     })
 }
 
-fn resolve_check_settings(args: &CheckArgs, cfg: &Config) -> Settings {
+/// `DEPENDABLE_CONCURRENCY`, read through [`env_override`] so a value that is not a
+/// whole number is an error naming the variable rather than a silent fallback.
+fn env_concurrency() -> anyhow::Result<Option<usize>> {
+    env_override(
+        "DEPENDABLE_CONCURRENCY",
+        |raw| raw.parse::<usize>().ok(),
+        "a non-negative whole number",
+    )
+}
+
+/// Effective settings for `dependable check`: CLI, then `DEPENDABLE_*`, then config.
+///
+/// # Errors
+///
+/// When `DEPENDABLE_FAIL_ON` or `DEPENDABLE_CONCURRENCY` holds a value that cannot
+/// be understood. Falling through to the config default instead would let a typo in
+/// a workflow (`DEPENDABLE_FAIL_ON: vulnerabilities`) disarm the gate, silently.
+fn resolve_check_settings(args: &CheckArgs, cfg: &Config) -> anyhow::Result<Settings> {
     let env_no_vuln = env_flag("DEPENDABLE_NO_VULN");
     let env_no_cache = env_flag("DEPENDABLE_NO_CACHE");
     let env_ghsa = env_flag("DEPENDABLE_INCLUDE_GHSA");
-    let env_concurrency = std::env::var("DEPENDABLE_CONCURRENCY")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok());
-    let env_fail_on = std::env::var("DEPENDABLE_FAIL_ON")
-        .ok()
-        .and_then(|s| FailOn::from_env(&s));
+    let env_concurrency = env_concurrency()?;
+    let env_fail_on = env_override(
+        "DEPENDABLE_FAIL_ON",
+        FailOn::from_env,
+        "a --fail-on level (none, outdated, vulnerable, any)",
+    )?;
 
     // Documented precedence, honoured for every value: CLI, then env, then config.
     // The old test `args.fail_on != FailOn::None` could not tell an explicit
@@ -93,7 +110,7 @@ fn resolve_check_settings(args: &CheckArgs, cfg: &Config) -> Settings {
     // off from the command line at all.
     let fail_on = args.fail_on.or(env_fail_on).unwrap_or(cfg.global.fail_on);
 
-    Settings {
+    Ok(Settings {
         concurrency: args
             .concurrency
             .or(env_concurrency)
@@ -114,7 +131,7 @@ fn resolve_check_settings(args: &CheckArgs, cfg: &Config) -> Settings {
             .map_or_else(|| cfg.global.unstable.into(), Into::into),
         registry: cfg.rust.registry.clone(),
         osv_url: cfg.vulnerability.osv_batch_url.clone(),
-    }
+    })
 }
 
 /// Whether the config's `[policy]` block needs license data collected.
@@ -407,7 +424,7 @@ fn progress_sink() -> Arc<dyn Fn(ProgressEvent) + Send + Sync> {
 pub async fn run_check(args: CheckArgs) -> anyhow::Result<ExitCode> {
     let cfg =
         load_config(&args.config).with_context(|| format!("reading {}", args.config.display()))?;
-    let settings = resolve_check_settings(&args, &cfg);
+    let settings = resolve_check_settings(&args, &cfg)?;
     check_fail_on_is_enforceable(settings.fail_on, settings.check_vuln)?;
     // Both policy steps run before discovery, so a misconfigured gate costs a
     // parse rather than a full network check.
@@ -608,8 +625,8 @@ fn check_fail_on_is_enforceable(fail_on: FailOn, check_vuln: bool) -> anyhow::Re
 /// The effective `[policy]` block: the config file's, with `DEPENDABLE_*`
 /// overrides applied. `None` means nothing is gated.
 ///
-/// Unlike the rest of the environment layer, a malformed override is an error
-/// rather than a silently ignored value — the same reasoning as
+/// As everywhere [`env_override`] reads the environment, a malformed override is an
+/// error rather than a silently ignored value — the same reasoning as
 /// [`crate::config::load_policy`]: an unenforced gate must never look enforced.
 ///
 /// # Errors
@@ -680,9 +697,12 @@ fn is_cvss_score(score: &f64) -> bool {
     (0.0..=10.0).contains(score)
 }
 
-/// Read one `DEPENDABLE_*` policy override, failing loudly on a value that
+/// Read one valued `DEPENDABLE_*` override, failing loudly on a value that
 /// cannot be understood. An unset or empty variable overrides nothing.
-#[cfg(feature = "report")]
+///
+/// Every valued variable goes through here — the `[policy]` overrides,
+/// `DEPENDABLE_FAIL_ON`, and `DEPENDABLE_CONCURRENCY` — so none of them can fold a
+/// typo into "nobody said" and let a lower layer's default take over.
 fn env_override<T>(
     key: &str,
     parse: impl Fn(&str) -> Option<T>,
@@ -1196,17 +1216,18 @@ const TEMPLATE_DIR: &str = "dependable-templates";
 /// `--unstable`, `--format`, or `--ecosystem`, and inventing values for them
 /// would be worse than twenty honest lines.
 #[cfg(feature = "report")]
-fn resolve_report_settings(args: &crate::cli::ReportArgs, cfg: &Config) -> Settings {
+fn resolve_report_settings(
+    args: &crate::cli::ReportArgs,
+    cfg: &Config,
+) -> anyhow::Result<Settings> {
     // The same value-sensitive reading `check` uses: `DEPENDABLE_NO_VULN=0` keeps the
     // scan on here too, rather than disabling it because the variable merely exists.
     let env_no_vuln = env_flag("DEPENDABLE_NO_VULN");
     let env_no_cache = env_flag("DEPENDABLE_NO_CACHE");
     let env_ghsa = env_flag("DEPENDABLE_INCLUDE_GHSA");
-    let env_concurrency = std::env::var("DEPENDABLE_CONCURRENCY")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok());
+    let env_concurrency = env_concurrency()?;
 
-    Settings {
+    Ok(Settings {
         concurrency: env_concurrency.unwrap_or(cfg.global.concurrency).max(1),
         depth: args.depth,
         check_lockfile: cfg.global.lock_file,
@@ -1220,7 +1241,7 @@ fn resolve_report_settings(args: &crate::cli::ReportArgs, cfg: &Config) -> Setti
         unstable: cfg.global.unstable.into(),
         registry: cfg.rust.registry.clone(),
         osv_url: cfg.vulnerability.osv_batch_url.clone(),
-    }
+    })
 }
 
 /// Say which upgrades this manifest cannot make, and where they can be made instead.
@@ -1383,7 +1404,7 @@ pub async fn run_report(args: crate::cli::ReportArgs) -> anyhow::Result<ExitCode
 
     let cfg =
         load_config(&args.config).with_context(|| format!("reading {}", args.config.display()))?;
-    let settings = resolve_report_settings(&args, &cfg);
+    let settings = resolve_report_settings(&args, &cfg)?;
     let root = args.path.clone().unwrap_or_else(|| PathBuf::from("."));
 
     // Before discovery and before the network: a bad override must not cost a
@@ -2673,7 +2694,8 @@ mod tests {
         let explicit = resolve_check_settings(
             &check_args(&["dependable", "check", "--fail-on", "none"]),
             &cfg,
-        );
+        )
+        .expect("settings");
         assert_eq!(
             explicit.fail_on,
             FailOn::None,
@@ -2681,14 +2703,16 @@ mod tests {
         );
 
         // Absent, the config still governs.
-        let absent = resolve_check_settings(&check_args(&["dependable", "check"]), &cfg);
+        let absent =
+            resolve_check_settings(&check_args(&["dependable", "check"]), &cfg).expect("settings");
         assert_eq!(absent.fail_on, FailOn::Any);
 
         // And a non-default flag still wins, as it always did.
         let vulnerable = resolve_check_settings(
             &check_args(&["dependable", "check", "--fail-on", "vulnerable"]),
             &cfg,
-        );
+        )
+        .expect("settings");
         assert_eq!(vulnerable.fail_on, FailOn::Vulnerable);
     }
 }
