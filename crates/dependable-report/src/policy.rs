@@ -977,6 +977,7 @@ fn parse_ecosystem(raw: &str) -> Option<Ecosystem> {
         "csharp" | "c#" | "dotnet" | "nuget" => Some(Ecosystem::CSharp),
         "elixir" | "hex" | "mix" => Some(Ecosystem::Elixir),
         "jvm" | "maven" | "kotlin" | "java" => Some(Ecosystem::Jvm),
+        "swift" | "swiftpm" | "spm" => Some(Ecosystem::Swift),
         _ => None,
     }
 }
@@ -1206,6 +1207,8 @@ reason = "CVE-2023-xxxx fix"
             ("mix", Ecosystem::Elixir),
             ("kotlin", Ecosystem::Jvm),
             ("Maven", Ecosystem::Jvm),
+            ("swift", Ecosystem::Swift),
+            ("SwiftPM", Ecosystem::Swift),
         ];
         for (word, expected) in cases {
             let parsed = policy(&format!(

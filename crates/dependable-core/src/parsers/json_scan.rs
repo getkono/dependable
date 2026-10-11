@@ -33,19 +33,57 @@ pub struct JsonStringValue {
     pub escaped: bool,
 }
 
+/// A whole-document scan: the string values found, and whether the document was
+/// structurally sound.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScannedJson {
+    /// Every string value found, in document order.
+    pub values: Vec<JsonStringValue>,
+    /// Whether the document parsed to its end with nothing unexpected. `false`
+    /// means [`values`](Self::values) is a *prefix* of the document's strings,
+    /// which is a different thing from the document's strings.
+    pub well_formed: bool,
+}
+
 /// Scan JSON or JSONC `src`, returning every string value with its path, in
 /// document order. Malformed input yields whatever was scanned up to the error.
+///
+/// A caller that cannot tell a short list from a complete one — because the file
+/// *is* the list rather than an annotation on one — wants [`scan_document`]
+/// instead, which says whether the scan reached the end.
 #[must_use]
 pub fn scan_strings(src: &str) -> Vec<JsonStringValue> {
+    scan_document(src).values
+}
+
+/// Scan JSON or JSONC `src`, reporting both the string values and whether the
+/// document was well-formed.
+///
+/// Well-formedness is judged structurally: every object and array closed, every
+/// string terminated, every key followed by a `:`, every bare scalar a real JSON
+/// literal, and nothing left over after the top-level value. It is deliberately
+/// not a validator — duplicate keys, JSONC comments, and lone surrogates all
+/// pass — it answers only "did the scan see the whole document".
+#[must_use]
+pub fn scan_document(src: &str) -> ScannedJson {
     let mut scanner = Scanner {
         bytes: src.as_bytes(),
         src,
         i: 0,
         out: Vec::new(),
+        well_formed: true,
     };
     scanner.skip_trivia();
     scanner.parse_value(&[]);
-    scanner.out
+    scanner.skip_trivia();
+    // Anything after the top-level value belongs to no value at all.
+    if scanner.i < scanner.bytes.len() {
+        scanner.well_formed = false;
+    }
+    ScannedJson {
+        values: scanner.out,
+        well_formed: scanner.well_formed,
+    }
 }
 
 /// One parsed string: its unescaped content, its raw span, and whether the two differ.
@@ -61,6 +99,9 @@ struct Scanner<'a> {
     src: &'a str,
     i: usize,
     out: Vec<JsonStringValue>,
+    /// Cleared the moment the document departs from JSON's grammar. Never
+    /// consulted by the scan itself, which always keeps going.
+    well_formed: bool,
 }
 
 impl Scanner<'_> {
@@ -110,8 +151,12 @@ impl Scanner<'_> {
                         content_end: s.end,
                         escaped: s.escaped,
                     });
+                } else {
+                    self.well_formed = false;
                 }
             }
+            // Nothing at all where a value belongs: the document ended early.
+            None => self.well_formed = false,
             _ => self.skip_scalar(),
         }
     }
@@ -127,8 +172,11 @@ impl Scanner<'_> {
                 }
                 // End of input: stop *without* advancing. Stepping past the end here is
                 // what left the cursor at `len + 1`, so the enclosing container's next
-                // `skip_trivia` sliced out of range.
-                None => return,
+                // `skip_trivia` sliced out of range. The object is truncated.
+                None => {
+                    self.well_formed = false;
+                    return;
+                }
                 Some(b',') => {
                     self.i += 1;
                     continue;
@@ -136,19 +184,25 @@ impl Scanner<'_> {
                 Some(b'"') => {}
                 // A stray `]` closes the array we are nested in, not this object; leave
                 // it for that frame rather than consuming it.
-                Some(b']') => return,
+                Some(b']') => {
+                    self.well_formed = false;
+                    return;
+                }
                 _ => {
                     // Unexpected; skip it rather than looping forever.
+                    self.well_formed = false;
                     self.i += 1;
                     continue;
                 }
             }
             let before = self.i;
             let Some(key) = self.parse_string() else {
+                self.well_formed = false;
                 return;
             };
             self.skip_trivia();
             if self.bytes.get(self.i) != Some(&b':') {
+                self.well_formed = false;
                 // Guarantee progress even if `parse_string` consumed nothing.
                 if self.i == before {
                     self.i += 1;
@@ -173,7 +227,11 @@ impl Scanner<'_> {
                     self.i += 1;
                     return;
                 }
-                None => return,
+                // End of input before the closing bracket: the array is truncated.
+                None => {
+                    self.well_formed = false;
+                    return;
+                }
                 Some(b',') => {
                     self.i += 1;
                     continue;
@@ -181,7 +239,10 @@ impl Scanner<'_> {
                 // A stray `}` closes the object we are nested in. `parse_value` would
                 // route it to `skip_scalar`, which breaks on `}` without advancing —
                 // an infinite loop. Hand it back to the enclosing frame instead.
-                Some(b'}') => return,
+                Some(b'}') => {
+                    self.well_formed = false;
+                    return;
+                }
                 _ => {}
             }
             let mut child = path.to_vec();
@@ -240,6 +301,7 @@ impl Scanner<'_> {
 
     /// Skip a non-string scalar (`number`, `true`, `false`, `null`).
     fn skip_scalar(&mut self) {
+        let start = self.i;
         while self.i < self.bytes.len() {
             match self.bytes[self.i] {
                 b',' | b'}' | b']' => break,
@@ -247,7 +309,21 @@ impl Scanner<'_> {
                 _ => self.i += 1,
             }
         }
+        // An empty token is a delimiter where a value belongs. The cursor stays on
+        // it, for the enclosing frame to consume, but the document is not JSON.
+        if !is_json_literal(&self.bytes[start..self.i]) {
+            self.well_formed = false;
+        }
     }
+}
+
+/// Whether `token` is one of JSON's bare literals or a number.
+///
+/// Only [`ScannedJson::well_formed`] reads this; the scan itself skips the token
+/// either way.
+fn is_json_literal(token: &[u8]) -> bool {
+    matches!(token, b"true" | b"false" | b"null")
+        || std::str::from_utf8(token).is_ok_and(|text| text.parse::<f64>().is_ok())
 }
 
 /// Unescape a JSON string body.
@@ -504,6 +580,58 @@ mod tests {
             .find(|v| v.path == ["café", "react"])
             .unwrap();
         assert_eq!(&src[v.content_start..v.content_end], "^18.0.0");
+    }
+
+    /// A truncated document used to walk the cursor off the end of the buffer and
+    /// panic on the next slice — a crash on `dependable list`, from nothing worse
+    /// than a half-written file. Every prefix of a real document must scan.
+    #[test]
+    fn every_prefix_of_a_document_scans_without_panicking() {
+        let src = r#"{
+            "pins": [
+                { "identity": "swift-nio", "location": "https://github.com/apple/swift-nio.git",
+                  "state": { "version": "2.65.0" } }
+            ],
+            "version": 2
+        }"#;
+        for cut in 0..=src.len() {
+            let _ = scan_document(&src[..cut]);
+        }
+    }
+
+    /// A closing delimiter where a value belongs used to hand the same byte back to
+    /// the enclosing loop forever. Terminating matters more than what it returns.
+    #[test]
+    fn a_delimiter_where_a_value_belongs_terminates() {
+        for src in ["[ } ]", "{ \"a\": }", "{ \"a\": ] }", "[[[", "{{{"] {
+            let scanned = scan_document(src);
+            assert!(!scanned.well_formed, "{src}");
+        }
+    }
+
+    /// The signal a reader of a file that *is* a dependency list depends on: a
+    /// document that did not scan to its end must not pass as one that did.
+    #[test]
+    fn well_formedness_separates_a_whole_document_from_a_prefix() {
+        let src = r#"{ "a": [1, 2, {"b": "c"}], "d": null, "e": true }"#;
+        assert!(scan_document(src).well_formed);
+        assert!(scan_document(&src[..src.len() - 1]).well_formed.eq(&false));
+
+        // JSONC still counts as well-formed: comments are this scanner's business.
+        assert!(scan_document("{ /* hi */ \"a\": 1 } // done").well_formed);
+
+        // Trailing content after the top-level value belongs to no value at all.
+        assert!(!scan_document("not json at all {{{").well_formed);
+        assert!(!scan_document("{} garbage").well_formed);
+        assert!(!scan_document("").well_formed);
+
+        // An unterminated string, and a key with no value.
+        assert!(!scan_document(r#"{ "a": "unterminated "#).well_formed);
+        assert!(!scan_document(r#"{ "a" 1 }"#).well_formed);
+
+        // A bare token that is no JSON literal.
+        assert!(!scan_document(r#"{ "a": nope }"#).well_formed);
+        assert!(scan_document(r#"{ "a": -1.5e3 }"#).well_formed);
     }
 
     #[test]

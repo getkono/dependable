@@ -236,3 +236,164 @@ fn quiet_empties_stdout_but_keeps_the_annotations() {
     // `-q` means "only print errors", and the annotations *are* the errors.
     assert!(stderr_of(&output).contains("::notice "));
 }
+
+/// A `Package.swift` is a Swift program, so it declares nothing readable. The
+/// pins are the dependency list, and every versioned one is `Undetermined`:
+/// Swift publishes no registry, so no currency can be established for any of them.
+const PACKAGE_SWIFT: &str = "// swift-tools-version:5.10\nimport PackageDescription\n\nlet package = Package(name: \"SampleApp\")\n";
+
+/// Two `remoteSourceControl` pins carrying versions — two `Undetermined` rows,
+/// and not one row of any other status.
+const PACKAGE_RESOLVED: &str = r#"{
+  "pins" : [
+    {
+      "identity" : "swift-nio",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/apple/swift-nio.git",
+      "state" : { "revision" : "635b2589494c97e48c62514bc8b37ced762e0a62", "version" : "2.65.0" }
+    },
+    {
+      "identity" : "swift-log",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/apple/swift-log.git",
+      "state" : { "revision" : "9cb486020ebf03bfa5b5df985387a14a98744537", "version" : "1.5.4" }
+    }
+  ],
+  "version" : 2
+}"#;
+
+/// A Swift project, with a `Package.resolved` beside it only when `resolved` says so.
+///
+/// Deliberately *not* [`workdir`]: a `Cargo.toml` in the same directory would
+/// contribute rows of its own and the counts below would stop meaning anything.
+fn swift_workdir(name: &str, resolved: bool) -> PathBuf {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("Package.swift"), PACKAGE_SWIFT).unwrap();
+    if resolved {
+        fs::write(dir.join("Package.resolved"), PACKAGE_RESOLVED).unwrap();
+    }
+    fs::write(dir.join(".dependable.toml"), CONFIG).unwrap();
+    dir
+}
+
+/// The undetermined case: the pins were read, and not one of them could be
+/// checked for a newer version.
+///
+/// Every one is `Undetermined`, a status the renderer does not annotate, so no
+/// table is built — and an empty table set used to reach the all-clear line. That
+/// line is the same false claim of currency the table heading, the HTML report,
+/// `manifests_unread` in JSON and `DEP003` in SARIF were all changed to stop
+/// making; the job summary is the one a pull request actually renders.
+#[test]
+fn the_summary_never_calls_an_undetermined_swift_project_clean() {
+    let dir = swift_workdir("github_swift_undetermined", true);
+    let summary = dir.join("summary.md");
+    let output = check(
+        &dir,
+        &["--annotations", "always"],
+        &[
+            ("GITHUB_WORKSPACE", dir.to_str().unwrap()),
+            ("GITHUB_STEP_SUMMARY", summary.to_str().unwrap()),
+        ],
+    );
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    let markdown = fs::read_to_string(&summary).expect("a summary file");
+
+    assert!(
+        !markdown.contains("No outdated or vulnerable dependencies found."),
+        "nothing was found because nothing could be checked: {markdown}"
+    );
+    assert!(markdown.contains("2 dependencies checked"), "{markdown}");
+    assert!(markdown.contains("2 undetermined"), "{markdown}");
+    assert!(markdown.contains("**Coverage caveat**"), "{markdown}");
+    assert!(
+        markdown.contains("2 dependencies could not be checked for a newer version"),
+        "{markdown}"
+    );
+}
+
+/// The unread case, which this feature calls the common state: Apple advises a
+/// library package not to commit its `Package.resolved`, so there is nothing to
+/// read and the run produces no rows at all.
+///
+/// Worse than the undetermined case, because every status count is a tally of
+/// rows that *were* read: with no rows the totals line is a row of zeros
+/// identical to a project with no dependencies. Only the caveat separates them.
+#[test]
+fn the_summary_never_calls_an_unread_swift_project_clean() {
+    let dir = swift_workdir("github_swift_unread", false);
+    let summary = dir.join("summary.md");
+    let output = check(
+        &dir,
+        &["--annotations", "always"],
+        &[
+            ("GITHUB_WORKSPACE", dir.to_str().unwrap()),
+            ("GITHUB_STEP_SUMMARY", summary.to_str().unwrap()),
+        ],
+    );
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    let markdown = fs::read_to_string(&summary).expect("a summary file");
+    let stderr = stderr_of(&output);
+
+    assert!(
+        !markdown.contains("No outdated or vulnerable dependencies found."),
+        "a project nothing was read from must never render as a clean one: {markdown}"
+    );
+    assert!(markdown.contains("**Coverage caveat**"), "{markdown}");
+    assert!(
+        markdown.contains("The dependency list for 1 manifest could not be read"),
+        "{markdown}"
+    );
+    // Named, the way `DEP003` names it: the fact belongs to a file.
+    assert!(markdown.contains("`Package.swift`"), "{markdown}");
+
+    // And the pull request itself hears about it. With no rows there is no
+    // per-dependency annotation to emit, so without this one the annotation
+    // channel is silent — which is exactly what a clean project looks like.
+    assert!(
+        stderr.contains(
+            "::notice file=Package.swift,title=dependable%3A dependency list could not be read::"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("means nothing was looked at, not that nothing is wrong."),
+        "{stderr}"
+    );
+}
+
+/// The guard on the guard: gating the all-clear line must not withhold it from a
+/// run that genuinely earned it.
+#[test]
+fn a_genuinely_clean_run_still_gets_the_all_clear() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("github_clean_all_clear");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    // No dependencies at all: nothing to check, and nothing left unchecked.
+    fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(dir.join(".dependable.toml"), CONFIG).unwrap();
+
+    let summary = dir.join("summary.md");
+    let output = check(
+        &dir,
+        &["--annotations", "always"],
+        &[
+            ("GITHUB_WORKSPACE", dir.to_str().unwrap()),
+            ("GITHUB_STEP_SUMMARY", summary.to_str().unwrap()),
+        ],
+    );
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    let markdown = fs::read_to_string(&summary).expect("a summary file");
+
+    assert!(
+        markdown.contains("No outdated or vulnerable dependencies found."),
+        "{markdown}"
+    );
+    assert!(!markdown.contains("Coverage caveat"), "{markdown}");
+}

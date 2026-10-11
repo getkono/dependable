@@ -69,6 +69,45 @@ fn report_writes_a_document_to_stdout() {
     assert!(stdout.contains("Skipped mix.exs"), "{stdout}");
 }
 
+/// A manifest the config switches off is skipped, and its lockfile is then not the
+/// report's business: a Swift project with no `Package.resolved` must not carry
+/// advice on resolving a dependency list nobody asked to read into the document.
+#[test]
+fn report_carries_no_lockfile_note_for_a_skipped_manifest() {
+    let dir = workdir("report_swift_disabled_no_resolved");
+    fs::copy(
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/sample-swift/Package.swift"
+        ),
+        dir.join("Package.swift"),
+    )
+    .expect("copy Package.swift");
+    let config = dir.join("dependable.toml");
+    fs::write(&config, "[swift]\nenabled = false\n").expect("write the config");
+
+    let out = run(&[
+        "report",
+        dir.to_str().expect("a UTF-8 path"),
+        "--config",
+        config.to_str().expect("a UTF-8 path"),
+        "--no-vuln",
+    ]);
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("Skipped Package.swift"), "{stdout}");
+    assert!(
+        !stdout.contains("Package.resolved"),
+        "a skipped manifest gets no lockfile note; {stdout}"
+    );
+}
+
 #[test]
 fn report_output_flag_writes_a_file_and_leaves_stdout_empty() {
     let (dir, config) = hermetic_tree("report_output_file");

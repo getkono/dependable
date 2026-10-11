@@ -6,9 +6,11 @@ covers the other question: **why a language you use is not on that list, and wha
 put it there.**
 
 It exists because "no Kotlin support" is not itself a reason. Each of the three most
-frequently asked-about absences — Swift, the JVM languages, and C/C++ — fails for a
-different reason, at a different point in the pipeline, with a different amount of work
-between here and there. Writing the bar down makes those answers checkable and gives a
+frequently asked-about languages — Swift, the JVM languages, and C/C++ — fails the bar for
+a different reason, at a different point in the pipeline, with a different amount of work
+between here and there. Two of them have since shipped in part: the JVM's declarative
+manifests, and Swift's `Package.resolved` as a vulnerability-only path. C/C++ remains
+absent. Writing the bar down makes those answers checkable and gives a
 contributor something to build against.
 
 For what is deferred from the PRD, see [`SCOPE.md`](SCOPE.md). For how `dependable` sits
@@ -102,6 +104,13 @@ it is the `pubspec.lock` shape: versions without a tree.
 product, silently absent, on a per-manifest basis. That is not disqualifying, but it has
 to be labelled as loudly as the `UnreadableLockfile` notice is, or a Swift user
 reasonably concludes their dependencies are all current.
+
+**Shipped on those terms.** Swift is supported through `Package.resolved` alone, as the
+[**Supported languages**](../README.md#supported-languages) table records: every pin is
+scanned against `SwiftURL` and reported `undetermined`, every Swift manifest carries a
+warning that nothing in it could be checked for currency, a project with no
+`Package.resolved` is reported as unread rather than empty, and `--fix` does not apply.
+What it still lacks is G3 — currency checking waits on the trigger in §4.
 
 ### JVM (Kotlin / Java / Scala) — the registry is fine; the manifest is the problem
 
@@ -237,7 +246,7 @@ on evidence rather than on argument.
 | Candidate | Trigger | How to check |
 |---|---|---|
 | **JVM** | Nothing — it is admitted. The declarative slices are tracked as issues. | — |
-| **Swift** | Either a public SE-0292 registry with meaningful adoption, or acceptance that a vulnerability-only `check` is worth shipping when clearly labelled. | Adoption is a judgement call; the `Package.resolved`-only path is tracked as an issue and needs no trigger. |
+| **Swift** | The vulnerability-only `Package.resolved` path is admitted and shipped. Checking currency as well needs a public SE-0292 registry with meaningful adoption. | Adoption is a judgement call. |
 | **C / C++** | OSV publishing `vcpkg` or `ConanCenter` advisory data. That alone does not fix G3 or G4, but it is the gate that makes the rest worth reconsidering. | `curl -s https://osv-vulnerabilities.storage.googleapis.com/ecosystems.txt \| grep -iE 'vcpkg\|conan'` — currently returns nothing. |
 | **Any language in §3** | An issue describing a real project. | — |
 
