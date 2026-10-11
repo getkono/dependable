@@ -395,15 +395,19 @@ pub fn has_policy_table(path: &Path) -> bool {
 mod schema_tests {
     use super::*;
 
-    fn write(name: &str, content: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir()
-            .join("dependable-config-schema-tests")
-            .join(name);
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create the scratch directory");
-        let path = dir.join("dependable.toml");
+    /// Writes `content` to a `dependable.toml` in a fresh scratch directory no
+    /// other test process can pick, named after `name`.
+    ///
+    /// The directory is removed when the returned guard drops, so bind it to a
+    /// named variable (`_tmp`, not `_`) for the length of the test.
+    fn write(name: &str, content: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::Builder::new()
+            .prefix(&format!("dependable-config-schema-tests-{name}"))
+            .tempdir()
+            .expect("create the scratch directory");
+        let path = tmp.path().join("dependable.toml");
         std::fs::write(&path, content).expect("write the config");
-        path
+        (tmp, path)
     }
 
     /// `[policy]` is a known key in every build, enforced or not.
@@ -414,7 +418,7 @@ mod schema_tests {
     /// about unenforced policies exists to serve.
     #[test]
     fn a_policy_block_loads_whether_or_not_this_build_enforces_it() {
-        let path = write("policy_present", "[policy]\nmax_cvss = 7.0\n");
+        let (_tmp, path) = write("policy_present", "[policy]\nmax_cvss = 7.0\n");
         let config = load_config(&path).expect("a config carrying `[policy]` must load");
         // The rest of the file is still read, so this is not a blanket "ignore
         // everything" escape hatch.
@@ -425,7 +429,7 @@ mod schema_tests {
     /// error, in both builds.
     #[test]
     fn an_undeclared_key_is_still_rejected() {
-        let path = write("unknown_key", "[nonsense]\nvalue = 1\n");
+        let (_tmp, path) = write("unknown_key", "[nonsense]\nvalue = 1\n");
         assert!(load_config(&path).is_err());
     }
 }
@@ -436,41 +440,48 @@ mod tests {
     use std::path::PathBuf;
 
     use dependable_fetch::core::result::Severity;
+    use tempfile::TempDir;
 
     use super::*;
 
     /// A scratch directory of our own, so the tests never read the repository's
-    /// real `.dependable.toml`.
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir()
-            .join("dependable-config-tests")
-            .join(name);
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("create the scratch directory");
-        dir
+    /// real `.dependable.toml`, and one no other test process can pick, named
+    /// after `name`.
+    ///
+    /// The directory is removed when the returned guard drops, so bind it to a
+    /// named variable (`_tmp`, not `_`) for the length of the test.
+    fn scratch(name: &str) -> (TempDir, PathBuf) {
+        let tmp = tempfile::Builder::new()
+            .prefix(&format!("dependable-config-tests-{name}"))
+            .tempdir()
+            .expect("create the scratch directory");
+        let dir = tmp.path().to_path_buf();
+        (tmp, dir)
     }
 
-    fn write(name: &str, content: &str) -> PathBuf {
-        let path = scratch(name).join("dependable.toml");
+    fn write(name: &str, content: &str) -> (TempDir, PathBuf) {
+        let (tmp, dir) = scratch(name);
+        let path = dir.join("dependable.toml");
         fs::write(&path, content).expect("write the config");
-        path
+        (tmp, path)
     }
 
     #[test]
     fn a_missing_file_declares_no_policy() {
-        let path = scratch("missing").join("nope.toml");
+        let (_tmp, dir) = scratch("missing");
+        let path = dir.join("nope.toml");
         assert_eq!(load_policy(&path), Ok(PolicySource::Absent));
     }
 
     #[test]
     fn a_file_without_a_policy_block_declares_no_policy() {
-        let path = write("no_block", "[global]\nconcurrency = 4\n");
+        let (_tmp, path) = write("no_block", "[global]\nconcurrency = 4\n");
         assert_eq!(load_policy(&path), Ok(PolicySource::Absent));
     }
 
     #[test]
     fn an_unparseable_file_is_an_error_not_an_absent_policy() {
-        let path = write("broken", "this is not = = toml\n");
+        let (_tmp, path) = write("broken", "this is not = = toml\n");
         assert!(
             load_policy(&path).is_err(),
             "expected an error, got {:?}",
@@ -480,7 +491,7 @@ mod tests {
 
     #[test]
     fn a_valid_policy_block_is_loaded() {
-        let path = write(
+        let (_tmp, path) = write(
             "valid",
             "[policy]\nmax_cvss = 7.0\ndenied_packages = [{ name = \"left-pad\" }]\n",
         );
@@ -497,7 +508,7 @@ mod tests {
         // `Policy` denies unknown fields, so before `allowed_licenses` existed a
         // user copying the documented `[policy]` block got a hard parse error.
         // This test pins that case shut.
-        let path = write(
+        let (_tmp, path) = write(
             "licenses",
             "[policy]\nallowed_licenses = [\"MIT\", \"Apache-2.0\"]\nunknown_licenses = \"fail\"\n",
         );
@@ -514,7 +525,7 @@ mod tests {
     fn a_policy_that_exists_but_is_invalid_is_an_error() {
         // The hole this closes: `load_config` would swallow this into defaults,
         // leaving a gate that looks configured and enforces nothing.
-        let path = write("wrong_type", "[policy]\nmax_cvss = \"high\"\n");
+        let (_tmp, path) = write("wrong_type", "[policy]\nmax_cvss = \"high\"\n");
         assert!(load_policy(&path).is_err());
         // `load_config` used to return `Policy::default()` here — the same silent
         // fallback, one layer down. It now refuses the file outright.
@@ -526,7 +537,7 @@ mod tests {
     /// nothing on stderr to say so.
     #[test]
     fn a_wrong_typed_value_does_not_silently_disarm_the_gate() {
-        let path = write(
+        let (_tmp, path) = write(
             "wrong_typed_global",
             "[global]\nfail_on = \"vulnerable\"\nconcurrency = \"twenty\"\n",
         );
@@ -549,7 +560,7 @@ mod tests {
                 "[rust]\nregistery = \"https://example.test\"\n",
             ),
         ] {
-            let path = write(name, body);
+            let (_tmp, path) = write(name, body);
             assert!(load_config(&path).is_err(), "{name} was accepted");
         }
     }
@@ -557,7 +568,8 @@ mod tests {
     /// A file that is simply absent is still not an error.
     #[test]
     fn a_missing_config_is_defaults() {
-        let path = scratch("missing_config").join("nope.toml");
+        let (_tmp, dir) = scratch("missing_config");
+        let path = dir.join("nope.toml");
         let cfg = load_config(&path).expect("a missing file is not an error");
         assert_eq!(cfg.global.fail_on, FailOn::None);
         assert_eq!(cfg.global.concurrency, 20);
@@ -565,7 +577,7 @@ mod tests {
 
     #[test]
     fn a_mistyped_policy_key_is_an_error_that_names_the_key() {
-        let path = write("typo", "[policy]\nmax_cvvs = 7.0\n");
+        let (_tmp, path) = write("typo", "[policy]\nmax_cvvs = 7.0\n");
         let error = load_policy(&path)
             .expect_err("a typo is an error")
             .to_string();
@@ -574,7 +586,7 @@ mod tests {
 
     #[test]
     fn an_unknown_severity_is_an_error_that_lists_the_bands() {
-        let path = write("band", "[policy]\nfail_on_severity = \"nope\"\n");
+        let (_tmp, path) = write("band", "[policy]\nfail_on_severity = \"nope\"\n");
         let error = load_policy(&path)
             .expect_err("an unknown band is an error")
             .to_string();
@@ -586,7 +598,7 @@ mod tests {
     fn the_config_field_and_load_policy_agree() {
         // One schema, one figment: the embedded field cannot drift from the
         // separately loaded one.
-        let path = write(
+        let (_tmp, path) = write(
             "agree",
             "[policy]\nfail_on_severity = \"high\"\nmax_major_behind = 2\n",
         );
