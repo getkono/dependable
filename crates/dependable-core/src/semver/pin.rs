@@ -2,7 +2,7 @@
 //!
 //! Most constraints are ranges: they say which releases a project would accept,
 //! not which one it uses. A few name a single release outright — Cargo's
-//! `=1.2.3`, PEP 440's `==2.28.1`, NuGet's `[1.2.3]`, a bare Maven or Hex
+//! `=1.2.3`, PEP 440's `==2.28.1`, NuGet's `[1.2.3]`, a bare Maven, Hex, or NuGet
 //! version — and for those the manifest has already answered the question a
 //! lockfile would otherwise have to. [`exact_pin`] is how a caller with only a
 //! manifest in hand tells the two apart.
@@ -78,8 +78,8 @@ const NOT_IN_A_VERSION: &[char] = &[
 /// is whether *that* string parses.
 ///
 /// Note that "exact" is the translator's reading, not the string's shape. A bare
-/// `1.2.3` translates to an exact version for Maven and Hex, a caret range for
-/// Cargo, Python, npm, and Dart, and an open lower bound for NuGet — this reports
+/// `1.2.3` translates to an exact version for Maven, Hex, and NuGet, and a caret
+/// range for Cargo, Python, npm, and Dart — this reports
 /// a pin only where that ecosystem's translator already says so. For npm and Dart
 /// the caret reading is this tree's, not the ecosystem's: both read a bare version
 /// as exact, so their pins go unreported until the translator agrees (#155 for
@@ -150,9 +150,12 @@ mod tests {
     fn recognizes_exactly_the_constraints_that_name_one_release() {
         let cases: &[(&str, Ecosystem, Option<&str>)] = &[
             // -- C# / NuGet ------------------------------------------------
-            // A bare `Version` is an inclusive *minimum* in NuGet, so it names a
-            // set. See `semver::nuget`; #113 tracks whether that reading is right.
-            ("13.0.1", Ecosystem::CSharp, None),
+            // A bare `Version` is read as exact (#113): it is the release restore
+            // resolves to. A partial one is exact too, but `1.0` is not a
+            // `semver::Version` as written, so it is not reported.
+            ("13.0.1", Ecosystem::CSharp, Some("13.0.1")),
+            ("1.0", Ecosystem::CSharp, None),
+            ("1.0.0.4", Ecosystem::CSharp, None),
             ("[2.10.0,3.0.0)", Ecosystem::CSharp, None),
             ("[1.2.3]", Ecosystem::CSharp, Some("1.2.3")),
             ("1.*", Ecosystem::CSharp, None),
