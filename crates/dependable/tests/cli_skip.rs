@@ -7,14 +7,22 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
+use tempfile::TempDir;
+
 const MIX_EXS: &str = "defmodule Sample.MixProject do\n  use Mix.Project\n  defp deps do\n    [{:phoenix, \"~> 1.7\"}]\n  end\nend\n";
 const DISABLE_ELIXIR: &str = "[elixir]\nenabled = false\n";
 
-fn workdir(name: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir
+/// A fresh scratch directory no other test process can pick, named after `name`.
+///
+/// The directory is removed when the returned guard drops, so bind it to a named
+/// variable (`_tmp`, not `_`) for the length of the test.
+fn workdir(name: &str) -> (TempDir, PathBuf) {
+    let tmp = tempfile::Builder::new()
+        .prefix(name)
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
+    let dir = tmp.path().to_path_buf();
+    (tmp, dir)
 }
 
 fn run(args: &[&str]) -> std::process::Output {
@@ -26,7 +34,7 @@ fn run(args: &[&str]) -> std::process::Output {
 
 #[test]
 fn check_skips_disabled_ecosystem() {
-    let dir = workdir("skip_check_disabled");
+    let (_tmp, dir) = workdir("skip_check_disabled");
     fs::write(dir.join("mix.exs"), MIX_EXS).unwrap();
     let config = dir.join("dependable.toml");
     fs::write(&config, DISABLE_ELIXIR).unwrap();
@@ -49,7 +57,7 @@ fn check_skips_disabled_ecosystem() {
 
 #[test]
 fn list_surfaces_supported_manifest() {
-    let dir = workdir("list_supported");
+    let (_tmp, dir) = workdir("list_supported");
     fs::write(dir.join("mix.exs"), MIX_EXS).unwrap();
 
     let output = run(&["list", dir.to_str().unwrap()]);
