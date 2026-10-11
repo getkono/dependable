@@ -1228,6 +1228,11 @@ fn resolve_report_settings(args: &crate::cli::ReportArgs, cfg: &Config) -> Setti
 /// there is no line here to rewrite. Without this the two commands appear to contradict
 /// each other, and nothing points at the file that can actually be changed.
 ///
+/// `PackageSource::Inherited` and not merely "has no position": a
+/// [`PackageSource::Locked`] entry is also skipped by `fix`, but there is no root
+/// holding its version, so this note has no file to send the reader to. Swift is told
+/// so once per project instead, by the check itself.
+///
 /// Returns how many it named, because the summary line has to know. These never
 /// reach [`fix::plan`]'s declined list — the item is not rewritable, so the
 /// planner drops it before any constraint is consulted — and a summary counting
