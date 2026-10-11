@@ -10,6 +10,17 @@
 //! The scan is total: every reachable input either yields values or stops. Malformed
 //! input yields whatever was scanned up to the error, and never panics or loops —
 //! manifests arrive half-written from editors often enough that both were reachable.
+//! Nesting deeper than 256 objects and arrays is treated the same way: the scan
+//! stops there and keeps what it found, because the recursion that walks containers
+//! would otherwise overflow the stack, and an overflow aborts the process outright.
+
+/// The deepest nesting of objects and arrays the scan descends into.
+///
+/// A container opened beyond it ends the scan, as malformed input does: the values
+/// already found are kept and the document is reported not well-formed. Real
+/// manifests nest a handful of levels; the bound exists so that crafted input — a
+/// pull request's `package.json` of fifty thousand `[` — cannot exhaust the stack.
+const MAX_DEPTH: usize = 256;
 
 /// A string value found in a JSON(C) document.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,9 +83,11 @@ pub fn scan_document(src: &str) -> ScannedJson {
         i: 0,
         out: Vec::new(),
         well_formed: true,
+        path: Vec::new(),
+        depth: 0,
     };
     scanner.skip_trivia();
-    scanner.parse_value(&[]);
+    scanner.parse_value();
     scanner.skip_trivia();
     // Anything after the top-level value belongs to no value at all.
     if scanner.i < scanner.bytes.len() {
@@ -102,6 +115,11 @@ struct Scanner<'a> {
     /// Cleared the moment the document departs from JSON's grammar. Never
     /// consulted by the scan itself, which always keeps going.
     well_formed: bool,
+    /// The path to the value at the cursor: a key or index is pushed on entering
+    /// a member and popped on leaving it, so descending costs no copy of the path.
+    path: Vec<String>,
+    /// How many containers enclose the cursor, bounded by [`MAX_DEPTH`].
+    depth: usize,
 }
 
 impl Scanner<'_> {
@@ -137,15 +155,24 @@ impl Scanner<'_> {
     }
 
     /// Parse a value (object, array, string, or scalar) at the cursor, recording
-    /// any string values reachable under `path`.
-    fn parse_value(&mut self, path: &[String]) {
+    /// any string values reachable under the current path.
+    fn parse_value(&mut self) {
         match self.bytes.get(self.i) {
-            Some(b'{') => self.parse_object(path),
-            Some(b'[') => self.parse_array(path),
+            Some(b'{' | b'[') if self.depth >= MAX_DEPTH => self.stop(),
+            Some(b'{') => {
+                self.depth += 1;
+                self.parse_object();
+                self.depth -= 1;
+            }
+            Some(b'[') => {
+                self.depth += 1;
+                self.parse_array();
+                self.depth -= 1;
+            }
             Some(b'"') => {
                 if let Some(s) = self.parse_string() {
                     self.out.push(JsonStringValue {
-                        path: path.to_vec(),
+                        path: self.path.clone(),
                         value: s.value,
                         content_start: s.start,
                         content_end: s.end,
@@ -161,7 +188,15 @@ impl Scanner<'_> {
         }
     }
 
-    fn parse_object(&mut self, path: &[String]) {
+    /// End the scan where it stands: the document is not well-formed, and every
+    /// enclosing frame finds the input exhausted and returns, so the values already
+    /// recorded are the scan's result.
+    fn stop(&mut self) {
+        self.well_formed = false;
+        self.i = self.bytes.len();
+    }
+
+    fn parse_object(&mut self) {
         self.i += 1; // consume '{'
         loop {
             self.skip_trivia();
@@ -211,13 +246,13 @@ impl Scanner<'_> {
             }
             self.i += 1; // consume ':'
             self.skip_trivia();
-            let mut child = path.to_vec();
-            child.push(key.value);
-            self.parse_value(&child);
+            self.path.push(key.value);
+            self.parse_value();
+            self.path.pop();
         }
     }
 
-    fn parse_array(&mut self, path: &[String]) {
+    fn parse_array(&mut self) {
         self.i += 1; // consume '['
         let mut index = 0usize;
         loop {
@@ -245,10 +280,10 @@ impl Scanner<'_> {
                 }
                 _ => {}
             }
-            let mut child = path.to_vec();
-            child.push(index.to_string());
+            self.path.push(index.to_string());
             let before = self.i;
-            self.parse_value(&child);
+            self.parse_value();
+            self.path.pop();
             // Nothing below is allowed to stall: a scalar that begins with a byte
             // `skip_scalar` treats as a terminator would otherwise spin here forever.
             if self.i == before {
@@ -632,6 +667,64 @@ mod tests {
         // A bare token that is no JSON literal.
         assert!(!scan_document(r#"{ "a": nope }"#).well_formed);
         assert!(scan_document(r#"{ "a": -1.5e3 }"#).well_formed);
+    }
+
+    /// `depth` arrays nested inside one another, holding a single string.
+    fn nested_arrays(depth: usize) -> String {
+        format!("{}\"deep\"{}", "[".repeat(depth), "]".repeat(depth))
+    }
+
+    /// Nesting up to the bound scans like any other document: the innermost value
+    /// is found under its full path, and the document is whole.
+    #[test]
+    fn nesting_at_the_depth_bound_scans_whole() {
+        let scanned = scan_document(&nested_arrays(MAX_DEPTH));
+        assert!(scanned.well_formed);
+        assert_eq!(scanned.values.len(), 1);
+        assert_eq!(scanned.values[0].value, "deep");
+        assert_eq!(scanned.values[0].path, vec!["0"; MAX_DEPTH]);
+
+        let objects = format!(
+            "{}\"deep\"{}",
+            "{\"k\":".repeat(MAX_DEPTH),
+            "}".repeat(MAX_DEPTH)
+        );
+        let scanned = scan_document(&objects);
+        assert!(scanned.well_formed);
+        assert_eq!(scanned.values[0].path, vec!["k"; MAX_DEPTH]);
+    }
+
+    /// One container past the bound stops the scan instead of descending: what came
+    /// before is kept, nothing after is invented, and the document is not whole.
+    #[test]
+    fn nesting_past_the_depth_bound_stops_and_keeps_the_prefix() {
+        let scanned = scan_document(&nested_arrays(MAX_DEPTH + 1));
+        assert!(!scanned.well_formed);
+        assert!(scanned.values.is_empty());
+
+        let src = format!(
+            r#"{{"name": "demo", "deep": {}, "after": "unreached"}}"#,
+            nested_arrays(MAX_DEPTH)
+        );
+        let scanned = scan_document(&src);
+        assert!(!scanned.well_formed);
+        let got = paths(&scanned.values);
+        assert_eq!(got, vec![(vec!["name"], "demo")]);
+    }
+
+    /// Unbounded recursion overflowed the stack here, and an overflow aborts the
+    /// process rather than panicking. The scan must return.
+    #[test]
+    fn hostile_nesting_returns_rather_than_overflowing_the_stack() {
+        for src in [
+            "[".repeat(100_000),
+            "{\"a\":".repeat(100_000),
+            nested_arrays(100_000),
+        ] {
+            let scanned = scan_document(&src);
+            assert!(!scanned.well_formed);
+            assert!(scanned.values.is_empty());
+        }
     }
 
     #[test]
