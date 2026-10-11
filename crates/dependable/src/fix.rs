@@ -97,7 +97,9 @@ pub enum DeclineReason {
     /// [`Item::is_pinned`](dependable_fetch::core::Item::is_pinned). Not a
     /// refusal by the constraint's *shape* — the rewrite would succeed — but the
     /// author holds the version deliberately, and the action that changes it is a
-    /// flag rather than a rewrite of the constraint.
+    /// flag rather than a rewrite of the constraint. A lone `=` in front of a
+    /// partial (`=1.2`) is counted as a pin but reports [`Self::EqualsPartial`],
+    /// because `--all` would not move it either.
     Pinned,
     /// No version resolved to write: the row has an update and neither
     /// `latest_compatible` (the default target) nor `latest_available` (under
@@ -431,12 +433,29 @@ fn plan_fixes(
         // `forced` guard below names `--overrides` in turn. Each note is true at
         // the moment it is printed, which is what
         // `an_override_that_is_also_a_pin_reports_the_pin` walks through.
+        //
+        // Unless the constraint's shape refuses the rewrite anyway: `is_pinned`
+        // counts a lone `=` by its operator, so `=1.2` lands here, but it is a
+        // range that `rewrite_constraint` declines as `EqualsPartial` — with
+        // `--all` as well. A note naming `--all` would then point at a flag that
+        // does not move it, so the shape's own reason is reported instead (#157),
+        // naming the same version `--all` would name, so the note reads the same
+        // with or without the flag. Every refusal `rewrite_constraint` makes reads
+        // only the constraint, never the version it would write, so asking it with
+        // the constraint itself as the version answers the question.
         if item.is_pinned(ecosystem) && !all {
+            let reason = rewrite_constraint(
+                &item.version_constraint,
+                &item.version_constraint,
+                ecosystem,
+            )
+            .err()
+            .unwrap_or(DeclineReason::Pinned);
             declined.push(Declined {
                 name: item.name.clone(),
                 constraint: item.version_constraint.clone(),
                 target: result.latest_available.clone(),
-                reason: DeclineReason::Pinned,
+                reason,
             });
             continue;
         }
@@ -1190,6 +1209,52 @@ mod tests {
         );
         assert_eq!(records.len(), 1, "{records:?}");
         assert!(declined.is_empty(), "{declined:?}");
+    }
+
+    /// Issue #157: a lone `=` in front of a partial (`=1.2`, `=16`) is counted
+    /// by `is_pinned` as a pin, but it is a range `--all` declines as
+    /// [`DeclineReason::EqualsPartial`] and never moves. Without `--all` the
+    /// note has to give that reason too, not [`DeclineReason::Pinned`], whose
+    /// clause points at a flag that would not help.
+    #[test]
+    fn an_equals_partial_is_declined_for_its_shape_not_as_a_pin() {
+        let cargo = "[dependencies]\nserde = \"=1.2\"\n";
+        let npm = r#"{
+  "dependencies": {
+    "react": "=16"
+  }
+}
+"#;
+        for (kind, content, name, target) in [
+            (ManifestKind::CargoToml, cargo, "serde", "1.2.9"),
+            (ManifestKind::PackageJson, npm, "react", "16.14.0"),
+        ] {
+            let results = results_for(kind, content, &[(name, target)]);
+            assert_eq!(
+                results.len(),
+                1,
+                "{kind:?}: the fixture must produce one item"
+            );
+            assert!(
+                results[0].item.is_pinned(Some(kind.ecosystem())),
+                "{kind:?}: the fixture must be one `is_pinned` counts"
+            );
+            for all in [false, true] {
+                let (updated, records, declined) =
+                    plan_fixes(content, &results, all, false, Some(kind.ecosystem()))
+                        .expect("the plan applies");
+                assert_eq!(updated, content, "{kind:?} all={all}: the range was pinned");
+                assert!(records.is_empty(), "{kind:?} all={all}: {records:?}");
+                assert_eq!(
+                    declined
+                        .iter()
+                        .map(|item| (item.reason, item.target.as_deref()))
+                        .collect::<Vec<_>>(),
+                    [(DeclineReason::EqualsPartial, Some(target))],
+                    "{kind:?} all={all}: {declined:?}"
+                );
+            }
+        }
     }
 
     /// A `$name` override is a reference to another entry's constraint, and the
