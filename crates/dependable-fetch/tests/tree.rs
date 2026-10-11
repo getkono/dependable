@@ -1,10 +1,10 @@
 //! Hermetic tests for the offline workspace graph builder (no network).
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use dependable_fetch::{
-    DependencyGraph, GraphSource, NodeKind, TreeOptions, WorkspaceGraphOptions,
+    DependencyGraph, GraphSource, NodeKind, TreeOptions, WorkspaceGraph, WorkspaceGraphOptions,
     build_workspace_graph,
 };
 use tempfile::TempDir;
@@ -139,6 +139,18 @@ fn version_of<'g>(graph: &'g DependencyGraph, name: &str) -> Option<&'g str> {
         .as_deref()
 }
 
+/// The nested workspace root `built` reports for one node, panicking if there is
+/// no such node, so a missing node cannot pass as "not nested".
+fn nested_root_of<'b>(built: &'b WorkspaceGraph, name: &str) -> Option<&'b Path> {
+    let idx = built
+        .graph
+        .nodes()
+        .iter()
+        .position(|n| n.name == name)
+        .unwrap_or_else(|| panic!("node {name} missing"));
+    built.nested_roots.get(&idx).map(PathBuf::as_path)
+}
+
 fn kind_of(graph: &DependencyGraph, name: &str) -> NodeKind {
     graph
         .nodes()
@@ -187,6 +199,8 @@ fn builds_resolved_graph_from_lockfile() {
 
     // The excluded crate is not a member.
     assert!(g.nodes().iter().all(|n| n.name != "legacy"));
+    // One workspace, so no node is governed by another root.
+    assert!(built.nested_roots.is_empty(), "{:?}", built.nested_roots);
 
     // Inter-member edge a -> b, and the duplicate syn versions are distinct.
     let flat = flatten(g);
@@ -400,6 +414,84 @@ version = "7.7.7"
         Some("7.7.7"),
         "and a version the crate states outright is still its own"
     );
+
+    // Resolved against a different root, and the graph says which one: `a-fuzz`'s
+    // `0.0.0` must not read like `a`'s `1.0.0`.
+    assert_eq!(nested_root_of(&built, "a"), None);
+    assert_eq!(nested_root_of(&built, "a-fuzz"), Some(Path::new("fuzz")));
+    assert_eq!(
+        nested_root_of(&built, "a-fuzz-stated"),
+        Some(Path::new("fuzz")),
+        "a crate deeper in the nested tree names the root that governs it, not its own directory"
+    );
+    assert_eq!(built.nested_roots.len(), 2, "{:?}", built.nested_roots);
+    // `tree --invert` renders the inverted graph against the same table.
+    let inverted = built.graph.inverted();
+    for (&idx, dir) in &built.nested_roots {
+        assert_eq!(inverted.nodes()[idx], built.graph.nodes()[idx], "{dir:?}");
+    }
+}
+
+/// A lockfile graph marks a nested crate the same way, where the lockfile lists it:
+/// whose root governs a crate is a fact about the scan, not about where its version
+/// was read. A nested crate the lockfile does not list has no node, and so no entry.
+#[test]
+fn a_lockfile_graph_marks_the_nested_crates_it_lists() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    fs::write(
+        dir.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"crates/a\"]\n",
+    )
+    .unwrap();
+    let member = dir.join("crates").join("a");
+    fs::create_dir_all(&member).unwrap();
+    fs::write(
+        member.join("Cargo.toml"),
+        "[package]\nname = \"a\"\nversion = \"1.0.0\"\n",
+    )
+    .unwrap();
+    for (sub, name) in [("fuzz", "a-fuzz"), ("examples", "a-example")] {
+        let nested = dir.join(sub);
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(
+            nested.join("Cargo.toml"),
+            format!("[workspace]\n\n[package]\nname = \"{name}\"\nversion = \"0.0.0\"\n"),
+        )
+        .unwrap();
+    }
+    fs::write(
+        dir.join("Cargo.lock"),
+        r#"version = 4
+
+[[package]]
+name = "a"
+version = "1.0.0"
+
+[[package]]
+name = "a-fuzz"
+version = "0.0.0"
+dependencies = [
+ "a",
+]
+"#,
+    )
+    .unwrap();
+
+    let built = build_workspace_graph(dir, &WorkspaceGraphOptions::default()).unwrap();
+    assert_eq!(built.source, GraphSource::Lockfile);
+    assert_eq!(nested_root_of(&built, "a"), None);
+    assert_eq!(nested_root_of(&built, "a-fuzz"), Some(Path::new("fuzz")));
+    assert!(
+        built.graph.nodes().iter().all(|n| n.name != "a-example"),
+        "the fixture must leave `a-example` out of the lockfile"
+    );
+    assert_eq!(
+        built.nested_roots.len(),
+        1,
+        "no entry for a crate with no node: {:?}",
+        built.nested_roots
+    );
 }
 
 /// The guard on the fix above: a nested root that declares a `[workspace]` and no
@@ -544,6 +636,17 @@ version.workspace = true
         version_of(g, "leaf"),
         Some("3.0.0"),
         "the nearest [workspace] ancestor governs, not the outermost"
+    );
+    // And the nearest one is the root each crate is reported under.
+    assert_eq!(nested_root_of(&built, "a"), None);
+    assert_eq!(nested_root_of(&built, "mid"), Some(Path::new("mid")));
+    assert_eq!(
+        nested_root_of(&built, "inner"),
+        Some(Path::new("mid").join("inner").as_path())
+    );
+    assert_eq!(
+        nested_root_of(&built, "leaf"),
+        Some(Path::new("mid").join("inner").as_path())
     );
 }
 
@@ -806,6 +909,17 @@ shared-dep.workspace = true
         version_of(g, "shared-dep"),
         None,
         "and no dependency constraint either — the outer `[workspace.dependencies]` does not reach across"
+    );
+    assert_eq!(
+        nested_root_of(&built, "target-crate"),
+        Some(Path::new("fuzz")),
+        "the unreadable root is still the boundary the crate is reported under"
+    );
+    assert_eq!(nested_root_of(&built, "a"), None);
+    assert_eq!(
+        nested_root_of(&built, "shared-dep"),
+        None,
+        "only a workspace node is ever listed"
     );
 }
 

@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use dependable_core::{
     CargoTomlParser, DependencyGraph, DependencyKind, Ecosystem, Item, LockedPackage, LockfileKind,
-    ManifestKind, PackageSource, ParseError, Parser, ResolvedLockfile, exact_pin, parse,
+    ManifestKind, NodeKind, PackageSource, ParseError, Parser, ResolvedLockfile, exact_pin, parse,
     parse_bun_lock_graph, parse_cargo_lock_graph, parse_composer_lock_graph, parse_mix_lock_graph,
     parse_package_lock_graph, parse_package_name, parse_project, parse_workspace,
     resolve_workspace_inheritance,
@@ -70,6 +70,29 @@ pub struct WorkspaceGraph {
     pub graph: DependencyGraph,
     /// Whether the graph is the full resolved one or the shallow fallback.
     pub source: GraphSource,
+    /// The [`NodeKind::Workspace`] nodes that
+    /// belong to a *nested* workspace rather than the scanned one, each mapped to
+    /// that nested root's directory relative to the scanned root (`fuzz`,
+    /// `examples/demo`).
+    ///
+    /// A scan descends into a `fuzz/` or `examples/` tree with its own `[workspace]`
+    /// table, and the crates there are workspace crates — just not *this*
+    /// workspace's. Their `version.workspace = true` and `dep.workspace = true` are
+    /// resolved against that nested root, so a version read for one came from a
+    /// different authority than a governed member's. This is where that is said.
+    ///
+    /// A directory whose `Cargo.toml` exists but cannot be read or parsed counts as
+    /// such a root too: it may declare a `[workspace]`, so the crates beneath it are
+    /// not resolved against the scanned root either, and they are listed here under
+    /// that directory.
+    ///
+    /// Kept beside the graph rather than on each node, as [`Self::source`] is: it is
+    /// a fact about how this scan was made, read off the filesystem, and the
+    /// IO-free graph model has no notion of a workspace root's directory. Keys are
+    /// indices into [`DependencyGraph::nodes`]; [`DependencyGraph::inverted`] keeps
+    /// every index, so they hold for the inverted graph too. Empty for every graph
+    /// that is not a Cargo workspace scan, and for a scan with no nested root.
+    pub nested_roots: BTreeMap<usize, PathBuf>,
 }
 
 /// Options for [`build_workspace_graph`].
@@ -141,6 +164,7 @@ pub fn build_workspace_graph(
         let resolved = parse_cargo_lock_graph(&lock_content)?;
         let graph = DependencyGraph::from_resolved(&resolved, &workspace_names, &roots);
         return Ok(WorkspaceGraph {
+            nested_roots: nested_roots(&graph, &members, &scopes, &root_dir),
             graph,
             source: GraphSource::Lockfile,
         });
@@ -148,9 +172,41 @@ pub fn build_workspace_graph(
 
     let graph = shallow_graph(&members, &workspace_names, &roots, &scopes);
     Ok(WorkspaceGraph {
+        nested_roots: nested_roots(&graph, &members, &scopes, &root_dir),
         graph,
         source: GraphSource::Manifests,
     })
+}
+
+/// Which of `graph`'s workspace nodes a nested root governs, and where that root
+/// is relative to `root_dir`: the value of [`WorkspaceGraph::nested_roots`].
+///
+/// Matched by name, which is unambiguous for a workspace node: the member walk
+/// keeps one crate per `[package] name`, and a dependency sharing a member's name
+/// is classified as that member rather than as a second node.
+fn nested_roots(
+    graph: &DependencyGraph,
+    members: &[Member],
+    scopes: &[Scope],
+    root_dir: &Path,
+) -> BTreeMap<usize, PathBuf> {
+    // Scope 0 is the scanned root, which governs everything that is not listed.
+    let nested: HashMap<&str, &Path> = members
+        .iter()
+        .filter(|member| member.scope != 0)
+        .map(|member| (member.name.as_str(), scopes[member.scope].dir.as_path()))
+        .collect();
+    graph
+        .nodes()
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| node.kind == NodeKind::Workspace)
+        .filter_map(|(idx, node)| {
+            let dir = nested.get(node.name.as_str())?;
+            let relative = dir.strip_prefix(root_dir).unwrap_or(dir);
+            Some((idx, relative.to_path_buf()))
+        })
+        .collect()
 }
 
 /// Walk up from `start` to the workspace root directory: the nearest ancestor
@@ -189,11 +245,14 @@ fn excluded_dirs(root_dir: &Path, root_content: &str) -> HashSet<PathBuf> {
 /// `version.workspace = true` and its `dep.workspace = true` name the *same* root;
 /// answering them from different manifests is the bug this type exists to prevent.
 ///
-/// The [`Default`] scope — both tables empty — is what an *opaque* boundary gets:
+/// A scope with both tables empty is what an *opaque* boundary gets:
 /// a root whose manifest cannot be read or parsed lends no authority at all, but
 /// still stops the enclosing root's from reaching past it.
 #[derive(Default)]
 struct Scope {
+    /// The directory holding this root's `Cargo.toml`, which is what
+    /// [`WorkspaceGraph::nested_roots`] names for the crates it governs.
+    dir: PathBuf,
     /// `[workspace.package]`, the source of a member's `version.workspace = true`.
     package_defaults: BTreeMap<String, String>,
     /// `[workspace.dependencies]`, the source of a member's `dep.workspace = true`.
@@ -206,8 +265,9 @@ struct Scope {
 /// — which is the honest answer rather than a fallback: a root declaring no
 /// `[workspace.package] version` resolves its members' `version.workspace = true`
 /// to nothing, never to some other root's number.
-fn scope_of(content: &str) -> Scope {
+fn scope_of(dir: &Path, content: &str) -> Scope {
     Scope {
+        dir: dir.to_path_buf(),
         package_defaults: parse_workspace(content)
             .map(|ws| ws.package_defaults)
             .unwrap_or_default(),
@@ -292,7 +352,7 @@ fn collect_members(
         members: Vec::new(),
         // The scan root is index 0, and a nested root can only be pushed after the
         // root that contains it — so a smaller index is always the outer scope.
-        scopes: vec![scope_of(root_content)],
+        scopes: vec![scope_of(root_dir, root_content)],
     };
     walk.descend(root_dir, 64, 0);
     (walk.members, walk.scopes)
@@ -332,7 +392,7 @@ impl Walk<'_> {
             Boundary::Manifest(content)
                 if dir != self.root_dir && parse_workspace(content).is_some() =>
             {
-                self.scopes.push(scope_of(content));
+                self.scopes.push(scope_of(dir, content));
                 self.scopes.len() - 1
             }
             // A manifest that exists but cannot be read or parsed is an opaque
@@ -342,7 +402,10 @@ impl Walk<'_> {
             // borrowing an enclosing root's — a file that exists and cannot be read is
             // not evidence that the outer root governs what is beneath it.
             Boundary::Opaque if dir != self.root_dir => {
-                self.scopes.push(Scope::default());
+                self.scopes.push(Scope {
+                    dir: dir.to_path_buf(),
+                    ..Scope::default()
+                });
                 self.scopes.len() - 1
             }
             _ => scope,
@@ -580,6 +643,7 @@ pub fn build_project_graph(
         return Ok(WorkspaceGraph {
             graph,
             source: GraphSource::Unsupported,
+            nested_roots: BTreeMap::new(),
         });
     }
 
@@ -598,7 +662,11 @@ pub fn build_project_graph(
         } else {
             GraphSource::UnreadableLockfile
         };
-        return Ok(WorkspaceGraph { graph, source });
+        return Ok(WorkspaceGraph {
+            graph,
+            source,
+            nested_roots: BTreeMap::new(),
+        });
     };
 
     // The manifest has *a* format we can read edges from, but the one actually
@@ -615,6 +683,7 @@ pub fn build_project_graph(
         return Ok(WorkspaceGraph {
             graph,
             source: GraphSource::Unsupported,
+            nested_roots: BTreeMap::new(),
         });
     };
 
@@ -635,6 +704,7 @@ pub fn build_project_graph(
             return Ok(WorkspaceGraph {
                 graph,
                 source: GraphSource::UnreadableLockfile,
+                nested_roots: BTreeMap::new(),
             });
         }
     };
@@ -642,6 +712,7 @@ pub fn build_project_graph(
     Ok(WorkspaceGraph {
         graph: DependencyGraph::from_resolved(&resolved, &workspace_names, &roots),
         source: GraphSource::Lockfile,
+        nested_roots: BTreeMap::new(),
     })
 }
 
