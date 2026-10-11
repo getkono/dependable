@@ -35,7 +35,7 @@ use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
 
 use dependable_fetch::core::result::Advisory;
-use dependable_fetch::{CheckResult, DependencyStatus};
+use dependable_fetch::{CheckResult, DependencyStatus, Ecosystem};
 
 use crate::cli::AnnotationMode;
 use crate::output::{ManifestReport, Summary, current_display, latest_display};
@@ -102,12 +102,11 @@ impl Level {
 /// declared constraint is noise on a pull request. It still appears in the table
 /// and in the job summary's totals.
 ///
-/// `Undetermined` is excluded too, but for a different reason and with a
-/// different remedy. It is not a per-dependency finding a reviewer can act on —
-/// in a registryless ecosystem *every* row carries it — so annotating each one
-/// would spend the whole ten-per-step budget saying the same thing. The fact is
-/// instead carried by the job summary, in [`totals`] and in [`caveats`], and by
-/// [`unread_command`] where the dependency list itself went unread.
+/// `Undetermined` is a notice, like `Error`: both say the dependency was not
+/// checked. In an ecosystem with no registry *every* row carries it, so those
+/// notices say why in their own words (see [`message`]) and share the notice
+/// level's ten-per-step cap; the job summary, in [`totals`] and in [`caveats`],
+/// still counts every one of them.
 ///
 /// Levels are independent of `--fail-on`. Deriving the level from whether a
 /// finding trips the gate would make a vulnerability a warning under
@@ -134,6 +133,20 @@ struct Finding<'a> {
     /// What to show a human: [`Self::file`] when there is one, else the
     /// absolute path.
     manifest: String,
+    /// The manifest's ecosystem, which decides why an `Undetermined` result
+    /// could not be checked.
+    ecosystem: Ecosystem,
+}
+
+impl Finding<'_> {
+    /// Whether this result went unchecked because its ecosystem publishes no
+    /// registry, rather than because its declared version could not be read.
+    ///
+    /// Only a checkable item qualifies: a path or git entry, or one whose version
+    /// is missing, would have gone unchecked with a registry too.
+    fn is_registryless(&self) -> bool {
+        !self.ecosystem.has_registry() && self.result.item.is_checkable()
+    }
 }
 
 /// Escape a workflow-command **message** (everything after `::`).
@@ -258,6 +271,7 @@ fn group<'a>(
                 result,
                 file: file.clone(),
                 manifest: manifest.clone(),
+                ecosystem: report.ecosystem,
             });
         }
     }
@@ -385,6 +399,13 @@ fn message(finding: &Finding<'_>, level: Level) -> String {
         ),
         Level::Notice => match &result.status {
             DependencyStatus::Error(why) => format!("{name} could not be checked: {why}"),
+            // The version was read (a Swift pin's comes from `Package.resolved`), so
+            // "could not be read" would be false: what is missing is a registry.
+            DependencyStatus::Undetermined if finding.is_registryless() => format!(
+                "{name} {current} could not be checked for a newer version: {} publishes \
+                 no package registry",
+                finding.ecosystem.display_name()
+            ),
             DependencyStatus::Undetermined => {
                 format!("{name} could not be checked: its declared version could not be read")
             }
@@ -1380,5 +1401,62 @@ mod tests {
         );
         assert_eq!(level_of(&DependencyStatus::UpToDate), None);
         assert_eq!(level_of(&DependencyStatus::PatchAvailable), None);
+    }
+
+    /// A registry-less ecosystem's `Undetermined` is a version that *was* read and
+    /// had nowhere to be compared, so its notice says that rather than claiming the
+    /// version could not be read. Anywhere else the old text still holds.
+    #[test]
+    fn an_undetermined_notice_names_a_missing_registry_only_where_there_is_none() {
+        let undetermined =
+            || CheckResult::new(item("swift-nio", 3), DependencyStatus::Undetermined);
+        let mut swift = report("/w/Package.swift", vec![undetermined()]);
+        swift.ecosystem = Ecosystem::Swift;
+        let rust = report("/w/Cargo.toml", vec![undetermined()]);
+
+        let swift_lines = lines_for(&[swift]);
+        assert_eq!(swift_lines.len(), 1, "{swift_lines:?}");
+        assert!(
+            swift_lines[0].contains(
+                "could not be checked for a newer version: Swift publishes no package registry"
+            ),
+            "{swift_lines:?}"
+        );
+        assert!(
+            !swift_lines[0].contains("could not be read"),
+            "{swift_lines:?}"
+        );
+
+        let rust_lines = lines_for(&[rust]);
+        assert!(
+            rust_lines[0]
+                .contains("swift-nio could not be checked: its declared version could not be read"),
+            "{rust_lines:?}"
+        );
+    }
+
+    /// An entry with no version to check would have gone unchecked with a registry
+    /// too, so blaming the missing registry for it would be the opposite mistake.
+    #[test]
+    fn an_unversioned_registryless_entry_keeps_the_could_not_be_read_text() {
+        let mut unversioned = item("swift-nio", 3);
+        unversioned.source = PackageSource::Unresolved;
+        let mut swift = report(
+            "/w/Package.swift",
+            vec![CheckResult::new(
+                unversioned,
+                DependencyStatus::Undetermined,
+            )],
+        );
+        swift.ecosystem = Ecosystem::Swift;
+        let lines = lines_for(&[swift]);
+        assert!(
+            lines[0].contains("its declared version could not be read"),
+            "{lines:?}"
+        );
+        assert!(
+            !lines[0].contains("publishes no package registry"),
+            "{lines:?}"
+        );
     }
 }
