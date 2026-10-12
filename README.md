@@ -868,6 +868,37 @@ A registry that answered `404` (or, for a Go proxy, `410`) *answered*: a private
 internal or deleted package is a per-dependency fact, reported in the table and noted
 on stderr, and it does not make a gate unanswerable.
 
+### Certifying the manifests whose registries answered
+
+By default the refusal is all or nothing: one registry declining anywhere exits `2`,
+even when every other manifest was checked against registries that answered every
+request. `--certify-answered` opts out of that for `--fail-on vulnerable` and
+`--fail-on outdated`:
+
+```console
+$ dependable check --fail-on vulnerable --certify-answered
+warning: services/api/go.mod is not certified: the Go registry did not answer
+```
+
+- **The unit is the manifest.** A manifest any of whose registries declined is left
+  uncertified *in full* — a `Cargo.toml` whose alternate registry timed out while
+  crates.io answered, or a `deno.json` whose JSR imports failed while its npm imports
+  resolved, is named on stderr as a whole, because nothing in a pass/fail verdict
+  shows which of a manifest's dependencies went where.
+- **Exit `0` then means less.** No dependency anywhere matched the gate, and every
+  manifest *not* named in a `… is not certified` line had every registry answer. It no
+  longer means every dependency in the run was evaluated. The line prints under
+  `--quiet` too, because it is the part of the result a pass gives up.
+- **A finding still fails.** A vulnerability or stale dependency the answered half of
+  an uncertified manifest established exits `1`; only passing over that manifest was
+  in doubt.
+- **Nothing certified is still a refusal.** When no manifest had every registry answer,
+  the run exits `2` exactly as without the flag. So does a certified manifest whose
+  own vulnerability scan did not complete or whose constraints could not be read.
+
+The flag has no effect under `--fail-on none` or `--fail-on any`, and none on a
+`[policy]` severity rule, which still refuses the whole run.
+
 `.dependable.toml` is validated: an unknown key or a wrong-typed value is an error,
 not a silent fallback to defaults. One mistyped character used to reset
 `[global] fail_on` to `none` and disarm the gate with nothing on stderr.
