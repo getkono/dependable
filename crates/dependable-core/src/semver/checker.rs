@@ -77,17 +77,23 @@ enum LockedPreRelease {
     /// names a pre-release on the same `major.minor.patch`. npm and Cargo resolve
     /// this way, so a locked pre-release outside it is outside the constraint.
     OptIn,
-    /// By ordering alone. PEP 440 excludes pre-releases only from *selection* and
-    /// admits one already in use, and NuGet and Maven have no opt-in rule at all,
-    /// so a translated `2.1rc1` (`2.1.0-rc.1`) is inside `>=2.0` as it is ordered.
+    /// By ordering alone. NuGet and Maven have no opt-in rule at all, so a
+    /// translated `2.1.0-rc1` is inside `[2.0,)` as it is ordered.
     ByOrdering,
+    /// By ordering, with PEP 440's one exception. PEP 440 excludes pre-releases only
+    /// from *selection* and admits one already in use, so a translated `2.1rc1`
+    /// (`2.1.0-rc.1`) is inside `>=2.0`; but an exclusive `<V` must not allow a
+    /// pre-release of `V` itself unless `V` is a pre-release, so `2.1rc1` is outside
+    /// `<2.1` although it is ordered below `2.1`.
+    Pep440,
 }
 
 /// The rule for a locked pre-release in `ecosystem`'s dialect: by ordering where the
 /// version was translated from a dialect without semver's opt-in rule.
 fn locked_pre_release_rule(ecosystem: Ecosystem) -> LockedPreRelease {
     match ecosystem {
-        Ecosystem::Python | Ecosystem::CSharp | Ecosystem::Jvm => LockedPreRelease::ByOrdering,
+        Ecosystem::Python => LockedPreRelease::Pep440,
+        Ecosystem::CSharp | Ecosystem::Jvm => LockedPreRelease::ByOrdering,
         _ => LockedPreRelease::OptIn,
     }
 }
@@ -96,6 +102,19 @@ fn locked_pre_release_rule(ecosystem: Ecosystem) -> LockedPreRelease {
 fn admits_locked(req: &VersionReq, locked: &Version, rule: LockedPreRelease) -> bool {
     if locked.pre.is_empty() || rule == LockedPreRelease::OptIn {
         return req.matches(locked);
+    }
+    // PEP 440: `<V`, where `V` is a final release, keeps out every pre-release of
+    // `V`. A partial `V` reads its missing components as `0`, as PEP 440 pads them.
+    if rule == LockedPreRelease::Pep440
+        && req.comparators.iter().any(|c| {
+            c.op == ::semver::Op::Less
+                && c.pre.is_empty()
+                && c.major == locked.major
+                && c.minor.unwrap_or(0) == locked.minor
+                && c.patch.unwrap_or(0) == locked.patch
+        })
+    {
+        return false;
     }
     // Add a comparator that `locked` satisfies and that opts its own
     // `major.minor.patch` in to pre-releases: `>=X.Y.Z-0`, where `-0` is the lowest
@@ -587,5 +606,73 @@ mod tests {
         assert_eq!(e.status, DependencyStatus::UpdateAvailable);
         assert_eq!(e.latest_compatible.as_deref(), Some("1.9.0"));
         assert_eq!(e.latest_available.as_deref(), Some("2.0.0"));
+    }
+
+    /// PEP 440: an exclusive `<V` must not allow a pre-release of `V` unless `V` is
+    /// itself one. `requests<2.1` locked at `2.1rc1` (translated `2.1.0-rc.1`, which
+    /// is ordered below `2.1.0`) is outside its constraint.
+    #[test]
+    fn a_python_pre_release_of_the_lt_bound_is_outdated() {
+        let available = vers(&["2.0.0", "2.1.0-rc.1", "2.1.0"]);
+        let e = check_version_for("<2.1", Ecosystem::Python, &available, Some("2.1.0-rc.1"));
+        assert_eq!(e.status, DependencyStatus::Outdated, "{e:?}");
+
+        // A partial bound pads with zeros, as PEP 440 does: `<2` keeps out `2.0rc1`.
+        let e = check_version_for(
+            "<2",
+            Ecosystem::Python,
+            &vers(&["1.9.0", "2.0.0-rc.1"]),
+            Some("2.0.0-rc.1"),
+        );
+        assert_eq!(e.status, DependencyStatus::Outdated, "{e:?}");
+    }
+
+    /// The exclusion is only for a pre-release of the bound's own final release.
+    #[test]
+    fn a_python_pre_release_below_the_lt_bound_is_still_admitted() {
+        // A bound that is itself a pre-release admits an earlier one of its release.
+        let e = check_version_for(
+            "<2.1rc2",
+            Ecosystem::Python,
+            &vers(&["2.0.0", "2.1.0-rc.1"]),
+            Some("2.1.0-rc.1"),
+        );
+        assert_eq!(e.status, DependencyStatus::UpToDate, "{e:?}");
+
+        // A pre-release of an earlier release is ordered inside `<2.1`.
+        let e = check_version_for(
+            "<2.1",
+            Ecosystem::Python,
+            &vers(&["2.0.0", "2.0.1-rc.1"]),
+            Some("2.0.1-rc.1"),
+        );
+        assert_eq!(e.status, DependencyStatus::UpToDate, "{e:?}");
+
+        // `<=` is inclusive, so PEP 440's exclusion does not reach it.
+        let e = check_version_for(
+            "<=2.1",
+            Ecosystem::Python,
+            &vers(&["2.0.0", "2.1.0-rc.1"]),
+            Some("2.1.0-rc.1"),
+        );
+        assert_eq!(e.status, DependencyStatus::UpToDate, "{e:?}");
+    }
+
+    /// NuGet and Maven have no such exclusion: `2.1.0-rc1` is ordered below `2.1.0`,
+    /// so it is inside an exclusive upper bound there.
+    #[test]
+    fn a_nuget_or_maven_pre_release_of_the_upper_bound_is_admitted() {
+        for (constraint, ecosystem) in [
+            ("[2.0,2.1)", Ecosystem::CSharp),
+            ("[2.0,2.1)", Ecosystem::Jvm),
+        ] {
+            let e = check_version_for(
+                constraint,
+                ecosystem,
+                &vers(&["2.0.0", "2.1.0-rc.1"]),
+                Some("2.1.0-rc.1"),
+            );
+            assert_eq!(e.status, DependencyStatus::UpToDate, "{ecosystem:?}: {e:?}");
+        }
     }
 }
