@@ -39,14 +39,23 @@ pub enum BareVersion {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum Ecosystem {
+    /// Rust crates, from crates.io.
     Rust,
+    /// Go modules, from the Go module proxy.
     Go,
+    /// JavaScript packages, from the npm registry.
     Npm,
+    /// Python packages, from PyPI.
     Python,
+    /// PHP packages, from Packagist.
     Php,
+    /// Dart and Flutter packages, from pub.dev.
     Dart,
+    /// .NET packages, from NuGet.
     CSharp,
+    /// Elixir and Erlang packages, from Hex.
     Elixir,
+    /// JVM artifacts, from Maven Central.
     Jvm,
     /// Swift packages, identified by their git URL.
     ///

@@ -7,37 +7,51 @@
 
 use serde::{Deserialize, Serialize};
 
+/// A `POST /v1/querybatch` body: several version lookups in one request.
 #[derive(Debug, Serialize)]
 pub struct BatchRequest {
+    /// The lookups, answered in the same order in [`BatchResponse::results`].
     pub queries: Vec<Query>,
 }
 
+/// One lookup in a [`BatchRequest`]: is this exact version of a package affected?
 #[derive(Debug, Serialize)]
 pub struct Query {
+    /// The exact version to look up.
     pub version: String,
+    /// The package to look it up for.
     pub package: Package,
 }
 
+/// A package as OSV identifies it: a name within an ecosystem.
 #[derive(Debug, Serialize)]
 pub struct Package {
+    /// The package name, as OSV keys the ecosystem's advisories.
     pub name: String,
+    /// OSV's name for the ecosystem (`crates.io`, `PyPI`, ...).
     pub ecosystem: String,
 }
 
+/// A `querybatch` response.
 #[derive(Debug, Default, Deserialize)]
 pub struct BatchResponse {
+    /// One result per query, in request order.
     #[serde(default)]
     pub results: Vec<QueryResult>,
 }
 
+/// The answer to one [`Query`] in a batch.
 #[derive(Debug, Default, Deserialize)]
 pub struct QueryResult {
+    /// The advisories affecting the queried version; empty when there are none.
     #[serde(default)]
     pub vulns: Vec<VulnRef>,
 }
 
+/// An advisory as `querybatch` reports it: its ID alone.
 #[derive(Debug, Deserialize)]
 pub struct VulnRef {
+    /// The advisory's ID.
     pub id: String,
 }
 

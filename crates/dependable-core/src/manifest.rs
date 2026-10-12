@@ -79,18 +79,32 @@ manifest_kinds! {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ManifestKind {
+    /// Cargo's `Cargo.toml`.
     CargoToml,
+    /// Go modules' `go.mod`.
     GoMod,
+    /// npm's `package.json`.
     PackageJson,
+    /// Deno's `deno.json` or `deno.jsonc`.
     DenoJson,
+    /// pnpm's `pnpm-workspace.yaml` (or `.yml`) and its catalogs.
     PnpmWorkspaceYaml,
+    /// Composer's `composer.json`.
     ComposerJson,
+    /// A pip requirements file, such as `requirements.txt`.
     RequirementsTxt,
+    /// A `pyproject.toml`, or pixi's `pixi.toml`.
     PyprojectToml,
+    /// Dart and Flutter's `pubspec.yaml`.
     PubspecYaml,
+    /// Mix's `mix.exs`.
     MixExs,
+    /// A NuGet project file: a `*.csproj`, or a central `Directory.Packages.props`.
     Csproj,
+    /// A Gradle version catalog: a `*.versions.toml`, such as
+    /// `gradle/libs.versions.toml`.
     GradleVersionCatalog,
+    /// Maven's `pom.xml`.
     PomXml,
     /// SwiftPM's `Package.swift`.
     ///
