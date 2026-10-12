@@ -647,6 +647,34 @@ mod tests {
         assert_eq!(none.latest_in_major, None);
     }
 
+    /// The branches that return before the constraint is evaluated — an untranslatable
+    /// dialect, a channel or branch name, and a constraint that is not a range — still
+    /// anchor `latest_in_major` on the locked version, so a locked `0.x` keeps naming
+    /// the last `0.x` release after `1.0` ships.
+    #[test]
+    fn latest_in_major_is_kept_when_the_constraint_is_not_evaluated() {
+        let versions = vers(&["0.1.0", "0.9.0", "0.9.3", "1.0.0"]);
+
+        // An unclosed Maven interval: `check_version_for`'s untranslatable branch.
+        let untranslatable =
+            check_version_for("[0.1,0.9", Ecosystem::Jvm, &versions, Some("0.1.0"));
+        assert_eq!(untranslatable.status, DependencyStatus::Undetermined);
+        assert_eq!(untranslatable.latest_in_major.as_deref(), Some("0.9.3"));
+
+        // npm's `next` channel: the dialect-tag branch.
+        let tag = check_version("next", &versions, Some("0.1.0"));
+        assert_eq!(tag.status, DependencyStatus::Undetermined);
+        assert_eq!(tag.latest_in_major.as_deref(), Some("0.9.3"));
+
+        // Not a range at all: the unparseable-constraint branch.
+        let bogus = check_version("^^^bogus", &versions, Some("0.1.0"));
+        assert!(
+            matches!(bogus.status, DependencyStatus::Error(_)),
+            "{bogus:?}"
+        );
+        assert_eq!(bogus.latest_in_major.as_deref(), Some("0.9.3"));
+    }
+
     /// The reachability witness for issue #87: a wildcard constraint really does
     /// reach the fix layer as an upgradable dependency, so the guard there is not
     /// dead code. `1.x` allows `1.9.0` but not `2.0.0`, so the newest release sits
