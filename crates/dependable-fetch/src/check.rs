@@ -291,6 +291,13 @@ pub struct ManifestCheck {
     /// Empty on a fully cached run even where the registry is down: a cache hit issues
     /// no request, so nothing declines to answer. That is the same reach the boolean
     /// always had.
+    ///
+    /// A caller certifying part of a run over the registries that did answer — the CLI's
+    /// `--certify-answered` — should treat a manifest with a non-empty collection as
+    /// uncertified *in full*, including the results its other registries answered for.
+    /// Those results are real, and a finding among them is still a finding; but nothing
+    /// a reader of a pass/fail verdict sees partitions a manifest by route, so passing
+    /// over its answered half would certify a split nobody can inspect.
     pub unreachable_registries: Vec<UnreachableRegistry>,
     /// The manifest whose `[workspace.dependencies]` govern this one — itself, when it
     /// declares its own `[workspace]`, else the nearest ancestor that does.
