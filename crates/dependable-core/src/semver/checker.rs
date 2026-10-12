@@ -18,6 +18,14 @@ pub struct Evaluation {
     pub latest_available: Option<String>,
     /// Whether a patch-level update exists within the constraint.
     pub patch_available: bool,
+    /// Newest available version on the **same major** as the version in use (the
+    /// locked version, else [`Self::latest_compatible`]). `None` when no version is
+    /// in use.
+    ///
+    /// Under `0.x` this is the newest `0.x` release, which is what lets a consumer
+    /// count the breaking `0.x` releases a dependency skips on its way out of that
+    /// line: [`Self::latest_available`] alone stops naming them once `1.0` ships.
+    pub latest_in_major: Option<String>,
 }
 
 /// Parse a version-requirement string into a [`semver::VersionReq`].
@@ -61,12 +69,20 @@ pub fn check_version_for(
             locked_at,
             locked_pre_release_rule(ecosystem),
         ),
-        None => Evaluation {
-            status: DependencyStatus::Undetermined,
-            latest_compatible: None,
-            latest_available: newest(versions).map(|v| v.to_string()),
-            patch_available: false,
-        },
+        None => {
+            let parsed: Vec<Version> = versions
+                .iter()
+                .filter_map(|v| Version::parse(v).ok())
+                .collect();
+            let locked = locked_at.and_then(|s| Version::parse(s).ok());
+            Evaluation {
+                status: DependencyStatus::Undetermined,
+                latest_compatible: None,
+                latest_available: parsed.iter().max().map(ToString::to_string),
+                patch_available: false,
+                latest_in_major: newest_in_major(&parsed, locked.as_ref()),
+            }
+        }
     }
 }
 
@@ -131,9 +147,14 @@ fn admits_locked(req: &VersionReq, locked: &Version, rule: LockedPreRelease) -> 
     by_ordering.matches(locked)
 }
 
-/// The newest parseable version in `versions`, if any.
-fn newest(versions: &[String]) -> Option<Version> {
-    versions.iter().filter_map(|v| Version::parse(v).ok()).max()
+/// The newest of `versions` on `current`'s major, or `None` without a `current`.
+fn newest_in_major(versions: &[Version], current: Option<&Version>) -> Option<String> {
+    let current = current?;
+    versions
+        .iter()
+        .filter(|v| v.major == current.major)
+        .max()
+        .map(ToString::to_string)
 }
 
 /// Classify a dependency.
@@ -160,6 +181,7 @@ fn evaluate(
         .collect();
     parsed.sort();
     parsed.dedup();
+    let locked = locked_at.and_then(|s| Version::parse(s).ok());
 
     let Some(latest_available) = parsed.last().cloned() else {
         return Evaluation {
@@ -167,6 +189,7 @@ fn evaluate(
             latest_compatible: None,
             latest_available: None,
             patch_available: false,
+            latest_in_major: None,
         };
     };
 
@@ -195,6 +218,7 @@ fn evaluate(
                 latest_compatible: None,
                 latest_available: Some(latest_available.to_string()),
                 patch_available: false,
+                latest_in_major: newest_in_major(&parsed, locked.as_ref()),
             };
         }
         // What is left is not a range at all — `^^^bogus`, a constraint whose operators
@@ -210,11 +234,13 @@ fn evaluate(
                 latest_compatible: None,
                 latest_available: Some(latest_available.to_string()),
                 patch_available: false,
+                latest_in_major: newest_in_major(&parsed, locked.as_ref()),
             };
         }
     };
     let latest_compatible = parsed.iter().rev().find(|v| req.matches(v)).cloned();
-    let locked = locked_at.and_then(|s| Version::parse(s).ok());
+    let current = locked.clone().or_else(|| latest_compatible.clone());
+    let latest_in_major = newest_in_major(&parsed, current.as_ref());
 
     // A locked version that no longer satisfies the declared constraint.
     if let Some(locked) = locked.as_ref()
@@ -225,10 +251,9 @@ fn evaluate(
             latest_compatible: latest_compatible.map(|v| v.to_string()),
             latest_available: Some(latest_available.to_string()),
             patch_available: false,
+            latest_in_major,
         };
     }
-
-    let current = locked.clone().or_else(|| latest_compatible.clone());
 
     let status = match current.as_ref() {
         // Nothing the constraint allows is available at all.
@@ -257,6 +282,7 @@ fn evaluate(
         latest_compatible: latest_compatible.map(|v| v.to_string()),
         latest_available: Some(latest_available.to_string()),
         patch_available,
+        latest_in_major,
     }
 }
 
@@ -594,6 +620,31 @@ mod tests {
         let versions = vec!["0.2.3".to_string(), "0.2.9".to_string()];
         let ev = check_version("^0.2.3", &versions, Some("0.2.3"));
         assert_eq!(ev.status, DependencyStatus::PatchAvailable);
+    }
+
+    /// `latest_in_major` is the newest release on the major of the version in use —
+    /// the locked version, else the best the constraint allows — so it still names the
+    /// last `0.x` release once `1.0` has shipped (#150).
+    #[test]
+    fn latest_in_major_names_the_newest_release_on_the_current_major() {
+        let versions = vers(&["0.1.0", "0.9.0", "0.9.3", "1.0.0", "2.1.0"]);
+
+        let locked = check_version("0.1", &versions, Some("0.1.0"));
+        assert_eq!(locked.latest_in_major.as_deref(), Some("0.9.3"));
+        assert_eq!(locked.latest_available.as_deref(), Some("2.1.0"));
+
+        // A lock outside its constraint is still the version in use.
+        let outdated = check_version("^1", &versions, Some("0.1.0"));
+        assert_eq!(outdated.status, DependencyStatus::Outdated);
+        assert_eq!(outdated.latest_in_major.as_deref(), Some("0.9.3"));
+
+        // No lockfile: the current version is the one the constraint resolves to.
+        let unlocked = check_version("^1", &versions, None);
+        assert_eq!(unlocked.latest_in_major.as_deref(), Some("1.0.0"));
+
+        // Nothing in use, nothing to anchor a major on.
+        let none = check_version("^5", &versions, None);
+        assert_eq!(none.latest_in_major, None);
     }
 
     /// The reachability witness for issue #87: a wildcard constraint really does

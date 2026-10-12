@@ -1526,7 +1526,7 @@ fn evaluate_item(
 ///    the pre-release and flavour markers are still readable.
 /// 2. The survivors, `locked`, and `constraint` are translated to semver with the
 ///    same per-ecosystem translation, so both sides of the comparison agree.
-/// 3. The reported `latest_compatible` / `latest_available` are mapped back to the
+/// 3. The reported `latest_compatible` / `latest_available` / `latest_in_major` are mapped back to the
 ///    spelling the registry actually publishes (see `in_native_versions`).
 ///
 /// `constraint` is in the manifest's own dialect; `""` (no constraint declared)
@@ -1602,7 +1602,7 @@ fn to_semver_versions(versions: &[String], ecosystem: Ecosystem) -> Vec<(String,
 /// Restore the registry-native spelling of an evaluation's reported versions.
 ///
 /// `check_version` compares semver and reports semver, so its `latest_compatible`
-/// / `latest_available` are translated strings. Each is matched back to the native
+/// / `latest_available` / `latest_in_major` are translated strings. Each is matched back to the native
 /// string it came from by *parsed* semver equality rather than by text, because a
 /// version that round-trips through [`semver::Version`] can come back spelled
 /// differently from the string that was handed in.
@@ -1624,6 +1624,9 @@ fn in_native_versions(
         .map(|v| native_for(&v, translated, ecosystem).unwrap_or(v));
     eval.latest_available = eval
         .latest_available
+        .map(|v| native_for(&v, translated, ecosystem).unwrap_or(v));
+    eval.latest_in_major = eval
+        .latest_in_major
         .map(|v| native_for(&v, translated, ecosystem).unwrap_or(v));
     eval
 }
@@ -3294,6 +3297,21 @@ mod tests {
             UnstableFilter::Exclude,
         );
         assert_eq!(result.latest_available.as_deref(), Some("12.0.9"));
+    }
+
+    /// `latest_in_major` is reported in the registry's own spelling, like the other
+    /// versions an evaluation names, so a policy gate parses what was published.
+    #[test]
+    fn latest_in_major_keeps_the_native_spelling() {
+        let hibernate = jvm_item("org.hibernate.orm:hibernate-core", "5.4.0.Final");
+        let result = evaluated(
+            &hibernate,
+            &["6.6.0.Final", "5.6.15.Final", "5.4.0.Final"],
+            Ecosystem::Jvm,
+            UnstableFilter::Exclude,
+        );
+        assert_eq!(result.latest_in_major.as_deref(), Some("5.6.15.Final"));
+        assert_eq!(result.latest_available.as_deref(), Some("6.6.0.Final"));
     }
 
     /// Under the default filter — the one every user gets — a milestone or a beta

@@ -29,6 +29,9 @@ pub struct CheckResult {
     pub latest_available: Option<String>,
     /// Whether a patch-level update exists within the constraint.
     pub patch_available: bool,
+    /// Newest available version on the same major as the version in use — under
+    /// `0.x`, the newest `0.x` release. See [`Evaluation::latest_in_major`].
+    pub latest_in_major: Option<String>,
     /// Vulnerability IDs affecting the current/locked version.
     pub current_vulnerabilities: Vec<String>,
     /// All vulnerabilities by version, for "upgrading fixes N issues" reporting.
@@ -64,6 +67,7 @@ impl CheckResult {
             latest_compatible: None,
             latest_available: None,
             patch_available: false,
+            latest_in_major: None,
             current_vulnerabilities: Vec::new(),
             all_vulnerabilities: HashMap::new(),
             advisories: Vec::new(),
@@ -101,6 +105,7 @@ impl CheckResult {
             latest_compatible: eval.latest_compatible,
             latest_available: eval.latest_available,
             patch_available: eval.patch_available,
+            latest_in_major: eval.latest_in_major,
             current_vulnerabilities: Vec::new(),
             all_vulnerabilities: HashMap::new(),
             advisories: Vec::new(),
@@ -971,6 +976,7 @@ mod tests {
                 latest_compatible: Some("1.0.0".to_string()),
                 latest_available: Some("1.0.0".to_string()),
                 patch_available: false,
+                latest_in_major: Some("1.0.0".to_string()),
             },
         );
         assert!(evaluated.advisories.is_empty());

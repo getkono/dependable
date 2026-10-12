@@ -672,7 +672,11 @@ pub fn evaluate(report: &Report, policy: &Policy) -> PolicyOutcome {
                     .as_deref()
                     .and_then(|raw| parse_version(raw, ecosystem))
             {
-                let behind = major_distance(&version, &latest);
+                let in_major = result
+                    .latest_in_major
+                    .as_deref()
+                    .and_then(|raw| parse_version(raw, ecosystem));
+                let behind = major_distance(&version, &latest, in_major.as_ref());
                 if behind > allowed {
                     push(
                         Level::Violation,
@@ -890,25 +894,30 @@ fn parse_version(raw: &str, ecosystem: Ecosystem) -> Option<semver::Version> {
 /// not zero. Counting it as zero would make the gate blind to exactly the churn it
 /// exists to catch.
 ///
-/// Crossing out of `0.x` counts the majors past `0` alone, so `0.1 -> 1.0` is one and
-/// `0.1 -> 3.0` is three.
+/// Crossing out of `0.x` counts the `0.x` breaking releases skipped on the way out —
+/// read from `in_major`, the newest published release on `current`'s major — plus one
+/// for the crossing and one for each major past `1.0`. With `0.9.x` the last `0.x`
+/// release, `0.1 -> 1.0` is nine and `0.1 -> 3.0` is eleven, so the distance never
+/// shrinks as upstream moves on: `0.1 -> 1.0` is at least the `0.1 -> 0.9` before it.
 ///
-/// # Limitation
-/// The measure is **not monotonic across that crossing**, and this rewrite did not make
-/// it so: it is a restatement of the same truth table, identical on every input. The
-/// 0.x releases skipped on the way out of the line are not counted, because the set of
-/// published versions is not available here — only the two endpoints are. So a
-/// dependency at `0.1.0` scores 8 against an upstream `0.9.0` and 1 against `1.0.0`, and
-/// a `max_major_behind = 2` gate it had been failing starts passing the moment upstream
-/// ships `1.0.0` — further behind, measured as closer. Repairing that needs the
-/// published version set this function is not given, which is a design change rather
-/// than a repair; it is tracked in #150 rather than attempted here.
-fn major_distance(current: &semver::Version, latest: &semver::Version) -> u64 {
+/// Without `in_major` (no version in use was established, or nothing on its major is
+/// published any more) the skipped `0.x` releases cannot be counted, and the crossing
+/// counts the majors past `0` alone — a lower bound, never an overcount.
+fn major_distance(
+    current: &semver::Version,
+    latest: &semver::Version,
+    in_major: Option<&semver::Version>,
+) -> u64 {
     match (current.major, latest.major) {
         // Both on the 0.x line: the minor is the breaking axis.
         (0, 0) => latest.minor.saturating_sub(current.minor),
-        // Leaving 0.x: the crossing is one breaking release, plus each major past 1.0.
-        (0, to) => to,
+        // Leaving 0.x: the 0.x minors skipped, the crossing, and each major past 1.0.
+        (0, to) => {
+            let skipped = in_major
+                .filter(|last| last.major == 0)
+                .map_or(0, |last| last.minor.saturating_sub(current.minor));
+            skipped.saturating_add(to)
+        }
         // Both past 1.0: the major is the breaking axis.
         (from, to) => to.saturating_sub(from),
     }
@@ -1934,27 +1943,65 @@ reason = "CVE-2023-xxxx fix"
         assert!(outcome.has_violations());
     }
 
-    /// The measure, stated as it actually behaves. Under `0.x` the minor is the breaking
-    /// axis; past `1.0` the major is; and across the crossing only the majors past `0`
-    /// are counted — so `0.1 -> 0.9` is 8 while `0.1 -> 1.0` is 1, and being further
-    /// behind measures as being closer. That is a known limitation, recorded on
-    /// [`major_distance`] and tracked in #150, not something this test claims is fixed.
+    /// The measure is monotonic in the latest version, across the `0.x -> 1.0` crossing
+    /// too (#150): under `0.x` the minor is the breaking axis, past `1.0` the major is,
+    /// and leaving `0.x` counts the `0.x` releases skipped on the way out, so
+    /// `0.1 -> 1.0` is never closer than the `0.1 -> 0.9` before it.
     #[test]
-    fn major_distance_counts_the_breaking_axis_of_each_version_line() {
+    fn major_distance_is_monotonic_across_the_zero_dot_x_crossing() {
         let v = |s: &str| semver::Version::parse(s).unwrap();
-        assert_eq!(major_distance(&v("0.1.0"), &v("0.9.0")), 8);
-        assert_eq!(major_distance(&v("0.1.0"), &v("1.0.0")), 1);
-        assert_eq!(major_distance(&v("0.1.0"), &v("3.0.0")), 3);
-        // Monotonic in the major once past 1.0 — and, as the limitation says, *not*
-        // across the crossing: 8 for `0.9.0` against 1 for the `1.0.0` that follows it.
-        assert!(
-            major_distance(&v("0.1.0"), &v("3.0.0")) > major_distance(&v("0.1.0"), &v("1.0.0"))
+        let last_zero = v("0.9.3");
+        let in_major = Some(&last_zero);
+        // Upstream's history, oldest first, seen from a dependency stuck at 0.1.0.
+        let upstream = [
+            "0.1.0", "0.5.0", "0.9.0", "0.9.3", "1.0.0", "1.4.0", "3.0.0",
+        ];
+        let distances: Vec<u64> = upstream
+            .iter()
+            .map(|latest| {
+                let latest = v(latest);
+                // Before 1.0 ships, the newest 0.x release *is* the latest.
+                let in_major = if latest.major == 0 {
+                    Some(&latest)
+                } else {
+                    in_major
+                };
+                major_distance(&v("0.1.0"), &latest, in_major)
+            })
+            .collect();
+        assert_eq!(distances, [0, 4, 8, 8, 9, 9, 11]);
+        assert!(distances.windows(2).all(|w| w[0] <= w[1]), "{distances:?}");
+
+        // Leaving from the last 0.x line skips nothing but the crossing itself.
+        assert_eq!(major_distance(&v("0.9.0"), &v("1.0.0"), in_major), 1);
+        // Without the published 0.x line, the skipped releases cannot be counted:
+        // the majors past 0 are a lower bound.
+        assert_eq!(major_distance(&v("0.1.0"), &v("1.0.0"), None), 1);
+        assert_eq!(major_distance(&v("0.1.0"), &v("3.0.0"), None), 3);
+        // Past 1.0 the major is the axis, and `in_major` changes nothing.
+        let one = v("1.8.0");
+        assert_eq!(major_distance(&v("1.0.0"), &v("3.0.0"), Some(&one)), 2);
+        assert_eq!(major_distance(&v("4.0.0"), &v("1.0.0"), None), 0);
+    }
+
+    /// The gate reads the published `0.x` line from the result: the `0.1.0` that fails
+    /// `max_major_behind = 2` against `0.9.0` keeps failing once upstream ships `1.0.0`.
+    #[test]
+    fn a_release_of_one_dot_zero_does_not_pass_a_failing_zero_dot_x_gate() {
+        let gate = |latest: &str| {
+            let mut result = locked("tokio = \"0.1\"", "0.1.0");
+            result.latest_available = Some(latest.to_string());
+            result.latest_in_major = Some("0.9.0".to_string());
+            evaluate(&rust(vec![result]), &policy("max_major_behind = 2\n"))
+        };
+        for latest in ["0.9.0", "1.0.0"] {
+            let outcome = gate(latest);
+            assert_eq!(outcome.violation_count(), 1, "{latest}");
+        }
+        assert_eq!(
+            messages(&gate("1.0.0"))[0],
+            "max_major_behind  tokio 0.1.0 (Cargo.toml): 9 major versions behind 1.0.0 (allowed 2)"
         );
-        assert!(
-            major_distance(&v("0.1.0"), &v("0.9.0")) > major_distance(&v("0.1.0"), &v("1.0.0"))
-        );
-        assert_eq!(major_distance(&v("1.0.0"), &v("3.0.0")), 2);
-        assert_eq!(major_distance(&v("4.0.0"), &v("1.0.0")), 0);
     }
 
     /// `cvss.rs` scores only v3.0 and v3.1 vectors, so a v4-only advisory carries no
