@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/getkono/dependable/compare/dependable-tui-v0.1.3...dependable-tui-v0.2.0) - 2026-10-12
+
+### Added
+
+- mark a nested workspace's crate in the tree, JSON, and TUI ([#186](https://github.com/getkono/dependable/pull/186))
+- *(jvm)* pom.xml parser — literal versions and same-file properties only ([#95](https://github.com/getkono/dependable/pull/95))
+- *(fetch)* [**breaking**] report a dependency pinned to an exact version rather than leaving it unknown ([#120](https://github.com/getkono/dependable/pull/120))
+- *(core)* report a manifest we recognise but cannot read
+
+### Fixed
+
+- *(tui)* compare a package lookup's versions in the ecosystem's own dialect ([#196](https://github.com/getkono/dependable/pull/196))
+- *(tui)* [**breaking**] report a dependency with no known version as unknown ([#104](https://github.com/getkono/dependable/pull/104))
+- *(fetch)* resolve an unread build script against its build root
+
+### Other
+
+- *(core)* [**breaking**] mark WalkOptions and Tree #[non_exhaustive] and add WalkOptions builders ([#172](https://github.com/getkono/dependable/pull/172))
+- cover the UnreadableLockfile fallback for a v1 package-lock.json ([#171](https://github.com/getkono/dependable/pull/171))
+
 ## [0.1.3](https://github.com/getkono/dependable/compare/dependable-tui-v0.1.2...dependable-tui-v0.1.3) - 2026-08-29
 
 ### Added
