@@ -679,10 +679,10 @@ fn a_constraint_already_at_its_target_is_reported() {
 }
 
 /// Issue #118: npm's bare `"1.2.3"` names exactly one release, as Cargo's
-/// `=1.2.3` does, so a plain `fix` holds it as a pin even though `check` —
-/// reading the bare version as a caret — reports `1.9.0` as compatible and
-/// `2.0.0` beyond it. Before #118 a plain `fix` rewrote it to `1.9.0`. `--all`
-/// still moves it.
+/// `=1.2.3` does, so a plain `fix` holds it as a pin while `2.0.0` waits beyond
+/// it. Before #118 a plain `fix` rewrote it to `1.9.0`, the release `check` then
+/// called compatible by reading the bare version as a caret; since #155 `check`
+/// reads it as exact too. `--all` still moves it.
 #[test]
 fn a_bare_npm_version_is_held_as_a_pin() {
     let (_tmp, dir) = workdir("fix_bare_npm_pin");
