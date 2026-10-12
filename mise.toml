@@ -36,7 +36,7 @@ run = "cargo test --workspace"
 # than a repeat of the first.
 #
 # It `depends` on `test` so one `mise run test:color` runs both legs, plain first:
-# CI's single test step and the `ci` task rely on that. Serializing also keeps the
+# CI's single test step relies on that. Serializing also keeps the
 # two runs from contending for one Cargo target directory and interleaving their
 # output. `FORCE_COLOR` is in no fingerprint, so the second run rebuilds nothing
 # and costs only its own test execution.
