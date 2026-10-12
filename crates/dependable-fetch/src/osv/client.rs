@@ -66,8 +66,14 @@ fn derive_query_url(batch_url: &str) -> String {
 /// A single OSV query: does `(ecosystem, name, version)` have known vulns?
 #[derive(Debug, Clone)]
 pub struct OsvQuery {
+    /// OSV's name for the ecosystem, as [`Ecosystem::osv_name`] gives it
+    /// (`crates.io`, `PyPI`, ...).
+    ///
+    /// [`Ecosystem::osv_name`]: dependable_core::Ecosystem::osv_name
     pub ecosystem: String,
+    /// The package name, as OSV keys the ecosystem's advisories.
     pub name: String,
+    /// The exact version to check.
     pub version: String,
 }
 

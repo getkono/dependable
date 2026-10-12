@@ -36,6 +36,8 @@
 //! # }
 //! ```
 
+#![warn(missing_docs)]
+
 use std::time::Duration;
 
 pub mod cache;

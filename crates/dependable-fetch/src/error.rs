@@ -20,11 +20,19 @@ pub enum FetchError {
     #[error("http error: {0}")]
     Http(reqwest::Error),
 
+    /// The registry answered that the named package does not exist.
     #[error("package `{0}` not found")]
     NotFound(String),
 
+    /// The registry answered a package request with an unsuccessful HTTP status that
+    /// does not mean "not found".
     #[error("registry returned status {code} for `{package}`")]
-    Status { code: u16, package: String },
+    Status {
+        /// The HTTP status code.
+        code: u16,
+        /// The package that was requested.
+        package: String,
+    },
 
     /// A successful response that carried no versions at all.
     ///
@@ -35,7 +43,10 @@ pub enum FetchError {
     /// it as a 404 exempted it from a `--fail-on` gate, certifying a build against a
     /// dependency nothing was ever known about.
     #[error("registry listed no versions for `{package}`")]
-    EmptyVersionList { package: String },
+    EmptyVersionList {
+        /// The package that was requested.
+        package: String,
+    },
 
     /// The registry listed the package, and every release it lists is yanked.
     ///
@@ -44,16 +55,32 @@ pub enum FetchError {
     /// list. Unlike [`EmptyVersionList`](Self::EmptyVersionList) nothing about it
     /// suggests the registry failed to answer.
     #[error("every published version of `{package}` is yanked")]
-    AllYanked { package: String },
+    AllYanked {
+        /// The package that was requested.
+        package: String,
+    },
 
+    /// A successful registry response whose body could not be read as the expected
+    /// document.
     #[error("failed to decode response for `{package}`: {detail}")]
-    Decode { package: String, detail: String },
+    Decode {
+        /// The package that was requested.
+        package: String,
+        /// Why the body could not be decoded.
+        detail: String,
+    },
 
+    /// An OSV response that could not be used: a body that failed to decode, or a
+    /// `querybatch` answer with fewer results than queries. The string says which.
     #[error("OSV query failed: {0}")]
     Osv(String),
 
+    /// OSV answered with an unsuccessful HTTP status.
     #[error("OSV returned status {code}")]
-    OsvStatus { code: u16 },
+    OsvStatus {
+        /// The HTTP status code.
+        code: u16,
+    },
 }
 
 impl From<reqwest::Error> for FetchError {

@@ -11,6 +11,8 @@ use crate::item::Item;
 /// versions because of transitive resolution.
 #[derive(Debug, Clone, Default)]
 pub struct LockfileData {
+    /// Every locked version of each package, keyed by package name, in the order
+    /// `Cargo.lock` lists them.
     pub versions: HashMap<String, Vec<String>>,
 }
 
