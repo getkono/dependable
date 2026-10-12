@@ -4,6 +4,8 @@
 //! filesystem, network, or async — which keeps the crate fully unit-testable
 //! without mocking.
 
+#![warn(missing_docs)]
+
 pub mod ecosystem;
 pub mod error;
 pub mod graph;
