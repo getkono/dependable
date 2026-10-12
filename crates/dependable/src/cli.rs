@@ -110,6 +110,16 @@ pub struct CheckArgs {
     /// saying `fail_on = "any"` could not be turned off from the command line.
     #[arg(long, value_enum)]
     pub fail_on: Option<FailOn>,
+    /// When a registry does not answer, certify `--fail-on vulnerable`/`outdated`
+    /// over the manifests whose registries all answered instead of refusing the
+    /// whole run.
+    ///
+    /// A manifest any of whose registries declined is left uncertified in full and
+    /// named on stderr; a finding in it still fails the build. The run is still
+    /// refused (exit 2) when no manifest could be certified. No effect under
+    /// `--fail-on none` or `any`, nor on a `[policy]` severity rule.
+    #[arg(long)]
+    pub certify_answered: bool,
     /// GitHub Actions annotations and job summary: `auto` (default, on under
     /// the runner), `always`, or `never`.
     #[arg(long, value_enum, default_value_t = AnnotationMode::Auto)]

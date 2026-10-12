@@ -822,6 +822,142 @@ fn the_refusal_names_the_registry_that_declined_and_not_the_one_that_answered() 
 }
 
 // ---------------------------------------------------------------------------
+// `--certify-answered`: certify the manifests whose registries all answered
+// ---------------------------------------------------------------------------
+
+/// #142's mixed case: one manifest, two routes, one answered. A `deno.json` whose npm
+/// imports resolve against a registry that answers while its JSR imports go to one that
+/// returns `500` — and, beside it, a `package.json` whose only registry answered.
+///
+/// Returns the scratch guard, the directory, the config, and JSR's printed authority.
+/// `chalk` is the `deno.json`'s npm import; `chalk_range` decides whether it is behind.
+fn mixed_deno_project(name: &str, chalk_range: &str) -> (TempDir, PathBuf, PathBuf, String) {
+    let (tmp, dir) = workdir(name);
+    let npm = registry(vec![
+        (
+            "/express".to_string(),
+            packument("express", &["4.19.2"], "4.19.2"),
+        ),
+        (
+            "/chalk".to_string(),
+            packument("chalk", &["4.1.2", "5.3.0"], "5.3.0"),
+        ),
+    ]);
+    // JSR declines rather than saying "no such package": a 404 would be an answer.
+    let jsr = registry(vec![("/@std/path/meta.json".to_string(), status(500))]);
+    let config = dir.join(".dependable.toml");
+    fs::write(
+        &config,
+        format!(
+            "[npm]\nregistry = \"{npm}\"\njsr_registry = \"{jsr}\"\n\n\
+             [vulnerability]\nenabled = true\nosv_batch_url = \"{npm}{OSV_BATCH_PATH}\"\n"
+        ),
+    )
+    .unwrap();
+    fs::create_dir_all(dir.join("edge")).unwrap();
+    fs::write(
+        dir.join("edge/deno.json"),
+        format!(
+            "{{ \"imports\": {{ \"chalk\": \"npm:chalk@{chalk_range}\", \
+             \"path\": \"jsr:@std/path@^1.0.0\" }} }}\n"
+        ),
+    )
+    .unwrap();
+    let jsr_authority = jsr.trim_start_matches("http://").to_owned();
+    (tmp, dir, config, jsr_authority)
+}
+
+/// The fully answered `package.json` beside [`mixed_deno_project`]'s `deno.json`.
+fn write_answered_package_json(dir: &Path) {
+    fs::write(
+        dir.join("package.json"),
+        "{\"name\":\"app\",\"dependencies\":{\"express\":\"^4.19.0\"}}\n",
+    )
+    .unwrap();
+}
+
+/// #142. By default one declining registry refuses the whole run. Under
+/// `--certify-answered` the manifest whose registries all answered is certified, and the
+/// `deno.json` is left uncertified *in full* — its npm import answered too, but the
+/// manifest is the unit the warning and the reader see.
+#[test]
+fn certify_answered_certifies_the_answered_manifest_and_names_the_mixed_one() {
+    let (_tmp, dir, config, jsr_authority) = mixed_deno_project("gate_certify_mixed", "^5.0.0");
+    write_answered_package_json(&dir);
+
+    let (stdout, stderr, code) = outcome(&check(&dir, &config, &["--fail-on", "vulnerable"]));
+    assert_eq!(code, 2, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stderr.contains("cannot honour --fail-on"),
+        "stderr: {stderr}"
+    );
+
+    let (stdout, stderr, code) = outcome(&check(
+        &dir,
+        &config,
+        &["--fail-on", "vulnerable", "--certify-answered"],
+    ));
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        !stderr.contains("cannot honour --fail-on"),
+        "a run with an answered manifest was still refused:\n{stderr}"
+    );
+    let uncertified: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.contains("is not certified"))
+        .collect();
+    assert_eq!(uncertified.len(), 1, "stderr: {stderr}");
+    assert!(
+        uncertified[0].contains("deno.json")
+            && uncertified[0].contains(&format!(
+                "the npm ({jsr_authority}) registry did not answer"
+            )),
+        "the mixed manifest was not named with the registry that declined:\n{stderr}"
+    );
+    // Both manifests are still reported in full.
+    assert!(
+        stdout.contains("express") && stdout.contains("chalk"),
+        "stdout: {stdout}"
+    );
+}
+
+/// A finding the answered half of an uncertified manifest established still fails the
+/// build: only *passing* over that manifest was in doubt.
+#[test]
+fn certify_answered_still_fails_on_a_finding_in_an_uncertified_manifest() {
+    let (_tmp, dir, config, _) = mixed_deno_project("gate_certify_finding", "^4.0.0");
+    write_answered_package_json(&dir);
+
+    let (stdout, stderr, code) = outcome(&check(
+        &dir,
+        &config,
+        &["--fail-on", "outdated", "--certify-answered"],
+    ));
+    assert_eq!(code, 1, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stderr.contains("is not certified"), "stderr: {stderr}");
+}
+
+/// With nothing fully answered there is nothing to certify, and certifying the empty set
+/// would be the vacuous pass the gate exists to refuse.
+#[test]
+fn certify_answered_refuses_a_run_with_no_fully_answered_manifest() {
+    let (_tmp, dir, config, jsr_authority) = mixed_deno_project("gate_certify_nothing", "^5.0.0");
+
+    let (stdout, stderr, code) = outcome(&check(
+        &dir,
+        &config,
+        &["--fail-on", "vulnerable", "--certify-answered"],
+    ));
+    assert_eq!(code, 2, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "cannot honour --fail-on: the npm ({jsr_authority}) registry did not answer"
+        )),
+        "stderr: {stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // A `[policy]` severity rule over a registry that never answered
 // ---------------------------------------------------------------------------
 

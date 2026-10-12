@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use dependable_fetch::osv::Severity;
 use dependable_fetch::{
-    Checker, DependencyStatus, Ecosystem, GoProxyFetcher, JsrFetcher, ManifestKind, NpmFetcher,
-    PackageSource, PackagistFetcher, PyPiFetcher, ScopedRegistry, build_client,
+    Checker, DependencyStatus, Ecosystem, ErrorOrigin, GoProxyFetcher, JsrFetcher, ManifestKind,
+    NpmFetcher, PackageSource, PackagistFetcher, PyPiFetcher, ScopedRegistry, build_client,
 };
 use wiremock::matchers::{body_string_contains, method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1782,6 +1782,71 @@ async fn a_deno_manifest_orders_both_declining_registries_by_root() {
             check.results.iter().map(|r| &r.status).collect::<Vec<_>>()
         );
     }
+}
+
+/// #142's mixed case in the shape the issue names: one `Cargo.toml` routing to crates.io
+/// and to a private alternate registry, and only crates.io answering. Partial
+/// certification rests on what this pins: the crates.io result is a real status, the
+/// alternate one is an unanswered error, and the manifest reports exactly the alternate
+/// registry — so a caller can name it, and leave the manifest uncertified as a whole.
+#[tokio::test]
+async fn a_cargo_manifest_with_one_declining_alternate_registry_reports_only_that_one() {
+    let crates = MockServer::start().await;
+    mount_index(&crates).await;
+    let private = MockServer::start().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&private)
+        .await;
+
+    let checker = Checker::builder()
+        .http_client(build_client().unwrap())
+        .rust_registry(crates.uri(), None)
+        .rust_alt_registry("private", private.uri(), None)
+        .vulnerabilities(false)
+        .build()
+        .unwrap();
+
+    let manifest = r#"
+[dependencies]
+serde = "1"
+internal = { version = "1", registry = "private" }
+"#;
+    let check = checker
+        .check_manifest(ManifestKind::CargoToml, manifest, None)
+        .await
+        .unwrap();
+
+    let by_name = |n: &str| {
+        check
+            .results
+            .iter()
+            .find(|r| r.item.name == n)
+            .unwrap_or_else(|| panic!("missing result for {n}"))
+    };
+    // crates.io answered, so its dependency carries a real status.
+    assert!(
+        !matches!(by_name("serde").status, DependencyStatus::Error(_)),
+        "{:?}",
+        by_name("serde").status
+    );
+    assert_eq!(by_name("serde").error_origin, ErrorOrigin::None);
+    // The alternate registry declined, and its dependency says so.
+    assert!(matches!(
+        by_name("internal").status,
+        DependencyStatus::Error(_)
+    ));
+    assert_eq!(by_name("internal").error_origin, ErrorOrigin::Unanswered);
+
+    // Only the registry that declined is reported, and crates.io is not implicated.
+    assert_eq!(check.unreachable_registries.len(), 1, "{check:?}");
+    let declined = &check.unreachable_registries[0];
+    assert_eq!(declined.ecosystem, Ecosystem::Rust);
+    assert_eq!(
+        declined.root.as_deref().map(|r| r.trim_end_matches('/')),
+        Some(private.uri().trim_end_matches('/'))
+    );
+    assert!(check.registry_unreachable);
 }
 
 /// #112: `ManifestCheck::unreachable_registries` is per *registry*, but `fetch_all`
