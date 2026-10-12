@@ -35,11 +35,11 @@ run = "cargo test --workspace"
 # `supports-color`, which is what makes this a real second configuration rather
 # than a repeat of the first.
 #
-# It `depends` on `test` rather than running beside it: both invocations share one
-# Cargo target directory, and the CLI integration tests keep fixed-name scratch
-# fixtures under `CARGO_TARGET_TMPDIR` that they wipe on entry, so two concurrent
-# runs delete each other's. `FORCE_COLOR` is in no fingerprint, so the serialized
-# second run rebuilds nothing and costs only its own test execution.
+# It `depends` on `test` so one `mise run test:color` runs both legs, plain first:
+# CI's single test step and the `ci` task rely on that. Serializing also keeps the
+# two runs from contending for one Cargo target directory and interleaving their
+# output. `FORCE_COLOR` is in no fingerprint, so the second run rebuilds nothing
+# and costs only its own test execution.
 [tasks."test:color"]
 description = "Run the test suite with terminal color forced on"
 depends = ["test"]
@@ -50,9 +50,10 @@ env = { FORCE_COLOR = "3" }
 # is the only thing that builds and tests the feature-off configuration. The
 # `check` names the binary's own build as a failure separate from its tests.
 #
-# `wait_for` rather than `depends`: it must not run beside `test` or `test:color`
-# (the CLI integration tests share fixed-name scratch fixtures under
-# `CARGO_TARGET_TMPDIR`), but running it alone should not drag them in.
+# `wait_for` rather than `depends`: it must not run beside `test` or `test:color`,
+# but running it alone should not drag them in. The CLI integration tests run the
+# binary at `CARGO_BIN_EXE_dependable`, the shared `target/debug/dependable`, so a
+# feature-off build running concurrently would replace it under the other suite.
 [tasks."test:no-default-features"]
 description = "Build and test the workspace with default features off"
 wait_for = ["test", "test:color"]
