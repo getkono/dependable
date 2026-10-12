@@ -4,9 +4,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use dependable_fetch::core::check_version;
 use dependable_fetch::{
-    Checker, Ecosystem, ManifestKind, WorkspaceGraphOptions, build_project_graph,
+    Checker, Ecosystem, Evaluation, ManifestKind, UnstableFilter, WorkspaceGraphOptions,
+    build_project_graph, evaluate_versions,
 };
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -125,6 +125,30 @@ pub fn spawn_lookup(checker: Arc<Checker>, key: PackageKey, tx: UnboundedSender<
     });
 }
 
+/// How far `version` is behind what the registry publishes, as the detail pane
+/// reports it.
+///
+/// No declared constraint governs a resolved package, so an empty constraint asks
+/// the only question that applies: is the version actually in use behind what the
+/// registry now offers? It is empty rather than `*` because `*` is not a range
+/// every dialect reads (Maven has no such spelling, and an unreadable constraint
+/// is `Undetermined`), while an empty one means "any version" in each of them.
+/// Both `published` and `version` are in the registry's own dialect, and
+/// [`evaluate_versions`] compares them as that ecosystem reads them — the same
+/// translation the CLI applies — and reports the newest release under the
+/// spelling the registry publishes. Pre-releases stay candidates, as they always
+/// have in this pane.
+#[must_use]
+pub fn freshness(ecosystem: Ecosystem, published: &[String], version: &str) -> Evaluation {
+    evaluate_versions(
+        ecosystem,
+        "",
+        published,
+        Some(version),
+        UnstableFilter::IncludeAlways,
+    )
+}
+
 /// Gather metadata, freshness, and advisories for one package.
 async fn lookup(
     checker: &Checker,
@@ -144,10 +168,7 @@ async fn lookup(
     // show what we have, with a note, rather than failing the whole pane.
     match checker.fetch_versions(ecosystem, name).await {
         Ok(versions) => {
-            // No declared constraint governs a resolved transitive package, so
-            // `*` asks the engine the only question that applies: is the version
-            // actually in use behind what the registry now offers?
-            let evaluation = check_version("*", &versions, Some(version));
+            let evaluation = freshness(ecosystem, &versions, version);
             facts.latest = evaluation.latest_available.clone();
             facts.status = Some(evaluation.status);
         }

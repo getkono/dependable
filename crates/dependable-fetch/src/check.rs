@@ -1482,44 +1482,92 @@ fn evaluate_item(
         return unfetchable(item);
     }
     match fetched.get(&(cache_key.to_owned(), item.name.clone())) {
-        Some(Ok(versions)) => {
-            // The current version drives `IncludeIfCurrent`: the locked version if
-            // known, else the declared constraint (its pre-release markers, if any,
-            // are detected by substring).
-            let current = item
-                .locked_version
-                .as_deref()
-                .or(Some(item.version_constraint.as_str()));
-            // Filter on the raw (registry-native) version strings so pre-release
-            // detection sees real markers, then translate to semver for comparison.
-            let filtered = unstable.filter(versions, current, ecosystem);
-            let filtered = same_flavour_only(&filtered, current, ecosystem);
-            let translated = to_semver_versions(&filtered, ecosystem);
-            let candidates: Vec<String> = translated
-                .iter()
-                .map(|(semver, _)| semver.clone())
-                .collect();
-            // Translation happens inside `check_version_for`, which is what keeps a
-            // dialect this crate could not read (`[4.0,4.9`, `LATEST`, `!=2.31.0`)
-            // apart from a manifest that declared no constraint at all. The first is
-            // `Undetermined`; only the second is `*`.
-            let eval = check_version_for(
-                &item.version_constraint,
+        Some(Ok(versions)) => CheckResult::from_evaluation(
+            item.clone(),
+            evaluate_versions(
                 ecosystem,
-                &candidates,
+                &item.version_constraint,
+                versions,
                 item.locked_version.as_deref(),
-            );
-            CheckResult::from_evaluation(
-                item.clone(),
-                in_native_versions(eval, &translated, ecosystem),
-            )
-        }
+                unstable,
+            ),
+        ),
         Some(Err(failure)) => {
             CheckResult::errored(item.clone(), failure.message.clone(), failure.origin)
         }
         // No entry at all: the task was never issued, or its result never arrived. No
         // registry answered anything here.
         None => CheckResult::errored(item.clone(), "not fetched", ErrorOrigin::Local),
+    }
+}
+
+/// Evaluate a registry's published `versions` against a declared `constraint` and
+/// the version in use, in the ecosystem's own version dialect.
+///
+/// This is the one place the whole comparison happens, for every frontend: the
+/// [`Checker`] calls it for each manifest entry, and a caller holding only a
+/// version list from [`Checker::fetch_versions`] (the TUI's package pane) calls it
+/// directly. Python (PEP 440), C# (NuGet) and the JVM (Maven) publish versions that
+/// semver cannot parse, and [`check_version`](dependable_core::check_version) drops
+/// any string it cannot parse without saying so. Handing it untranslated strings
+/// hides a two-segment or `.Final` newest release, and reads a current version such
+/// as `4.12` as *no* current version — which it then reports as up to date.
+///
+/// So the sequence is fixed here rather than repeated by each caller:
+///
+/// 1. `unstable` and the JVM flavour filter run over the **native** strings, where
+///    the pre-release and flavour markers are still readable.
+/// 2. The survivors, `locked`, and `constraint` are translated to semver with the
+///    same per-ecosystem translation, so both sides of the comparison agree.
+/// 3. The reported `latest_compatible` / `latest_available` are mapped back to the
+///    spelling the registry actually publishes (see `in_native_versions`).
+///
+/// `constraint` is in the manifest's own dialect; `""` (no constraint declared)
+/// asks only whether `locked` is behind the newest release. Not `"*"`: that is a
+/// spelling some dialects do not have — Maven's is untranslatable and evaluates as
+/// [`DependencyStatus::Undetermined`]. `locked` is the version in use — a lockfile's
+/// resolved version, or a graph node's — in the registry's dialect. A `locked`
+/// string the translation cannot read is passed through as written.
+#[must_use]
+pub fn evaluate_versions(
+    ecosystem: Ecosystem,
+    constraint: &str,
+    versions: &[String],
+    locked: Option<&str>,
+    unstable: UnstableFilter,
+) -> Evaluation {
+    // The current version drives `IncludeIfCurrent` and the flavour filter: the
+    // locked version if known, else the declared constraint (its pre-release
+    // markers, if any, are detected by substring).
+    let current = locked.or(Some(constraint));
+    let filtered = unstable.filter(versions, current, ecosystem);
+    let filtered = same_flavour_only(&filtered, current, ecosystem);
+    let translated = to_semver_versions(&filtered, ecosystem);
+    let candidates: Vec<String> = translated
+        .iter()
+        .map(|(semver, _)| semver.clone())
+        .collect();
+    // The version in use goes through the same translation as the list it is
+    // compared against: `4.12` and `2.0rc1` are not semver as written, and
+    // `check_version` would read either as no version at all.
+    let locked = locked.map(|v| to_semver(v, ecosystem).unwrap_or_else(|| v.to_owned()));
+    // Translation of the constraint happens inside `check_version_for`, which is what
+    // keeps a dialect this crate could not read (`[4.0,4.9`, `LATEST`, `!=2.31.0`)
+    // apart from a manifest that declared no constraint at all. The first is
+    // `Undetermined`; only the second is `*`.
+    let eval = check_version_for(constraint, ecosystem, &candidates, locked.as_deref());
+    in_native_versions(eval, &translated, ecosystem)
+}
+
+/// One registry-native version in semver, or `None` when the ecosystem's
+/// translation cannot read it. An ecosystem that publishes semver already is its
+/// own translation.
+fn to_semver(version: &str, ecosystem: Ecosystem) -> Option<String> {
+    match ecosystem {
+        Ecosystem::Python => dependable_core::semver::python::pep440_to_semver(version),
+        Ecosystem::CSharp => dependable_core::semver::nuget::nuget_to_semver(version),
+        Ecosystem::Jvm => dependable_core::semver::maven::maven_to_semver(version),
+        _ => Some(version.to_owned()),
     }
 }
 
@@ -1538,17 +1586,9 @@ fn evaluate_item(
 /// The result keeps the input order, which is the registry's newest-first order
 /// ([`crate::registries::FetchedVersions`]).
 fn to_semver_versions(versions: &[String], ecosystem: Ecosystem) -> Vec<(String, String)> {
-    let translate: fn(&str) -> Option<String> = match ecosystem {
-        Ecosystem::Python => dependable_core::semver::python::pep440_to_semver,
-        Ecosystem::CSharp => dependable_core::semver::nuget::nuget_to_semver,
-        Ecosystem::Jvm => dependable_core::semver::maven::maven_to_semver,
-        // Every other ecosystem publishes semver already, so the native string is
-        // its own translation.
-        _ => return versions.iter().map(|v| (v.clone(), v.clone())).collect(),
-    };
     versions
         .iter()
-        .filter_map(|v| translate(v).map(|semver| (semver, v.clone())))
+        .filter_map(|v| to_semver(v, ecosystem).map(|semver| (semver, v.clone())))
         .collect()
 }
 
@@ -2846,6 +2886,64 @@ mod tests {
             Ok(versions.iter().map(|v| (*v).to_string()).collect()),
         );
         evaluate_item(item, &fetched, CACHE_KEY, ecosystem, unstable)
+    }
+
+    /// A locked version is compared in the same translation as the list it is
+    /// compared against. A PEP 440 `2.0` is not semver as written, and read
+    /// untranslated it was no locked version at all: the comparison fell back to the
+    /// best compatible release and called a project two releases behind current.
+    #[test]
+    fn a_locked_version_in_its_own_dialect_is_compared_not_dropped() {
+        let mut declared = item_of(ManifestKind::RequirementsTxt, "requests>=2.0\n");
+        declared.locked_version = Some("2.0".to_string());
+        let result = evaluated(
+            &declared,
+            &["2.2", "2.1", "2.0"],
+            Ecosystem::Python,
+            UnstableFilter::Exclude,
+        );
+        assert_eq!(result.status, DependencyStatus::UpdateAvailable);
+        assert_eq!(result.latest_available.as_deref(), Some("2.2"));
+    }
+
+    /// A pre-release in use translates to a semver pre-release, which semver's
+    /// opt-in rule keeps out of `>=2.0.0`. PEP 440 admits a pre-release already in
+    /// use, so a project locked at the newest release, `2.1rc1`, is up to date, not
+    /// outside its constraint.
+    #[test]
+    fn a_locked_pre_release_inside_the_range_is_not_outdated() {
+        let mut declared = item_of(ManifestKind::RequirementsTxt, "requests>=2.0\n");
+        declared.locked_version = Some("2.1rc1".to_string());
+        let newest = evaluated(
+            &declared,
+            &["2.1rc1", "2.0"],
+            Ecosystem::Python,
+            UnstableFilter::IncludeIfCurrent,
+        );
+        assert_eq!(newest.status, DependencyStatus::UpToDate);
+        assert_eq!(newest.latest_available.as_deref(), Some("2.1rc1"));
+
+        // Behind its own final release, it is a patch behind — still not outside
+        // the range.
+        let behind = evaluated(
+            &declared,
+            &["2.1", "2.1rc1", "2.0"],
+            Ecosystem::Python,
+            UnstableFilter::IncludeIfCurrent,
+        );
+        assert_eq!(behind.status, DependencyStatus::PatchAvailable);
+        assert_eq!(behind.latest_available.as_deref(), Some("2.1"));
+
+        // A range the pre-release is ordered outside of still reads as outside it.
+        let mut capped = item_of(ManifestKind::RequirementsTxt, "requests<2.0\n");
+        capped.locked_version = Some("2.1rc1".to_string());
+        let outside = evaluated(
+            &capped,
+            &["2.1rc1", "2.0", "1.9"],
+            Ecosystem::Python,
+            UnstableFilter::IncludeIfCurrent,
+        );
+        assert_eq!(outside.status, DependencyStatus::Outdated);
     }
 
     /// Every version this tool reports has to be one the registry publishes. The
