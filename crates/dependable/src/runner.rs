@@ -521,9 +521,12 @@ pub async fn run_check(args: CheckArgs) -> anyhow::Result<ExitCode> {
         // dependency whose fetch failed has no version to ask OSV about, so it is never
         // queried and its advisory list is empty too. The test is the one
         // `--fail-on vulnerable` already applies, so a severity rule and that gate refuse
-        // exactly the same runs.
+        // exactly the same runs. Always over the whole run: `--certify-answered` relaxes
+        // `--fail-on` only, because a policy is evaluated over one report of every
+        // manifest and has no notion of the ones it should leave out.
         if policy.requires_cvss()
-            && let Err(reason) = gate_is_answerable(&reports, FailOn::Vulnerable)
+            && let Err(reason) =
+                gate_is_answerable(&reports, FailOn::Vulnerable, Certification::Whole)
         {
             eprintln!("error: `[policy]` gates on advisory severity, but {reason}");
             eprintln!("       refusing to pass a policy that was never evaluated");
@@ -536,7 +539,12 @@ pub async fn run_check(args: CheckArgs) -> anyhow::Result<ExitCode> {
             return Ok(ExitCode::from(1));
         }
     }
-    Ok(exit_code(&reports, fail_on, args.quiet))
+    let certification = if args.certify_answered {
+        Certification::Answered
+    } else {
+        Certification::Whole
+    };
+    Ok(exit_code(&reports, fail_on, certification, args.quiet))
 }
 
 /// Assemble the neutral report model the policy engine consumes from the CLI's
@@ -1851,10 +1859,39 @@ fn expand_env(content: &str) -> String {
 /// being right and this tool being incomplete, and failing a build over that punishes
 /// the user for our gap. [`note_undetermined`] says so on stderr, and `--fail-on any`
 /// still fails on it.
-fn gate_is_answerable(reports: &[ManifestReport], fail_on: FailOn) -> Result<(), String> {
+///
+/// # What the gate certifies, and over which manifests
+///
+/// Under [`Certification::Whole`] — the default — the answer is about the whole run: if
+/// any registry anywhere declined, nothing is certified, and a passing exit code means
+/// every dependency in the run was evaluated.
+///
+/// Under [`Certification::Answered`] (`--certify-answered`) a `vulnerable` or `outdated`
+/// gate is asked over the manifests [`partition`] certifies instead: those **every**
+/// registry of which answered. The unit is the manifest, not the route, even though the
+/// routing key is per registry. A `Cargo.toml` reaching crates.io and an alternate
+/// registry, or a `deno.json` reaching npm and JSR, whose second registry declined is
+/// left uncertified *in full*, including the dependencies its first registry answered
+/// for — because the reader of an exit code sees manifests, not routes, and a manifest
+/// certified "except for the half that went elsewhere" is a partition nobody reading the
+/// job can see. Certifying less than the routes would allow is the conservative side:
+/// a finer partition later only relaxes it.
+///
+/// Every reason below is then asked of the certified manifests alone — they are the run
+/// the verdict is about — and the uncertified ones are named on stderr by
+/// [`note_uncertified`]. Their findings still fail the build: a vulnerability found in a
+/// half-answered manifest is a fact, and only *passing* over it was in doubt. A run in
+/// which no manifest could be certified is refused exactly as under `Whole`, because
+/// certifying the empty set is the vacuous pass this function exists to prevent.
+fn gate_is_answerable(
+    reports: &[ManifestReport],
+    fail_on: FailOn,
+    certification: Certification,
+) -> Result<(), String> {
     if fail_on == FailOn::None {
         return Ok(());
     }
+    let (reports, _) = partition(reports, fail_on, certification);
     let mut reasons: Vec<String> = Vec::new();
     if reports
         .iter()
@@ -1868,7 +1905,7 @@ fn gate_is_answerable(reports: &[ManifestReport], fail_on: FailOn) -> Result<(),
     // settings match specific statuses and skip errors entirely, which is where a run
     // that established nothing could still be reported as clean.
     if fail_on != FailOn::Any {
-        let unanswered = unanswered_registries(reports);
+        let unanswered = unanswered_registries(reports.iter().copied());
         // Empty pushes nothing at all — which is what keeps the 404 carve-out and the
         // locally-unevaluable dependency below reaching the gate on their own terms.
         if !unanswered.is_empty() {
@@ -1888,6 +1925,57 @@ fn gate_is_answerable(reports: &[ManifestReport], fail_on: FailOn) -> Result<(),
     Err(join_reasons(&reasons))
 }
 
+/// How much of a run a `--fail-on` gate may certify when a registry did not answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Certification {
+    /// All or nothing: one registry declining anywhere refuses the whole run.
+    Whole,
+    /// `--certify-answered`: certify the manifests whose registries all answered, and
+    /// name the rest. See [`gate_is_answerable`].
+    Answered,
+}
+
+/// Split the run into the manifests a gate's verdict covers and those it leaves
+/// uncertified, as `(certified, uncertified)`.
+///
+/// Everything is certified — the second list is empty — unless the gate is `vulnerable`
+/// or `outdated` under [`Certification::Answered`] *and* at least one manifest had
+/// every registry answer. `none` gates on nothing, and `any` already fails on the
+/// unanswered results themselves rather than refusing, so neither has anything to
+/// partition. With no manifest fully answered the whole run is returned as certified,
+/// so [`gate_is_answerable`] refuses it on the registries that declined.
+fn partition(
+    reports: &[ManifestReport],
+    fail_on: FailOn,
+    certification: Certification,
+) -> (Vec<&ManifestReport>, Vec<&ManifestReport>) {
+    let partitions = certification == Certification::Answered
+        && matches!(fail_on, FailOn::Vulnerable | FailOn::Outdated);
+    let (answered, declined): (Vec<&ManifestReport>, Vec<&ManifestReport>) = reports
+        .iter()
+        .partition(|r| r.integrity.registry_unreachable.is_empty());
+    if !partitions || answered.is_empty() {
+        return (reports.iter().collect(), Vec::new());
+    }
+    (answered, declined)
+}
+
+/// Name on stderr, one line per manifest, what a `--certify-answered` pass left
+/// uncertified and which of its registries declined.
+///
+/// Printed under `--quiet` as well: the line is what makes a partial pass honest. Without
+/// it exit 0 would read as "every dependency here was checked", which is the one claim
+/// `--certify-answered` gives up.
+fn note_uncertified(uncertified: &[&ManifestReport]) {
+    for report in uncertified {
+        eprintln!(
+            "warning: {} is not certified: {}",
+            report.path.display(),
+            name_unanswered(&unanswered_registries([*report]))
+        );
+    }
+}
+
 /// Every registry that declined to answer anywhere in the run, deduplicated, in a stable
 /// order, rendered as labels.
 ///
@@ -1895,9 +1983,9 @@ fn gate_is_answerable(reports: &[ManifestReport], fail_on: FailOn) -> Result<(),
 /// polyglot repository is many [`ManifestReport`]s, and the same unreachable registry is
 /// one fact however many manifests routed to it. A union of sorted lists is not sorted,
 /// so this sorts the result itself.
-fn unanswered_registries(reports: &[ManifestReport]) -> Vec<String> {
+fn unanswered_registries<'a>(reports: impl IntoIterator<Item = &'a ManifestReport>) -> Vec<String> {
     let mut labels: Vec<String> = reports
-        .iter()
+        .into_iter()
         .flat_map(|r| r.integrity.registry_unreachable.iter())
         .map(dependable_fetch::UnreachableRegistry::label)
         .collect();
@@ -2054,16 +2142,30 @@ fn note_undetermined(reports: &[ManifestReport], fail_on: FailOn, quiet: bool) {
 /// The status never travels alone: `check` emits a manifest-level warning on
 /// stderr naming the dependencies involved, and [`note_undetermined`] counts
 /// them, so a failing job says what to fix.
-fn exit_code(reports: &[ManifestReport], fail_on: FailOn, quiet: bool) -> ExitCode {
+///
+/// # What exit `0` means under `--certify-answered`
+///
+/// Not "every dependency in this run was evaluated". It means: no dependency anywhere in
+/// the run matched the gate, and every manifest *not* named in a `warning: … is not
+/// certified` line on stderr had every registry it routed to answer. The findings scan
+/// below still covers every manifest, so an uncertified one can fail the build but never
+/// pass it on its own word.
+fn exit_code(
+    reports: &[ManifestReport],
+    fail_on: FailOn,
+    certification: Certification,
+    quiet: bool,
+) -> ExitCode {
     // A gate whose inputs are missing must fail, not pass. `--fail-on vulnerable` with an
     // unreachable OSV used to exit 0 while printing the errors that explain why it could
     // not know — a green build that had never been checked, which is the one outcome a
     // gate exists to prevent.
-    if let Err(reason) = gate_is_answerable(reports, fail_on) {
+    if let Err(reason) = gate_is_answerable(reports, fail_on, certification) {
         eprintln!("error: cannot honour --fail-on: {reason}");
         eprintln!("       refusing to report a clean run that was never completed");
         return ExitCode::from(2);
     }
+    note_uncertified(&partition(reports, fail_on, certification).1);
     note_unresolved(reports, fail_on, quiet);
     note_undetermined(reports, fail_on, quiet);
     let triggered = reports
@@ -2383,11 +2485,11 @@ mod tests {
             },
             &[DependencyStatus::UpToDate],
         )];
-        assert!(gate_is_answerable(&reports, FailOn::Vulnerable).is_err());
-        assert!(gate_is_answerable(&reports, FailOn::Outdated).is_err());
-        assert!(gate_is_answerable(&reports, FailOn::Any).is_err());
+        assert!(gate_is_answerable(&reports, FailOn::Vulnerable, Certification::Whole).is_err());
+        assert!(gate_is_answerable(&reports, FailOn::Outdated, Certification::Whole).is_err());
+        assert!(gate_is_answerable(&reports, FailOn::Any, Certification::Whole).is_err());
         // Nothing was gated on, so nothing can be missing.
-        assert!(gate_is_answerable(&reports, FailOn::None).is_ok());
+        assert!(gate_is_answerable(&reports, FailOn::None, Certification::Whole).is_ok());
     }
 
     /// A registry that never answered leaves every dependency it covered unfounded, so
@@ -2404,18 +2506,21 @@ mod tests {
             },
             &[DependencyStatus::Error("registry unreachable".to_owned())],
         )];
-        assert!(gate_is_answerable(&reports, FailOn::Vulnerable).is_err());
-        assert!(gate_is_answerable(&reports, FailOn::Outdated).is_err());
+        assert!(gate_is_answerable(&reports, FailOn::Vulnerable, Certification::Whole).is_err());
+        assert!(gate_is_answerable(&reports, FailOn::Outdated, Certification::Whole).is_err());
         assert_eq!(
-            exit_code(&reports, FailOn::Vulnerable, false),
+            exit_code(&reports, FailOn::Vulnerable, Certification::Whole, false),
             ExitCode::from(2)
         );
         // `Any` fails on the `Error` statuses an unanswering registry produces, so its
         // promise is kept — that is the gate working, not a hole.
-        assert!(gate_is_answerable(&reports, FailOn::Any).is_ok());
-        assert_eq!(exit_code(&reports, FailOn::Any, false), ExitCode::from(1));
+        assert!(gate_is_answerable(&reports, FailOn::Any, Certification::Whole).is_ok());
+        assert_eq!(
+            exit_code(&reports, FailOn::Any, Certification::Whole, false),
+            ExitCode::from(1)
+        );
         // Nothing was gated on, so nothing can be missing.
-        assert!(gate_is_answerable(&reports, FailOn::None).is_ok());
+        assert!(gate_is_answerable(&reports, FailOn::None, Certification::Whole).is_ok());
     }
 
     /// A registry that answered "no such package" answered. A private or internal
@@ -2447,20 +2552,23 @@ mod tests {
                 not_found,
             ],
         )];
-        assert!(gate_is_answerable(&reports, FailOn::Vulnerable).is_ok());
-        assert!(gate_is_answerable(&reports, FailOn::Outdated).is_ok());
-        assert!(gate_is_answerable(&reports, FailOn::Any).is_ok());
+        assert!(gate_is_answerable(&reports, FailOn::Vulnerable, Certification::Whole).is_ok());
+        assert!(gate_is_answerable(&reports, FailOn::Outdated, Certification::Whole).is_ok());
+        assert!(gate_is_answerable(&reports, FailOn::Any, Certification::Whole).is_ok());
         assert_eq!(
-            exit_code(&reports, FailOn::Vulnerable, false),
+            exit_code(&reports, FailOn::Vulnerable, Certification::Whole, false),
             ExitCode::SUCCESS
         );
         assert_eq!(
-            exit_code(&reports, FailOn::Outdated, false),
+            exit_code(&reports, FailOn::Outdated, Certification::Whole, false),
             ExitCode::SUCCESS
         );
         // `Any` still fails on the error itself — that is the gate working, and it is
         // the setting that asks to hear about anything less than a clean answer.
-        assert_eq!(exit_code(&reports, FailOn::Any, false), ExitCode::from(1));
+        assert_eq!(
+            exit_code(&reports, FailOn::Any, Certification::Whole, false),
+            ExitCode::from(1)
+        );
     }
 
     /// The other half of the same distinction, and the regression the carve-out
@@ -2492,19 +2600,22 @@ mod tests {
             ],
         )];
         assert_eq!(
-            gate_is_answerable(&reports, FailOn::Vulnerable).unwrap_err(),
+            gate_is_answerable(&reports, FailOn::Vulnerable, Certification::Whole).unwrap_err(),
             "1 dependency could not be evaluated"
         );
-        assert!(gate_is_answerable(&reports, FailOn::Outdated).is_err());
+        assert!(gate_is_answerable(&reports, FailOn::Outdated, Certification::Whole).is_err());
         assert_eq!(
-            exit_code(&reports, FailOn::Vulnerable, false),
+            exit_code(&reports, FailOn::Vulnerable, Certification::Whole, false),
             ExitCode::from(2)
         );
         // `Any` fails on the `Error` itself, so its promise is kept.
-        assert!(gate_is_answerable(&reports, FailOn::Any).is_ok());
-        assert_eq!(exit_code(&reports, FailOn::Any, false), ExitCode::from(1));
+        assert!(gate_is_answerable(&reports, FailOn::Any, Certification::Whole).is_ok());
+        assert_eq!(
+            exit_code(&reports, FailOn::Any, Certification::Whole, false),
+            ExitCode::from(1)
+        );
         // Nothing was gated on, so nothing can be missing.
-        assert!(gate_is_answerable(&reports, FailOn::None).is_ok());
+        assert!(gate_is_answerable(&reports, FailOn::None, Certification::Whole).is_ok());
     }
 
     /// Every unanswerable reason at once, read as one sentence rather than as a
@@ -2521,7 +2632,7 @@ mod tests {
             vec![],
         )];
         assert_eq!(
-            gate_is_answerable(&reports, FailOn::Vulnerable).unwrap_err(),
+            gate_is_answerable(&reports, FailOn::Vulnerable, Certification::Whole).unwrap_err(),
             "the vulnerability scan did not complete, the Rust registry did not answer and 2 \
              dependencies could not be evaluated"
         );
@@ -2549,7 +2660,12 @@ mod tests {
 
         // One registry, one name.
         assert_eq!(
-            gate_is_answerable(&[report(Ecosystem::Go)], FailOn::Vulnerable).unwrap_err(),
+            gate_is_answerable(
+                &[report(Ecosystem::Go)],
+                FailOn::Vulnerable,
+                Certification::Whole
+            )
+            .unwrap_err(),
             "the Go registry did not answer"
         );
 
@@ -2558,18 +2674,18 @@ mod tests {
         let both = [report(Ecosystem::Npm), report(Ecosystem::Go)];
         let reversed = [report(Ecosystem::Go), report(Ecosystem::Npm)];
         assert_eq!(
-            gate_is_answerable(&both, FailOn::Vulnerable).unwrap_err(),
+            gate_is_answerable(&both, FailOn::Vulnerable, Certification::Whole).unwrap_err(),
             "the Go and npm registries did not answer"
         );
         assert_eq!(
-            gate_is_answerable(&reversed, FailOn::Vulnerable).unwrap_err(),
-            gate_is_answerable(&both, FailOn::Vulnerable).unwrap_err()
+            gate_is_answerable(&reversed, FailOn::Vulnerable, Certification::Whole).unwrap_err(),
+            gate_is_answerable(&both, FailOn::Vulnerable, Certification::Whole).unwrap_err()
         );
 
         // The same registry reached from two manifests is one fact, not two.
         let twice = [report(Ecosystem::Go), report(Ecosystem::Go)];
         assert_eq!(
-            gate_is_answerable(&twice, FailOn::Vulnerable).unwrap_err(),
+            gate_is_answerable(&twice, FailOn::Vulnerable, Certification::Whole).unwrap_err(),
             "the Go registry did not answer"
         );
 
@@ -2580,13 +2696,13 @@ mod tests {
             report(Ecosystem::Jvm),
         ];
         assert_eq!(
-            gate_is_answerable(&three, FailOn::Vulnerable).unwrap_err(),
+            gate_is_answerable(&three, FailOn::Vulnerable, Certification::Whole).unwrap_err(),
             "the Go, JVM and npm registries did not answer"
         );
 
         // The settings that were never blocked by this reason still are not.
-        assert!(gate_is_answerable(&both, FailOn::Any).is_ok());
-        assert!(gate_is_answerable(&both, FailOn::None).is_ok());
+        assert!(gate_is_answerable(&both, FailOn::Any, Certification::Whole).is_ok());
+        assert!(gate_is_answerable(&both, FailOn::None, Certification::Whole).is_ok());
     }
 
     /// Several roots reduce to one printed label, and under a root-ordered sort they need
@@ -2612,7 +2728,7 @@ mod tests {
             vec![],
         )];
         assert_eq!(
-            gate_is_answerable(&reports, FailOn::Vulnerable).unwrap_err(),
+            gate_is_answerable(&reports, FailOn::Vulnerable, Certification::Whole).unwrap_err(),
             "the Rust (nexus.corp) and Rust (other.host) registries did not answer"
         );
     }
@@ -2634,7 +2750,7 @@ mod tests {
             vec![],
         )];
         assert_eq!(
-            gate_is_answerable(&reports, FailOn::Vulnerable).unwrap_err(),
+            gate_is_answerable(&reports, FailOn::Vulnerable, Certification::Whole).unwrap_err(),
             "the npm (jsr.io) registry did not answer"
         );
     }
@@ -2654,7 +2770,7 @@ mod tests {
             vec![],
         )];
         assert_eq!(
-            gate_is_answerable(&reports, FailOn::Vulnerable).unwrap_err(),
+            gate_is_answerable(&reports, FailOn::Vulnerable, Certification::Whole).unwrap_err(),
             "1 dependency could not be evaluated"
         );
     }
@@ -2686,9 +2802,9 @@ mod tests {
             ScanIntegrity::default(),
             &[DependencyStatus::UpToDate],
         )];
-        assert!(gate_is_answerable(&clean, FailOn::Vulnerable).is_ok());
+        assert!(gate_is_answerable(&clean, FailOn::Vulnerable, Certification::Whole).is_ok());
         assert_eq!(
-            exit_code(&clean, FailOn::Vulnerable, false),
+            exit_code(&clean, FailOn::Vulnerable, Certification::Whole, false),
             ExitCode::SUCCESS
         );
 
@@ -2697,9 +2813,150 @@ mod tests {
             &[DependencyStatus::Vulnerable],
         )];
         assert_eq!(
-            exit_code(&vulnerable, FailOn::Vulnerable, false),
+            exit_code(&vulnerable, FailOn::Vulnerable, Certification::Whole, false),
             ExitCode::from(1)
         );
+    }
+
+    /// A manifest one of whose registries declined, holding the given statuses — the
+    /// mixed case of #142 when `statuses` includes a result its other registry answered.
+    fn declined_report(statuses: &[DependencyStatus]) -> ManifestReport {
+        report_with(
+            ScanIntegrity {
+                registry_unreachable: vec![unreachable_default(Ecosystem::Go)],
+                ..ScanIntegrity::default()
+            },
+            statuses,
+        )
+    }
+
+    /// #142: `--certify-answered` certifies the manifests whose registries all answered,
+    /// and only those. The default stays all-or-nothing.
+    #[test]
+    fn certify_answered_certifies_the_manifests_whose_registries_all_answered() {
+        let reports = vec![
+            report_with(ScanIntegrity::default(), &[DependencyStatus::UpToDate]),
+            declined_report(&[DependencyStatus::UpToDate]),
+        ];
+        for fail_on in [FailOn::Vulnerable, FailOn::Outdated] {
+            assert!(gate_is_answerable(&reports, fail_on, Certification::Answered).is_ok());
+            assert_eq!(
+                exit_code(&reports, fail_on, Certification::Answered, false),
+                ExitCode::SUCCESS
+            );
+            assert_eq!(
+                gate_is_answerable(&reports, fail_on, Certification::Whole).unwrap_err(),
+                "the Go registry did not answer"
+            );
+        }
+
+        // The half-answered manifest is the one left out, whole — not the clean one.
+        let (certified, uncertified) =
+            partition(&reports, FailOn::Vulnerable, Certification::Answered);
+        assert_eq!(certified.len(), 1);
+        assert!(certified[0].integrity.registry_unreachable.is_empty());
+        assert_eq!(uncertified.len(), 1);
+        assert!(!uncertified[0].integrity.registry_unreachable.is_empty());
+    }
+
+    /// An uncertified manifest can fail the build but never pass it: a vulnerability its
+    /// answered registry did establish is a fact, and only passing over it was in doubt.
+    #[test]
+    fn a_finding_in_an_uncertified_manifest_still_fails_the_build() {
+        let reports = vec![
+            report_with(ScanIntegrity::default(), &[DependencyStatus::UpToDate]),
+            declined_report(&[DependencyStatus::Vulnerable]),
+        ];
+        assert_eq!(
+            exit_code(&reports, FailOn::Vulnerable, Certification::Answered, false),
+            ExitCode::from(1)
+        );
+    }
+
+    /// Certifying the empty set is the vacuous pass the gate exists to prevent, so a run
+    /// in which every manifest had a registry decline is refused exactly as by default.
+    #[test]
+    fn certify_answered_refuses_a_run_with_no_fully_answered_manifest() {
+        let reports = vec![
+            declined_report(&[DependencyStatus::UpToDate]),
+            declined_report(&[]),
+        ];
+        assert_eq!(
+            gate_is_answerable(&reports, FailOn::Vulnerable, Certification::Answered).unwrap_err(),
+            "the Go registry did not answer"
+        );
+        assert_eq!(
+            exit_code(&reports, FailOn::Vulnerable, Certification::Answered, false),
+            ExitCode::from(2)
+        );
+    }
+
+    /// The opt-in relaxes the registry reason only by narrowing *which* manifests are
+    /// asked. A certified manifest's own gaps still refuse the run, and an uncertified
+    /// manifest's do not, because the verdict is no longer about it.
+    #[test]
+    fn certify_answered_still_refuses_a_certified_manifest_with_its_own_gaps() {
+        let certified_gap = vec![
+            report_with(
+                ScanIntegrity {
+                    unevaluated: 1,
+                    ..ScanIntegrity::default()
+                },
+                &[],
+            ),
+            declined_report(&[]),
+        ];
+        assert_eq!(
+            gate_is_answerable(&certified_gap, FailOn::Vulnerable, Certification::Answered)
+                .unwrap_err(),
+            "1 dependency could not be evaluated"
+        );
+
+        let uncertified_gap = vec![
+            report_with(ScanIntegrity::default(), &[]),
+            report_with(
+                ScanIntegrity {
+                    vulnerability_scan_failed: true,
+                    registry_unreachable: vec![unreachable_default(Ecosystem::Go)],
+                    ..ScanIntegrity::default()
+                },
+                &[],
+            ),
+        ];
+        assert!(
+            gate_is_answerable(
+                &uncertified_gap,
+                FailOn::Vulnerable,
+                Certification::Answered
+            )
+            .is_ok()
+        );
+    }
+
+    /// `none` gates on nothing and `any` already fails on the unanswered results, so
+    /// neither has anything to partition, and `--certify-answered` changes neither.
+    #[test]
+    fn certify_answered_changes_nothing_under_none_or_any() {
+        let reports = vec![
+            report_with(ScanIntegrity::default(), &[DependencyStatus::UpToDate]),
+            declined_report(&[DependencyStatus::Error("timed out".to_owned())]),
+        ];
+        for fail_on in [FailOn::None, FailOn::Any] {
+            let (certified, uncertified) = partition(&reports, fail_on, Certification::Answered);
+            assert_eq!((certified.len(), uncertified.len()), (2, 0), "{fail_on:?}");
+            assert_eq!(
+                exit_code(&reports, fail_on, Certification::Answered, false),
+                exit_code(&reports, fail_on, Certification::Whole, false),
+                "{fail_on:?}"
+            );
+        }
+    }
+
+    /// The flag parses, and is off unless given.
+    #[test]
+    fn certify_answered_is_opt_in() {
+        assert!(!check_args(&["dependable", "check"]).certify_answered);
+        assert!(check_args(&["dependable", "check", "--certify-answered"]).certify_answered);
     }
 
     /// Parse a real command line, so the test exercises the same `Option` clap produces
