@@ -66,3 +66,15 @@ minijinja = "2"
 # dev
 wiremock = "0.6"
 tempfile = "3"
+
+# Dev and test builds give workspace crates line tables only and dependencies
+# no debuginfo, so target/ stays small under fast iteration. Workspace
+# backtraces keep file:line; dependency frames keep their symbol names but lose
+# file:line. For full debuginfo when step-debugging:
+#   CARGO_PROFILE_DEV_DEBUG=2 cargo ...                          # workspace crates
+#   cargo --config 'profile.dev.package."*".debug=2' ...         # dependencies
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
